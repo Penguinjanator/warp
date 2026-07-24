@@ -52,9 +52,10 @@ def mk_hook(layer_idx):
             idx = out[2].reshape(-1, top_k)
         else:
             idx = torch.topk(out.float(), top_k).indices.reshape(-1, top_k)
-        if idx.shape[0] != 1:
-            return  # skip prefill
-        step_layers.append((layer_idx, sorted(idx[0].tolist())))
+        # last position = routing of the newest token (works both with KV
+        # cache, where idx has 1 row, and with full re-forward, where it
+        # has seq_len rows)
+        step_layers.append((layer_idx, sorted(idx[-1].tolist())))
     return hook
 
 
@@ -64,16 +65,19 @@ for li, layer in enumerate(model.model.layers):
 ids = tok(PROMPT, return_tensors="pt").input_ids.to(dev)
 print(f"prompt tokens: {ids.shape[1]}; generating {N_NEW}...", flush=True)
 
+torch.manual_seed(0)
 with torch.no_grad():
-    cur = model.generate(ids, max_new_tokens=1, do_sample=False)  # warm + prefill
-    step_layers.clear()
+    cur = ids
     for i in range(N_NEW):
-        out = model(cur)
+        out = model(cur)  # full re-forward: O(n^2) but cache-agnostic
         step_layers.sort()
-        if len(step_layers) == cfg.num_hidden_layers:
+        if i > 0 and len(step_layers) == cfg.num_hidden_layers:
             trace.append({"tok": i, "layers": [l for _, l in step_layers]})
         step_layers.clear()
-        nxt = out.logits[0, -1].argmax().reshape(1, 1)
+        # sample (temp 0.7): greedy on base models degenerates into loops,
+        # which would inflate expert-reuse stats and bias the feasibility gate
+        probs = torch.softmax(out.logits[0, -1].float() / 0.7, dim=-1)
+        nxt = torch.multinomial(probs, 1).reshape(1, 1).to(cur.device)
         cur = torch.cat([cur, nxt], dim=1)
         if (i + 1) % 50 == 0:
             print(f"  {i+1}/{N_NEW}", flush=True)
