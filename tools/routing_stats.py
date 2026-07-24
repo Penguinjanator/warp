@@ -96,6 +96,13 @@ def model_shape(cfg):
         "kv_lora":       _cfg(cfg, "kv_lora_rank"),
         "q_lora":        _cfg(cfg, "q_lora_rank"),
     }
+    if s["moe_inter"] is None and s["n_experts"]:
+        # Mixtral/OLMoE-style configs size experts with plain intermediate_size.
+        # (DeepSeek-family always has moe_intermediate_size — there
+        # intermediate_size is the dense FFN and would be wrong here.)
+        s["moe_inter"] = s["dense_inter"]
+        print("!! moe_intermediate_size missing: falling back to "
+              "intermediate_size (Mixtral/OLMoE convention)", file=sys.stderr)
     missing = [k for k, v in s.items() if v is None and k not in ("kv_lora", "q_lora")]
     if missing:
         print(f"!! config keys not recognized for: {missing} — inspect config.json "
