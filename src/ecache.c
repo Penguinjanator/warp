@@ -2,8 +2,11 @@
 
 #include "ecache.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "waste_format.h"
 
 #define EC_SAMPLE 16      /* victims sampled per eviction (Redis-style)     */
 
@@ -141,4 +144,82 @@ const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
     c->slot[vi].hits = 1;
     c->slot[vi].last = c->clock;
     return c->slot[vi].data;
+}
+
+/* ---- learned hotlist ---------------------------------------------------- */
+
+int waste_ecache_save_usage(const waste_ecache *c, const char *path,
+                            uint64_t tokens)
+{
+    if (!c->slot || !path) return -1;
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    waste_usage_hdr h = { WASTE_MAGIC_USAGE, 1, tokens };
+    int rc = fwrite(&h, sizeof h, 1, f) == 1 ? 0 : -1;
+    for (int i = 0; i < c->n_slots && !rc; i++) {
+        if (c->slot[i].key < 0) continue;
+        waste_usage_ent e;
+        e.layer = (uint16_t)(c->slot[i].key >> 16);
+        e.expert_id = (uint16_t)(c->slot[i].key & 0xFFFF);
+        e.hits = c->slot[i].hits;
+        e.last_seen = (uint32_t)c->slot[i].last;
+        e.next_layer_top = 0;
+        if (fwrite(&e, sizeof e, 1, f) != 1) rc = -1;
+    }
+    fclose(f);
+    if (rc) remove(path);
+    return rc;
+}
+
+/* Preload the hottest recorded experts, best first, until the cache is
+ * full. Returns how many were loaded, or -1. */
+int waste_ecache_warm(waste_ecache *c, const char *path,
+                      waste_fetch_fn fetch, void *user)
+{
+    if (!c->slot || !path) return -1;
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    waste_usage_hdr h;
+    if (fread(&h, sizeof h, 1, f) != 1 || h.magic != WASTE_MAGIC_USAGE) {
+        fclose(f);
+        return -1;
+    }
+
+    long start = ftell(f);
+    fseek(f, 0, SEEK_END);
+    const long n = (ftell(f) - start) / (long)sizeof(waste_usage_ent);
+    fseek(f, start, SEEK_SET);
+    if (n <= 0) { fclose(f); return 0; }
+
+    waste_usage_ent *ent = (waste_usage_ent *)malloc((size_t)n * sizeof *ent);
+    if (!ent || fread(ent, sizeof *ent, (size_t)n, f) != (size_t)n) {
+        free(ent); fclose(f); return -1;
+    }
+    fclose(f);
+
+    /* hottest first; a partial selection is enough since we stop at n_slots */
+    const int want = (int)n < c->n_slots ? (int)n : c->n_slots;
+    for (int i = 0; i < want; i++) {
+        int best = i;
+        for (int j = i + 1; j < n; j++)
+            if (ent[j].hits > ent[best].hits) best = j;
+        const waste_usage_ent t = ent[i]; ent[i] = ent[best]; ent[best] = t;
+    }
+
+    int loaded = 0;
+    for (int i = 0; i < want; i++) {
+        const int32_t key = ((int32_t)ent[i].layer << 16) | ent[i].expert_id;
+        if (ec_lookup(c, key) >= 0) continue;
+        const int vi = ec_victim(c);
+        if (vi < 0) break;
+        if (fetch(user, ent[i].layer, ent[i].expert_id, c->slot[vi].data) != 0) continue;
+        const int had = c->slot[vi].key >= 0;
+        c->slot[vi].key = key;
+        c->slot[vi].hits = ent[i].hits;
+        c->slot[vi].last = ++c->clock;
+        if (had) ec_rehash(c); else ec_insert(c, key, vi);
+        loaded++;
+    }
+    free(ent);
+    return loaded;
 }

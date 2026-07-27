@@ -26,6 +26,7 @@ struct waste_ctx {
     waste_memplan plan;
     char path[512];
     int pos;                 /* next position in the sequence */
+    int warmed;              /* experts preloaded from the hotlist */
     waste_stats stats;
 };
 
@@ -184,6 +185,8 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
         return WASTE_E_IO;
     }
     c->tok = waste_tok_open(model_path);      /* optional */
+    /* warm the cache from what previous runs learned, if anything */
+    c->warmed = waste_model_warm_cache(&c->m, model_path);
     *out = c;
     return WASTE_OK;
 }
@@ -382,14 +385,19 @@ void waste_state_reset(waste_ctx *c)
 
 waste_status waste_state_save(waste_ctx *c, const char *path)
 {
-    (void)c; (void)path;
-    return WASTE_E_UNSUPPORTED;      /* 0.2.0 */
+    if (!c || !path) return WASTE_E_ARG;
+    return waste_model_state_save(&c->m, path, c->pos) == 0 ? WASTE_OK : WASTE_E_IO;
 }
 
 waste_status waste_state_load(waste_ctx *c, const char *path)
 {
-    (void)c; (void)path;
-    return WASTE_E_UNSUPPORTED;
+    if (!c || !path) return WASTE_E_ARG;
+    int pos = 0;
+    const int rc = waste_model_state_load(&c->m, path, &pos);
+    if (rc == -2) return WASTE_E_FORMAT;      /* built for a different model */
+    if (rc) return WASTE_E_IO;
+    c->pos = pos;
+    return WASTE_OK;
 }
 
 waste_status waste_model_get_info(const waste_ctx *c, waste_model_info *out)
@@ -408,6 +416,12 @@ waste_status waste_model_get_info(const waste_ctx *c, waste_model_info *out)
     out->arch = "kimi-linear";
     out->quant_summary = "experts VQ3R, trunk Q8G/F32";
     return WASTE_OK;
+}
+
+waste_status waste_save_usage(waste_ctx *c)
+{
+    if (!c) return WASTE_E_ARG;
+    return waste_model_save_usage(&c->m, c->path) < 0 ? WASTE_E_IO : WASTE_OK;
 }
 
 waste_status waste_get_stats(const waste_ctx *c, waste_stats *out)

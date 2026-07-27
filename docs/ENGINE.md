@@ -161,9 +161,51 @@ version that shipped keeps the decode-style LUT arithmetic and reorganizes
 not the expert, so they are built once per token and reused across every
 expert that token routes to.
 
+## Session state
+
+`waste_state_save` / `waste_state_load` persist the whole session: KDA
+recurrent state, the short-conv rings, the MLA KV cache, the AttnRes block
+history and the position. The file records every shape it depends on, so
+a state built for a different model is rejected with `WASTE_E_FORMAT`
+rather than silently producing nonsense.
+
+This matters more here than in a conventional engine. At K3's streaming
+speeds re-prefilling a long agent transcript is minutes; restoring it is a
+file read. `waste chat` exposes it as `/save FILE` and `/load FILE`, and
+`tests/test_state.c` asserts that a reloaded session continues with
+exactly the same tokens.
+
+## Learned hotlist
+
+The cache records which experts a workload actually touches, and
+`--learn` writes that to `usage.waste` beside the container. The next open
+preloads the hottest ones, so a run starts warm instead of empty.
+
+Measured on Kimi-Linear, same prompt twice at a 5 GB budget:
+
+| | expert misses | hit rate |
+|---|---|---|
+| cold | 1602 | 61% |
+| warm | 1175 | 72% |
+
+This does not move the floor Gate 5 established — a cache below one
+token's working set still keeps nothing alive — it removes the ramp at the
+start of every run.
+
 ## Verification bar
 
 The CLI must never be able to do something the library cannot, and
-`waste_plan_memory` must agree with `waste_memory_used` after open (a
-test asserts it). Any allocation path that can exceed the budget is a bug,
-not a tuning issue.
+`waste_plan_memory` must agree with `waste_memory_used` after open. Any
+allocation path that can exceed the budget is a bug, not a tuning issue.
+
+`make check` runs everything: kernels against their reference
+implementations, the container round-trip, chunked prefill against
+token-at-a-time, int8 storage against f32, the SIMD backend against the
+CPU baseline, the cache against no cache, the engine against the PyTorch
+oracle, session round-trip, hotlist effect, budget enforcement including
+peak RSS, and the tokenizer against Python tiktoken. **16 checks.**
+
+It exists because this project twice lost hours to checks that silently
+did not run — once to objects compiled against a stale header, once to a
+stale test binary. So it rebuilds first, and a missing prerequisite is
+reported as SKIP, never as a pass.

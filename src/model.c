@@ -989,6 +989,132 @@ void waste_apply_attn_res(waste_model *m, const float *blockres, int nb,
     }
 }
 
+int waste_model_warm_cache(waste_model *m, const char *dir)
+{
+    if (m->cache.n_slots <= 0) return 0;
+    char p[512];
+    snprintf(p, sizeof p, "%s/usage.waste", dir);
+    return waste_ecache_warm(&m->cache, p, bank_fetch, m);
+}
+
+int waste_model_save_usage(const waste_model *m, const char *dir)
+{
+    if (m->cache.n_slots <= 0) return 0;
+    char p[512];
+    snprintf(p, sizeof p, "%s/usage.waste", dir);
+    return waste_ecache_save_usage(&m->cache, p, m->cache.clock);
+}
+
+/* ---- session state ------------------------------------------------------
+ * Written with the shapes it depends on, so a state file that no longer
+ * matches the model is rejected rather than silently producing nonsense.
+ */
+
+typedef struct {
+    uint32_t magic, version;
+    int32_t  n_layers, hidden, kda_heads, kda_dim, conv_k, n_heads;
+    int32_t  qk_nope, qk_rope, v_head, attn_res_block;
+    int32_t  pos, n_blockres;
+    uint32_t reserved[2];
+} waste_state_hdr;
+
+static void state_fill(const waste_model *m, waste_state_hdr *h, int pos)
+{
+    const waste_config *c = &m->cfg;
+    memset(h, 0, sizeof *h);
+    h->magic = WASTE_MAGIC_KDASTATE;
+    h->version = 1;
+    h->n_layers = c->n_layers; h->hidden = c->hidden;
+    h->kda_heads = c->kda_heads; h->kda_dim = c->kda_dim; h->conv_k = c->conv_k;
+    h->n_heads = c->n_heads; h->qk_nope = c->qk_nope; h->qk_rope = c->qk_rope;
+    h->v_head = c->v_head; h->attn_res_block = c->attn_res_block;
+    h->pos = pos; h->n_blockres = m->n_blockres;
+}
+
+int waste_model_state_save(const waste_model *m, const char *path, int pos)
+{
+    const waste_config *c = &m->cfg;
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    waste_state_hdr h;
+    state_fill(m, &h, pos);
+    int rc = fwrite(&h, sizeof h, 1, f) == 1 ? 0 : -1;
+
+    const int H = c->kda_heads, D = c->kda_dim, C = H * D;
+    const int qd = c->qk_nope + c->qk_rope;
+    for (int L = 0; L < c->n_layers && !rc; L++) {
+        if (c->kda_layer[L]) {
+            if (fwrite(m->S[L], sizeof(float), (size_t)H * D * D, f) != (size_t)H * D * D) rc = -1;
+            const size_t cn = (size_t)3 * C * (c->conv_k - 1);
+            if (!rc && fwrite(m->conv[L], sizeof(float), cn, f) != cn) rc = -1;
+        } else {
+            const int32_t nkv = m->n_kv[L];
+            if (fwrite(&nkv, sizeof nkv, 1, f) != 1) { rc = -1; break; }
+            const size_t kn = (size_t)nkv * c->n_heads * qd;
+            const size_t vn = (size_t)nkv * c->n_heads * c->v_head;
+            if (kn && fwrite(m->kcache[L], sizeof(float), kn, f) != kn) rc = -1;
+            if (!rc && vn && fwrite(m->vcache[L], sizeof(float), vn, f) != vn) rc = -1;
+        }
+    }
+    if (!rc && c->attn_res_block && m->n_blockres > 0) {
+        const size_t n = (size_t)m->n_blockres * c->hidden;
+        if (fwrite(m->blockres, sizeof(float), n, f) != n) rc = -1;
+    }
+    if (!rc && fwrite(m->x, sizeof(float), (size_t)c->hidden, f) != (size_t)c->hidden) rc = -1;
+    fclose(f);
+    if (rc) remove(path);
+    return rc;
+}
+
+int waste_model_state_load(waste_model *m, const char *path, int *pos)
+{
+    const waste_config *c = &m->cfg;
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    waste_state_hdr h, want;
+    state_fill(m, &want, 0);
+    if (fread(&h, sizeof h, 1, f) != 1) { fclose(f); return -1; }
+    /* every shape must match; pos and n_blockres are the payload */
+    if (h.magic != want.magic || h.version != want.version ||
+        h.n_layers != want.n_layers || h.hidden != want.hidden ||
+        h.kda_heads != want.kda_heads || h.kda_dim != want.kda_dim ||
+        h.conv_k != want.conv_k || h.n_heads != want.n_heads ||
+        h.qk_nope != want.qk_nope || h.qk_rope != want.qk_rope ||
+        h.v_head != want.v_head || h.attn_res_block != want.attn_res_block) {
+        fclose(f);
+        return -2;                       /* state does not belong to this model */
+    }
+
+    const int H = c->kda_heads, D = c->kda_dim, C = H * D;
+    const int qd = c->qk_nope + c->qk_rope;
+    int rc = 0;
+    for (int L = 0; L < c->n_layers && !rc; L++) {
+        if (c->kda_layer[L]) {
+            if (fread(m->S[L], sizeof(float), (size_t)H * D * D, f) != (size_t)H * D * D) rc = -1;
+            const size_t cn = (size_t)3 * C * (c->conv_k - 1);
+            if (!rc && fread(m->conv[L], sizeof(float), cn, f) != cn) rc = -1;
+        } else {
+            int32_t nkv = 0;
+            if (fread(&nkv, sizeof nkv, 1, f) != 1) { rc = -1; break; }
+            if (nkv < 0 || nkv > m->kv_cap) { rc = -1; break; }
+            const size_t kn = (size_t)nkv * c->n_heads * qd;
+            const size_t vn = (size_t)nkv * c->n_heads * c->v_head;
+            if (kn && fread(m->kcache[L], sizeof(float), kn, f) != kn) rc = -1;
+            if (!rc && vn && fread(m->vcache[L], sizeof(float), vn, f) != vn) rc = -1;
+            m->n_kv[L] = nkv;
+        }
+    }
+    m->n_blockres = h.n_blockres;
+    if (!rc && c->attn_res_block && h.n_blockres > 0) {
+        const size_t n = (size_t)h.n_blockres * c->hidden;
+        if (fread(m->blockres, sizeof(float), n, f) != n) rc = -1;
+    }
+    if (!rc && fread(m->x, sizeof(float), (size_t)c->hidden, f) != (size_t)c->hidden) rc = -1;
+    fclose(f);
+    if (!rc && pos) *pos = h.pos;
+    return rc;
+}
+
 /* ---- chunked prefill ---------------------------------------------------
  * Decode and prefill want opposite strategies for the experts.
  *

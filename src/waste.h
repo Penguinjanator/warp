@@ -198,6 +198,10 @@ typedef struct {
 
 waste_status waste_model_get_info(const waste_ctx *ctx, waste_model_info *out);
 
+/* Persist which experts this workload used, so the next open can warm the
+ * cache instead of starting cold. Written next to the container. */
+waste_status waste_save_usage(waste_ctx *ctx);
+
 /* Aggregate counters since open; a CLI `--stats` prints these. */
 typedef struct {
     uint64_t tokens_generated, experts_hit, experts_missed, bytes_read;

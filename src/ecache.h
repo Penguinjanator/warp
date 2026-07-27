@@ -57,6 +57,15 @@ typedef int (*waste_fetch_fn)(void *user, int layer, int expert, uint8_t *dst);
 const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
                                 waste_fetch_fn fetch, void *user);
 
+/* Persist / restore which experts this workload actually uses. Gate 5
+ * measured a 0% hit rate until the cache exceeds one token's working set;
+ * a warm start does not change that floor, but it does remove the cold
+ * ramp at the beginning of every run. */
+int waste_ecache_save_usage(const waste_ecache *c, const char *path,
+                            uint64_t tokens);
+int waste_ecache_warm(waste_ecache *c, const char *path,
+                      waste_fetch_fn fetch, void *user);
+
 static inline double waste_ecache_hit_rate(const waste_ecache *c)
 {
     const uint64_t t = c->hits + c->misses;

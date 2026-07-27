@@ -46,7 +46,7 @@ typedef struct {
     uint64_t budget;
     uint32_t ctx, max_tokens;
     float temperature, top_p;
-    int top_k, threads, quiet;
+    int top_k, threads, quiet, learn;
     uint64_t seed;
 } opts;
 
@@ -70,6 +70,7 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
         else if (!strcmp(argv[i], "--seed") && i + 1 < argc) o->seed = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) o->threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-q") || !strcmp(argv[i], "--quiet")) o->quiet = 1;
+        else if (!strcmp(argv[i], "--learn")) o->learn = 1;
         else if (argv[i][0] == '-') { fprintf(stderr, "unknown option %s\n", argv[i]); return -1; }
     }
     return 0;
@@ -217,6 +218,7 @@ static int cmd_run(int argc, char **argv)
     const waste_status st = open_model(argv[2], &o, &c);
     if (st != WASTE_OK) return fail("open", st);
     const int r = run_prompt(c, &o, argv[3], !o.quiet);
+    if (o.learn) waste_save_usage(c);
     waste_close(c);
     return r;
 }
@@ -230,8 +232,8 @@ static int cmd_chat(int argc, char **argv)
     const waste_status st = open_model(argv[2], &o, &c);
     if (st != WASTE_OK) return fail("open", st);
 
-    printf("%s — /reset clears state, /stats prints counters, Ctrl-D exits\n",
-           waste_build_info());
+    printf("%s\n/reset clears state, /save FILE and /load FILE persist it, "
+           "/stats prints counters, Ctrl-D exits\n", waste_build_info());
     char line[8192];
     while (1) {
         fputs("\n> ", stdout);
@@ -241,6 +243,19 @@ static int cmd_chat(int argc, char **argv)
         while (l && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = 0;
         if (!l) continue;
         if (!strcmp(line, "/reset")) { waste_state_reset(c); printf("(state cleared)\n"); continue; }
+        if (!strncmp(line, "/save ", 6)) {
+            const waste_status s = waste_state_save(c, line + 6);
+            printf(s == WASTE_OK ? "(saved to %s)\n" : "(save failed: %s)\n",
+                   s == WASTE_OK ? line + 6 : waste_strerror(s));
+            continue;
+        }
+        if (!strncmp(line, "/load ", 6)) {
+            const waste_status s = waste_state_load(c, line + 6);
+            printf(s == WASTE_OK ? "(loaded %s — continuing that conversation)\n"
+                                 : "(load failed: %s)\n",
+                   s == WASTE_OK ? line + 6 : waste_strerror(s));
+            continue;
+        }
         if (!strcmp(line, "/stats")) {
             waste_stats s;
             waste_get_stats(c, &s);
@@ -308,7 +323,9 @@ int main(int argc, char **argv)
                "  waste info   MODEL            container details\n"
                "  waste version\n\n"
                "options: --budget 8G  --ctx N  -n N  --temp F  --top-p F\n"
-               "         --top-k N  --seed N  --threads N  -q\n",
+               "         --top-k N  --seed N  --threads N  -q  --learn\n"
+         "  --learn records which experts the run used, so the next open\n"
+         "  starts with a warm cache instead of an empty one\n",
                waste_version());
         return argc < 2 ? 2 : 0;
     }

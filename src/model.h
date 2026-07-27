@@ -105,6 +105,17 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed);
 const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
                                  int pos0);
 int waste_model_chunk_max(const waste_model *m);
+
+/* Session state: KDA recurrent state + short-conv rings + MLA KV + the
+ * AttnRes history. Saving it turns a cold re-prefill into a file read,
+ * which at streaming speeds is minutes versus milliseconds. */
+/* Learned hotlist: which experts this workload uses, so the next run does
+ * not start with an empty cache. Stored next to the container. */
+int waste_model_warm_cache(waste_model *m, const char *dir);
+int waste_model_save_usage(const waste_model *m, const char *dir);
+
+int waste_model_state_save(const waste_model *m, const char *path, int pos);
+int waste_model_state_load(waste_model *m, const char *path, int *pos);
 const waste_tensor *waste_find(const waste_model *m, const char *name);
 
 /* Exposed for unit tests (tests/test_k3parts.c) — these are the pieces of
