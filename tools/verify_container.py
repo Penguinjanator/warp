@@ -23,6 +23,7 @@ MAGIC_CODEBOOK = 0x4B424357
 ALIGN = 4096
 VEC_DIM = 8
 CB_ENTRIES = 256
+IDX_BLOCK = 64
 HDR = "<IHHBBHHHIIIIIIII"        # must match waste_expert_hdr
 HDR_SIZE = 48
 KINDS = (("gate", "w1"), ("up", "w3"), ("down", "w2"))
@@ -45,7 +46,7 @@ def load_codebooks(path):
     return books
 
 
-def read_expert(bank_bytes, rec_off, books, cb_base, stages, shapes):
+def read_expert(bank_bytes, rec_off, books, cb_base, stages, shapes, block=0):
     h = struct.unpack(HDR, bank_bytes[rec_off:rec_off + HDR_SIZE])
     (magic, layer, eid, fmt, flags, cb_id, lowrank_id, _r0,
      blocks, g_off, u_off, d_off, corr_off, crc, _r1, _r2) = h
@@ -65,8 +66,16 @@ def read_expert(bank_bytes, rec_off, books, cb_base, stages, shapes):
         M, N = shapes[i]
         nvec = M * N // VEC_DIM
         beg = offs[kind] - HDR_SIZE
-        idx = torch.frombuffer(bytearray(body[beg:beg + nvec * stages]),
-                               dtype=torch.uint8).view(nvec, stages).long()
+        raw = torch.frombuffer(bytearray(body[beg:beg + nvec * stages]),
+                               dtype=torch.uint8)
+        if block:                       # [M/B][nvr][B][stage] -> [nvec][stage]
+            nvr = N // VEC_DIM
+            nb = (M + block - 1) // block
+            idx = (raw.view(nb, nvr, block, stages).permute(0, 2, 1, 3)
+                      .reshape(nb * block, nvr, stages)[:M]
+                      .reshape(nvec, stages).long())
+        else:
+            idx = raw.view(nvec, stages).long()
         recon = torch.zeros(nvec, VEC_DIM)
         for s in range(stages):
             recon += books[cb_base + i * stages + s][idx[:, s]]
@@ -104,7 +113,8 @@ def main():
         off, checked = 0, 0
         while off < len(bank) and checked < args.experts:
             rec, blocks, eid = read_expert(bank, off, books,
-                                           meta["codebook_base"], stages, shapes)
+                                           meta["codebook_base"], stages, shapes,
+                                           man["expert_quant"].get("index_block", 0))
             assert off % ALIGN == 0, f"record {eid} not 4 KiB aligned"
             for i, (kind, tag) in enumerate(KINDS):
                 W = sr.get(f"model.layers.{L}.block_sparse_moe.experts.{eid}.{tag}.weight")

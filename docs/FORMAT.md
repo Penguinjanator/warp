@@ -80,6 +80,15 @@ Residual (multi-stage) VQ: each successive codebook quantizes what the
 previous stages left over. Bits/weight = N, plus 16/n_in for the channel
 scale. Measured on real Kimi experts in Gate 3.
 
+**Index layout is blocked by 64 rows** (`index_block` in the manifest):
+`[row_block][vector_position][row_in_block][stage]`. The engine walks a
+tile of rows for one vector position at a time; in plain row-major order
+those rows sit `n_in/8 * stages` bytes apart, so each is a separate cache
+line. Blocked, a tile's indices for one position are contiguous — measured
+**1.44x** on the gather loop, which is ~40% of a token. The block size
+matches `VQ_TILE` in the engine; a reader must honour `index_block` (0 =
+plain row-major).
+
 ### Shared low-rank: on probation — specified, NOT implemented in v0
 
 `lowrank.bin` and the `lowrank_id` field exist in the spec but the

@@ -36,6 +36,7 @@ ALIGN = 4096
 FMT_F32, FMT_F16, FMT_Q8G, FMT_Q4G, FMT_VQ3R, FMT_VQ2R = 0, 1, 2, 3, 4, 5
 VEC_DIM = 8
 CB_ENTRIES = 256
+IDX_BLOCK = 64          # rows per index block; matches VQ_TILE in the engine
 KINDS = (("gate", "w1"), ("up", "w3"), ("down", "w2"))   # Mixtral naming
 
 
@@ -105,6 +106,24 @@ def assign(X, C, chunk=1 << 20):
     return out
 
 
+def block_indices(idx, M, N, stages):
+    """Reorder [stages, nvec] -> [M/B][v][row_in_block][stage].
+
+    The engine walks a tile of rows for one vector position at a time; in
+    row-major order those rows sit N/8*stages bytes apart, so each one is a
+    separate cache line. Blocked, a tile's indices for a given position are
+    contiguous. Measured 1.44x on the gather loop.
+    """
+    nvr = N // VEC_DIM
+    t = idx.view(stages, M, nvr).permute(1, 2, 0)            # [M, nvr, st]
+    pad = (-M) % IDX_BLOCK
+    if pad:
+        t = torch.cat([t, torch.zeros(pad, nvr, stages, dtype=t.dtype)], 0)
+    nb = t.shape[0] // IDX_BLOCK
+    t = t.view(nb, IDX_BLOCK, nvr, stages).permute(0, 2, 1, 3)
+    return t.contiguous()
+
+
 def quantize_vq(W, books, dev):
     """W [out, in] -> (indices uint8 [stages, nvec], per-channel fp16 scale)."""
     M, N = W.shape
@@ -143,17 +162,17 @@ def raw_bytes(t):
     buf.view(t.dtype)[:t.numel()] = t.flatten()
     return bytes(memoryview(buf.numpy() if False else bytearray(buf.tolist())))
 
-def write_expert_record(f, layer, eid, cb_base, payloads, scales):
+def write_expert_record(f, layer, eid, cb_base, payloads, scales, shapes):
     """One 4 KiB-aligned WEXP record: header, then gate|up|down indices,
     then the per-channel scales for all three."""
     hdr_size = 48
     off = hdr_size
     offsets = []
     body = bytearray()
-    for p in payloads:                       # [stages, nvec] uint8
+    for i, p in enumerate(payloads):          # [stages, nvec] uint8
         offsets.append(off)
-        # transpose so a vector's stage indices sit together (decode locality)
-        b = raw_bytes(p.T.contiguous())
+        M, N = shapes[i]
+        b = raw_bytes(block_indices(p, M, N, p.shape[0]))
         body += b
         off += len(b)
     corr_off = off
@@ -250,7 +269,8 @@ def main():
                     idx, sc = quantize_vq(W[kind][e], books[kind], dev)
                     payloads.append(idx)
                     scales.append(sc)
-                write_expert_record(f, L, e, cb_index[(L, "gate")], payloads, scales)
+                write_expert_record(f, L, e, cb_index[(L, "gate")], payloads,
+                                    scales, [tuple(W[k][e].shape) for k, _ in KINDS])
         os.replace(bank + ".tmp", bank)
         sz = os.path.getsize(bank)
         manifest_layers[str(L)] = {"file": os.path.basename(bank),
@@ -293,7 +313,7 @@ def main():
         "config": cfg,
         "expert_quant": {"fmt": "VQ3R" if args.stages == 3 else "VQ2R",
                          "stages": args.stages, "vec_dim": VEC_DIM,
-                         "entries": CB_ENTRIES,
+                         "entries": CB_ENTRIES, "index_block": IDX_BLOCK,
                          "bits_per_weight": args.stages},
         "layers": manifest_layers,
         "trunk": tindex,

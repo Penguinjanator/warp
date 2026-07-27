@@ -56,6 +56,7 @@ class Container:
         self.man = json.load(open(os.path.join(path, "manifest.json")))
         self.cfg = self.man["config"]
         self.stages = self.man["expert_quant"]["stages"]
+        self.iblock = self.man["expert_quant"].get("index_block", 0)
         self._load_codebooks()
         self._load_trunk()
         self.banks = {}
@@ -114,8 +115,16 @@ class Container:
             M, N = shapes[i]
             nvec = M * N // VEC_DIM
             beg = (g_off, u_off, d_off)[i]
-            idx = torch.frombuffer(bytearray(buf[beg:beg + nvec * self.stages]),
-                                   dtype=torch.uint8).view(nvec, self.stages).long()
+            raw = torch.frombuffer(bytearray(buf[beg:beg + nvec * self.stages]),
+                                   dtype=torch.uint8)
+            if self.iblock:      # [M/B][nvr][B][stage] -> [nvec][stage]
+                B, nvr = self.iblock, N // VEC_DIM
+                nb = (M + B - 1) // B
+                idx = (raw.view(nb, nvr, B, self.stages).permute(0, 2, 1, 3)
+                          .reshape(nb * B, nvr, self.stages)[:M]
+                          .reshape(nvec, self.stages).long())
+            else:
+                idx = raw.view(nvec, self.stages).long()
             recon = torch.zeros(nvec, VEC_DIM)
             for s in range(self.stages):
                 recon += self.books[cb_base + i * self.stages + s].cpu()[idx[:, s]]

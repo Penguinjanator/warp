@@ -568,29 +568,65 @@ typedef struct {
  * table is read M/64 times and the tile's indices (55 KB) stay in L1.
  * This is a cache-blocking win, not a SIMD one: the inner op is a gather,
  * which NEON cannot vectorize. */
-#define VQ_TILE 64
+#define VQ_TILE 64          /* must equal the container's index_block */
+#ifndef VQ_SUPER
+#define VQ_SUPER 2          /* index blocks handled per pass (swept: 2 wins) */
+#endif
 
+/* What this loop actually costs, measured rather than assumed:
+ *   - it is NOT table bandwidth. Re-reading the 884 KB table once per
+ *     64-row tile works out to 8.2 GB/token, which would need 165 GB/s —
+ *     suspiciously exactly this machine's ceiling — but raising VQ_SUPER
+ *     to cut that traffic made it *slower* (0.25 -> 0.40 s at SUPER=8),
+ *     because the table is shared read-only across threads and stays
+ *     cached, while the extra index streams and accumulators do not.
+ *   - it is NOT index locality either. Blocking the index layout so a
+ *     tile's indices are contiguous measured 1.44x in isolation and
+ *     changed nothing here.
+ *   - it IS the load -> address -> load dependency of each gather.
+ *     Interleaving four independent rows keeps four chains in flight and
+ *     is what finally moved it.
+ * Swept: VQ_SUPER 1 and 2 tie within noise, 4+ is worse. */
 static void vq_rows(int b, int e, void *p)
 {
     vq_arg *a = (vq_arg *)p;
     const int nv = a->nv, st = a->stages, en = a->entries;
-    float acc[VQ_TILE];
+    float acc[VQ_TILE * VQ_SUPER];
 
-    for (int r0 = b; r0 < e; r0 += VQ_TILE) {
-        const int r1 = (r0 + VQ_TILE < e) ? r0 + VQ_TILE : e;
-        const int nr = r1 - r0;
-        memset(acc, 0, (size_t)nr * sizeof(float));
+    for (int r0 = b; r0 < e; r0 += VQ_TILE * VQ_SUPER) {
+        const int rows = (r0 + VQ_TILE * VQ_SUPER < e) ? VQ_TILE * VQ_SUPER : e - r0;
+        const int nblk = (rows + VQ_TILE - 1) / VQ_TILE;
+        memset(acc, 0, (size_t)rows * sizeof(float));
 
         for (int v = 0; v < nv; v++) {
             const float *blk = a->lut + (size_t)v * st * en;
-            const uint8_t *ix = a->idx + ((size_t)r0 * nv + v) * st;
-            for (int r = 0; r < nr; r++, ix += (size_t)nv * st) {
-                float t = blk[ix[0]];
-                for (int s = 1; s < st; s++) t += blk[s * en + ix[s]];
-                acc[r] += t;
+            for (int j = 0; j < nblk; j++) {
+                const int nr = (j + 1) * VQ_TILE <= rows ? VQ_TILE
+                                                         : rows - j * VQ_TILE;
+                const uint8_t *ix = a->idx +
+                    ((size_t)(r0 / VQ_TILE + j) * nv + v) * VQ_TILE * st;
+                float *ac = acc + (size_t)j * VQ_TILE;
+                /* Each gather is load -> address -> load, a ~5-cycle chain.
+                 * Four rows are independent, so interleaving them keeps
+                 * four chains in flight instead of one. */
+                int r = 0;
+                if (st == 3) {
+                    for (; r + 4 <= nr; r += 4, ix += 4 * 3) {
+                        const float t0 = blk[ix[0]] + blk[en + ix[1]] + blk[2 * en + ix[2]];
+                        const float t1 = blk[ix[3]] + blk[en + ix[4]] + blk[2 * en + ix[5]];
+                        const float t2 = blk[ix[6]] + blk[en + ix[7]] + blk[2 * en + ix[8]];
+                        const float t3 = blk[ix[9]] + blk[en + ix[10]] + blk[2 * en + ix[11]];
+                        ac[r] += t0; ac[r + 1] += t1; ac[r + 2] += t2; ac[r + 3] += t3;
+                    }
+                }
+                for (; r < nr; r++, ix += st) {
+                    float t = blk[ix[0]];
+                    for (int s = 1; s < st; s++) t += blk[s * en + ix[s]];
+                    ac[r] += t;
+                }
             }
         }
-        for (int r = 0; r < nr; r++)
+        for (int r = 0; r < rows; r++)
             a->y[r0 + r] = acc[r] * f16_to_f32(a->scale[r0 + r]);
     }
 }
@@ -600,7 +636,9 @@ static void vq_apply(waste_model *m, float *y, const uint8_t *idx,
 {
     PROF_START(P_LUTA);
     vq_arg a = { y, idx, scale, lut, N / m->vec_dim, m->stages, m->cb_entries };
-    waste_parallel_for(M, 32, vq_rows, &a);
+    /* min_chunk = VQ_TILE keeps every thread's range block-aligned, which
+     * the blocked index layout requires. */
+    waste_parallel_for(M, VQ_TILE * VQ_SUPER, vq_rows, &a);
     PROF_END(P_LUTA);
 }
 

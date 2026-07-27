@@ -79,12 +79,16 @@ static inline void waste_pool_init(int nthreads)
         pthread_create(&g_pool.th[i], NULL, waste__worker, &g_pool);
 }
 
-/* Runs fn over [0,n) split into chunks. Blocks until complete. */
+/* Runs fn over [0,n) split into chunks; every chunk boundary is a multiple
+ * of min_chunk. Blocks until complete. */
 static inline void waste_parallel_for(int n, int min_chunk, waste_range_fn fn, void *arg)
 {
     if (g_pool.nthreads <= 1 || n <= min_chunk) { fn(0, n, arg); return; }
     int chunk = (n + g_pool.nthreads - 1) / g_pool.nthreads;
     if (chunk < min_chunk) chunk = min_chunk;
+    /* Round up to a whole number of min_chunk units: callers that block
+     * their data (the VQ tile) need every range to start on a boundary. */
+    chunk = ((chunk + min_chunk - 1) / min_chunk) * min_chunk;
 
     pthread_mutex_lock(&g_pool.mu);
     g_pool.fn = fn; g_pool.arg = arg; g_pool.n = n; g_pool.chunk = chunk;
