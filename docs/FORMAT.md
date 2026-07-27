@@ -42,7 +42,7 @@ model.waste/
   experts-L{layer}.bin # one expert bank per layer (or grouped, TBD)
   subs-L{layer}.bin    # 1-bit substitute bank (optional)
   codebooks.bin        # VQ codebooks, resident
-  lowrank.bin          # KBVQ shared low-rank factors (FP16), resident
+  lowrank.bin          # shared low-rank factors — NOT written in v0, see below
   usage.waste          # runtime-appended routing stats / learned hotlist
 ```
 
@@ -68,17 +68,49 @@ JSON (hardened parser, treat as untrusted — earlier work st.h lesson). Contain
 | 5 | **VQ2R** | 2.01 (2 codebooks x 256, dim 8) | only where Gate 3 quality allows |
 | 6 | **SUB1** | ~1.0 direct VQ | cache-miss substitutes |
 
-**VQxR record** (per expert matrix): indices into a per-layer codebook
-(8-dim vectors; codebook size 2^12 for VQ3R, 2^8 for VQ2R — TBD via
-ablation), per-channel FP16 scale+bias correction, plus a residual header
-naming the shared low-rank block it composes with:
+**VQxR record** (per expert matrix): N stages of 8-dim VQ indices into
+per-layer codebooks of 256 entries each (N=3 for VQ3R, N=2 for VQ2R), plus
+one FP16 scale per output channel:
 
 ```
-W_expert ≈ (U_shared · V_shared^T) ⊙ per-channel-correction + dequant(VQ indices)
+W_expert ≈ scale_per_channel * sum_{s=1..N} codebook_s[index_s]
 ```
 
-`U/V` shared factors (rank ~1/128 of dim, ~0.1 bit/param amortized overhead)
-live in `lowrank.bin`, always resident in RAM.
+Residual (multi-stage) VQ: each successive codebook quantizes what the
+previous stages left over. Bits/weight = N, plus 16/n_in for the channel
+scale. Measured on real Kimi experts in Gate 3.
+
+### Shared low-rank: on probation — specified, NOT implemented in v0
+
+`lowrank.bin` and the `lowrank_id` field exist in the spec but the
+converter does not emit them and the engine does not read them;
+`lowrank_id` must be 0 in v0.
+
+**Why parked** (Gate 3 plus a follow-up subspace measurement, 2026-07-27,
+on real Kimi-Linear-48B experts):
+
+- at rank N/128 the shared basis costs 0.12 bits/weight and reduces error
+  by 0.3 pp — noise;
+- at equal budget it loses badly: kbvq2 at 4.01 bits = 28.87% error, plain
+  per-row INT4 at 4.01 bits = 15.20%;
+- structurally, Kimi's experts are nearly mutually orthogonal — pairwise
+  overlap of their rank-72 dominant subspaces is **0.046 against a random
+  baseline of 0.031** (identical = 1.0); a shared basis captures 7.1% of
+  energy vs 3.1% for random directions and 20.0% for each expert's own.
+
+**Why not deleted.** Those measurements are in the *unweighted* weight
+metric. "KLT-guided" in the paper most likely means a basis chosen after
+whitening by the activation covariance, and there is a credible mechanism
+by which that flips the result: every expert sees the same hidden-state
+distribution, and LLM hidden states concentrate in a few dominant
+directions, so in the activation-weighted metric the useful directions may
+be shared *by construction* even though the weights are orthogonal here.
+
+**What settles it:** rerun the Gate 3 comparison with an importance matrix
+from real activations, in the same rented GPU session as Gate 2 and the
+Gate 4 oracle. Revive if a whitened shared basis buys >1.5 pp of error at
+≤0.15 bits/weight; otherwise delete the section and the field. No data has
+been written in this format yet, so either way it is a cheap change.
 
 ### Expert bank record (`experts-L{n}.bin`)
 
@@ -118,8 +150,8 @@ measured on a calibration corpus (earlier work `the precompiled hotlist` approac
 1. Stream K3 release shards (MXFP4) one at a time — never needs the full
    1.5 TB locally beyond the shard in flight + output (earlier work
    `convert_fp8_to_int4.py` discipline).
-2. Dequant MXFP4 → f32 blocks; accumulate KLT/SVD stats per layer for the
-   shared low-rank extraction (two-pass or online PCA, TBD).
+2. Dequant MXFP4 → f32 blocks. (No shared-basis pass in v0 — see "Shared
+   low-rank: on probation".)
 3. GEMQ-style bit allocation from an importance matrix (earlier work imatrix
    pipeline; fallback: weight-energy heuristic Σrow²).
 4. Emit VQ codebooks (k-means in 8-dim space), indices, corrections;
