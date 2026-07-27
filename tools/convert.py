@@ -33,12 +33,40 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mxfp4 import ST                                            # noqa: E402
 
+# --- native VQ encoder (optional; ~15x the torch path) --------------------
+_VQ = None
+
+
+def _load_vq():
+    """libwastevq: the assign fused with the argmin, so the [n, 256] distance
+    matrix never exists. torch has to materialize it — 1.4 GB per stage for
+    one expert matrix — which is what made conversion memory-bound."""
+    global _VQ
+    if _VQ is not None:
+        return _VQ or None
+    import ctypes
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for name in ("libwastevq.dylib", "libwastevq.so"):
+        path = os.path.join(here, name)
+        if os.path.exists(path):
+            lib = ctypes.CDLL(path)
+            lib.waste_vq_encode.argtypes = [
+                ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_int]
+            lib.waste_vq_encode.restype = None
+            _VQ = (lib, ctypes)
+            return _VQ
+    _VQ = False
+    return None
+
 MAGIC_EXPERT = 0x50584557        # 'WEXP'
 MAGIC_CODEBOOK = 0x4B424357      # 'WCBK'
 ALIGN = 4096
 FMT_F32, FMT_F16, FMT_Q8G, FMT_Q4G, FMT_VQ3R, FMT_VQ2R = 0, 1, 2, 3, 4, 5
 VEC_DIM = 8
 CB_ENTRIES = 256
+TRAIN_VECTORS = 300000       # vectors k-means sees per (layer, matrix kind)
 IDX_BLOCK = 64          # rows per index block; matches VQ_TILE in the engine
 KINDS = (("gate", "w1"), ("up", "w3"), ("down", "w2"))   # Mixtral naming
 
@@ -131,9 +159,23 @@ def quantize_vq(W, books, dev):
     """W [out, in] -> (indices uint8 [stages, nvec], per-channel fp16 scale)."""
     M, N = W.shape
     scale = W.abs().amax(-1, keepdim=True).clamp(min=1e-8)
+
+    vq = _load_vq()
+    if vq is not None:
+        lib, ctypes = vq
+        X = (W / scale).reshape(-1, VEC_DIM).contiguous().float()
+        B = torch.stack([C.detach().cpu().float() for C in books]).contiguous()
+        n, st = X.shape[0], len(books)
+        out = torch.empty(n * st, dtype=torch.uint8)
+        fp = ctypes.POINTER(ctypes.c_float)
+        lib.waste_vq_encode(
+            ctypes.cast(X.data_ptr(), fp), n,
+            ctypes.cast(B.data_ptr(), fp), st, CB_ENTRIES, VEC_DIM,
+            ctypes.cast(out.data_ptr(), ctypes.POINTER(ctypes.c_uint8)), 0)
+        return out.view(n, st).T.contiguous(), scale.half().flatten().cpu()
+
     X = (W / scale).to(dev).reshape(-1, VEC_DIM)
-    idxs = []
-    resid = X
+    idxs, resid = [], X
     for C in books:
         i = assign(resid, C)
         idxs.append(i.to(torch.uint8).cpu())
@@ -200,6 +242,67 @@ def write_expert_record(f, layer, eid, cb_base, payloads, scales, shapes):
     return blocks
 
 
+# ------------------------------------------------------------- worker ----
+
+def convert_layer(job):
+    """One layer, in its own process. Layers share nothing: separate bank
+    file, separate codebook file, codebook ids assigned by the parent from
+    the layer's position, so the merge is a concatenation in layer order."""
+    (L, src, out, prefix, n_exp, stages, device, cb_sample, cb_base) = job
+    import time as _t
+    bank = os.path.join(out, f"experts-L{L}.bin")
+    cbf = os.path.join(out, f"codebooks-L{L}.bin")
+    if os.path.exists(bank) and os.path.exists(cbf):
+        return (L, os.path.getsize(bank), cb_base, "cached")
+
+    st = ST(src)
+    dev = torch.device(device)
+
+    def ename(e, tag):
+        return f"{prefix}model.layers.{L}.block_sparse_moe.experts.{e}.{tag}.weight"
+
+    if not (st.have(ename(0, "w1")) or st.have(ename(0, "w1") + "_packed")):
+        return (L, 0, cb_base, "missing")
+
+    t0 = _t.time()
+    shapes = [tuple(st.tensor(ename(0, tag)).shape) for _, tag in KINDS]
+
+    books, sample_ids = {}, list(range(0, n_exp, max(1, n_exp // cb_sample)))[:cb_sample]
+    per = max(1, TRAIN_VECTORS // len(sample_ids))
+    with open(cbf + ".tmp", "wb") as cf:
+        for ki, (kind, tag) in enumerate(KINDS):
+            chunks = []
+            for e in sample_ids:
+                W = st.tensor(ename(e, tag))
+                sc = W.abs().amax(-1, keepdim=True).clamp(min=1e-8)
+                V = (W / sc).reshape(-1, VEC_DIM)
+                g = torch.Generator().manual_seed(1234 + e)
+                chunks.append(V[torch.randperm(V.shape[0], generator=g)[:per]])
+                del W, V
+            X = torch.cat(chunks); del chunks
+            books[kind] = train_codebooks(X, stages, dev, sample=TRAIN_VECTORS)
+            del X
+            for si, C in enumerate(books[kind]):
+                cid = cb_base + ki * stages + si
+                cf.write(struct.pack("<IHBBII", MAGIC_CODEBOOK, cid & 0xFFFF,
+                                     FMT_VQ3R, VEC_DIM, CB_ENTRIES, 0))
+                cf.write(raw_bytes(C.cpu().half()))
+    os.replace(cbf + ".tmp", cbf)
+
+    with open(bank + ".tmp", "wb") as f:
+        for e in range(n_exp):
+            payloads, scales = [], []
+            for kind, tag in KINDS:
+                W = st.tensor(ename(e, tag))
+                idx, sc = quantize_vq(W, books[kind], dev)
+                payloads.append(idx); scales.append(sc)
+                del W
+            write_expert_record(f, L, e, cb_base, payloads, scales, shapes)
+    os.replace(bank + ".tmp", bank)
+    return (L, os.path.getsize(bank), cb_base, f"{_t.time()-t0:.0f}s")
+
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", default="/Volumes/WasteDisk/kimi-linear")
@@ -208,6 +311,12 @@ def main():
     ap.add_argument("--stages", type=int, default=3, help="3 = VQ3R, 2 = VQ2R")
     ap.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu")
     ap.add_argument("--experts", type=int, default=0, help="limit experts (debug)")
+    ap.add_argument("--skip-trunk", action="store_true",
+                    help="experts only (the trunk is unchanged between runs)")
+    ap.add_argument("--jobs", type=int, default=3,
+                    help="layers converted in parallel; measured sweet spot "
+                         "is 3 — beyond that the native encoder is already "
+                         "using every core")
     ap.add_argument("--cb-sample", type=int, default=12,
                     help="experts sampled per layer to fit the codebooks")
     args = ap.parse_args()
@@ -234,76 +343,51 @@ def main():
               else list(range(first_dense, n_layers)))
 
     # ---- expert banks, one layer at a time ------------------------------
-    cb_path = os.path.join(args.out, "codebooks.bin")
-    cb_f = open(cb_path, "ab" if os.path.exists(cb_path) else "wb")
-    cb_index, cb_next = {}, cb_f.tell() // (16 + CB_ENTRIES * VEC_DIM * 2)
     manifest_layers = {}
 
 
     def ename(L, e, tag):
         return f"{prefix}model.layers.{L}.block_sparse_moe.experts.{e}.{tag}.weight"
 
-    for L in layers:
-        bank = os.path.join(args.out, f"experts-L{L}.bin")
-        if os.path.exists(bank):
-            print(f"layer {L}: bank exists, skipping")
-            continue
-        if not (st.have(ename(L, 0, "w1")) or st.have(ename(L, 0, "w1") + "_packed")):
-            print(f"layer {L}: experts not available (shard missing), skipping")
-            continue
-        t0 = time.time()
+    n_cb_per_layer = 3 * args.stages
+    jobs = [(L, args.src, args.out, prefix, n_exp, args.stages, str(dev),
+             args.cb_sample, i * n_cb_per_layer)
+            for i, L in enumerate(layers)]
 
-        shapes = [tuple(st.tensor(ename(L, 0, tag)).shape) for _, tag in KINDS]
-        print(f"layer {L}: {n_exp} experts, shapes {shapes}", flush=True)
+    if args.jobs > 1:
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")     # torch/MPS is not fork-safe
+        print(f"converting {len(jobs)} layers with {args.jobs} processes", flush=True)
+        with ctx.Pool(args.jobs) as pool:
+            results = []
+            for res in pool.imap_unordered(convert_layer, jobs):
+                results.append(res)
+                Lr, sz, base, how = res
+                print(f"  layer {Lr}: {sz/2**20:.0f} MB, cb base {base} [{how}] "
+                      f"({len(results)}/{len(jobs)})", flush=True)
+    else:
+        results = []
+        for j in jobs:
+            res = convert_layer(j)
+            results.append(res)
+            print(f"  layer {res[0]}: {res[1]/2**20:.0f} MB [{res[3]}]", flush=True)
 
-        # Codebooks are trained on a sample of experts rather than all of
-        # them: at K3's size one layer is ~118 GB in f32, so nothing here
-        # ever holds more than a handful at once.
-        books = {}
-        sample_ids = list(range(0, n_exp, max(1, n_exp // args.cb_sample)))[:args.cb_sample]
-        for (kind, tag), (M, N) in zip(KINDS, shapes):
-            chunks = []
-            for e in sample_ids:
-                W = st.tensor(ename(L, e, tag))
-                sc = W.abs().amax(-1, keepdim=True).clamp(min=1e-8)
-                chunks.append((W / sc).reshape(-1, VEC_DIM))
-                del W
-            X = torch.cat(chunks)
-            del chunks
-            books[kind] = train_codebooks(X, args.stages, dev)
-            del X
-            cb_index[(L, kind)] = cb_next
-            for C in books[kind]:
-                cb_f.write(struct.pack("<IHBBII", MAGIC_CODEBOOK, cb_next & 0xFFFF,
-                                       FMT_VQ3R, VEC_DIM, CB_ENTRIES, 0))
-                cb_f.write(raw_bytes(C.cpu().half()))
-                cb_next += 1
-        print(f"layer {L}: codebooks trained on {len(sample_ids)} experts "
-              f"({time.time()-t0:.1f}s)", flush=True)
+    for L, sz, base, how in sorted(results):
+        if sz:
+            manifest_layers[str(L)] = {"file": f"experts-L{L}.bin",
+                                       "experts": n_exp, "bytes": sz,
+                                       "codebook_base": base}
 
-        with open(bank + ".tmp", "wb") as f:
-            for e in range(n_exp):
-                payloads, scales = [], []
-                for kind, tag in KINDS:
-                    W = st.tensor(ename(L, e, tag))
-                    idx, sc = quantize_vq(W, books[kind], dev)
-                    payloads.append(idx)
-                    scales.append(sc)
-                    del W
-                write_expert_record(f, L, e, cb_index[(L, "gate")], payloads,
-                                    scales, shapes)
-                if e and e % 128 == 0:
-                    print(f"    {e}/{n_exp} ({time.time()-t0:.0f}s)", flush=True)
-        os.replace(bank + ".tmp", bank)
-        sz = os.path.getsize(bank)
-        manifest_layers[str(L)] = {"file": os.path.basename(bank),
-                                   "experts": n_exp, "bytes": sz,
-                                   "codebook_base": cb_index[(L, "gate")]}
-        print(f"layer {L}: wrote {sz/2**20:.0f} MB in {time.time()-t0:.1f}s\n",
-              flush=True)
-        del books
+    # merge the per-layer codebook files in layer order; ids were handed out
+    # from the same order, so the concatenation is already indexed correctly
+    with open(os.path.join(args.out, "codebooks.bin"), "wb") as cb_out:
+        for L in layers:
+            part = os.path.join(args.out, f"codebooks-L{L}.bin")
+            if os.path.exists(part):
+                with open(part, "rb") as pf:
+                    cb_out.write(pf.read())
+                os.remove(part)
 
-    cb_f.close()
 
     # ---- tokenizer: copy it in so the container is self-contained -------
     import shutil
@@ -317,6 +401,9 @@ def main():
     # ---- trunk ----------------------------------------------------------
     trunk_path = os.path.join(args.out, "trunk.bin")
     tindex = []
+    if args.skip_trunk:
+        print("skipping trunk")
+        return 0
     with open(trunk_path, "wb") as tf:
         for name in sorted(sr.names()):
             if ".experts." in name or name.endswith(("_packed", "_scale")):

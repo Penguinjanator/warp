@@ -15,7 +15,7 @@ CFLAGS  += -DVQ_SUPER=$(VQ_SUPER)
 CFLAGS  += -MMD -MP
 
 SRC := src/model.c src/kda.c src/backend.c src/ecache.c src/version.c \
-       src/tokenizer.c src/waste.c
+       src/tokenizer.c src/waste.c src/vq.c
 ifneq (,$(findstring arm,$(shell uname -m)))
 SRC += src/kda_neon.c
 endif
@@ -30,7 +30,11 @@ CFLAGS += -DWASTE_ENABLE_CUDA=1
 LDLIBS += -lcudart
 endif
 
-all: waste libwaste.a
+all: waste libwaste.a libwastevq.dylib
+
+# shared object so tools/convert.py can call the encoder through ctypes
+libwastevq.dylib: src/vq.c
+	$(CC) $(CFLAGS) -shared -fPIC -o $@ $< -lm -lpthread
 
 libwaste.a: $(OBJ)
 	ar rcs $@ $^
@@ -58,6 +62,7 @@ test_k3parts: tests/test_k3parts.o libwaste.a
 
 clean:
 	rm -f $(OBJ) cli/*.o tests/*.o $(OBJ:.o=.d) cli/*.d tests/*.d libwaste.a waste \
-	      test_kda test_container test_forward test_tokenizer test_k3parts
+	      test_kda test_container test_forward test_tokenizer test_k3parts \
+	      libwastevq.dylib libwastevq.so
 
 .PHONY: all test clean
