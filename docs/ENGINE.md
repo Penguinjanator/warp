@@ -129,6 +129,38 @@ Two things this changes:
 - Numbers assume the analytic trunk estimate. Gate 1 replaces it with
   exact tensor sizes from the shard headers.
 
+## Chunked prefill
+
+Decoding is one token at a time by nature, but prefill is not, and for a
+streaming engine the difference is not compute — it is disk. Tokens in a
+chunk route to *overlapping* expert sets, so the number of distinct
+experts is far below `n_tokens * top_k`, and each one need only be read
+once.
+
+`waste_model_prefill()` processes up to 64 tokens together. Measured on a
+32-token prompt against the same prompt fed one token at a time:
+
+| | expert reads | bytes read | time |
+|---|---|---|---|
+| one token at a time | 6656 | 16.53 GB | 5.03 s |
+| **chunked** | **2032** | **5.05 GB** | **3.85 s** |
+
+**3.3x fewer reads**, identical logits (max abs difference 6.7e-06 on
+values of magnitude ~18, i.e. float noise). On a machine where the whole
+container fits in page cache this shows up as a modest 1.3x; on K3, where
+the experts do not fit in anything, it is the difference between reading
+17 GB per prompt token and reading 5.
+
+One design note worth recording, because the first attempt got it wrong.
+The obvious approach is to expand each expert once and run GEMMs, on the
+theory that the cost amortizes over the chunk. Measured, it does not: 16
+tokens spread across ~1200 distinct experts, under 3 tokens each, so
+expanding 7 M weights to serve 3 vectors is far worse than the LUT. The
+version that shipped keeps the decode-style LUT arithmetic and reorganizes
+*only* to read each expert once — gate/up tables depend on the token but
+not the expert, so they are built once per token and reused across every
+expert that token routes to.
+
 ## Verification bar
 
 The CLI must never be able to do something the library cannot, and

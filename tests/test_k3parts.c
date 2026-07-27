@@ -80,14 +80,13 @@ int main(int argc, char **argv)
         memset(&m, 0, sizeof m);
         m.cfg.hidden = hid;
         m.cfg.eps = eps;
-        m.n_blockres = nb;
         m.blockres = malloc((size_t)nb * hid * 4);
         m.att = malloc(4096 * 4);
         float *ps = malloc((size_t)hid * 4), *nw = malloc((size_t)hid * 4),
               *pw = malloc((size_t)hid * 4), *o = malloc((size_t)hid * 4);
         for (int i = 0; i < nb * hid; i++) m.blockres[i] = frand() * 2.0f;
         for (int i = 0; i < hid; i++) { ps[i] = frand() * 2.0f; nw[i] = frand(); pw[i] = frand(); }
-        waste_apply_attn_res(&m, ps, nw, pw, o);
+        waste_apply_attn_res(&m, m.blockres, nb, ps, nw, pw, o);
         wi(f, nb); wi(f, hid); wf(f, eps);
         wr(f, m.blockres, nb * hid); wr(f, ps, hid);
         wr(f, nw, hid); wr(f, pw, hid); wr(f, o, hid);

@@ -49,8 +49,19 @@ int main(int argc, char **argv)
            100.0 * m.cache.n_slots / (double)(m.cfg.n_experts * 26));
 
     const float *lg = NULL;
+    const int chunked = getenv("WASTE_CHUNK") && atoi(getenv("WASTE_CHUNK")) != 0;
     t0 = now();
-    for (int i = 0; i < n; i++) lg = waste_model_step(&m, ids[i], i, NULL);
+    if (chunked) {
+        int done = 0;
+        while (done < n) {
+            int c = n - done;
+            if (c > waste_model_chunk_max(&m)) c = waste_model_chunk_max(&m);
+            lg = waste_model_prefill(&m, ids + done, c, done);
+            done += c;
+        }
+    } else {
+        for (int i = 0; i < n; i++) lg = waste_model_step(&m, ids[i], i, NULL);
+    }
     const double tp = now() - t0;
 
     int best = 0;

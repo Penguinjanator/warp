@@ -72,6 +72,13 @@ typedef struct {
 
     /* scratch */
     float *x, *h, *tmp, *att, *logits;
+    /* chunked prefill scratch (allocated on first use) */
+    float *cx, *cnorm, *cresid, *cq, *ckv, *clat, *cff, *cexp;
+    float *cblockres, *cprefix;
+    int   *croute;
+    float *crw;
+    int    chunk_cap;
+
     float *blockres;                 /* AttnRes history: [nblocks][hidden]  */
     int    n_blockres;
     float *prefix_sum, *ares;
@@ -89,6 +96,15 @@ void waste_model_free(waste_model *m);
 /* Runs one token; returns logits (vocab floats, owned by the model).
  * `pos` is the position in the sequence (0-based). */
 const float *waste_model_step(waste_model *m, int token, int pos, int *routed);
+
+/* Prefill a chunk of `n` tokens starting at `pos0`, returning the logits of
+ * the last one. Equivalent to n successive waste_model_step calls, but the
+ * projections become GEMMs and — the part that matters for a streaming
+ * engine — each distinct expert the chunk routes to is read from disk once
+ * instead of once per token. */
+const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
+                                 int pos0);
+int waste_model_chunk_max(const waste_model *m);
 const waste_tensor *waste_find(const waste_model *m, const char *name);
 
 /* Exposed for unit tests (tests/test_k3parts.c) — these are the pieces of
@@ -97,8 +113,9 @@ const waste_tensor *waste_find(const waste_model *m, const char *name);
 float waste_situ_pair(float gate, float up, float beta, float linear_beta);
 void  waste_kda_decay_gate(float *g, const float *A_log, const float *dt_bias,
                            int H, int D, float lower_bound);
-void  waste_apply_attn_res(waste_model *m, const float *prefix_sum,
-                           const float *norm_w, const float *proj_w, float *out);
+void  waste_apply_attn_res(waste_model *m, const float *blockres, int nb,
+                           const float *prefix_sum, const float *norm_w,
+                           const float *proj_w, float *out);
 
 #ifdef __cplusplus
 }

@@ -562,6 +562,9 @@ void waste_model_free(waste_model *m)
     free(m->ff); free(m->e_gate); free(m->e_up); free(m->e_down); free(m->lut);
     free(m->xq); free(m->xs); free(m->miss_buf);
     free(m->blockres); free(m->prefix_sum); free(m->ares);
+    free(m->cx); free(m->cnorm); free(m->cresid); free(m->cq); free(m->ckv);
+    free(m->clat); free(m->cff); free(m->cexp); free(m->cblockres);
+    free(m->cprefix); free(m->croute); free(m->crw);
     waste_ecache_free(&m->cache);
 }
 
@@ -962,14 +965,14 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
  *   scores = sum(k * (norm.weight * proj.weight))   (nb+1)
  *   out    = softmax(scores) . v
  */
-void waste_apply_attn_res(waste_model *m, const float *prefix_sum,
-                           const float *norm_w, const float *proj_w,
-                           float *out)
+void waste_apply_attn_res(waste_model *m, const float *blockres, int nb,
+                          const float *prefix_sum, const float *norm_w,
+                          const float *proj_w, float *out)
 {
-    const int hid = m->cfg.hidden, nb = m->n_blockres;
+    const int hid = m->cfg.hidden;
     float *sc = m->att;
     for (int i = 0; i <= nb; i++) {
-        const float *v = (i < nb) ? m->blockres + (size_t)i * hid : prefix_sum;
+        const float *v = (i < nb) ? blockres + (size_t)i * hid : prefix_sum;
         float ss = 0;
         for (int j = 0; j < hid; j++) ss += v[j] * v[j];
         const float r = 1.0f / sqrtf(ss / (float)hid + m->cfg.eps);
@@ -980,13 +983,446 @@ void waste_apply_attn_res(waste_model *m, const float *prefix_sum,
     softmax(sc, nb + 1);
     memset(out, 0, (size_t)hid * sizeof(float));
     for (int i = 0; i <= nb; i++) {
-        const float *v = (i < nb) ? m->blockres + (size_t)i * hid : prefix_sum;
+        const float *v = (i < nb) ? blockres + (size_t)i * hid : prefix_sum;
         const float p = sc[i];
         for (int j = 0; j < hid; j++) out[j] += p * v[j];
     }
 }
 
+/* ---- chunked prefill ---------------------------------------------------
+ * Decode and prefill want opposite strategies for the experts.
+ *
+ * Decoding one token, an expert's weights are used for a single vector, so
+ * expanding them is pure waste and the LUT wins: never dequantize.
+ *
+ * Prefilling a chunk, the same expert serves many tokens, so it pays to
+ * expand it once and run a real GEMM — dense FMA runs ~50x faster than the
+ * gathers the LUT needs, and the expansion amortizes over the chunk.
+ *
+ * The bigger win is upstream of that: tokens in a chunk route to
+ * overlapping expert sets, so the union is far smaller than n * top_k, and
+ * each distinct expert is read from disk exactly once.
+ */
+
+#define CHUNK_MAX 64
+
+int waste_model_chunk_max(const waste_model *m) { (void)m; return CHUNK_MAX; }
+
+/* Y[T][out] = X[T][in] . W^T, parallel over output rows. */
+typedef struct {
+    float *Y; const float *W, *X; int in, out, T;
+} mm_arg;
+
+static void mm_rows(int b, int e, void *p)
+{
+    mm_arg *a = (mm_arg *)p;
+    for (int o = b; o < e; o++) {
+        const float *row = a->W + (size_t)o * a->in;
+        for (int t = 0; t < a->T; t++)
+            a->Y[(size_t)t * a->out + o] = dotf(row, a->X + (size_t)t * a->in, a->in);
+    }
+}
+
+static void matmul_f32(float *Y, const float *W, const float *X,
+                       int out, int in, int T)
+{
+    mm_arg a = { Y, W, X, in, out, T };
+    waste_parallel_for(out, 32, mm_rows, &a);
+}
+
+/* Tensor-aware batched matmul; dequantizes a Q8G row on the fly. */
+typedef struct {
+    float *Y; const int8_t *W; const uint16_t *ws; const float *X;
+    int in, out, T, ng, group;
+} mmq_arg;
+
+static void mmq_rows(int b, int e, void *p)
+{
+    mmq_arg *a = (mmq_arg *)p;
+    const int g = a->group, ng = a->ng;
+    float *row = (float *)malloc((size_t)a->in * sizeof(float));
+    if (!row) return;
+    for (int o = b; o < e; o++) {
+        const int8_t *q = a->W + (size_t)o * ng * g;
+        const uint16_t *sc = a->ws + (size_t)o * ng;
+        for (int k = 0; k < ng; k++) {
+            const float s = f16_to_f32(sc[k]);
+            const int lim = (k * g + g <= a->in) ? g : a->in - k * g;
+            for (int i = 0; i < lim; i++) row[k * g + i] = (float)q[(size_t)k * g + i] * s;
+        }
+        for (int t = 0; t < a->T; t++)
+            a->Y[(size_t)t * a->out + o] = dotf(row, a->X + (size_t)t * a->in, a->in);
+    }
+    free(row);
+}
+
+static void matmul_t(waste_model *m, float *Y, const waste_tensor *t,
+                     const float *X, int out, int in, int T)
+{
+    (void)m;
+    if (!t || (!t->q && !t->data)) {
+        memset(Y, 0, (size_t)T * out * sizeof(float));
+        return;
+    }
+    if (!t->q) { matmul_f32(Y, t->data, X, out, in, T); return; }
+    const int g = t->group, ng = (in + g - 1) / g;
+    mmq_arg a = { Y, t->q, t->qs, X, in, out, T, ng, g };
+    waste_parallel_for(out, 32, mmq_rows, &a);
+}
+
+/* Expand one expert's VQ indices into f32 [M][N]. */
+static void vq_expand(waste_model *m, float *W, const uint8_t *idx,
+                      const uint16_t *scale, int M, int N, int cb_base)
+{
+    const int nv_row = N / m->vec_dim, st = m->stages, en = m->cb_entries,
+              vd = m->vec_dim;
+    for (int r0 = 0; r0 < M; r0 += VQ_TILE) {
+        const int nr = (r0 + VQ_TILE <= M) ? VQ_TILE : M - r0;
+        const uint8_t *base = idx + (size_t)(r0 / VQ_TILE) * nv_row * VQ_TILE * st;
+        for (int v = 0; v < nv_row; v++) {
+            const uint8_t *ix = base + (size_t)v * VQ_TILE * st;
+            for (int r = 0; r < nr; r++, ix += st) {
+                float *dst = W + (size_t)(r0 + r) * N + (size_t)v * vd;
+                for (int d = 0; d < vd; d++) dst[d] = 0.0f;
+                for (int s = 0; s < st; s++) {
+                    const float *C = m->codebooks +
+                        ((size_t)(cb_base + s) * en + ix[s]) * vd;
+                    for (int d = 0; d < vd; d++) dst[d] += C[d];
+                }
+            }
+        }
+    }
+    for (int r = 0; r < M; r++) {
+        const float sc = f16_to_f32(scale[r]);
+        float *row = W + (size_t)r * N;
+        for (int i = 0; i < N; i++) row[i] *= sc;
+    }
+}
+
 /* ---- forward ----------------------------------------------------------- */
+
+static int prefill_alloc(waste_model *m, int T)
+{
+    if (m->chunk_cap >= T) return 0;
+    const waste_config *c = &m->cfg;
+    const int hid = c->hidden, lat = c->latent_dim ? c->latent_dim : hid;
+    const int wide = c->kda_heads * c->kda_dim;
+    const int big = hid > wide ? hid : wide;
+    const int inter = c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter;
+    const int nb = c->attn_res_block ? c->n_layers / c->attn_res_block + 2 : 1;
+
+    free(m->cx); free(m->cnorm); free(m->cresid); free(m->cq); free(m->ckv);
+    free(m->clat); free(m->cff); free(m->cexp); free(m->cblockres);
+    free(m->cprefix); free(m->croute); free(m->crw);
+
+    m->cx     = (float *)calloc((size_t)T * hid, sizeof(float));
+    m->cnorm  = (float *)calloc((size_t)T * hid, sizeof(float));
+    m->cresid = (float *)calloc((size_t)T * hid, sizeof(float));
+    {   /* cq holds 2 LUTs per token plus one for `down` */
+        const size_t lut_sz = (size_t)((hid > lat ? hid : lat) / 8) * 3 * 256;
+        m->cq = (float *)calloc((size_t)(2 * T + 1) * lut_sz + 64, sizeof(float));
+    }
+    {   /* ckv holds the shared-expert staging: gate, up, out */
+        const int si = c->moe_inter * (c->n_shared ? c->n_shared : 1);
+        m->ckv = (float *)calloc((size_t)T * (size_t)(2 * si + hid) + 64, sizeof(float));
+    }
+    m->clat   = (float *)calloc((size_t)T * (size_t)(2 * lat + 2 * hid), sizeof(float));
+    {   /* cff serves two callers: the per-token MoE staging (2*moe_inter +
+         * lat) and the batched dense FFN (2 * T * dense_inter). Size for
+         * whichever is larger — getting this wrong overflows silently. */
+        const size_t moe_need = (size_t)2 * c->moe_inter + (size_t)(hid > lat ? hid : lat);
+        const size_t dense_need = (size_t)2 * T * c->dense_inter;
+        m->cff = (float *)calloc((moe_need > dense_need ? moe_need : dense_need) + 64,
+                                 sizeof(float));
+    }
+    /* one expanded expert: gate/up [inter][lat] and down [hid][inter] */
+    m->cexp   = (float *)calloc((size_t)2 * c->moe_inter * lat + (size_t)lat * c->moe_inter,
+                                sizeof(float));
+    m->cblockres = (float *)calloc((size_t)T * nb * hid, sizeof(float));
+    m->cprefix   = (float *)calloc((size_t)T * hid, sizeof(float));
+    m->croute = (int *)calloc((size_t)T * 64, sizeof(int));
+    m->crw    = (float *)calloc((size_t)T * 64, sizeof(float));
+    m->chunk_cap = T;
+    return (m->cx && m->cnorm && m->cresid && m->cq && m->ckv && m->clat &&
+            m->cff && m->cexp && m->cblockres && m->cprefix && m->croute &&
+            m->crw) ? 0 : -1;
+}
+
+/* MoE over a whole chunk.
+ *
+ * The first attempt expanded each expert once and ran GEMMs, on the theory
+ * that the cost amortizes over the chunk. Measured, it does not: a chunk of
+ * 16 tokens spreads over ~1200 distinct experts, i.e. under 3 tokens each,
+ * so expanding 7 M weights to serve 3 vectors is far worse than the LUT.
+ *
+ * What the chunk *does* buy is I/O: those 3328 (token, expert) pairs are
+ * only 1210 distinct experts, so the disk sees 2.75x fewer reads. So keep
+ * the decode-style LUT maths and reorganize purely to read each expert
+ * once. gate/up tables depend on the token but not the expert (codebooks
+ * are per layer), so they are built once per token and reused across every
+ * expert that token routes to.
+ */
+static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT)
+{
+    const waste_config *c = &m->cfg;
+    const int E = c->n_experts, K = c->top_k, hid = c->hidden;
+    const int lat = c->latent_dim ? c->latent_dim : hid, inter = c->moe_inter;
+    int *route = m->croute;
+    float *rw = m->crw;
+
+    float *sc = m->att + 4096, *score = sc + E;
+    const float *bias = T(m, "%smodel.layers.%d.block_sparse_moe.gate.e_score_correction_bias",
+                          c->prefix, L);
+    for (int t = 0; t < nT; t++) {
+        matvec_t(m, sc, waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.gate.weight",
+                                            c->prefix, L)), in + (size_t)t * hid, E, hid);
+        for (int e = 0; e < E; e++) score[e] = 1.0f / (1.0f + expf(-sc[e]));
+        int *idx = route + (size_t)t * K;
+        float *w = rw + (size_t)t * K;
+        for (int j = 0; j < K; j++) {
+            int best = -1; float bv = -1e30f;
+            for (int e = 0; e < E; e++) {
+                int taken = 0;
+                for (int p = 0; p < j; p++) if (idx[p] == e) { taken = 1; break; }
+                if (taken) continue;
+                const float v = score[e] + (bias ? bias[e] : 0.0f);
+                if (v > bv) { bv = v; best = e; }
+            }
+            idx[j] = best; w[j] = score[best];
+        }
+        if (c->renorm && K > 1) {
+            float s = 0;
+            for (int j = 0; j < K; j++) s += w[j];
+            for (int j = 0; j < K; j++) w[j] /= (s + 1e-20f);
+        }
+        for (int j = 0; j < K; j++) w[j] *= c->routed_scale;
+    }
+
+    const float *xin = in;
+    float *lat_in = m->clat, *ysum = lat_in + (size_t)nT * lat;
+    if (c->latent_dim) {
+        matmul_t(m, lat_in, waste_find(m, tname(
+                     "%smodel.layers.%d.block_sparse_moe.routed_expert_down_proj.weight",
+                     c->prefix, L)), in, lat, hid, nT);
+        xin = lat_in;
+    }
+    memset(ysum, 0, (size_t)nT * lat * sizeof(float));
+
+    /* gate/up tables: one per token, shared by every expert it routes to */
+    const int lut_sz = ((hid > lat ? hid : lat) / m->vec_dim) * m->stages * m->cb_entries;
+    float *lut_gu = m->cq;                    /* [nT][2][lut_sz] */
+    float *lut_down = lut_gu + (size_t)nT * 2 * lut_sz;
+    int lut_ready = 0;
+
+    float *ga = m->cff, *ub = ga + inter, *acc = m->cff + 2 * inter;
+
+    for (int e = 0; e < E; e++) {
+        int used = 0;
+        for (int i = 0; i < nT * K; i++) if (route[i] == e) { used = 1; break; }
+        if (!used) continue;
+
+        PROF_START(P_EDEQ);
+        const uint8_t *rec = read_expert(m, L, e);
+        PROF_END(P_EDEQ);
+        if (!rec) continue;
+        const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
+        const uint16_t *s16 = (const uint16_t *)(rec + h->chan_corr_off);
+
+        PROF_START(P_EMM);
+        if (!lut_ready) {
+            for (int t = 0; t < nT; t++) {
+                vq_build_lut(lut_gu + (size_t)(2 * t) * lut_sz, m->codebooks,
+                             h->codebook_id + 0 * m->stages,
+                             xin + (size_t)t * lat, lat, m->stages,
+                             m->cb_entries, m->vec_dim);
+                vq_build_lut(lut_gu + (size_t)(2 * t + 1) * lut_sz, m->codebooks,
+                             h->codebook_id + 1 * m->stages,
+                             xin + (size_t)t * lat, lat, m->stages,
+                             m->cb_entries, m->vec_dim);
+            }
+            lut_ready = 1;
+        }
+        for (int t = 0; t < nT; t++) {
+            float wj = 0;
+            for (int j = 0; j < K; j++)
+                if (route[(size_t)t * K + j] == e) { wj = rw[(size_t)t * K + j]; break; }
+            if (wj == 0.0f) continue;
+
+            vq_apply(m, ga, rec + h->gate_off, s16, inter, lat,
+                     lut_gu + (size_t)(2 * t) * lut_sz);
+            vq_apply(m, ub, rec + h->up_off, s16 + inter, inter, lat,
+                     lut_gu + (size_t)(2 * t + 1) * lut_sz);
+            if (c->act_situ)
+                for (int i = 0; i < inter; i++)
+                    ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta, c->situ_linear_beta);
+            else
+                for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
+            vq_matvec(m, acc, rec + h->down_off, s16 + 2 * inter, ga, lat, inter,
+                      h->codebook_id + 2 * m->stages, lut_down);
+            float *dst = ysum + (size_t)t * lat;
+            for (int i = 0; i < lat; i++) dst[i] += wj * acc[i];
+        }
+        PROF_END(P_EMM);
+    }
+
+    if (c->latent_dim) {
+        if (c->latent_norm) {
+            const float *nw = waste_find(m, tname(
+                "%smodel.layers.%d.block_sparse_moe.routed_expert_norm.weight",
+                c->prefix, L))->data;
+            for (int t = 0; t < nT; t++)
+                rmsnorm(ysum + (size_t)t * lat, ysum + (size_t)t * lat, nw, lat, c->eps);
+        }
+        matmul_t(m, out, waste_find(m, tname(
+                     "%smodel.layers.%d.block_sparse_moe.routed_expert_up_proj.weight",
+                     c->prefix, L)), ysum, hid, lat, nT);
+    } else {
+        memcpy(out, ysum, (size_t)nT * hid * sizeof(float));
+    }
+
+    /* shared experts, on the full hidden state */
+    const int si = inter * (c->n_shared ? c->n_shared : 1);
+    float *sa = m->ckv, *sb = sa + (size_t)nT * si, *sh = sb + (size_t)nT * si;
+    matmul_t(m, sa, waste_find(m, tname(
+                 "%smodel.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight",
+                 c->prefix, L)), in, si, hid, nT);
+    matmul_t(m, sb, waste_find(m, tname(
+                 "%smodel.layers.%d.block_sparse_moe.shared_experts.up_proj.weight",
+                 c->prefix, L)), in, si, hid, nT);
+    for (int i = 0; i < nT * si; i++)
+        sa[i] = c->act_situ ? waste_situ_pair(sa[i], sb[i], c->situ_beta, c->situ_linear_beta)
+                            : silu(sa[i]) * sb[i];
+    matmul_t(m, sh, waste_find(m, tname(
+                 "%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight",
+                 c->prefix, L)), sa, hid, si, nT);
+    for (int i = 0; i < nT * hid; i++) out[i] += sh[i];
+}
+
+/* Prefill a chunk. KDA and MLA still walk the tokens in order — the
+ * recurrence and the causal mask demand it, and both are cheap — but every
+ * projection is a GEMM and the MoE sees the whole chunk at once. */
+const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
+                                 int pos0)
+{
+    const waste_config *c = &m->cfg;
+    const int hid = c->hidden;
+    if (n <= 0) return m->logits;
+    if (n == 1) return waste_model_step(m, tokens[0], pos0, NULL);
+    if (n > CHUNK_MAX) n = CHUNK_MAX;
+    if (prefill_alloc(m, n)) return NULL;
+
+    const waste_tensor *emb = waste_find(m, tname("%smodel.embed_tokens.weight", c->prefix));
+    for (int t = 0; t < n; t++) {
+        float *dst = m->cx + (size_t)t * hid;
+        if (emb->data) memcpy(dst, emb->data + (size_t)tokens[t] * hid, (size_t)hid * 4);
+        else {
+            const int g = emb->group, ng = (hid + g - 1) / g;
+            const int8_t *row = emb->q + (size_t)tokens[t] * ng * g;
+            const uint16_t *sc = emb->qs + (size_t)tokens[t] * ng;
+            for (int k = 0; k < ng; k++) {
+                const float sv = f16_to_f32(sc[k]);
+                for (int i = 0; i < g && k * g + i < hid; i++)
+                    dst[k * g + i] = (float)row[k * g + i] * sv;
+            }
+        }
+    }
+
+    const int ares_on = c->attn_res_block > 0;
+    int nb = 0;
+    int ps_live = 0;
+
+    for (int L = 0; L < c->n_layers; L++) {
+        if (ares_on) {
+            memcpy(m->cprefix, m->cx, (size_t)n * hid * sizeof(float));
+            ps_live = 1;
+            if (nb > 0) {
+                const float *nw = waste_find(m, tname("%smodel.layers.%d.self_attention_res_norm.weight", c->prefix, L))->data;
+                const float *pw = waste_find(m, tname("%smodel.layers.%d.self_attention_res_proj.weight", c->prefix, L))->data;
+                const int stride = (c->n_layers / c->attn_res_block + 2) * hid;
+                for (int t = 0; t < n; t++)
+                    waste_apply_attn_res(m, m->cblockres + (size_t)t * stride, nb,
+                                         m->cprefix + (size_t)t * hid, nw, pw,
+                                         m->cx + (size_t)t * hid);
+            }
+            if (L % c->attn_res_block == 0) {
+                const int stride = (c->n_layers / c->attn_res_block + 2) * hid;
+                for (int t = 0; t < n; t++)
+                    memcpy(m->cblockres + (size_t)t * stride + (size_t)nb * hid,
+                           m->cprefix + (size_t)t * hid, (size_t)hid * sizeof(float));
+                nb++;
+                ps_live = 0;
+            }
+        }
+
+        const float *iln = waste_find(m, tname("%smodel.layers.%d.input_layernorm.weight", c->prefix, L))->data;
+        for (int t = 0; t < n; t++)
+            rmsnorm(m->cnorm + (size_t)t * hid, m->cx + (size_t)t * hid, iln, hid, c->eps);
+
+        /* attention: per token, but on the batched norm buffer */
+        for (int t = 0; t < n; t++) {
+            if (c->kda_layer[L]) kda_layer(m, L, m->cnorm + (size_t)t * hid,
+                                           m->cresid + (size_t)t * hid);
+            else mla_layer(m, L, m->cnorm + (size_t)t * hid,
+                           m->cresid + (size_t)t * hid, pos0 + t);
+        }
+
+        if (ares_on) {
+            if (ps_live) for (int i = 0; i < n * hid; i++) m->cprefix[i] += m->cresid[i];
+            else { memcpy(m->cprefix, m->cresid, (size_t)n * hid * sizeof(float)); ps_live = 1; }
+            const float *nw = waste_find(m, tname("%smodel.layers.%d.mlp_res_norm.weight", c->prefix, L))->data;
+            const float *pw = waste_find(m, tname("%smodel.layers.%d.mlp_res_proj.weight", c->prefix, L))->data;
+            const int stride = (c->n_layers / c->attn_res_block + 2) * hid;
+            for (int t = 0; t < n; t++)
+                waste_apply_attn_res(m, m->cblockres + (size_t)t * stride, nb,
+                                     m->cprefix + (size_t)t * hid, nw, pw,
+                                     m->cx + (size_t)t * hid);
+        } else {
+            for (int i = 0; i < n * hid; i++) m->cx[i] += m->cresid[i];
+        }
+
+        const float *pln = waste_find(m, tname("%smodel.layers.%d.post_attention_layernorm.weight", c->prefix, L))->data;
+        for (int t = 0; t < n; t++)
+            rmsnorm(m->cnorm + (size_t)t * hid, m->cx + (size_t)t * hid, pln, hid, c->eps);
+
+        if (waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L))) {
+            PROF_START(P_ROUTE);
+            moe_chunk(m, L, m->cnorm, m->cresid, n);
+            PROF_END(P_ROUTE);
+        } else {
+            const int inter = c->dense_inter;
+            float *a = m->cff, *b = a + (size_t)n * inter;
+            matmul_t(m, a, waste_find(m, tname("%smodel.layers.%d.mlp.gate_proj.weight", c->prefix, L)), m->cnorm, inter, hid, n);
+            matmul_t(m, b, waste_find(m, tname("%smodel.layers.%d.mlp.up_proj.weight", c->prefix, L)), m->cnorm, inter, hid, n);
+            for (int i = 0; i < n * inter; i++)
+                a[i] = c->act_situ ? waste_situ_pair(a[i], b[i], c->situ_beta, c->situ_linear_beta)
+                                   : silu(a[i]) * b[i];
+            matmul_t(m, m->cresid, waste_find(m, tname("%smodel.layers.%d.mlp.down_proj.weight", c->prefix, L)), a, hid, inter, n);
+        }
+
+        if (ares_on) {
+            for (int i = 0; i < n * hid; i++) m->cprefix[i] += m->cresid[i];
+            memcpy(m->cx, m->cprefix, (size_t)n * hid * sizeof(float));
+        } else {
+            for (int i = 0; i < n * hid; i++) m->cx[i] += m->cresid[i];
+        }
+    }
+
+    /* hand the chunk's block-residual history to the per-token path: decode
+     * continues from the last token's row */
+    if (ares_on) {
+        const int stride = (c->n_layers / c->attn_res_block + 2) * hid;
+        memcpy(m->blockres, m->cblockres + (size_t)(n - 1) * stride,
+               (size_t)nb * hid * sizeof(float));
+    }
+    m->n_blockres = nb;
+    const float *fnw = waste_find(m, tname("%smodel.norm.weight", c->prefix))->data;
+    float *last = m->cnorm;
+    rmsnorm(last, m->cx + (size_t)(n - 1) * hid, fnw, hid, c->eps);
+    matvec_t(m, m->logits, waste_find(m, tname("%slm_head.weight", c->prefix)), last,
+             c->vocab, hid);
+    memcpy(m->x, m->cx + (size_t)(n - 1) * hid, (size_t)hid * sizeof(float));
+    return m->logits;
+}
 
 const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
 {
@@ -1020,7 +1456,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
             memcpy(ps, m->x, (size_t)hid * sizeof(float));
             ps_live = 1;
             if (m->n_blockres > 0) {
-                waste_apply_attn_res(m, ps,
+                waste_apply_attn_res(m, m->blockres, m->n_blockres, ps,
                     waste_find(m, tname("%smodel.layers.%d.self_attention_res_norm.weight", c->prefix, L))->data,
                     waste_find(m, tname("%smodel.layers.%d.self_attention_res_proj.weight", c->prefix, L))->data,
                     m->x);
@@ -1041,7 +1477,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         if (ares_on) {
             if (ps_live) for (int i = 0; i < hid; i++) ps[i] += resid[i];
             else { memcpy(ps, resid, (size_t)hid * sizeof(float)); ps_live = 1; }
-            waste_apply_attn_res(m, ps,
+            waste_apply_attn_res(m, m->blockres, m->n_blockres, ps,
                 waste_find(m, tname("%smodel.layers.%d.mlp_res_norm.weight", c->prefix, L))->data,
                 waste_find(m, tname("%smodel.layers.%d.mlp_res_proj.weight", c->prefix, L))->data,
                 m->x);

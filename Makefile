@@ -32,6 +32,10 @@ endif
 
 all: waste libwaste.a libwastevq.dylib
 
+# `make` builds the shipped artifacts; `make test` also builds the checkers.
+# They are separate targets, so remember which one you need — testing a
+# stale test binary costs more time than rebuilding it.
+
 # shared object so tools/convert.py can call the encoder through ctypes
 libwastevq.dylib: src/vq.c
 	$(CC) $(CFLAGS) -shared -fPIC -o $@ $< -lm -lpthread
