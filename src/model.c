@@ -26,7 +26,7 @@
 #include <time.h>
 double waste_prof[8];
 uint64_t waste_prof_n[8];
-enum { P_PROJ, P_KDA, P_MLA, P_ROUTE, P_EDEQ, P_EMM, P_HEAD, P_OTHER };
+enum { P_LUTB, P_KDA, P_MLA, P_ROUTE, P_EDEQ, P_EMM, P_HEAD, P_LUTA };
 static int prof_on = -1;
 static double pnow(void)
 {
@@ -58,6 +58,22 @@ const waste_tensor *waste_find(const waste_model *m, const char *name)
     return NULL;
 }
 
+/* Formats a tensor name. Rotates over several buffers because callers pass
+ * two or three of these to the same function, and C does not order
+ * argument evaluation — a single static buffer would make them all alias. */
+__attribute__((format(printf, 1, 2)))
+static const char *tname(const char *fmt, ...)
+{
+    static char buf[8][160];
+    static int turn = 0;
+    char *b = buf[turn++ & 7];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, 160, fmt, ap);
+    va_end(ap);
+    return b;
+}
+
 __attribute__((format(printf, 2, 3)))
 static const float *T(const waste_model *m, const char *fmt, ...)
 {
@@ -68,6 +84,16 @@ static const float *T(const waste_model *m, const char *fmt, ...)
     va_end(ap);
     const waste_tensor *t = waste_find(m, buf);
     return t ? t->data : NULL;
+}
+
+static inline float f16_to_f32(uint16_t h)
+{
+    const uint32_t sign = (uint32_t)(h >> 15) << 31;
+    const uint32_t e = (h >> 10) & 0x1f, mn = h & 0x3ff;
+    const uint32_t bits = e ? (sign | ((e + 112u) << 23) | (mn << 13)) : sign;
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
 }
 
 /* ---- kernels used only here (dispatchable later) ----------------------- */
@@ -103,6 +129,91 @@ static inline float dotf(const float *a, const float *b, int n)
 }
 #endif
 
+static int q8_off = 1;     /* 1 = keep the trunk stored as int8          */
+static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
+
+/* ---- int8 x int8 matvec (SDOT / dotprod) --------------------------------
+ * The trunk is already stored Q8G: int8 weights with one fp16 scale per
+ * group of 128 inputs. Keeping it that way (instead of expanding to f32 at
+ * load) saves ~6 GB of RAM and lets the dot run on ARM SDOT / x86 VNNI.
+ * Activations are quantized per group with the same geometry, so a group
+ * contributes scale_w * scale_x * <int32 dot>.
+ */
+typedef struct {
+    float *y; const int8_t *W; const uint16_t *ws;
+    const int8_t *xq; const float *xs; int in, ng, group;
+} mvq_arg;
+
+static inline int32_t idot(const int8_t *a, const int8_t *b, int n)
+{
+#if defined(__ARM_FEATURE_DOTPROD)
+    int32x4_t acc = vdupq_n_s32(0);
+    int i = 0;
+    for (; i + 16 <= n; i += 16)
+        acc = vdotq_s32(acc, vld1q_s8(a + i), vld1q_s8(b + i));
+    int32_t s = vaddvq_s32(acc);
+    for (; i < n; i++) s += (int32_t)a[i] * b[i];
+    return s;
+#else
+    int32_t s = 0;
+    for (int i = 0; i < n; i++) s += (int32_t)a[i] * b[i];
+    return s;
+#endif
+}
+
+/* int8 weights, f32 activations: dequantize the row inline. Keeps the
+ * 4x memory saving of int8 storage while producing exactly the numbers the
+ * f32 path does — no activation quantization error. */
+static void mvq_rows_f32(int b, int e, void *p)
+{
+    mvq_arg *a = (mvq_arg *)p;
+    const int ng = a->ng, g = a->group;
+    const float *x = (const float *)a->xs;      /* raw activations */
+    for (int o = b; o < e; o++) {
+        const int8_t *row = a->W + (size_t)o * ng * g;
+        const uint16_t *ws = a->ws + (size_t)o * ng;
+        float acc = 0;
+        for (int k = 0; k < ng; k++) {
+            const int8_t *w = row + (size_t)k * g;
+            const float *xx = x + (size_t)k * g;
+            const int lim = (k * g + g <= a->in) ? g : a->in - k * g;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+            float32x4_t s0 = vdupq_n_f32(0);
+            int i = 0;
+            for (; i + 8 <= lim; i += 8) {
+                const int16x8_t w16 = vmovl_s8(vld1_s8(w + i));
+                s0 = vfmaq_f32(s0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(w16))),
+                               vld1q_f32(xx + i));
+                s0 = vfmaq_f32(s0, vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16))),
+                               vld1q_f32(xx + i + 4));
+            }
+            float part = vaddvq_f32(s0);
+            for (; i < lim; i++) part += (float)w[i] * xx[i];
+#else
+            float part = 0;
+            for (int i = 0; i < lim; i++) part += (float)w[i] * xx[i];
+#endif
+            acc += f16_to_f32(ws[k]) * part;
+        }
+        a->y[o] = acc;
+    }
+}
+
+static void mvq_rows(int b, int e, void *p)
+{
+    mvq_arg *a = (mvq_arg *)p;
+    const int ng = a->ng, g = a->group;
+    for (int o = b; o < e; o++) {
+        const int8_t *row = a->W + (size_t)o * ng * g;
+        const uint16_t *ws = a->ws + (size_t)o * ng;
+        float acc = 0;
+        for (int k = 0; k < ng; k++)
+            acc += f16_to_f32(ws[k]) * a->xs[k] *
+                   (float)idot(row + (size_t)k * g, a->xq + (size_t)k * g, g);
+        a->y[o] = acc;
+    }
+}
+
 typedef struct { float *y; const float *W, *x; int in; } mv_arg;
 
 static void mv_rows(int b, int e, void *p)
@@ -118,6 +229,45 @@ static void matvec(float *y, const float *W, const float *x, int out, int in)
 {
     mv_arg a = { y, W, x, in };
     waste_parallel_for(out, 64, mv_rows, &a);
+}
+
+/* Quantize x into per-group int8 (same grouping as the weights). */
+static void quant_act(const float *x, int n, int g, int8_t *q, float *sc)
+{
+    const int ng = (n + g - 1) / g;
+    for (int k = 0; k < ng; k++) {
+        const int beg = k * g, end = (beg + g < n) ? beg + g : n;
+        float amax = 0;
+        for (int i = beg; i < end; i++) {
+            const float v = fabsf(x[i]);
+            if (v > amax) amax = v;
+        }
+        const float s = amax > 0 ? amax / 127.0f : 1.0f;
+        sc[k] = s;
+        const float inv = 1.0f / s;
+        for (int i = beg; i < end; i++) {
+            int v = (int)lrintf(x[i] * inv);
+            q[i] = (int8_t)(v > 127 ? 127 : (v < -127 ? -127 : v));
+        }
+        for (int i = end; i < beg + g; i++) q[i] = 0;
+    }
+}
+
+/* Matvec against a trunk tensor, quantized path when available. */
+static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
+                     const float *x, int out, int in)
+{
+    if (!t || (!t->q && !t->data)) { memset(y, 0, (size_t)out * sizeof(float)); return; }
+    if (!t->q) { matvec(y, t->data, x, out, in); return; }
+    const int g = t->group, ng = (in + g - 1) / g;
+    if (sdot_on) {
+        quant_act(x, in, g, m->xq, m->xs);
+        mvq_arg a = { y, t->q, t->qs, m->xq, m->xs, in, ng, g };
+        waste_parallel_for(out, 64, mvq_rows, &a);
+    } else {
+        mvq_arg a = { y, t->q, t->qs, NULL, x, in, ng, g };
+        waste_parallel_for(out, 64, mvq_rows_f32, &a);
+    }
 }
 
 static inline float silu(float v) { return v / (1.0f + expf(-v)); }
@@ -150,6 +300,8 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
         js_str(d, js_get(d, e, "name"), t->name, sizeof t->name);
         const int fmt = (int)js_int(d, js_get(d, e, "fmt"), 0);
         const long off = js_int(d, js_get(d, e, "off"), 0);
+        const int g = (int)js_int(d, js_get(d, e, "group"), 128);
+        const long soff = js_int(d, js_get(d, e, "scale_off"), 0);
         int sh = js_get(d, e, "shape");
         t->ndim = d->tok[sh].size;
         t->n = 1;
@@ -157,17 +309,16 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
             t->shape[k] = (int)js_int(d, js_at(d, sh, k), 1);
             t->n *= (size_t)t->shape[k];
         }
-        t->data = (float *)malloc(t->n * sizeof(float));
-        if (!t->data) { free(blob); return -1; }
-
         if (fmt == 0) {                                   /* F32 */
+            t->data = (float *)malloc(t->n * sizeof(float));
+            if (!t->data) { free(blob); return -1; }
             memcpy(t->data, blob + off, t->n * sizeof(float));
-        } else {                                          /* Q8G */
-            const int g = (int)js_int(d, js_get(d, e, "group"), 128);
-            const long soff = js_int(d, js_get(d, e, "scale_off"), 0);
+        } else if (!q8_off) {                             /* Q8G -> f32 */
             const int N = t->shape[t->ndim - 1];
             const long rows = (long)(t->n / (size_t)N);
             const int ng = (N + g - 1) / g;
+            t->data = (float *)malloc(t->n * sizeof(float));
+            if (!t->data) { free(blob); return -1; }
             const int8_t *q = (const int8_t *)(blob + off);
             const uint16_t *sc = (const uint16_t *)(blob + soff);
             for (long r = 0; r < rows; r++) {
@@ -187,6 +338,16 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
                     }
                 }
             }
+        } else {                                          /* Q8G, kept int8 */
+            const int N = t->shape[t->ndim - 1];
+            const long rows = (long)(t->n / (size_t)N);
+            const int ng = (N + g - 1) / g;
+            t->group = g;
+            t->q = (int8_t *)malloc((size_t)rows * ng * g);
+            t->qs = (uint16_t *)malloc((size_t)rows * ng * sizeof(uint16_t));
+            if (!t->q || !t->qs) { free(blob); return -1; }
+            memcpy(t->q, blob + off, (size_t)rows * ng * g);
+            memcpy(t->qs, blob + soff, (size_t)rows * ng * sizeof(uint16_t));
         }
     }
     free(blob);
@@ -240,6 +401,8 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap)
     snprintf(path, sizeof path, "%s/manifest.json", dir);
     char *src = slurp(path, NULL);
     if (!src) return -1;
+    { const char *e = getenv("WASTE_Q8"); if (e && *e == '0') q8_off = 0; }
+    { const char *e = getenv("WASTE_SDOT"); sdot_on = e && *e != '0'; }
     js_doc d;
     if (js_parse(&d, src) < 0) { free(src); return -1; }
 
@@ -316,6 +479,12 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap)
     m->e_gate = (float *)malloc((size_t)c->moe_inter * c->hidden * sizeof(float));
     m->e_up = (float *)malloc((size_t)c->moe_inter * c->hidden * sizeof(float));
     m->e_down = (float *)malloc((size_t)c->hidden * c->moe_inter * sizeof(float));
+    {
+        const int nmax = c->hidden > c->dense_inter ? c->hidden : c->dense_inter;
+        m->xq = (int8_t *)calloc((size_t)nmax + 256, 1);
+        m->xs = (float *)calloc((size_t)nmax / 32 + 64, sizeof(float));
+    }
+
     {   /* LUT: [max_nv][stages][entries] */
         const int nmax = (c->hidden > c->moe_inter ? c->hidden : c->moe_inter);
         m->lut = (float *)malloc((size_t)3 * (nmax / 8 + 1) * m->stages
@@ -335,6 +504,8 @@ void waste_model_free(waste_model *m)
     }
     free(m->x); free(m->h); free(m->tmp); free(m->att); free(m->logits);
     free(m->ff); free(m->e_gate); free(m->e_up); free(m->e_down); free(m->lut);
+    free(m->xq); free(m->xs);
+    for (int i = 0; i < m->n_tensors; i++) { free(m->t[i].q); free(m->t[i].qs); }
 }
 
 /* ---- expert dequant ---------------------------------------------------- */
@@ -356,16 +527,6 @@ static const uint8_t *read_expert(waste_model *m, int L, int eid)
     return buf;
 }
 
-static inline float f16_to_f32(uint16_t h)
-{
-    const uint32_t sign = (uint32_t)(h >> 15) << 31;
-    const uint32_t e = (h >> 10) & 0x1f, mn = h & 0x3ff;
-    const uint32_t bits = e ? (sign | ((e + 112u) << 23) | (mn << 13)) : sign;
-    float f;
-    memcpy(&f, &bits, 4);
-    return f;
-}
-
 /* ---- fused VQ matvec ---------------------------------------------------
  * Never materializes the weights. For a matrix stored as `stages` codebook
  * indices per 8-dim vector, y[row] = scale[row] * sum_v sum_s C_s[i]. x_v.
@@ -381,6 +542,7 @@ static void vq_build_lut(float *lut, const float *books, int cb_base,
                          const float *x, int N, int stages, int entries,
                          int vec_dim)
 {
+    PROF_START(P_LUTB);
     const int nv = N / vec_dim;
     for (int v = 0; v < nv; v++) {
         const float *xv = x + (size_t)v * vec_dim;
@@ -391,6 +553,7 @@ static void vq_build_lut(float *lut, const float *books, int cb_base,
                 dst[c] = dotf(C + (size_t)c * vec_dim, xv, vec_dim);
         }
     }
+    PROF_END(P_LUTB);
 }
 
 typedef struct {
@@ -398,27 +561,47 @@ typedef struct {
     int nv, stages, entries;
 } vq_arg;
 
+/* Row-tiled so the per-position table block is loaded once for a whole
+ * tile instead of once per row. The naive row-outer/vector-inner order
+ * streams the entire table (884 KB for a 2304-wide matrix) M times; at
+ * M=1024 that is ~900 MB of traffic per matrix. With a tile of 64 rows the
+ * table is read M/64 times and the tile's indices (55 KB) stay in L1.
+ * This is a cache-blocking win, not a SIMD one: the inner op is a gather,
+ * which NEON cannot vectorize. */
+#define VQ_TILE 64
+
 static void vq_rows(int b, int e, void *p)
 {
     vq_arg *a = (vq_arg *)p;
     const int nv = a->nv, st = a->stages, en = a->entries;
-    for (int r = b; r < e; r++) {
-        const uint8_t *ix = a->idx + (size_t)r * nv * st;
-        const float *lut = a->lut;
-        float acc = 0;
+    float acc[VQ_TILE];
+
+    for (int r0 = b; r0 < e; r0 += VQ_TILE) {
+        const int r1 = (r0 + VQ_TILE < e) ? r0 + VQ_TILE : e;
+        const int nr = r1 - r0;
+        memset(acc, 0, (size_t)nr * sizeof(float));
+
         for (int v = 0; v < nv; v++) {
-            const float *blk = lut + (size_t)v * st * en;
-            for (int s = 0; s < st; s++) acc += blk[s * en + ix[v * st + s]];
+            const float *blk = a->lut + (size_t)v * st * en;
+            const uint8_t *ix = a->idx + ((size_t)r0 * nv + v) * st;
+            for (int r = 0; r < nr; r++, ix += (size_t)nv * st) {
+                float t = blk[ix[0]];
+                for (int s = 1; s < st; s++) t += blk[s * en + ix[s]];
+                acc[r] += t;
+            }
         }
-        a->y[r] = acc * f16_to_f32(a->scale[r]);
+        for (int r = 0; r < nr; r++)
+            a->y[r0 + r] = acc[r] * f16_to_f32(a->scale[r0 + r]);
     }
 }
 
 static void vq_apply(waste_model *m, float *y, const uint8_t *idx,
                      const uint16_t *scale, int M, int N, const float *lut)
 {
+    PROF_START(P_LUTA);
     vq_arg a = { y, idx, scale, lut, N / m->vec_dim, m->stages, m->cb_entries };
     waste_parallel_for(M, 32, vq_rows, &a);
+    PROF_END(P_LUTA);
 }
 
 static void vq_matvec(waste_model *m, float *y, const uint8_t *idx,
@@ -444,15 +627,15 @@ static void kda_layer(waste_model *m, int L, const float *in, float *out)
     for (int i = 0; i < 3; i++) {
         char b[128];
         snprintf(b, sizeof b, "model.layers.%d.self_attn.%s_proj.weight", L, nm[i]);
-        matvec(dstv[i], waste_find(m, b)->data, in, C, hid);
+        matvec_t(m, dstv[i], waste_find(m, b), in, C, hid);
         snprintf(b, sizeof b, "model.layers.%d.self_attn.%s_conv1d.weight", L, nm[i]);
         waste_k.short_conv_step(C, c->conv_k, waste_find(m, b)->data, NULL,
                                 m->conv[L] + (size_t)i * C * (c->conv_k - 1),
                                 dstv[i], dstv[i]);
     }
 
-    matvec(lo, T(m, "model.layers.%d.self_attn.f_a_proj.weight", L), in, D, hid);
-    matvec(g, T(m, "model.layers.%d.self_attn.f_b_proj.weight", L), lo, C, D);
+    matvec_t(m, lo, waste_find(m, tname("model.layers.%d.self_attn.f_a_proj.weight", L)), in, D, hid);
+    matvec_t(m, g, waste_find(m, tname("model.layers.%d.self_attn.f_b_proj.weight", L)), lo, C, D);
     const float *A_log = T(m, "model.layers.%d.self_attn.A_log", L);
     const float *dt = T(m, "model.layers.%d.self_attn.dt_bias", L);
     for (int h = 0; h < H; h++) {
@@ -465,18 +648,18 @@ static void kda_layer(waste_model *m, int L, const float *in, float *out)
             g[i] = a * sp;
         }
     }
-    matvec(beta, T(m, "model.layers.%d.self_attn.b_proj.weight", L), in, H, hid);
+    matvec_t(m, beta, waste_find(m, tname("model.layers.%d.self_attn.b_proj.weight", L)), in, H, hid);
     for (int h = 0; h < H; h++) beta[h] = 1.0f / (1.0f + expf(-beta[h]));
 
     waste_k.kda_step(H, D, D, q, k, v, g, beta, m->S[L], o, m->att);
 
-    matvec(lo, T(m, "model.layers.%d.self_attn.g_a_proj.weight", L), in, D, hid);
-    matvec(gate, T(m, "model.layers.%d.self_attn.g_b_proj.weight", L), lo, C, D);
+    matvec_t(m, lo, waste_find(m, tname("model.layers.%d.self_attn.g_a_proj.weight", L)), in, D, hid);
+    matvec_t(m, gate, waste_find(m, tname("model.layers.%d.self_attn.g_b_proj.weight", L)), lo, C, D);
     const float *onw = T(m, "model.layers.%d.self_attn.o_norm.weight", L);
     for (int h = 0; h < H; h++)
         waste_k.rmsnorm_gated(D, o + h * D, gate + h * D, onw, c->eps, o + h * D);
 
-    matvec(out, T(m, "model.layers.%d.self_attn.o_proj.weight", L), o, hid, C);
+    matvec_t(m, out, waste_find(m, tname("model.layers.%d.self_attn.o_proj.weight", L)), o, hid, C);
 }
 
 static void mla_layer(waste_model *m, int L, const float *in, float *out, int pos)
@@ -487,14 +670,14 @@ static void mla_layer(waste_model *m, int L, const float *in, float *out, int po
     float *q = m->tmp, *ckv = q + nh * qd, *kb = ckv + c->kv_lora + c->qk_rope;
     float *o = kb + nh * (c->qk_nope + vh);
 
-    matvec(q, T(m, "model.layers.%d.self_attn.q_proj.weight", L), in, nh * qd, hid);
-    matvec(ckv, T(m, "model.layers.%d.self_attn.kv_a_proj_with_mqa.weight", L), in,
-           c->kv_lora + c->qk_rope, hid);
+    matvec_t(m, q, waste_find(m, tname("model.layers.%d.self_attn.q_proj.weight", L)), in, nh * qd, hid);
+    matvec_t(m, ckv, waste_find(m, tname("model.layers.%d.self_attn.kv_a_proj_with_mqa.weight", L)),
+             in, c->kv_lora + c->qk_rope, hid);
     float *kpass = ckv, *krot = ckv + c->kv_lora;
     rmsnorm(kpass, kpass, T(m, "model.layers.%d.self_attn.kv_a_layernorm.weight", L),
             c->kv_lora, c->eps);
-    matvec(kb, T(m, "model.layers.%d.self_attn.kv_b_proj.weight", L), kpass,
-           nh * (c->qk_nope + vh), c->kv_lora);
+    matvec_t(m, kb, waste_find(m, tname("model.layers.%d.self_attn.kv_b_proj.weight", L)),
+             kpass, nh * (c->qk_nope + vh), c->kv_lora);
 
     float *kc = m->kcache[L] + (size_t)pos * nh * qd;
     float *vc = m->vcache[L] + (size_t)pos * nh * vh;
@@ -525,18 +708,19 @@ static void mla_layer(waste_model *m, int L, const float *in, float *out, int po
             for (int i = 0; i < vh; i++) oh[i] += w * vv[i];
         }
     }
-    matvec(out, T(m, "model.layers.%d.self_attn.o_proj.weight", L), o, hid, nh * vh);
+    matvec_t(m, out, waste_find(m, tname("model.layers.%d.self_attn.o_proj.weight", L)), o, hid, nh * vh);
 }
 
-static void ffn(waste_model *m, const float *W1, const float *W3, const float *W2,
-                const float *in, float *out, int inter, int hid, float w, int accum)
+static void ffn(waste_model *m, const waste_tensor *W1, const waste_tensor *W3,
+                const waste_tensor *W2, const float *in, float *out,
+                int inter, int hid, float w, int accum)
 {
     float *a = m->ff, *b = a + inter;
-    matvec(a, W1, in, inter, hid);
-    matvec(b, W3, in, inter, hid);
+    matvec_t(m, a, W1, in, inter, hid);
+    matvec_t(m, b, W3, in, inter, hid);
     for (int i = 0; i < inter; i++) a[i] = silu(a[i]) * b[i];
     float *dst = accum ? m->h : out;
-    matvec(dst, W2, a, hid, inter);
+    matvec_t(m, dst, W2, a, hid, inter);
     if (accum) for (int i = 0; i < hid; i++) out[i] += w * dst[i];
 }
 
@@ -545,7 +729,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     const waste_config *c = &m->cfg;
     const int E = c->n_experts, K = c->top_k, hid = c->hidden;
     float *sc = m->att + 4096;
-    matvec(sc, T(m, "model.layers.%d.block_sparse_moe.gate.weight", L), in, E, hid);
+    matvec_t(m, sc, waste_find(m, tname("model.layers.%d.block_sparse_moe.gate.weight", L)), in, E, hid);
     const float *bias = T(m, "model.layers.%d.block_sparse_moe.gate.e_score_correction_bias", L);
     float *score = sc + E;
     for (int e = 0; e < E; e++) score[e] = 1.0f / (1.0f + expf(-sc[e]));
@@ -608,9 +792,9 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     }
     /* shared expert */
     float *tmp = m->h;
-    ffn(m, T(m, "model.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight", L),
-        T(m, "model.layers.%d.block_sparse_moe.shared_experts.up_proj.weight", L),
-        T(m, "model.layers.%d.block_sparse_moe.shared_experts.down_proj.weight", L),
+    ffn(m, waste_find(m, tname("model.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight", L)),
+        waste_find(m, tname("model.layers.%d.block_sparse_moe.shared_experts.up_proj.weight", L)),
+        waste_find(m, tname("model.layers.%d.block_sparse_moe.shared_experts.down_proj.weight", L)),
         in, tmp, c->moe_inter * (c->n_shared ? c->n_shared : 1), hid, 1.0f, 0);
     for (int i = 0; i < hid; i++) out[i] += tmp[i];
 }
@@ -621,8 +805,20 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
 {
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
-    const float *emb = waste_find(m, "model.embed_tokens.weight")->data;
-    memcpy(m->x, emb + (size_t)token * hid, (size_t)hid * sizeof(float));
+    /* one embedding row; the table may be kept quantized */
+    const waste_tensor *emb = waste_find(m, "model.embed_tokens.weight");
+    if (emb->data) {
+        memcpy(m->x, emb->data + (size_t)token * hid, (size_t)hid * sizeof(float));
+    } else {
+        const int g = emb->group, ng = (hid + g - 1) / g;
+        const int8_t *row = emb->q + (size_t)token * ng * g;
+        const uint16_t *sc = emb->qs + (size_t)token * ng;
+        for (int k = 0; k < ng; k++) {
+            const float s = f16_to_f32(sc[k]);
+            for (int i = 0; i < g && k * g + i < hid; i++)
+                m->x[k * g + i] = (float)row[k * g + i] * s;
+        }
+    }
 
     float *resid = (float *)malloc((size_t)hid * sizeof(float));
     float *norm = (float *)malloc((size_t)hid * sizeof(float));
@@ -643,15 +839,15 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
             PROF_END(P_ROUTE);
         }
         else
-            ffn(m, T(m, "model.layers.%d.mlp.gate_proj.weight", L),
-                T(m, "model.layers.%d.mlp.up_proj.weight", L),
-                T(m, "model.layers.%d.mlp.down_proj.weight", L),
+            ffn(m, waste_find(m, tname("model.layers.%d.mlp.gate_proj.weight", L)),
+                waste_find(m, tname("model.layers.%d.mlp.up_proj.weight", L)),
+                waste_find(m, tname("model.layers.%d.mlp.down_proj.weight", L)),
                 norm, resid, c->dense_inter, hid, 1.0f, 0);
         for (int i = 0; i < hid; i++) m->x[i] += resid[i];
     }
     rmsnorm(norm, m->x, waste_find(m, "model.norm.weight")->data, hid, c->eps);
     PROF_START(P_HEAD);
-    matvec(m->logits, waste_find(m, "lm_head.weight")->data, norm, c->vocab, hid);
+    matvec_t(m, m->logits, waste_find(m, "lm_head.weight"), norm, c->vocab, hid);
     PROF_END(P_HEAD);
     free(resid);
     free(norm);

@@ -72,10 +72,11 @@ int main(int argc, char **argv)
 
     extern double waste_prof[8];
     if (getenv("WASTE_PROFILE")) {
-        const char *names[8] = {"proj","kda","mla","moe(all)","  expert deq",
-                                "  expert mm","lm_head","other"};
+        const char *names[8] = {"  LUT build","kda","mla","moe(all)",
+                                "  expert I/O","  expert mm","lm_head",
+                                "  LUT apply"};
         double tot = 0;
-        for (int i = 0; i < 8; i++) tot += (i == 4 || i == 5) ? 0 : waste_prof[i];
+        for (int i = 0; i < 8; i++) tot += (i == 0 || i == 4 || i == 5 || i == 7) ? 0 : waste_prof[i];
         printf("\n-- profile (s, %d steps) --\n", n + n_gen);
         for (int i = 0; i < 8; i++)
             if (waste_prof[i] > 0)

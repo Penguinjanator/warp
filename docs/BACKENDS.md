@@ -157,10 +157,40 @@ The two that mattered:
 with a workload that is becoming memory-bound. The pool splits by row, so
 results are bit-identical at any thread count; `WASTE_THREADS` overrides.
 
-Still on the table for this machine: int8 activations with SDOT/i8mm for
-the trunk projections (the hardware has both, and `waste_cpu_features()`
-already reports them), a NEON pass over the LUT accumulation, and Metal
-for the prefill GEMMs.
+### int8 and SDOT: where the instruction actually fits
+
+The expert matmul's inner loop is a **gather** (`acc += lut[block + s*256 +
+code]`), with no multiply — SDOT cannot vectorize it, and ARM has no gather
+instruction. Cache-blocking it (`VQ_TILE`, swept: 64 and 128 tie, larger is
+worse) bought 0.18 -> 0.15 s/token; the loop is latency-bound on dependent
+loads, not bandwidth-bound.
+
+Where SDOT *does* fit is the trunk: those are dense dots, and the trunk is
+already stored Q8G (int8 + one fp16 scale per 128 inputs). Keeping it int8
+instead of expanding to f32 at load gives three modes:
+
+| mode | s/token | RSS | logits vs oracle | top-10 |
+|---|---|---|---|---|
+| f32 weights (expand at load) | 0.15 | 9.5 GB | rel 1.6e-06 | identical |
+| **int8 stored, f32 math** | **0.13** | **3.9 GB** | **rel 1.5e-06** | **identical** |
+| int8 stored, int8 acts + SDOT | 0.13 | 3.9 GB | rel 1.2e-02 | **reordered** |
+
+SDOT does what it promises on its own slice — the trunk phases drop from
+0.30 s to 0.16 s, ~1.9x — but the trunk is only ~16% of a token, so Amdahl
+caps the end-to-end gain at ~13%, which the f32-math path matches without
+quantizing activations. Quantizing them costs four orders of magnitude of
+accuracy and reorders the top-10; argmax survived here, but that is luck,
+not a guarantee.
+
+**Default: int8 storage with f32 arithmetic.** It keeps the container's
+precision exactly, and the memory saving is the part that matters — 5.6 GB
+freed is 5.6 GB more expert cache, and Gate 2 says cache is what buys
+tokens/sec. `WASTE_SDOT=1` enables the activation-quantized path for anyone
+who wants to measure the trade on their own workload.
+
+Still on the table: i8mm/SMMLA for batched prefill (where activations are a
+matrix and the accuracy trade is amortized over more work), a NEON pass
+over the LUT accumulation, and Metal for the prefill GEMMs.
 
 ## Not yet done
 

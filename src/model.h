@@ -18,7 +18,10 @@ extern "C" {
 
 typedef struct {
     char name[128];
-    float *data;
+    float *data;          /* F32 tensors, or NULL when kept quantized       */
+    int8_t *q;            /* Q8G payload: int8, row-major                   */
+    uint16_t *qs;         /* Q8G scales: one fp16 per group of `group`      */
+    int group;
     int shape[4], ndim;
     size_t n;
 } waste_tensor;
@@ -56,7 +59,8 @@ typedef struct {
 
     /* scratch */
     float *x, *h, *tmp, *att, *logits;
-    float *e_gate, *e_up, *e_down, *ff, *lut;
+    float *e_gate, *e_up, *e_down, *ff, *lut, *xs;
+    int8_t *xq;
     uint64_t expert_reads;
 } waste_model;
 
