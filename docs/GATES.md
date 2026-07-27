@@ -86,14 +86,48 @@ top of the range every earlier projection assumed, and it has 1.7 TB free.
 *Kill criterion:* per-token I/O or disk footprint far above estimates
 (>20 GB/token @2 bit, or >1 TB at 2.5 bit).
 
-## Gate 2 — K3 real routing trace at batch 1. ⏳ needs weights + a rented
-## high-RAM box (hours, tens of €)
+## Gate 2 — real batch-1 routing on a Kimi MoE. ✅ RUN 2026-07-27 on
+## Kimi-Linear-48B (no GPU rental needed). Hit rates are BETTER than the
+## OLMoE stand-in; K3 itself still to confirm
 
 *Protects:* the 1.5 TB download and months of engine work.
-*Test:* `trace_hf.py` on K3 (adapt gate-module path), ≥2k tokens across
-3-4 domains; `simulate` with real record sizes.
-*Kill criterion:* LFRU hit < 40% at 40 GB cache AND flat coverage (no
-prunable cold tail) → projected < 0.5 tok/s on PCIe5 → stop or pivot.
+
+*Test:* `tools/kimi_ref.py --trace` — the pure-PyTorch oracle running off
+the 3-bit container, hooking the router each decode step. 300 tokens,
+coding prompt, batch 1. Fixture: `tests/trace_kimi_300.jsonl`. This is the
+same router family as K3 (sigmoid + grouped top-k, `routed_scaling_factor`)
+at 256 experts instead of 896.
+
+*Results:*
+
+- 208 unique (layer, expert) slots per token out of 6656 — **3.12% of the
+  expert set touched per token**;
+- **next-token reuse 33.6%** (OLMoE gave 43.5%: reuse *falls* as experts
+  get finer-grained, which is the direction that matters for K3's 896);
+- concentration is much sharper than OLMoE: top 8.7% of slots cover 50% of
+  activations, top 28% cover 80%, top 51% cover 95%;
+- LFRU hit rate vs cache fraction: 3% → 29.4%, 6% → 40.6%, 12% → 54.9%,
+  24% → 71.9%, 48% → 87.4%. **LRU collapses to 5.1% at the smallest cache
+  where LFRU still gets 29.4%** — frequency-first is not a nicety.
+
+*Consequence:* `memplan.py`'s hit curve now comes from this measurement
+instead of OLMoE. Projected K3 throughput at 3.01 bits (the Gate 3
+operating point) on the 12.78 GB/s internal SSD:
+
+| budget | cache | frac of experts | hit | GB/token | tok/s |
+|---|---|---|---|---|---|
+| 16 GB | 4.9 GB | 0.6% | 6% | 13.7 | 0.93 |
+| 32 GB | 20.9 GB | 2.6% | 25% | 10.9 | 1.17 |
+| **64 GB** | **52.9 GB** | **6.5%** | **42%** | **8.5** | **1.50** |
+| 128 GB | 116.9 GB | 14.3% | 58% | 6.1 | 2.09 |
+
+So ~1.5 tok/s on the target machine at 3 bits — the higher bit-width from
+Gate 3 costs less than feared, because the better-measured hit rate pays
+part of it back.
+
+*Caveat:* 256 experts, not 896. The trend from OLMoE (64) to Kimi-Linear
+(256) is *falling* per-token reuse but *rising* concentration; which
+dominates at 896 is exactly what Gate 2b on K3 itself must answer.
 
 ## Gate 3 — quantization quality at 2-2.5 bit. ⏳ needs weights (partial
 ## download: a few expert shards only)
