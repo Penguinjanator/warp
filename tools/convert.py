@@ -30,6 +30,9 @@ import zlib
 
 import torch
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mxfp4 import ST                                            # noqa: E402
+
 MAGIC_EXPERT = 0x50584557        # 'WEXP'
 MAGIC_CODEBOOK = 0x4B424357      # 'WCBK'
 ALIGN = 4096
@@ -205,16 +208,25 @@ def main():
     ap.add_argument("--stages", type=int, default=3, help="3 = VQ3R, 2 = VQ2R")
     ap.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu")
     ap.add_argument("--experts", type=int, default=0, help="limit experts (debug)")
+    ap.add_argument("--cb-sample", type=int, default=12,
+                    help="experts sampled per layer to fit the codebooks")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
     cfg = json.load(open(os.path.join(args.src, "config.json")))
+    prefix = ""
+    if "text_config" in cfg:                     # K3 nests the text model
+        cfg = {**cfg["text_config"], "_outer": {k: v for k, v in cfg.items()
+                                                if k != "text_config"}}
+        prefix = "language_model."
+    st = ST(args.src)
     sr = ShardReader(args.src)
     dev = torch.device(args.device)
     print(f"device={dev}  stages={args.stages}")
 
     n_layers = cfg["num_hidden_layers"]
     n_exp = cfg.get("num_experts") or cfg.get("n_routed_experts")
+    print(f"prefix {prefix!r}  layers {n_layers}  experts {n_exp}")
     first_dense = cfg.get("first_k_dense_replace", 0)
     if args.experts:
         n_exp = min(n_exp, args.experts)
@@ -227,50 +239,61 @@ def main():
     cb_index, cb_next = {}, cb_f.tell() // (16 + CB_ENTRIES * VEC_DIM * 2)
     manifest_layers = {}
 
+
+    def ename(L, e, tag):
+        return f"{prefix}model.layers.{L}.block_sparse_moe.experts.{e}.{tag}.weight"
+
     for L in layers:
         bank = os.path.join(args.out, f"experts-L{L}.bin")
         if os.path.exists(bank):
             print(f"layer {L}: bank exists, skipping")
             continue
-        t0 = time.time()
-        prefix = f"model.layers.{L}.block_sparse_moe.experts"
-        if f"{prefix}.0.w1.weight" not in sr.wm:
-            print(f"layer {L}: no experts, skipping")
+        if not (st.have(ename(L, 0, "w1")) or st.have(ename(L, 0, "w1") + "_packed")):
+            print(f"layer {L}: experts not available (shard missing), skipping")
             continue
+        t0 = time.time()
 
-        # load this layer's experts (one layer resident at a time)
-        W = {}
-        for kind, tag in KINDS:
-            W[kind] = torch.stack([sr.get(f"{prefix}.{e}.{tag}.weight")
-                                   for e in range(n_exp)])
-        print(f"layer {L}: loaded {n_exp} experts "
-              f"({sum(w.numel() for w in W.values())/1e6:.0f} M params) "
-              f"in {time.time()-t0:.1f}s", flush=True)
+        shapes = [tuple(st.tensor(ename(L, 0, tag)).shape) for _, tag in KINDS]
+        print(f"layer {L}: {n_exp} experts, shapes {shapes}", flush=True)
 
-        # per-(layer, kind) codebooks, trained on normalized weights
+        # Codebooks are trained on a sample of experts rather than all of
+        # them: at K3's size one layer is ~118 GB in f32, so nothing here
+        # ever holds more than a handful at once.
         books = {}
-        for kind, _ in KINDS:
-            Wk = W[kind]
-            sc = Wk.abs().amax(-1, keepdim=True).clamp(min=1e-8)
-            X = (Wk / sc).reshape(-1, VEC_DIM)
+        sample_ids = list(range(0, n_exp, max(1, n_exp // args.cb_sample)))[:args.cb_sample]
+        for (kind, tag), (M, N) in zip(KINDS, shapes):
+            chunks = []
+            for e in sample_ids:
+                W = st.tensor(ename(L, e, tag))
+                sc = W.abs().amax(-1, keepdim=True).clamp(min=1e-8)
+                chunks.append((W / sc).reshape(-1, VEC_DIM))
+                del W
+            X = torch.cat(chunks)
+            del chunks
             books[kind] = train_codebooks(X, args.stages, dev)
+            del X
             cb_index[(L, kind)] = cb_next
             for C in books[kind]:
                 cb_f.write(struct.pack("<IHBBII", MAGIC_CODEBOOK, cb_next & 0xFFFF,
                                        FMT_VQ3R, VEC_DIM, CB_ENTRIES, 0))
                 cb_f.write(raw_bytes(C.cpu().half()))
                 cb_next += 1
-        print(f"layer {L}: codebooks trained ({time.time()-t0:.1f}s)", flush=True)
+        print(f"layer {L}: codebooks trained on {len(sample_ids)} experts "
+              f"({time.time()-t0:.1f}s)", flush=True)
 
         with open(bank + ".tmp", "wb") as f:
             for e in range(n_exp):
                 payloads, scales = [], []
-                for kind, _ in KINDS:
-                    idx, sc = quantize_vq(W[kind][e], books[kind], dev)
+                for kind, tag in KINDS:
+                    W = st.tensor(ename(L, e, tag))
+                    idx, sc = quantize_vq(W, books[kind], dev)
                     payloads.append(idx)
                     scales.append(sc)
+                    del W
                 write_expert_record(f, L, e, cb_index[(L, "gate")], payloads,
-                                    scales, [tuple(W[k][e].shape) for k, _ in KINDS])
+                                    scales, shapes)
+                if e and e % 128 == 0:
+                    print(f"    {e}/{n_exp} ({time.time()-t0:.0f}s)", flush=True)
         os.replace(bank + ".tmp", bank)
         sz = os.path.getsize(bank)
         manifest_layers[str(L)] = {"file": os.path.basename(bank),
@@ -278,7 +301,7 @@ def main():
                                    "codebook_base": cb_index[(L, "gate")]}
         print(f"layer {L}: wrote {sz/2**20:.0f} MB in {time.time()-t0:.1f}s\n",
               flush=True)
-        del W
+        del books
 
     cb_f.close()
 
@@ -296,9 +319,11 @@ def main():
     tindex = []
     with open(trunk_path, "wb") as tf:
         for name in sorted(sr.names()):
-            if ".experts." in name:
+            if ".experts." in name or name.endswith(("_packed", "_scale")):
                 continue
-            t = sr.get(name)
+            if not st.have(name):
+                continue                      # shard not downloaded yet
+            t = st.tensor(name)
             off = tf.tell()
             if t.dim() == 1 or t.numel() < 1 << 16:
                 tf.write(raw_bytes(t.float()))
@@ -319,6 +344,7 @@ def main():
     manifest = {
         "format_version": 0,
         "arch": cfg.get("model_type", "kimi"),
+        "tensor_prefix": prefix,
         "config": cfg,
         "expert_quant": {"fmt": "VQ3R" if args.stages == 3 else "VQ2R",
                          "stages": args.stages, "vec_dim": VEC_DIM,

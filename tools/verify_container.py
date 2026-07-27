@@ -29,7 +29,7 @@ HDR_SIZE = 48
 KINDS = (("gate", "w1"), ("up", "w3"), ("down", "w2"))
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from convert import ShardReader                                   # noqa: E402
+from mxfp4 import ST                                              # noqa: E402
 
 
 def load_codebooks(path):
@@ -99,7 +99,8 @@ def main():
     print(f"container: {man['expert_quant']['fmt']}, {len(books)} codebooks, "
           f"layers {list(man['layers'])}")
 
-    sr = ShardReader(args.src)
+    sr = ST(args.src)
+    prefix = man.get("tensor_prefix", "")
     ok = True
     for lstr, meta in man["layers"].items():
         L = int(lstr)
@@ -107,7 +108,7 @@ def main():
         assert len(bank) == meta["bytes"]
         shapes = []
         for _kind, tag in KINDS:
-            t = sr.get(f"model.layers.{L}.block_sparse_moe.experts.0.{tag}.weight")
+            t = sr.tensor(f"{prefix}model.layers.{L}.block_sparse_moe.experts.0.{tag}.weight")
             shapes.append(tuple(t.shape))
 
         off, checked = 0, 0
@@ -117,7 +118,7 @@ def main():
                                            man["expert_quant"].get("index_block", 0))
             assert off % ALIGN == 0, f"record {eid} not 4 KiB aligned"
             for i, (kind, tag) in enumerate(KINDS):
-                W = sr.get(f"model.layers.{L}.block_sparse_moe.experts.{eid}.{tag}.weight")
+                W = sr.tensor(f"{prefix}model.layers.{L}.block_sparse_moe.experts.{eid}.{tag}.weight")
                 err = (W - rec[kind]).norm() / W.norm()
                 flag = "ok " if err < 0.30 else "BAD"
                 if err >= 0.30:
