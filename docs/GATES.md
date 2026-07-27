@@ -42,8 +42,44 @@ could route flatter or sharper); 299 tokens is short (LFRU barely warms
 up; earlier work's learned pin sets improve with hours of workload); single
 prompt/domain. Gate 2 reruns this exact pipeline on K3's real trace.
 
+## Gate H — is the storage fast enough to stream experts? ✅ RUN 2026-07-27
+## VERDICT: external USB disk is 13.6x too slow for inference; internal is fine
+
+*Protects:* 1.5 TB download + conversion onto the wrong device.
+
+*Test:* `tools/diskbench.c` — the engine's real access pattern (12 MB
+records, `F_NOCACHE`, `pread`, 1-8 threads), 8 GB working file.
+
+| device | seq write | seq read | random 12 MB (8 thr) | tok/s @12.5 GB/token |
+|---|---|---|---|---|
+| `/Volumes/WasteDisk` (APFS, USB, ASM246X bridge) | 0.91 GB/s | 0.92 GB/s | **0.94 GB/s** | **0.075** |
+| internal SSD (MacBook Pro M5 Pro, 64 GB) | 9.85 GB/s | 9.52 GB/s | **12.78 GB/s** | **1.02** |
+
+The external enclosure saturates at ~0.94 GB/s and does not scale with
+threads: an ASMedia ASM246X is a USB 10 Gbps bridge, so the bottleneck is
+the *bridge*, not the NVMe inside it. At that rate one cold token takes
+~13 s; with the Gate-0-measured 23% LFRU hit rate, ~10 s/token
+(**0.1 tok/s** — a 2000-token answer would take 5.5 hours).
+
+The internal SSD hits 12.8 GB/s on random expert-sized reads — exactly the
+top of the range every earlier projection assumed, and it has 1.7 TB free.
+
+*Resulting placement decision:*
+
+- **`/Volumes/WasteDisk/k3/` = download + staging** for the ~1.5 TB of raw
+  MXFP4 shards (sequential writes at 0.9 GB/s are perfectly adequate, and
+  it keeps the raw download off the internal disk permanently).
+- **internal SSD = the converted WASTE container** (~700-900 GB, fits in
+  1.7 TB free). This is what the engine streams experts from at runtime.
+- Conversion reads shards sequentially from external → writes container to
+  internal. Neither step is bottlenecked by the USB bridge.
+- *Optional upgrade:* the machine has three free Thunderbolt 5 buses
+  (120 Gb/s). Moving the same NVMe into a TB5/USB4 enclosure would give
+  ~5-6 GB/s and make external-disk inference viable (~0.4-0.5 tok/s at the
+  measured hit rate) — worth it only if the internal disk must stay free.
+
 ## Gate 1 — real K3 dimensions vs our estimates. ⏳ waiting for weights
-## (routine scheduled 2026-07-27 09:00)
+## (release countdown: 2026-07-27 ~17:00 Europe/Rome)
 
 *Protects:* buying/dedicating a 2 TB NVMe; all format TBDs.
 *Test:* `routing_stats.py fetch + math` on the released config/index.

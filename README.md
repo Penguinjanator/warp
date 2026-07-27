@@ -70,6 +70,18 @@ Two K3 architecture choices work in our favor:
 - 64 GB RAM (min), fast NVMe: 1–2 TB, PCIe5 or 2×PCIe4 RAID0 (8–14 GB/s).
 - A single mid-range SSD (~3 GB/s) will work but decode sub-1 tok/s.
 
+**Storage layout (measured — see [docs/GATES.md](docs/GATES.md) Gate H):**
+
+| path | role | measured random-read |
+|---|---|---|
+| `/Volumes/WasteDisk/k3/` | raw MXFP4 download + conversion staging (~1.5 TB) | 0.94 GB/s (USB bridge — fine for staging) |
+| internal SSD | converted WASTE container, streamed at runtime (~700–900 GB) | 12.78 GB/s |
+
+USB-bridged external enclosures (10 Gbps class) are ~13× too slow to
+stream experts: they cap at ~0.94 GB/s regardless of thread count, i.e.
+~0.1 tok/s. Keep the *download* there, run inference off internal NVMe
+(or a Thunderbolt 5 / USB4 enclosure at ~5–6 GB/s).
+
 ## Non-goals
 
 - Interactive chat-speed inference. WASTE targets usable agentic/batch
