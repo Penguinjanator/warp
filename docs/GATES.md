@@ -78,6 +78,50 @@ top of the range every earlier projection assumed, and it has 1.7 TB free.
   ~5-6 GB/s and make external-disk inference viable (~0.4-0.5 tok/s at the
   measured hit rate) — worth it only if the internal disk must stay free.
 
+## Gate 5 — does the real expert cache behave like the simulation?
+## ✅ RUN 2026-07-27. It does, and better above 12%
+
+*Protects:* the entire feasibility argument. Everything before this point
+assumed a cache that did not exist yet — the engine read every expert on
+every token, and on a 64 GB machine the kernel's page cache was quietly
+holding all 17 GB of Kimi-Linear, so the measured I/O cost was fiction.
+K3's ~816 GB gets no such help.
+
+*Test:* [src/ecache.c](../src/ecache.c) — bounded expert cache, LFRU with
+sampled eviction, `pread` with `F_NOCACHE` so the page cache is bypassed
+and the engine's own cache is the only one. 300 batch-1 decode tokens,
+budget swept.
+
+| budget | slots | % of expert set | hit rate | GB read/token | s/token |
+|---|---|---|---|---|---|
+| 512 MB | 201 | 3.0% | 13.2% | 0.448 | 0.16 |
+| 1 GB | 402 | 6.0% | 40.3% | 0.308 | 0.14 |
+| 2 GB | 805 | 12.1% | 61.9% | 0.197 | 0.13 |
+| 4 GB | 1610 | 24.2% | 84.8% | 0.078 | 0.12 |
+| 8 GB | 3221 | 48.4% | 93.9% | 0.031 | 0.11 |
+| 16 GB | 6442 | 96.8% | 94.2% | 0.030 | 0.11 |
+
+**Against the Gate 2 simulation** (same model, same policy, simulated):
+6% → 40.3% measured vs 40.6% simulated; 12% → 61.9% vs 54.9%; 24% → 84.8%
+vs 71.9%. The real cache matches at the K3-relevant fraction and beats the
+simulation above it. The 1.5 tok/s projection for K3 on 64 GB stands.
+
+**The one place it is worse is the most useful finding.** At 3% the
+measured hit rate is 13.2% against a simulated 29.4%, and at 1.5% it is
+*exactly zero* — 2604 evictions in 2704 accesses. The reason: one token
+touches 208 experts, so a cache of 100 slots keeps nothing alive long
+enough to be reused. **The cache floor is one token's working set**, and
+useful hit rates start at 2-3x that. For K3 that floor is ~960 experts x
+16.5 MB = **~16 GB**, which a 64 GB machine clears with room for 3x — but a
+32 GB machine would not, and that is now a measured statement rather than a
+guess.
+
+Correctness: cache on vs cache off is **bit-identical**, and both match the
+oracle at rel 1.50e-06. Placement decides speed, never precision.
+
+*Consequence:* `memplan.py`'s hit curve now comes from this measurement
+rather than from simulation.
+
 ## Gate 1 — real K3 dimensions vs our estimates. ⏳ waiting for weights
 ## (release countdown: 2026-07-27 ~17:00 Europe/Rome)
 

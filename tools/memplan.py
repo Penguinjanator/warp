@@ -155,13 +155,17 @@ def plan(s, args):
     }
 
 
-# Gate 2 (2026-07-27): LFRU hit rate vs cache fraction, measured on a real
-# batch-1 decode trace from Kimi-Linear-48B (256 experts, sigmoid +
-# grouped-topk router — the same router family as K3), 300 tokens on a
-# coding prompt. Replaces the earlier OLMoE curve, which came from a
-# 64-expert model and understated hit rates by ~6 pp at small caches.
-HIT_CURVE = [(0.00, 0.00), (0.030, 0.294), (0.061, 0.406), (0.121, 0.549),
-             (0.242, 0.719), (0.485, 0.874), (0.970, 0.919), (1.00, 1.00)]
+# Gate 5 (2026-07-27): LFRU hit rate vs cache fraction, MEASURED by the C
+# engine's own expert cache (src/ecache.c) over 300 batch-1 decode tokens
+# of Kimi-Linear-48B, reads bypassing the page cache. This replaces the
+# simulated Gate 2 curve; the two agree closely from 6% up, and the real
+# cache does better above 12% (84.8% vs a simulated 71.9% at 24%).
+#
+# Below ~3% the curve collapses: a cache smaller than ONE token's working
+# set (208 experts here) keeps nothing alive to the next token. For K3 that
+# floor is ~960 experts x 16.5 MB = ~16 GB.
+HIT_CURVE = [(0.00, 0.00), (0.030, 0.132), (0.060, 0.403), (0.121, 0.619),
+             (0.242, 0.848), (0.484, 0.939), (0.968, 0.942), (1.00, 1.00)]
 
 
 def hit_rate(frac):
@@ -238,9 +242,9 @@ def main():
         tps = args.disk_gbs / (io / GB) if io > 0 else float("inf")
         print(f"{b:>6.0f}G {avail/GB:>7.1f}G {frac:>5.1%} {h:>5.0%} "
               f"{io/GB:>8.1f} {tps:>7.2f}")
-    print("\n* hit rate interpolated from the Gate 2 curve measured on real "
-          "Kimi-Linear\n  batch-1 decode; K3's 896-expert routing may differ. "
-          "tok/s counts disk I/O only.")
+    print("\n* hit rate interpolated from the Gate 5 curve, measured by the C "
+          "engine's own\n  cache on Kimi-Linear batch-1 decode; K3's "
+          "896-expert routing may differ.\n  tok/s counts disk I/O only.")
     return 0
 
 

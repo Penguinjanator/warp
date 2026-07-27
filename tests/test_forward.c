@@ -14,6 +14,7 @@
 
 #include "../src/model.h"
 #include "../src/waste_backend.h"
+#include "../src/waste.h"
 
 static double now(void)
 {
@@ -37,10 +38,15 @@ int main(int argc, char **argv)
 
     waste_model m;
     double t0 = now();
-    if (waste_model_load(&m, dir, 4096)) { fprintf(stderr, "load failed\n"); return 1; }
-    printf("loaded in %.1fs — backend %s, %d layers, %d experts, top-%d, vocab %d\n",
-           now() - t0, waste_backend_name(), m.cfg.n_layers, m.cfg.n_experts,
-           m.cfg.top_k, m.cfg.vocab);
+    const char *cmb = getenv("WASTE_CACHE_MB");
+    const size_t cache_bytes = (size_t)(cmb ? atoi(cmb) : 0) << 20;
+    if (waste_model_load(&m, dir, 4096, cache_bytes)) { fprintf(stderr, "load failed\n"); return 1; }
+    printf("%s\n", waste_build_info());
+    printf("loaded in %.1fs — %d layers, %d experts, top-%d, vocab %d; "
+           "expert cache %d slots (%.0f MB, %.1f%% of the expert set)\n",
+           now() - t0, m.cfg.n_layers, m.cfg.n_experts, m.cfg.top_k, m.cfg.vocab,
+           m.cache.n_slots, (double)(m.cache.n_slots * m.cache.rec_bytes) / 1048576.0,
+           100.0 * m.cache.n_slots / (double)(m.cfg.n_experts * 26));
 
     const float *lg = NULL;
     t0 = now();
@@ -84,6 +90,12 @@ int main(int argc, char **argv)
                        100.0 * waste_prof[i] / tot);
         printf("  %-14s %7.2f\n", "accounted", tot);
     }
+    printf("\ncache: %llu hits / %llu misses = %.1f%% hit, %llu evictions, "
+           "%.2f GB read\n",
+           (unsigned long long)m.cache.hits, (unsigned long long)m.cache.misses,
+           100.0 * waste_ecache_hit_rate(&m.cache),
+           (unsigned long long)m.cache.evictions,
+           (double)m.cache.bytes_read / 1073741824.0);
     waste_model_free(&m);
     return 0;
 }

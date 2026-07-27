@@ -12,6 +12,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "ecache.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -37,7 +39,7 @@ typedef struct {
 } waste_config;
 
 typedef struct {
-    FILE *f;
+    int fd;                          /* pread + F_NOCACHE: no page cache    */
     long rec_bytes;
     int n_experts, cb_base;
 } waste_bank;
@@ -62,9 +64,13 @@ typedef struct {
     float *e_gate, *e_up, *e_down, *ff, *lut, *xs;
     int8_t *xq;
     uint64_t expert_reads;
+    waste_ecache cache;
+    uint8_t *miss_buf;               /* used when the cache is disabled     */
 } waste_model;
 
-int  waste_model_load(waste_model *m, const char *dir, int kv_cap);
+/* cache_bytes: hard ceiling for the expert cache; 0 = no cache. */
+int  waste_model_load(waste_model *m, const char *dir, int kv_cap,
+                      size_t cache_bytes);
 void waste_model_free(waste_model *m);
 /* Runs one token; returns logits (vocab floats, owned by the model).
  * `pos` is the position in the sequence (0-based). */

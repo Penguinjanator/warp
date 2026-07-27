@@ -35,6 +35,27 @@ extern "C" {
 
 #define WASTE_API_VERSION 1
 
+/* ---- engine version ----------------------------------------------------
+ * Semantic versioning. The numeric form is MAJOR*10000 + MINOR*100 + PATCH,
+ * so it compares with a plain integer test (SQLite's convention):
+ *     #if WASTE_VERSION_NUMBER >= 10200   // needs >= 1.2.0
+ * The compile-time macros describe the headers the caller built against;
+ * the functions report the library actually linked, which is what matters
+ * for an embeddable engine that may be updated independently.
+ */
+#define WASTE_VERSION_MAJOR  0
+#define WASTE_VERSION_MINOR  1
+#define WASTE_VERSION_PATCH  0
+#define WASTE_VERSION_STRING "0.1.0"
+#define WASTE_VERSION_NUMBER (WASTE_VERSION_MAJOR * 10000 + \
+                              WASTE_VERSION_MINOR * 100 + \
+                              WASTE_VERSION_PATCH)
+
+const char *waste_version(void);         /* e.g. "0.1.0"                    */
+int         waste_version_number(void);  /* e.g. 100                        */
+/* Build details: backend, SIMD, container format version. Never NULL. */
+const char *waste_build_info(void);
+
 /* ---- errors ------------------------------------------------------------ */
 
 typedef enum {

@@ -14,6 +14,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
+#include "ecache.h"
 #include "json.h"
 #include "threads.h"
 #include "kda.h"
@@ -386,7 +390,8 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     }
 }
 
-int waste_model_load(waste_model *m, const char *dir, int kv_cap)
+int waste_model_load(waste_model *m, const char *dir, int kv_cap,
+                     size_t cache_bytes)
 {
     memset(m, 0, sizeof *m);
     if (prof_on < 0) { const char *e = getenv("WASTE_PROFILE"); prof_on = e && *e != '0'; }
@@ -448,7 +453,13 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap)
         char fn[64];
         js_str(&d, js_get(&d, e, "file"), fn, sizeof fn);
         snprintf(path, sizeof path, "%s/%s", dir, fn);
-        m->bank[L].f = fopen(path, "rb");
+        m->bank[L].fd = open(path, O_RDONLY);
+#ifdef __APPLE__
+        if (m->bank[L].fd >= 0) {
+            fcntl(m->bank[L].fd, F_NOCACHE, 1);   /* the engine owns caching */
+            fcntl(m->bank[L].fd, F_RDAHEAD, 0);
+        }
+#endif
         m->bank[L].n_experts = (int)js_int(&d, js_get(&d, e, "experts"), 0);
         m->bank[L].cb_base = (int)js_int(&d, js_get(&d, e, "codebook_base"), 0);
         const long bytes = js_int(&d, js_get(&d, e, "bytes"), 0);
@@ -490,6 +501,14 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap)
         m->lut = (float *)malloc((size_t)3 * (nmax / 8 + 1) * m->stages
                                  * m->cb_entries * sizeof(float));
     }
+    {   /* expert cache, sized by the caller's budget */
+        long rec = 0;
+        for (int L = 0; L < c->n_layers; L++)
+            if (m->bank[L].rec_bytes > rec) rec = m->bank[L].rec_bytes;
+        if (waste_ecache_init(&m->cache, cache_bytes, (size_t)rec, 0)) return -1;
+        m->miss_buf = (uint8_t *)malloc((size_t)rec);
+        if (!m->miss_buf) return -1;
+    }
     return (m->x && m->logits && m->e_gate && m->e_up && m->e_down) ? 0 : -1;
 }
 
@@ -500,31 +519,36 @@ void waste_model_free(waste_model *m)
     free(m->codebooks);
     for (int L = 0; L < 128; L++) {
         free(m->S[L]); free(m->conv[L]); free(m->kcache[L]); free(m->vcache[L]);
-        if (m->bank[L].f) fclose(m->bank[L].f);
+        if (m->bank[L].fd > 0) close(m->bank[L].fd);
     }
     free(m->x); free(m->h); free(m->tmp); free(m->att); free(m->logits);
     free(m->ff); free(m->e_gate); free(m->e_up); free(m->e_down); free(m->lut);
-    free(m->xq); free(m->xs);
+    free(m->xq); free(m->xs); free(m->miss_buf);
+    waste_ecache_free(&m->cache);
     for (int i = 0; i < m->n_tensors; i++) { free(m->t[i].q); free(m->t[i].qs); }
 }
 
 /* ---- expert dequant ---------------------------------------------------- */
 
-/* Read one expert record; returns the raw buffer (indices stay packed). */
+/* One pread of a 4 KiB-aligned record — what the layout exists for. */
+static int bank_fetch(void *user, int layer, int expert, uint8_t *dst)
+{
+    waste_model *m = (waste_model *)user;
+    waste_bank *b = &m->bank[layer];
+    const ssize_t got = pread(b->fd, dst, (size_t)b->rec_bytes,
+                              (off_t)expert * b->rec_bytes);
+    if (got != (ssize_t)b->rec_bytes) return -1;
+    m->expert_reads++;
+    return 0;
+}
+
 static const uint8_t *read_expert(waste_model *m, int L, int eid)
 {
-    waste_bank *b = &m->bank[L];
-    static uint8_t *buf = NULL;
-    static size_t bufsz = 0;
-    if (bufsz < (size_t)b->rec_bytes) {
-        free(buf);
-        buf = (uint8_t *)malloc((size_t)b->rec_bytes);
-        bufsz = (size_t)b->rec_bytes;
-    }
-    fseek(b->f, (long)eid * b->rec_bytes, SEEK_SET);
-    if (fread(buf, 1, (size_t)b->rec_bytes, b->f) != (size_t)b->rec_bytes) return NULL;
-    m->expert_reads++;
-    return buf;
+    if (m->cache.n_slots > 0)
+        return waste_ecache_get(&m->cache, L, eid, bank_fetch, m);
+    m->cache.misses++;
+    m->cache.bytes_read += (size_t)m->bank[L].rec_bytes;
+    return bank_fetch(m, L, eid, m->miss_buf) == 0 ? m->miss_buf : NULL;
 }
 
 /* ---- fused VQ matvec ---------------------------------------------------
