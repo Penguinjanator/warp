@@ -32,22 +32,32 @@ built on the lessons of two prior engines:
   per-expert quantization (imatrix-guided), precompiled expert hotlists,
   overlapped SSD prefetch, proven 284B-MoE inference on 64 GB MacBooks.
 
-## Why K3 is (barely) possible on 64 GB
+## Why K3 is possible on 64 GB
+
+Weights released 2026-07-27; the numbers below are read from the actual
+files, not the announcement — see [docs/K3.md](docs/K3.md).
 
 | Quantity | Value |
 |---|---|
-| Total parameters | 2.8 T (896 experts, 16 active/token, ~50 B active) |
-| Native weights | MXFP4 + QAT from SFT stage (~1.5 TB) |
-| WASTE target (~2.2 bit avg experts) | **~700–900 GB on NVMe** |
-| Resident dense trunk (attn, routers, shared, embeddings @4–8 bit) | ~15–25 GB RAM |
-| KDA state + MLA KV (1M ctx capable) | ~1–3 GB RAM |
-| Hot expert cache (LFRU, pinned) | ~30–40 GB RAM |
-| Expert bytes read per cold token @2 bit | ~12.5 GB |
-| Expected decode on PCIe5 NVMe (×1–2) | **~1–3 tok/s** |
+| Layers / experts / top-k | 93 / 896 / 16 |
+| **MoE is latent**: experts run on a 3584-wide projection of hidden 7168 | 33.0 M params/expert |
+| Routed parameters | 2.72 T (matches the announced 2.8 T total) |
+| Native weights | MXFP4, one E8M0 scale per 32 — **1.42 TB, 96 shards** |
+| WASTE target (3 bit experts, per Gate 3) | **954 GB**, fits a 1.7 TB internal SSD |
+| Resident trunk + state | ~18 GB RAM (the floor) |
+| One token's expert working set — the real cache floor | **17.4 GB** |
+| Expert bytes read per cold token @3 bit | 17.1 GB |
+| Measured hit rate at 64 GB budget (Gate 5 curve) | ~40% |
+| Expected decode, internal SSD @12.78 GB/s measured | **~1 tok/s** |
 
-The binding constraints are **disk capacity and NVMe bandwidth**, not RAM.
-K3's extreme sparsity (1.8% active) means per-token expert traffic at 2 bit
-matches GLM-5.2 at 4 bit — the regime earlier work already handles.
+The binding constraints are **disk capacity and bandwidth**, not RAM — but
+RAM has a hard floor that is not the model's size: a cache below one
+token's working set keeps nothing alive between tokens and delivers a 0%
+hit rate. That floor is 17.4 GB for K3.
+
+Everything above is measured. [docs/LEARNED.md](docs/LEARNED.md) collects
+what was learned, including the two optimization theories that were
+plausible, well-motivated, and wrong.
 
 Two K3 architecture choices work in our favor:
 
