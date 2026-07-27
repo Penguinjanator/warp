@@ -6,3 +6,4 @@ model.waste/
 *.waste
 test_kda
 *.o
+test_container
