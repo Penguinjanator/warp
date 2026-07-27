@@ -15,11 +15,15 @@ drop (July 27, 2026) when real tensor shapes and routing statistics are known.
 3. **O_DIRECT-friendly.** Every independently-readable record is aligned to
    4 KiB and sized in 4 KiB multiples, so the page cache can be bypassed
    (earlier work both measured wins from `F_NOCACHE`/O_DIRECT on some drives).
-4. **Sub-4-bit without collapse.** The quantization scheme is the KBVQ-MoE
-   decomposition (arXiv 2602.11184): weight components *shared across
-   experts* are extracted (KLT-guided SVD) and stored once in FP16; only the
-   per-expert **residuals** are vector-quantized at 2–3 bit. Near-lossless
-   at 3 bit, usable at 2 bit where GPTQ collapses.
+4. **Sub-4-bit without collapse.** Per-expert weights are vector-quantized:
+   multi-stage (residual) VQ over 8-dim vectors with per-channel scales.
+   Gate 3 measured this on real Kimi experts — VQ decisively beats RTN
+   below 4 bits, and **3 bits (19.4% error) is the operating point**; 2-bit
+   VQ (33%) is more than double earlier work's known-good production int4.
+
+   The KBVQ-MoE shared-low-rank component (arXiv 2602.11184) is
+   **specified but NOT implemented in v0** — see "Shared low-rank: on
+   probation" below.
 5. **Non-uniform bits.** Global per-expert bit allocation à la GEMQ
    (arXiv 2605.23078): important experts get 3 bit, unimportant get 2 (or
    1-bit substitute only). Attention / router / norms / shared experts /
@@ -60,8 +64,8 @@ JSON (hardened parser, treat as untrusted — earlier work st.h lesson). Contain
 | 1 | F16/BF16 | 16 | low-rank factors, codebooks |
 | 2 | Q8G | 8 | shared experts, attention projections, MTP head |
 | 3 | Q4G | 4 (+f16 scale /g128) | trunk fallback, embeddings |
-| 4 | **VQ3R** | ~3.06 residual VQ | hot/important experts |
-| 5 | **VQ2R** | ~2.12 residual VQ | bulk experts |
+| 4 | **VQ3R** | 3.01 (3 codebooks x 256, dim 8) | default for experts (Gate 3) |
+| 5 | **VQ2R** | 2.01 (2 codebooks x 256, dim 8) | only where Gate 3 quality allows |
 | 6 | **SUB1** | ~1.0 direct VQ | cache-miss substitutes |
 
 **VQxR record** (per expert matrix): indices into a per-layer codebook

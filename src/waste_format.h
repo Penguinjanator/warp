@@ -69,7 +69,9 @@ typedef struct {
     uint8_t  fmt;            /* WQ_VQ3R | WQ_VQ2R                           */
     uint8_t  flags;          /* WF_*                                        */
     uint16_t codebook_id;    /* index into codebooks.bin                    */
-    uint16_t lowrank_id;     /* shared U/V block in lowrank.bin             */
+    uint16_t lowrank_id;     /* MUST BE 0 in v0: the shared low-rank block
+                              * is specified but not implemented — see
+                              * docs/FORMAT.md "on probation"              */
     uint16_t reserved0;
     uint32_t rec_4k_blocks;  /* total record size / 4096                    */
     /* payload offsets, relative to record start (bytes)                    */
