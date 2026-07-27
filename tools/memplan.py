@@ -45,10 +45,11 @@ def load_shape(data_dir):
         "layers":      _cfg(cfg, "num_hidden_layers"),
         "hidden":      _cfg(cfg, "hidden_size"),
         "n_experts":   _cfg(cfg, "n_routed_experts", "num_experts", "num_local_experts"),
-        "top_k":       _cfg(cfg, "num_experts_per_tok", "moe_top_k"),
+        # Kimi spells these differently from the DeepSeek family
+        "top_k":       _cfg(cfg, "num_experts_per_tok", "num_experts_per_token", "moe_top_k"),
         "moe_inter":   _cfg(cfg, "moe_intermediate_size"),
         "dense_inter": _cfg(cfg, "intermediate_size"),
-        "n_shared":    _cfg(cfg, "n_shared_experts", default=0) or 0,
+        "n_shared":    _cfg(cfg, "n_shared_experts", "num_shared_experts", default=0) or 0,
         "first_dense": _cfg(cfg, "first_k_dense_replace", default=0) or 0,
         "vocab":       _cfg(cfg, "vocab_size"),
         "n_heads":     _cfg(cfg, "num_attention_heads"),
@@ -61,6 +62,12 @@ def load_shape(data_dir):
     }
     if s["moe_inter"] is None:
         s["moe_inter"] = s["dense_inter"]
+    # Kimi-Linear/K3 declare the KDA vs full-attention split explicitly
+    lac = cfg.get("linear_attn_config") or {}
+    s["kda_layers_list"] = lac.get("kda_layers")
+    s["kda_heads"] = lac.get("num_heads")
+    s["kda_head_dim"] = lac.get("head_dim")
+    s["conv_k"] = lac.get("short_conv_kernel_size")
     return s, cfg
 
 
@@ -103,13 +110,24 @@ def plan(s, args):
 
     # --- state: KDA is O(1) in ctx, MLA KV is per token -------------------
     ctx = args.ctx
-    if args.kda_ratio > 0:
+    # prefer the config's explicit KDA layer list over the --kda-ratio guess
+    if s.get("kda_layers_list"):
+        kda_layers = len(s["kda_layers_list"])
+        heads = s["kda_heads"] or s["n_heads"] or 64
+        d_state = s["kda_head_dim"] or args.kda_dstate
+        src = "config"
+    elif args.kda_ratio > 0:
         kda_layers = int(L * args.kda_ratio / (args.kda_ratio + 1))
-        mla_layers = L - kda_layers
+        heads = s["n_heads"] or 64
         d_state = args.kda_dstate
-        kda_state = kda_layers * (s["n_heads"] or 64) * d_state * d_state * 4
+        src = f"--kda-ratio {args.kda_ratio}"
     else:
-        kda_layers, mla_layers, kda_state = 0, L, 0
+        kda_layers, heads, d_state, src = 0, 0, 0, "all-MLA"
+    mla_layers = L - kda_layers
+    kda_state = kda_layers * heads * d_state * d_state * 4
+    # short-conv ring buffers: 3 projections x (k-1) taps x proj width
+    conv_k = s.get("conv_k") or 4
+    kda_state += kda_layers * 3 * (conv_k - 1) * heads * d_state * 4
     per_tok = (s["kv_lora"] + s["qk_rope"]) if s["kv_lora"] else 2 * H
     mla_kv = mla_layers * ctx * per_tok * 2                # f16 latent
     state = kda_state + mla_kv
@@ -129,7 +147,7 @@ def plan(s, args):
         "emb": emb, "head": head, "attn": attn, "attn_note": attn_note,
         "router": router, "shared": shared, "dense_ffn": dense_ffn,
         "norms": norms, "trunk": trunk,
-        "kda_layers": kda_layers, "mla_layers": mla_layers,
+        "kda_layers": kda_layers, "mla_layers": mla_layers, "kda_src": src,
         "kda_state": kda_state, "mla_kv": mla_kv, "state": state,
         "scratch": scratch, "min_cache": min_cache, "floor": floor,
         "routed_total_disk": moe_layers * s["n_experts"] * p_expert * eb,
@@ -181,8 +199,8 @@ def main():
           f"top_k={s['top_k']} moe_inter={s['moe_inter']} vocab={s['vocab']}")
     print(f"assumptions: trunk {args.trunk_bits}b, experts {args.expert_bits}b, "
           f"ctx {args.ctx}, {args.threads} threads, attention = {p['attn_note']}")
-    print(f"             KDA:MLA = {p['kda_layers']}:{p['mla_layers']} layers, "
-          f"KDA d_state={args.kda_dstate}")
+    print(f"             KDA:MLA = {p['kda_layers']}:{p['mla_layers']} layers "
+          f"(from {p['kda_src']})")
 
     print("\n-- resident trunk (must always be in RAM) --")
     for k, label in (("emb", "embeddings"), ("head", "lm head"),

@@ -1,118 +1,141 @@
 # Kimi Delta Attention (KDA) — analysis & C kernel plan
 
-Status: draft. Based on the public Kimi Linear / Gated DeltaNet lineage
-(arXiv 2412.06464 Gated DeltaNet; Kimi Linear tech report). Exact K3
-hyperparameters (head counts, dims, KDA:MLA layer ratio) are **TBD until the
-July 27 weights drop** — everything below is written so only constants change.
+**Status: grounded in released reference code.** Moonshot ships
+`Kimi-Linear-48B-A3B` publicly, and it is the same architecture family K3
+builds on: KDA linear-attention layers interleaved with MLA, fine-grained
+MoE, 1M context. Everything below is read off its `config.json` and
+`modeling_kimi.py` (fetched 2026-07-27), so the kernel can be written and
+validated *before* K3 lands. K3-specific numbers (layer count, head
+counts, KDA:MLA ratio) still get confirmed at Gate 1.
 
 ## Why this matters for WASTE
 
-K3 pairs KDA (linear attention) with Gated MLA. For a memory-starved local
-engine this is the single best architectural gift:
+KDA state is O(1) in sequence length: one matrix state per head plus a
+tiny conv window. At 1M context the attention side costs megabytes, not
+gigabytes — RAM stays available for the expert cache, which is where
+tokens/sec actually comes from.
 
-- **KDA state is O(1) in sequence length**: one matrix-valued state per head,
-  `S ∈ R^{d_k × d_v}`. At e.g. 64 heads × 128×128 × f32 that is ~4 MB/layer
-  — versus gigabytes of KV for full attention at long context.
-- The remaining MLA layers store only the compressed latent
-  (~576 floats/token in the GLM/DeepSeek family — earlier work already has this
-  kernel, including the absorption trick and disk KV persistence).
-- Net effect: 1M-context capability without 1M-context memory. RAM stays
-  reserved for the expert cache, which is where tokens/sec comes from.
+## Confirmed architecture (Kimi-Linear-48B-A3B)
 
-## The recurrence
+| property | value |
+|---|---|
+| layers | 27 (layer 0 dense FFN, rest MoE) |
+| **full-attention (MLA) layers** | 4, 8, 12, 16, 20, 24, 27 — **7 of 27** |
+| **KDA layers** | the other 20 → **ratio 3:1**, every 4th layer is MLA |
+| KDA heads × head_dim | 32 × 128 |
+| KDA short conv | kernel size **4**, SiLU, on q/k/v separately |
+| MLA | `q_lora_rank=null` (direct q_proj), kv_lora 512, qk_nope 128, qk_rope 64, v_head 128 |
+| **`mla_use_nope: true`** | MLA layers carry **no positional encoding** — KDA supplies position implicitly (asserted in code) |
+| MoE | 256 experts, top-8, 1 shared, sigmoid router, grouped top-k, `routed_scaling_factor` 2.446 |
+| vocab / max len | 163840 / 1048576 |
 
-KDA is the delta rule with **per-channel (diagonal) decay gating** — a
-finer-grained Gated DeltaNet:
+The KDA:MLA 3:1 interleave is exactly what `tools/memplan.py` assumed —
+that estimate stands.
+
+## The KDA layer, precisely
+
+Per layer, from `KimiDeltaAttention`:
 
 ```
-S_t = S_{t-1} · Diag(α_t) + β_t · k_t (v_t − S_{t-1}ᵀ k_t)ᵀ
-o_t = S_tᵀ q_t
+q = SiLU(ShortConv_4(W_q · x))        # per-channel causal conv, then SiLU
+k = SiLU(ShortConv_4(W_k · x))
+v = SiLU(ShortConv_4(W_v · x))
+g = fused_kda_gate(W_fb · (W_fa · x), A_log, bias=dt_bias)   # per-channel decay
+beta = sigmoid(W_b · x)                                       # per-head, scalar
+o, S = KDA_recurrence(q, k, v, g, beta, S)    # L2-norms q,k inside the kernel
+o = RMSNormGated(o, W_gb · (W_ga · x))        # sigmoid-gated output norm
+y = W_o · o
 ```
 
-- `α_t ∈ (0,1)^{d_k}`: per-channel forget gate (data-dependent, from x_t).
-- `β_t ∈ (0,1)`: write strength.
-- The `(v_t − Sᵀk_t)` term is the "delta" correction — it *replaces* the old
-  association for key k_t instead of accumulating, which is what keeps the
-  state usable at long range.
+Structural facts that shape the C kernel:
 
-Decode cost per token per head: two GEMVs (`Sᵀk`, `Sᵀq`) + one rank-1
-update + one diagonal scale ≈ `3·d_k·d_v` MACs. For 64×128×128:
-~3.1 MFLOP/token/layer — trivially CPU-bound-friendly; the engine stays
-NVMe-bound, which is what we want.
+1. **There is a short causal conv (k=4) in front of q/k/v**, with SiLU.
+   This was an open question; it is now settled. Decode needs a 3-token
+   ring buffer per projection per layer — trivial memory, but it must be
+   part of the persisted session state.
+2. **The decay gate `g` is low-rank**: `hidden → head_dim(128) → n_heads*head_dim`,
+   then combined with a per-head learned `A_log` and `dt_bias`. So it is
+   **per-channel** (as assumed), produced through a rank-128 bottleneck —
+   cheap, and the two small matmuls fuse into the trunk GEMM pass.
+3. **`beta` is per-head scalar**, not per-channel.
+4. **q and k are L2-normalized inside the kernel** — a normalization step
+   the C kernel must reproduce exactly (it changes numerics).
+5. **The output gate is a gated RMSNorm with sigmoid activation**, gate
+   also produced via a rank-128 bottleneck (`g_a_proj`/`g_b_proj`). This
+   is the "gated" in Gated MLA/KDA — it is on the *output*, elementwise.
+6. Reference switches to a fused-recurrent path when `q_len <= 64` and a
+   chunked path otherwise — the same split WASTE should use
+   (decode = recurrent, prefill = chunked).
 
-## Kernel plan (C11, earlier work kernel style)
+## Recurrence
+
+```
+S_t = S_{t-1} · Diag(g_t) + β_t · k_t (v_t − S_{t-1}ᵀ k_t)ᵀ
+o_t = S_tᵀ q_t                    (q, k L2-normalized first)
+```
+
+Per token per head: two GEMVs + one rank-1 update + a diagonal scale ≈
+`3·d_k·d_v` MACs. For 32 heads × 128×128: ~1.6 MFLOP/token/layer — the
+engine stays NVMe-bound, as intended.
+
+## State budget (per session, K3-shaped)
+
+- recurrent state: `n_kda_layers × heads × d_k × d_v × 4 B`.
+  For 45 KDA layers × 32 heads × 128 × 128 f32 ≈ **377 MB** — flat in
+  context length.
+- conv windows: `3 projections × (kernel−1) × proj_size` per KDA layer —
+  a few MB total.
+- MLA latent KV: `(kv_lora + qk_rope) = 576` values/token/layer, only on
+  the ~1/4 of layers that are MLA.
+
+## C kernel plan
 
 ### Decode (batch 1): fused recurrent step
 
-One pass over the state per token, all three ops fused so `S` streams
-through cache exactly once:
-
 ```c
-// per head: S [dk][dv] f32, contiguous rows
-// 1. u = Sᵀ k      (GEMV, accumulate per dv-column)
-// 2. delta = beta * (v - u)
-// 3. S = Diag(alpha) * S + k · deltaᵀ   (row-scale + rank-1, fused)
-// 4. o = Sᵀ q      (GEMV — fusable into pass 3's row loop)
+/* per head: S[dk][dv] f32, row-major by dk */
+/* 0. q,k <- l2norm(q), l2norm(k)                                  */
+/* 1. u   = Sᵀk            (GEMV over rows, accumulate into dv)    */
+/* 2. d   = beta * (v - u)                                          */
+/* 3. S   = Diag(g)·S + k·dᵀ    (row-scale + rank-1, fused)         */
+/* 4. o   = Sᵀq            (fused into pass 3's row loop)           */
 ```
 
-- NEON: process `dv` in 4×f32 lanes (`vfmaq_f32`); `alpha` row-scale is one
-  `vmulq` per lane. AVX-512: 16-lane, same shape.
-- State precision: **f32 accumulate**. Ablate f16/bf16 storage with f32
-  accumulate later (halves state memory; risk: delta-rule error compounding
-  over 100k+ tokens — needs the oracle harness before enabling).
-- Layout: `S` row-major by `d_k` so the rank-1 update (`k_i · deltaᵀ`) writes
-  contiguous rows; both GEMVs then read rows sequentially (`Sᵀx` becomes
-  per-row dot-accumulate into `o[dv]`).
+NEON: 4×f32 lanes over `dv` (`vfmaq_f32`), `g` row-scale one `vmulq` per
+lane; AVX-512: 16 lanes, same shape. Row-major-by-`d_k` keeps the rank-1
+update writing contiguous rows and both GEMVs reading them sequentially,
+so `S` streams through cache once per token.
 
-### Prefill: chunkwise parallel form
+Short conv: 3 taps × SiLU per projection — a handful of FMAs, fused into
+the projection epilogue.
 
-Recurrent prefill would be O(T) sequential — too slow for long prompts.
-Use the standard chunked formulation (chunk C=64/128): intra-chunk attention
-computed as small GEMMs (parallel over chunks via OpenMP), inter-chunk state
-carried through the decayed cumulative products. This is the same
-structure Kimi contributed to vLLM ("KDA prefix caching"), which we can
-consult as a reference implementation for correctness, not code.
+### Prefill: chunked
 
-Prefill compute: O(T·C·d) — fine on CPU, and it batches beautifully with
-the expert batch-union reads earlier work already does for MTP verification.
+Chunk 64/128; intra-chunk as small GEMMs parallel over chunks (OpenMP),
+inter-chunk carried by decayed cumulative products. Mirrors the
+reference's `chunk_kda`. Batches naturally with the expert batch-union
+reads used for MTP verification.
 
 ### Gating projections
 
-`α_t`, `β_t`, plus q/k/v projections are ordinary dense matmuls — they live
-in `trunk.bin` at Q8G/Q4G and use the existing IDOT int8-activation kernels
-(NEON SDOT / AVX-VNNI) from earlier work `quant.h`. No new matmul work.
+`f_a/f_b`, `b_proj`, `g_a/g_b` are ordinary dense matmuls living in
+`trunk.bin` at Q8G/Q4G — reuse earlier work's int8-activation IDOT kernels
+(NEON SDOT / AVX-VNNI). No new matmul work.
 
-## Gated MLA layers
+## Validation (Gate 4) — runnable now, no K3 needed
 
-Reuse earlier work's MLA path (latent KV 576 f/token, absorption, `.coli_kv`
-persistence) plus the **gate**: K3's Gated MLA adds an output/head gate —
-implementation detail TBD from released code, expected to be an elementwise
-sigmoid gate on attention output (cheap, fusable into the o-proj).
+1. Port the recurrence + short conv + gated output norm to standalone C.
+2. Diff against `fused_recurrent_kda` from the reference on random
+   weights, f32, tolerance ~1e-5. The delta rule subtracts near-equal
+   terms, so accumulation order matters.
+3. Then token-exact greedy comparison on **real Kimi-Linear-48B weights**
+   (public, 20 shards) — a full-scale rehearsal of the K3 oracle bar, at
+   1/60 the size.
 
-If K3 ships a DSA-style sparse indexer for the MLA layers, earlier work's
-lightning-indexer implementation carries over.
+## Remaining unknowns (Gate 1, from K3's own config)
 
-## State persistence
-
-KDA state + MLA latent KV together are a few hundred MB at most →
-checkpoint to disk per conversation (extend `.coli_kv` container with a
-`KDAS` section) so sessions reopen warm with zero re-prefill. This matters
-*more* for WASTE than for earlier work: at 1–3 tok/s, re-prefilling a long agent
-transcript is minutes; restoring state is milliseconds.
-
-## Validation bar
-
-Token-exact against the HF reference (earlier work standard): run the released
-modeling code on a short prompt, dump per-layer S states and outputs, and
-diff. The delta rule is numerically touchy (subtraction of near-equal
-terms); f32 accumulation order must match the reference within tolerance,
-and greedy tokens must match exactly over ≥1k tokens before any
-quantization of the trunk is allowed into the KDA path.
-
-## Open questions (weights drop)
-
-1. Exact KDA:MLA interleave ratio (Kimi Linear used 3:1) and head/dim sizes.
-2. Is `α` per-channel on d_k only, or factored differently in K3?
-3. Does Gated MLA gate per-head or per-channel?
-4. Conv1d short-filter (à la Mamba/GLA) in front of q/k/v? Some DeltaNet
-   variants ship one — affects the decode hot loop.
+- layer count and KDA:MLA ratio at K3 scale (expect 3:1).
+- head counts / d_state (expect 128; memplan uses that).
+- whether K3 keeps `mla_use_nope` and the null `q_lora_rank`.
+- MTP head presence (`num_nextn_predict_layers` is 0 in Kimi-Linear;
+  K2 shipped one, and speculative decoding is a throughput lever for us).
