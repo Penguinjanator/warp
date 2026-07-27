@@ -56,20 +56,26 @@ def st_read(path, names):
 
 
 def load_experts(model_dir, layer, mat, n_experts):
-    idx = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))
-    wm = idx["weight_map"]
-    want = [f"model.layers.{layer}.block_sparse_moe.experts.{e}.{mat}.weight"
-            for e in range(n_experts)]
-    want = [w for w in want if w in wm]
-    if not want:
-        raise SystemExit(f"no such tensors (layer {layer}, {mat}) — check names")
-    byfile = {}
-    for w in want:
-        byfile.setdefault(wm[w], []).append(w)
-    tensors = {}
-    for fn, names in byfile.items():
-        tensors.update(st_read(os.path.join(model_dir, fn), names))
-    return torch.stack([tensors[w] for w in want])      # [E, out, in]
+    """Kimi-Linear stores experts as plain bf16; K3 ships them mxfp4-packed
+    under a `language_model.` prefix. Handle both."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from mxfp4 import ST
+    st = ST(model_dir)
+    out = []
+    for pref in ("", "language_model."):
+        want = [f"{pref}model.layers.{layer}.block_sparse_moe.experts.{e}.{mat}.weight"
+                for e in range(n_experts)]
+        if not any(st.have(w) or st.have(w + "_packed") for w in want):
+            continue
+        for w in want:
+            try:
+                out.append(st.tensor(w))
+            except KeyError:
+                break
+        break
+    if not out:
+        raise SystemExit(f"no experts available yet (layer {layer}, {mat})")
+    return torch.stack(out)                              # [E, out, in]
 
 
 # ----------------------------------------------------------- quantizers ----
