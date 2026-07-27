@@ -8,17 +8,10 @@
  */
 
 #include "kda.h"
+#include "waste_backend.h"
 
 #include <math.h>
 #include <string.h>
-
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#define WASTE_SIMD_NEON 1
-#elif defined(__AVX2__)
-#include <immintrin.h>
-#define WASTE_SIMD_AVX2 1
-#endif
 
 static float l2_rnorm(const float *x, int n)
 {
@@ -54,28 +47,7 @@ void waste_kda_step(int H, int K, int V,
             float *row = Sh + (size_t)kk * V;
             const float d = expf(gh[kk]);
             const float kv = kh[kk] * kn;
-#if WASTE_SIMD_NEON
-            const float32x4_t vd = vdupq_n_f32(d), vk = vdupq_n_f32(kv);
-            int i = 0;
-            for (; i + 4 <= V; i += 4) {
-                float32x4_t r = vmulq_f32(vld1q_f32(row + i), vd);
-                vst1q_f32(row + i, r);
-                vst1q_f32(u + i, vfmaq_f32(vld1q_f32(u + i), r, vk));
-            }
-            for (; i < V; i++) { row[i] *= d; u[i] += row[i] * kv; }
-#elif WASTE_SIMD_AVX2
-            const __m256 vd = _mm256_set1_ps(d), vk = _mm256_set1_ps(kv);
-            int i = 0;
-            for (; i + 8 <= V; i += 8) {
-                __m256 r = _mm256_mul_ps(_mm256_loadu_ps(row + i), vd);
-                _mm256_storeu_ps(row + i, r);
-                _mm256_storeu_ps(u + i,
-                    _mm256_fmadd_ps(r, vk, _mm256_loadu_ps(u + i)));
-            }
-            for (; i < V; i++) { row[i] *= d; u[i] += row[i] * kv; }
-#else
             for (int i = 0; i < V; i++) { row[i] *= d; u[i] += row[i] * kv; }
-#endif
         }
 
         /* delta: d = beta * (v - u), reused as the rank-1 right factor */
@@ -87,29 +59,7 @@ void waste_kda_step(int H, int K, int V,
             float *row = Sh + (size_t)kk * V;
             const float kv = kh[kk] * kn;
             const float qv = qh[kk] * qn;
-#if WASTE_SIMD_NEON
-            const float32x4_t vk = vdupq_n_f32(kv), vq = vdupq_n_f32(qv);
-            int i = 0;
-            for (; i + 4 <= V; i += 4) {
-                float32x4_t r = vfmaq_f32(vld1q_f32(row + i), vld1q_f32(u + i), vk);
-                vst1q_f32(row + i, r);
-                vst1q_f32(oh + i, vfmaq_f32(vld1q_f32(oh + i), r, vq));
-            }
-            for (; i < V; i++) { row[i] += u[i] * kv; oh[i] += row[i] * qv; }
-#elif WASTE_SIMD_AVX2
-            const __m256 vk = _mm256_set1_ps(kv), vq = _mm256_set1_ps(qv);
-            int i = 0;
-            for (; i + 8 <= V; i += 8) {
-                __m256 r = _mm256_fmadd_ps(_mm256_loadu_ps(u + i), vk,
-                                           _mm256_loadu_ps(row + i));
-                _mm256_storeu_ps(row + i, r);
-                _mm256_storeu_ps(oh + i,
-                    _mm256_fmadd_ps(r, vq, _mm256_loadu_ps(oh + i)));
-            }
-            for (; i < V; i++) { row[i] += u[i] * kv; oh[i] += row[i] * qv; }
-#else
             for (int i = 0; i < V; i++) { row[i] += u[i] * kv; oh[i] += row[i] * qv; }
-#endif
         }
     }
 }
@@ -155,4 +105,14 @@ void waste_rmsnorm_gated(int C, const float *x, const float *gate,
         const float g = 1.0f / (1.0f + expf(-gate[i]));
         y[i] = x[i] * r * weight[i] * g;
     }
+}
+
+/* Universal baseline registration: fills every slot. Other backends
+ * overwrite only what they implement (sqlite-vector discipline). */
+const char *waste_kda_register_cpu(waste_kernels *t)
+{
+    t->kda_step = waste_kda_step;
+    t->short_conv_step = waste_short_conv_step;
+    t->rmsnorm_gated = waste_rmsnorm_gated;
+    return "CPU";
 }

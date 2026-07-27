@@ -16,7 +16,13 @@ built on the lessons of two prior engines:
   every allocation, and the engine refuses to open below the model's
   floor instead of swapping. See [docs/ENGINE.md](docs/ENGINE.md) — the
   measured floor for a K3-shaped config is **~11.4 GB**, and RAM above
-  the floor buys cache hit rate, not headroom.
+  the floor buys cache hit rate, not headroom;
+- **cross-platform** (macOS, Windows, Linux) with **dynamically loaded
+  acceleration backends** — BLAS, CUDA, Metal, NEON, AVX-512 — over a
+  universal CPU implementation that is always present and always correct.
+  Dispatch follows sqlite-vector's discipline (one function-pointer table,
+  baseline first, best backend partially overrides, force-CPU escape
+  hatch): [docs/BACKENDS.md](docs/BACKENDS.md).
 
 - earlier work — three-tier expert streaming
   (VRAM → RAM → NVMe), LFRU learned expert cache, router-lookahead pilot,

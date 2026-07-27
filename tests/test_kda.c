@@ -15,6 +15,7 @@
 #include <stdlib.h>
 
 #include "../src/kda.h"
+#include "../src/waste_backend.h"
 
 static void *xread(FILE *f, size_t n)
 {
@@ -32,7 +33,8 @@ int main(int argc, char **argv)
     int32_t d[4];
     if (fread(d, sizeof(int32_t), 4, f) != 4) { fprintf(stderr, "bad header\n"); return 1; }
     const int T = d[0], H = d[1], K = d[2], V = d[3];
-    printf("T=%d H=%d K=%d V=%d\n", T, H, K, V);
+    waste_backend_init(WASTE_BE_AUTO);
+    printf("T=%d H=%d K=%d V=%d backend=%s\n", T, H, K, V, waste_backend_name());
 
     const size_t nqk = (size_t)T * H * K, nv = (size_t)T * H * V;
     float *q = xread(f, nqk * sizeof(float));
@@ -47,7 +49,11 @@ int main(int argc, char **argv)
     float *scratch = calloc((size_t)V, sizeof(float));
     if (!o || !scratch) { fprintf(stderr, "oom\n"); return 1; }
 
-    waste_kda_forward(T, H, K, V, q, k, v, g, beta, S, o, scratch);
+    for (int t = 0; t < T; t++)
+        waste_k.kda_step(H, K, V,
+                         q + (size_t)t * H * K, k + (size_t)t * H * K,
+                         v + (size_t)t * H * V, g + (size_t)t * H * K,
+                         beta + (size_t)t * H, S, o + (size_t)t * H * V, scratch);
 
     FILE *out = fopen(argv[2], "wb");
     if (!out) { perror("out"); return 1; }
