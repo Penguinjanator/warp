@@ -276,6 +276,14 @@ static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
 
 static inline float silu(float v) { return v / (1.0f + expf(-v)); }
 
+/* SiTU (K3): beta*tanh(g/beta)*sigmoid(g) * [linear_beta*tanh(u/linear_beta)]
+ * — replaces SiLU-and-multiply, and unlike it the "up" half is squashed too. */
+static inline float situ_pair(float g, float u, float beta, float lbeta)
+{
+    const float a = beta * tanhf(g / beta) / (1.0f + expf(-g));
+    return a * (lbeta > 0.0f ? lbeta * tanhf(u / lbeta) : u);
+}
+
 static void softmax(float *x, int n)
 {
     float mx = x[0];
@@ -378,7 +386,21 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     c->routed_scale = (float)js_num(d, js_get(d, cfg, "routed_scaling_factor"), 1.0);
     c->renorm = js_get(d, cfg, "moe_renormalize") >= 0;
 
+    c->latent_dim = (int)js_int(d, js_get(d, cfg, "routed_expert_hidden_size"), 0);
+    c->latent_norm = js_get(d, cfg, "latent_moe_use_norm") >= 0;
+    c->attn_res_block = (int)js_int(d, js_get(d, cfg, "attn_res_block_size"), 0);
+    c->mla_output_gate = js_get(d, cfg, "mla_use_output_gate") >= 0;
+    {
+        char act[32];
+        js_str(d, js_get(d, cfg, "hidden_act"), act, sizeof act);
+        c->act_situ = strcmp(act, "situ") == 0;
+    }
+    c->situ_beta = (float)js_num(d, js_get(d, cfg, "activation_situ_beta"), 1.0);
+    c->situ_linear_beta = (float)js_num(d, js_get(d, cfg, "activation_situ_linear_beta"), 0.0);
+
     int lac = js_get(d, cfg, "linear_attn_config");
+    c->full_rank_gate = js_get(d, lac, "use_full_rank_gate") >= 0;
+    c->gate_lower_bound = (float)js_num(d, js_get(d, lac, "gate_lower_bound"), 0.0);
     c->kda_heads = (int)js_int(d, js_get(d, lac, "num_heads"), 0);
     c->kda_dim = (int)js_int(d, js_get(d, lac, "head_dim"), 0);
     c->conv_k = (int)js_int(d, js_get(d, lac, "short_conv_kernel_size"), 4);
@@ -411,7 +433,13 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     js_doc d;
     if (js_parse(&d, src) < 0) { free(src); return -1; }
 
-    cfg_from_json(&m->cfg, &d, js_get(&d, 0, "config"));
+    {
+        int cfg = js_get(&d, 0, "config");
+        const int tc = js_get(&d, cfg, "text_config");   /* K3 nests it */
+        if (tc >= 0) { cfg = tc; snprintf(m->cfg.prefix, sizeof m->cfg.prefix,
+                                          "language_model."); }
+        cfg_from_json(&m->cfg, &d, cfg);
+    }
     const waste_config *c = &m->cfg;
 
     int eq = js_get(&d, 0, "expert_quant");
@@ -490,6 +518,13 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     m->e_gate = (float *)malloc((size_t)c->moe_inter * c->hidden * sizeof(float));
     m->e_up = (float *)malloc((size_t)c->moe_inter * c->hidden * sizeof(float));
     m->e_down = (float *)malloc((size_t)c->hidden * c->moe_inter * sizeof(float));
+    {   /* AttnRes history + the latent-MoE staging buffers */
+        const int nb = c->attn_res_block ? c->n_layers / c->attn_res_block + 2 : 0;
+        m->blockres = nb ? (float *)calloc((size_t)nb * c->hidden, sizeof(float)) : NULL;
+        m->prefix_sum = (float *)calloc((size_t)c->hidden, sizeof(float));
+        m->ares = (float *)calloc((size_t)(2 * c->hidden + 2 * (c->latent_dim
+                                  ? c->latent_dim : c->hidden)), sizeof(float));
+    }
     {
         const int nmax = c->hidden > c->dense_inter ? c->hidden : c->dense_inter;
         m->xq = (int8_t *)calloc((size_t)nmax + 256, 1);
@@ -514,7 +549,9 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
 
 void waste_model_free(waste_model *m)
 {
-    for (int i = 0; i < m->n_tensors; i++) free(m->t[i].data);
+    for (int i = 0; i < m->n_tensors; i++) {
+        free(m->t[i].data); free(m->t[i].q); free(m->t[i].qs);
+    }
     free(m->t);
     free(m->codebooks);
     for (int L = 0; L < 128; L++) {
@@ -524,8 +561,8 @@ void waste_model_free(waste_model *m)
     free(m->x); free(m->h); free(m->tmp); free(m->att); free(m->logits);
     free(m->ff); free(m->e_gate); free(m->e_up); free(m->e_down); free(m->lut);
     free(m->xq); free(m->xs); free(m->miss_buf);
+    free(m->blockres); free(m->prefix_sum); free(m->ares);
     waste_ecache_free(&m->cache);
-    for (int i = 0; i < m->n_tensors; i++) { free(m->t[i].q); free(m->t[i].qs); }
 }
 
 /* ---- expert dequant ---------------------------------------------------- */
@@ -688,40 +725,52 @@ static void kda_layer(waste_model *m, int L, const float *in, float *out)
     float *dstv[3] = { q, k, v };
     for (int i = 0; i < 3; i++) {
         char b[128];
-        snprintf(b, sizeof b, "model.layers.%d.self_attn.%s_proj.weight", L, nm[i]);
+        snprintf(b, sizeof b, "%smodel.layers.%d.self_attn.%s_proj.weight", c->prefix, L, nm[i]);
         matvec_t(m, dstv[i], waste_find(m, b), in, C, hid);
-        snprintf(b, sizeof b, "model.layers.%d.self_attn.%s_conv1d.weight", L, nm[i]);
+        snprintf(b, sizeof b, "%smodel.layers.%d.self_attn.%s_conv1d.weight", c->prefix, L, nm[i]);
         waste_k.short_conv_step(C, c->conv_k, waste_find(m, b)->data, NULL,
                                 m->conv[L] + (size_t)i * C * (c->conv_k - 1),
                                 dstv[i], dstv[i]);
     }
 
-    matvec_t(m, lo, waste_find(m, tname("model.layers.%d.self_attn.f_a_proj.weight", L)), in, D, hid);
-    matvec_t(m, g, waste_find(m, tname("model.layers.%d.self_attn.f_b_proj.weight", L)), lo, C, D);
-    const float *A_log = T(m, "model.layers.%d.self_attn.A_log", L);
-    const float *dt = T(m, "model.layers.%d.self_attn.dt_bias", L);
+    matvec_t(m, lo, waste_find(m, tname("%smodel.layers.%d.self_attn.f_a_proj.weight", c->prefix, L)), in, D, hid);
+    matvec_t(m, g, waste_find(m, tname("%smodel.layers.%d.self_attn.f_b_proj.weight", c->prefix, L)), lo, C, D);
+    const float *A_log = T(m, "%smodel.layers.%d.self_attn.A_log", c->prefix, L);
+    const float *dt = T(m, "%smodel.layers.%d.self_attn.dt_bias", c->prefix, L);
     for (int h = 0; h < H; h++) {
-        const float a = -expf(A_log[h]);
+        const float ea = expf(A_log[h]);
         for (int j = 0; j < D; j++) {
             const int i = h * D + j;
             const float z = g[i] + dt[i];
-            /* softplus, numerically safe */
-            const float sp = z > 20.0f ? z : log1pf(expf(z));
-            g[i] = a * sp;
+            if (c->gate_lower_bound < 0.0f) {
+                /* K3: g = lower_bound * sigmoid(exp(A_log) * z), so the decay
+                 * is bounded in (exp(lb), 1) instead of unbounded below. */
+                g[i] = c->gate_lower_bound / (1.0f + expf(-ea * z));
+            } else {
+                const float sp = z > 20.0f ? z : log1pf(expf(z));   /* softplus */
+                g[i] = -ea * sp;
+            }
         }
     }
-    matvec_t(m, beta, waste_find(m, tname("model.layers.%d.self_attn.b_proj.weight", L)), in, H, hid);
+    matvec_t(m, beta, waste_find(m, tname("%smodel.layers.%d.self_attn.b_proj.weight", c->prefix, L)), in, H, hid);
     for (int h = 0; h < H; h++) beta[h] = 1.0f / (1.0f + expf(-beta[h]));
 
     waste_k.kda_step(H, D, D, q, k, v, g, beta, m->S[L], o, m->att);
 
-    matvec_t(m, lo, waste_find(m, tname("model.layers.%d.self_attn.g_a_proj.weight", L)), in, D, hid);
-    matvec_t(m, gate, waste_find(m, tname("model.layers.%d.self_attn.g_b_proj.weight", L)), lo, C, D);
-    const float *onw = T(m, "model.layers.%d.self_attn.o_norm.weight", L);
+    if (c->full_rank_gate) {
+        matvec_t(m, gate, waste_find(m, tname("%smodel.layers.%d.self_attn.g_proj.weight",
+                                              c->prefix, L)), in, C, hid);
+    } else {
+        matvec_t(m, lo, waste_find(m, tname("%smodel.layers.%d.self_attn.g_a_proj.weight",
+                                            c->prefix, L)), in, D, hid);
+        matvec_t(m, gate, waste_find(m, tname("%smodel.layers.%d.self_attn.g_b_proj.weight",
+                                              c->prefix, L)), lo, C, D);
+    }
+    const float *onw = T(m, "%smodel.layers.%d.self_attn.o_norm.weight", c->prefix, L);
     for (int h = 0; h < H; h++)
         waste_k.rmsnorm_gated(D, o + h * D, gate + h * D, onw, c->eps, o + h * D);
 
-    matvec_t(m, out, waste_find(m, tname("model.layers.%d.self_attn.o_proj.weight", L)), o, hid, C);
+    matvec_t(m, out, waste_find(m, tname("%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L)), o, hid, C);
 }
 
 static void mla_layer(waste_model *m, int L, const float *in, float *out, int pos)
@@ -732,13 +781,13 @@ static void mla_layer(waste_model *m, int L, const float *in, float *out, int po
     float *q = m->tmp, *ckv = q + nh * qd, *kb = ckv + c->kv_lora + c->qk_rope;
     float *o = kb + nh * (c->qk_nope + vh);
 
-    matvec_t(m, q, waste_find(m, tname("model.layers.%d.self_attn.q_proj.weight", L)), in, nh * qd, hid);
-    matvec_t(m, ckv, waste_find(m, tname("model.layers.%d.self_attn.kv_a_proj_with_mqa.weight", L)),
+    matvec_t(m, q, waste_find(m, tname("%smodel.layers.%d.self_attn.q_proj.weight", c->prefix, L)), in, nh * qd, hid);
+    matvec_t(m, ckv, waste_find(m, tname("%smodel.layers.%d.self_attn.kv_a_proj_with_mqa.weight", c->prefix, L)),
              in, c->kv_lora + c->qk_rope, hid);
     float *kpass = ckv, *krot = ckv + c->kv_lora;
-    rmsnorm(kpass, kpass, T(m, "model.layers.%d.self_attn.kv_a_layernorm.weight", L),
+    rmsnorm(kpass, kpass, T(m, "%smodel.layers.%d.self_attn.kv_a_layernorm.weight", c->prefix, L),
             c->kv_lora, c->eps);
-    matvec_t(m, kb, waste_find(m, tname("model.layers.%d.self_attn.kv_b_proj.weight", L)),
+    matvec_t(m, kb, waste_find(m, tname("%smodel.layers.%d.self_attn.kv_b_proj.weight", c->prefix, L)),
              kpass, nh * (c->qk_nope + vh), c->kv_lora);
 
     float *kc = m->kcache[L] + (size_t)pos * nh * qd;
@@ -770,7 +819,7 @@ static void mla_layer(waste_model *m, int L, const float *in, float *out, int po
             for (int i = 0; i < vh; i++) oh[i] += w * vv[i];
         }
     }
-    matvec_t(m, out, waste_find(m, tname("model.layers.%d.self_attn.o_proj.weight", L)), o, hid, nh * vh);
+    matvec_t(m, out, waste_find(m, tname("%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L)), o, hid, nh * vh);
 }
 
 static void ffn(waste_model *m, const waste_tensor *W1, const waste_tensor *W3,
@@ -780,7 +829,11 @@ static void ffn(waste_model *m, const waste_tensor *W1, const waste_tensor *W3,
     float *a = m->ff, *b = a + inter;
     matvec_t(m, a, W1, in, inter, hid);
     matvec_t(m, b, W3, in, inter, hid);
-    for (int i = 0; i < inter; i++) a[i] = silu(a[i]) * b[i];
+    if (m->cfg.act_situ)
+        for (int i = 0; i < inter; i++)
+            a[i] = situ_pair(a[i], b[i], m->cfg.situ_beta, m->cfg.situ_linear_beta);
+    else
+        for (int i = 0; i < inter; i++) a[i] = silu(a[i]) * b[i];
     float *dst = accum ? m->h : out;
     matvec_t(m, dst, W2, a, hid, inter);
     if (accum) for (int i = 0; i < hid; i++) out[i] += w * dst[i];
@@ -790,9 +843,12 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
 {
     const waste_config *c = &m->cfg;
     const int E = c->n_experts, K = c->top_k, hid = c->hidden;
+    /* K3's Stable LatentMoE: experts run on a narrower projection of the
+     * hidden state. `in` still drives the router and the shared experts. */
+    const int lat = c->latent_dim ? c->latent_dim : hid;
     float *sc = m->att + 4096;
-    matvec_t(m, sc, waste_find(m, tname("model.layers.%d.block_sparse_moe.gate.weight", L)), in, E, hid);
-    const float *bias = T(m, "model.layers.%d.block_sparse_moe.gate.e_score_correction_bias", L);
+    matvec_t(m, sc, waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L)), in, E, hid);
+    const float *bias = T(m, "%smodel.layers.%d.block_sparse_moe.gate.e_score_correction_bias", c->prefix, L);
     float *score = sc + E;
     for (int e = 0; e < E; e++) score[e] = 1.0f / (1.0f + expf(-sc[e]));
 
@@ -819,10 +875,19 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     for (int j = 0; j < K; j++) w[j] *= c->routed_scale;
     if (routed) for (int j = 0; j < K; j++) routed[j] = idx[j];
 
-    memset(out, 0, (size_t)hid * sizeof(float));
     const int inter = c->moe_inter;
     float *ga = m->ff, *ub = ga + inter, *acc = m->e_gate;
-    const int lut_sz = (hid / m->vec_dim) * m->stages * m->cb_entries;
+    const float *xin = in;
+    float *lat_in = m->ares + hid, *lat_out = lat_in + lat;
+    if (c->latent_dim) {
+        matvec_t(m, lat_in, waste_find(m, tname(
+                     "%smodel.layers.%d.block_sparse_moe.routed_expert_down_proj.weight",
+                     c->prefix, L)), in, lat, hid);
+        xin = lat_in;
+    }
+    float *ysum = c->latent_dim ? lat_out : out;
+    memset(ysum, 0, (size_t)lat * sizeof(float));
+    const int lut_sz = ((hid > lat ? hid : lat) / m->vec_dim) * m->stages * m->cb_entries;
     float *lut_gate = m->lut, *lut_up = lut_gate + lut_sz, *lut_down = lut_up + lut_sz;
     int lut_ready = 0;
     for (int j = 0; j < K; j++) {
@@ -838,27 +903,75 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
          * every routed expert, so their tables are built once per token. */
         if (!lut_ready) {
             vq_build_lut(lut_gate, m->codebooks, h->codebook_id + 0 * m->stages,
-                         in, hid, m->stages, m->cb_entries, m->vec_dim);
+                         xin, lat, m->stages, m->cb_entries, m->vec_dim);
             vq_build_lut(lut_up, m->codebooks, h->codebook_id + 1 * m->stages,
-                         in, hid, m->stages, m->cb_entries, m->vec_dim);
+                         xin, lat, m->stages, m->cb_entries, m->vec_dim);
             lut_ready = 1;
         }
-        vq_apply(m, ga, rec + h->gate_off, sc, inter, hid, lut_gate);
-        vq_apply(m, ub, rec + h->up_off, sc + inter, inter, hid, lut_up);
-        for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
-        vq_matvec(m, acc, rec + h->down_off, sc + 2 * inter, ga, hid, inter,
+        vq_apply(m, ga, rec + h->gate_off, sc, inter, lat, lut_gate);
+        vq_apply(m, ub, rec + h->up_off, sc + inter, inter, lat, lut_up);
+        if (c->act_situ)
+            for (int i = 0; i < inter; i++)
+                ga[i] = situ_pair(ga[i], ub[i], c->situ_beta, c->situ_linear_beta);
+        else
+            for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
+        vq_matvec(m, acc, rec + h->down_off, sc + 2 * inter, ga, lat, inter,
                   h->codebook_id + 2 * m->stages, lut_down);
         const float wj = w[j];
-        for (int i = 0; i < hid; i++) out[i] += wj * acc[i];
+        for (int i = 0; i < lat; i++) ysum[i] += wj * acc[i];
         PROF_END(P_EMM);
     }
-    /* shared expert */
+    if (c->latent_dim) {
+        if (c->latent_norm)
+            rmsnorm(ysum, ysum, waste_find(m, tname(
+                        "%smodel.layers.%d.block_sparse_moe.routed_expert_norm.weight",
+                        c->prefix, L))->data, lat, c->eps);
+        matvec_t(m, out, waste_find(m, tname(
+                     "%smodel.layers.%d.block_sparse_moe.routed_expert_up_proj.weight",
+                     c->prefix, L)), ysum, hid, lat);
+    }
+
+    /* shared expert — on the original hidden state, not the latent */
     float *tmp = m->h;
-    ffn(m, waste_find(m, tname("model.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight", L)),
-        waste_find(m, tname("model.layers.%d.block_sparse_moe.shared_experts.up_proj.weight", L)),
-        waste_find(m, tname("model.layers.%d.block_sparse_moe.shared_experts.down_proj.weight", L)),
+    ffn(m, waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight", c->prefix, L)),
+        waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.shared_experts.up_proj.weight", c->prefix, L)),
+        waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight", c->prefix, L)),
         in, tmp, c->moe_inter * (c->n_shared ? c->n_shared : 1), hid, 1.0f, 0);
     for (int i = 0; i < hid; i++) out[i] += tmp[i];
+}
+
+/* ---- Attention Residuals (K3) ------------------------------------------
+ * Every layer mixes its running sum with a history of block residuals via a
+ * learned softmax attention over that history; every attn_res_block_size
+ * layers the current sum is appended to the history.
+ *
+ *   v      = [block_residual..., prefix_sum]        (nb+1) x hidden
+ *   k      = rmsnorm(v)                             (no weight yet)
+ *   scores = sum(k * (norm.weight * proj.weight))   (nb+1)
+ *   out    = softmax(scores) . v
+ */
+static void apply_attn_res(waste_model *m, const float *prefix_sum,
+                           const float *norm_w, const float *proj_w,
+                           float *out)
+{
+    const int hid = m->cfg.hidden, nb = m->n_blockres;
+    float *sc = m->att;
+    for (int i = 0; i <= nb; i++) {
+        const float *v = (i < nb) ? m->blockres + (size_t)i * hid : prefix_sum;
+        float ss = 0;
+        for (int j = 0; j < hid; j++) ss += v[j] * v[j];
+        const float r = 1.0f / sqrtf(ss / (float)hid + m->cfg.eps);
+        float acc = 0;
+        for (int j = 0; j < hid; j++) acc += v[j] * r * norm_w[j] * proj_w[j];
+        sc[i] = acc;
+    }
+    softmax(sc, nb + 1);
+    memset(out, 0, (size_t)hid * sizeof(float));
+    for (int i = 0; i <= nb; i++) {
+        const float *v = (i < nb) ? m->blockres + (size_t)i * hid : prefix_sum;
+        const float p = sc[i];
+        for (int j = 0; j < hid; j++) out[j] += p * v[j];
+    }
 }
 
 /* ---- forward ----------------------------------------------------------- */
@@ -868,7 +981,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
     /* one embedding row; the table may be kept quantized */
-    const waste_tensor *emb = waste_find(m, "model.embed_tokens.weight");
+    const waste_tensor *emb = waste_find(m, tname("%smodel.embed_tokens.weight", c->prefix));
     if (emb->data) {
         memcpy(m->x, emb->data + (size_t)token * hid, (size_t)hid * sizeof(float));
     } else {
@@ -884,32 +997,70 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
 
     float *resid = (float *)malloc((size_t)hid * sizeof(float));
     float *norm = (float *)malloc((size_t)hid * sizeof(float));
+    const int ares_on = c->attn_res_block > 0;
+    float *ps = m->prefix_sum;
+    int ps_live = 0;
+    m->n_blockres = 0;
+
     for (int L = 0; L < c->n_layers; L++) {
         char b[128];
-        snprintf(b, sizeof b, "model.layers.%d.input_layernorm.weight", L);
+        if (ares_on) {
+            memcpy(ps, m->x, (size_t)hid * sizeof(float));
+            ps_live = 1;
+            if (m->n_blockres > 0) {
+                apply_attn_res(m, ps,
+                    waste_find(m, tname("%smodel.layers.%d.self_attention_res_norm.weight", c->prefix, L))->data,
+                    waste_find(m, tname("%smodel.layers.%d.self_attention_res_proj.weight", c->prefix, L))->data,
+                    m->x);
+            }
+            if (L % c->attn_res_block == 0) {
+                memcpy(m->blockres + (size_t)m->n_blockres * hid, ps,
+                       (size_t)hid * sizeof(float));
+                m->n_blockres++;
+                ps_live = 0;
+            }
+        }
+
+        snprintf(b, sizeof b, "%smodel.layers.%d.input_layernorm.weight", c->prefix, L);
         rmsnorm(norm, m->x, waste_find(m, b)->data, hid, c->eps);
         if (c->kda_layer[L]) { PROF_START(P_KDA); kda_layer(m, L, norm, resid); PROF_END(P_KDA); }
         else { PROF_START(P_MLA); mla_layer(m, L, norm, resid, pos); PROF_END(P_MLA); }
-        for (int i = 0; i < hid; i++) m->x[i] += resid[i];
 
-        snprintf(b, sizeof b, "model.layers.%d.post_attention_layernorm.weight", L);
+        if (ares_on) {
+            if (ps_live) for (int i = 0; i < hid; i++) ps[i] += resid[i];
+            else { memcpy(ps, resid, (size_t)hid * sizeof(float)); ps_live = 1; }
+            apply_attn_res(m, ps,
+                waste_find(m, tname("%smodel.layers.%d.mlp_res_norm.weight", c->prefix, L))->data,
+                waste_find(m, tname("%smodel.layers.%d.mlp_res_proj.weight", c->prefix, L))->data,
+                m->x);
+        } else {
+            for (int i = 0; i < hid; i++) m->x[i] += resid[i];
+        }
+
+        snprintf(b, sizeof b, "%smodel.layers.%d.post_attention_layernorm.weight", c->prefix, L);
         rmsnorm(norm, m->x, waste_find(m, b)->data, hid, c->eps);
-        snprintf(b, sizeof b, "model.layers.%d.block_sparse_moe.gate.weight", L);
+        snprintf(b, sizeof b, "%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L);
         if (waste_find(m, b)) {
             PROF_START(P_ROUTE);
             moe_layer(m, L, norm, resid, routed ? routed + (size_t)L * c->top_k : NULL);
             PROF_END(P_ROUTE);
         }
         else
-            ffn(m, waste_find(m, tname("model.layers.%d.mlp.gate_proj.weight", L)),
-                waste_find(m, tname("model.layers.%d.mlp.up_proj.weight", L)),
-                waste_find(m, tname("model.layers.%d.mlp.down_proj.weight", L)),
+            ffn(m, waste_find(m, tname("%smodel.layers.%d.mlp.gate_proj.weight", c->prefix, L)),
+                waste_find(m, tname("%smodel.layers.%d.mlp.up_proj.weight", c->prefix, L)),
+                waste_find(m, tname("%smodel.layers.%d.mlp.down_proj.weight", c->prefix, L)),
                 norm, resid, c->dense_inter, hid, 1.0f, 0);
-        for (int i = 0; i < hid; i++) m->x[i] += resid[i];
+
+        if (ares_on) {
+            for (int i = 0; i < hid; i++) ps[i] += resid[i];
+            memcpy(m->x, ps, (size_t)hid * sizeof(float));
+        } else {
+            for (int i = 0; i < hid; i++) m->x[i] += resid[i];
+        }
     }
-    rmsnorm(norm, m->x, waste_find(m, "model.norm.weight")->data, hid, c->eps);
+    rmsnorm(norm, m->x, waste_find(m, tname("%smodel.norm.weight", c->prefix))->data, hid, c->eps);
     PROF_START(P_HEAD);
-    matvec_t(m, m->logits, waste_find(m, "lm_head.weight"), norm, c->vocab, hid);
+    matvec_t(m, m->logits, waste_find(m, tname("%slm_head.weight", c->prefix)), norm, c->vocab, hid);
     PROF_END(P_HEAD);
     free(resid);
     free(norm);

@@ -9,6 +9,10 @@ CFLAGS  ?= -O2 -std=c11 -Wall -Wextra
 LDLIBS  := -lm -lpthread
 VQ_SUPER ?= 2
 CFLAGS  += -DVQ_SUPER=$(VQ_SUPER)
+# Track header dependencies. Without this a changed struct in a header
+# leaves stale objects compiled against the old layout — which links fine
+# and then corrupts memory at run time.
+CFLAGS  += -MMD -MP
 
 SRC := src/model.c src/kda.c src/backend.c src/ecache.c src/version.c \
        src/tokenizer.c src/waste.c
@@ -48,8 +52,10 @@ test_tokenizer: tests/test_tokenizer.o libwaste.a
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+-include $(OBJ:.o=.d) cli/main.d $(patsubst %.c,%.d,$(wildcard tests/*.c))
+
 clean:
-	rm -f $(OBJ) cli/*.o tests/*.o libwaste.a waste \
+	rm -f $(OBJ) cli/*.o tests/*.o $(OBJ:.o=.d) cli/*.d tests/*.d libwaste.a waste \
 	      test_kda test_container test_forward test_tokenizer
 
 .PHONY: all test clean

@@ -36,6 +36,17 @@ typedef struct {
     int kda_layer[128];              /* 1 if layer is KDA                   */
     float eps, routed_scale;
     int renorm;
+
+    /* --- K3 additions (all absent/0 for Kimi-Linear) ------------------- */
+    int   latent_dim;                /* routed_expert_hidden_size; 0 = none */
+    int   latent_norm;               /* latent_moe_use_norm                 */
+    int   attn_res_block;            /* attn_res_block_size; 0 = no AttnRes */
+    int   full_rank_gate;            /* KDA g_proj instead of g_a/g_b       */
+    float gate_lower_bound;          /* 0 = softplus form, else bounded     */
+    int   mla_output_gate;           /* MLA sigmoid output gate             */
+    int   act_situ;                  /* 1 = SiTU instead of SiLU            */
+    float situ_beta, situ_linear_beta;
+    char  prefix[64];                /* "" or "language_model." (K3)        */
 } waste_config;
 
 typedef struct {
@@ -61,6 +72,9 @@ typedef struct {
 
     /* scratch */
     float *x, *h, *tmp, *att, *logits;
+    float *blockres;                 /* AttnRes history: [nblocks][hidden]  */
+    int    n_blockres;
+    float *prefix_sum, *ares;
     float *e_gate, *e_up, *e_down, *ff, *lut, *xs;
     int8_t *xq;
     uint64_t expert_reads;

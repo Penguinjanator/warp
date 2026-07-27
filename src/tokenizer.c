@@ -31,12 +31,15 @@ static int b64val(int c)
 
 static int b64decode(const char *s, int len, uint8_t *out)
 {
-    int n = 0, acc = 0, bits = 0;
+    /* unsigned: the accumulator shifts past bit 31 on long lines, and signed
+     * overflow there is UB the optimizer is entitled to turn into a trap */
+    int n = 0, bits = 0;
+    uint32_t acc = 0;
     for (int i = 0; i < len; i++) {
         if (s[i] == '=') break;
         const int v = b64val((unsigned char)s[i]);
         if (v < 0) continue;
-        acc = (acc << 6) | v;
+        acc = (acc << 6) | (uint32_t)v;
         bits += 6;
         if (bits >= 8) { bits -= 8; out[n++] = (uint8_t)((acc >> bits) & 0xff); }
     }
