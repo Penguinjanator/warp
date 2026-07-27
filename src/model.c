@@ -278,7 +278,7 @@ static inline float silu(float v) { return v / (1.0f + expf(-v)); }
 
 /* SiTU (K3): beta*tanh(g/beta)*sigmoid(g) * [linear_beta*tanh(u/linear_beta)]
  * — replaces SiLU-and-multiply, and unlike it the "up" half is squashed too. */
-static inline float situ_pair(float g, float u, float beta, float lbeta)
+float waste_situ_pair(float g, float u, float beta, float lbeta)
 {
     const float a = beta * tanhf(g / beta) / (1.0f + expf(-g));
     return a * (lbeta > 0.0f ? lbeta * tanhf(u / lbeta) : u);
@@ -714,6 +714,32 @@ static void vq_matvec(waste_model *m, float *y, const uint8_t *idx,
 
 /* ---- layers ------------------------------------------------------------ */
 
+/* Log-space decay gate, in place over [H][D].
+ *
+ * Kimi-Linear:  g = -exp(A_log) * softplus(z)         unbounded below
+ * K3:           g = lower_bound * sigmoid(exp(A_log) * z)
+ *
+ * The second is not a clamp of the first — it is a different function, and
+ * it confines the decay exp(g) to (exp(lower_bound), 1).
+ */
+void waste_kda_decay_gate(float *g, const float *A_log, const float *dt_bias,
+                          int H, int D, float lower_bound)
+{
+    for (int h = 0; h < H; h++) {
+        const float ea = expf(A_log[h]);
+        for (int j = 0; j < D; j++) {
+            const int i = h * D + j;
+            const float z = g[i] + (dt_bias ? dt_bias[i] : 0.0f);
+            if (lower_bound < 0.0f)
+                g[i] = lower_bound / (1.0f + expf(-ea * z));
+            else {
+                const float sp = z > 20.0f ? z : log1pf(expf(z));
+                g[i] = -ea * sp;
+            }
+        }
+    }
+}
+
 static void kda_layer(waste_model *m, int L, const float *in, float *out)
 {
     const waste_config *c = &m->cfg;
@@ -737,21 +763,7 @@ static void kda_layer(waste_model *m, int L, const float *in, float *out)
     matvec_t(m, g, waste_find(m, tname("%smodel.layers.%d.self_attn.f_b_proj.weight", c->prefix, L)), lo, C, D);
     const float *A_log = T(m, "%smodel.layers.%d.self_attn.A_log", c->prefix, L);
     const float *dt = T(m, "%smodel.layers.%d.self_attn.dt_bias", c->prefix, L);
-    for (int h = 0; h < H; h++) {
-        const float ea = expf(A_log[h]);
-        for (int j = 0; j < D; j++) {
-            const int i = h * D + j;
-            const float z = g[i] + dt[i];
-            if (c->gate_lower_bound < 0.0f) {
-                /* K3: g = lower_bound * sigmoid(exp(A_log) * z), so the decay
-                 * is bounded in (exp(lb), 1) instead of unbounded below. */
-                g[i] = c->gate_lower_bound / (1.0f + expf(-ea * z));
-            } else {
-                const float sp = z > 20.0f ? z : log1pf(expf(z));   /* softplus */
-                g[i] = -ea * sp;
-            }
-        }
-    }
+    waste_kda_decay_gate(g, A_log, dt, H, D, c->gate_lower_bound);
     matvec_t(m, beta, waste_find(m, tname("%smodel.layers.%d.self_attn.b_proj.weight", c->prefix, L)), in, H, hid);
     for (int h = 0; h < H; h++) beta[h] = 1.0f / (1.0f + expf(-beta[h]));
 
@@ -831,7 +843,7 @@ static void ffn(waste_model *m, const waste_tensor *W1, const waste_tensor *W3,
     matvec_t(m, b, W3, in, inter, hid);
     if (m->cfg.act_situ)
         for (int i = 0; i < inter; i++)
-            a[i] = situ_pair(a[i], b[i], m->cfg.situ_beta, m->cfg.situ_linear_beta);
+            a[i] = waste_situ_pair(a[i], b[i], m->cfg.situ_beta, m->cfg.situ_linear_beta);
     else
         for (int i = 0; i < inter; i++) a[i] = silu(a[i]) * b[i];
     float *dst = accum ? m->h : out;
@@ -912,7 +924,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
         vq_apply(m, ub, rec + h->up_off, sc + inter, inter, lat, lut_up);
         if (c->act_situ)
             for (int i = 0; i < inter; i++)
-                ga[i] = situ_pair(ga[i], ub[i], c->situ_beta, c->situ_linear_beta);
+                ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta, c->situ_linear_beta);
         else
             for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
         vq_matvec(m, acc, rec + h->down_off, sc + 2 * inter, ga, lat, inter,
@@ -950,7 +962,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
  *   scores = sum(k * (norm.weight * proj.weight))   (nb+1)
  *   out    = softmax(scores) . v
  */
-static void apply_attn_res(waste_model *m, const float *prefix_sum,
+void waste_apply_attn_res(waste_model *m, const float *prefix_sum,
                            const float *norm_w, const float *proj_w,
                            float *out)
 {
@@ -1008,7 +1020,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
             memcpy(ps, m->x, (size_t)hid * sizeof(float));
             ps_live = 1;
             if (m->n_blockres > 0) {
-                apply_attn_res(m, ps,
+                waste_apply_attn_res(m, ps,
                     waste_find(m, tname("%smodel.layers.%d.self_attention_res_norm.weight", c->prefix, L))->data,
                     waste_find(m, tname("%smodel.layers.%d.self_attention_res_proj.weight", c->prefix, L))->data,
                     m->x);
@@ -1029,7 +1041,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         if (ares_on) {
             if (ps_live) for (int i = 0; i < hid; i++) ps[i] += resid[i];
             else { memcpy(ps, resid, (size_t)hid * sizeof(float)); ps_live = 1; }
-            apply_attn_res(m, ps,
+            waste_apply_attn_res(m, ps,
                 waste_find(m, tname("%smodel.layers.%d.mlp_res_norm.weight", c->prefix, L))->data,
                 waste_find(m, tname("%smodel.layers.%d.mlp_res_proj.weight", c->prefix, L))->data,
                 m->x);

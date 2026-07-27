@@ -38,7 +38,7 @@ libwaste.a: $(OBJ)
 waste: cli/main.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-test: test_kda test_container test_forward test_tokenizer
+test: test_kda test_container test_forward test_tokenizer test_k3parts
 
 test_kda: tests/test_kda.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
@@ -48,6 +48,8 @@ test_forward: tests/test_forward.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 test_tokenizer: tests/test_tokenizer.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+test_k3parts: tests/test_k3parts.o libwaste.a
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -56,6 +58,6 @@ test_tokenizer: tests/test_tokenizer.o libwaste.a
 
 clean:
 	rm -f $(OBJ) cli/*.o tests/*.o $(OBJ:.o=.d) cli/*.d tests/*.d libwaste.a waste \
-	      test_kda test_container test_forward test_tokenizer
+	      test_kda test_container test_forward test_tokenizer test_k3parts
 
 .PHONY: all test clean
