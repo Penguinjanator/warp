@@ -305,6 +305,11 @@ def main():
     with torch.no_grad():
         t0 = time.time()
         logits = ref.forward(ids)
+        if args.dump:
+            with open(args.dump, "wb") as f:
+                b = logits[-1].contiguous().float().flatten()
+                f.write(struct.pack(f"<{b.numel()}f", *b.tolist()))
+            print(f"dumped logits -> {args.dump}")
         print(f"prefill {len(ids)} tok in {time.time()-t0:.1f}s; "
               f"logits {tuple(logits.shape)}, "
               f"argmax {int(logits[-1].argmax())}, "

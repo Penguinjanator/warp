@@ -140,8 +140,38 @@ activations; compare against the same measurement on GLM-5.2 layers
 *Kill criterion:* reconstruction error ≫ GLM-5.2-at-int4 levels →
 raise bits (disk grows) or stop.
 
-## Gate 4 — KDA kernel correctness. ⏳ after config known
+## Gate 4 — engine correctness. ✅ ALL THREE STEPS PASSED 2026-07-27
 
-*Protects:* full engine build.
-*Test:* standalone C kernel vs the released reference implementation on
-random weights, then token-exact oracle run on real weights (earlier work bar).
+*Protects:* every optimization built on top of the forward pass.
+
+**Steps 1-2** (kernel vs reference, random weights) — see docs/KDA.md:
+3.7e-08 / 4.1e-08 max output diff against fla's `naive_recurrent_kda`,
+on both the CPU baseline and the NEON path.
+
+**Step 3** (full forward pass vs oracle, real weights). `src/model.c`
+loads a WASTE container and runs Kimi-Linear end to end in C — trunk
+dequantized at load, experts read one 4 KiB record at a time and
+dequantized on demand, KDA through the dispatch table, MLA with a KV
+cache, sigmoid + top-k routing. Diffed against `tools/kimi_ref.py` on the
+same container and prompt:
+
+| metric | value |
+|---|---|
+| max abs diff on logits (magnitude ~15) | 4.0e-05 |
+| relative error \|\|c-r\|\| / \|\|r\|\| | 1.58e-06 |
+| argmax | identical (17374 = " Paris") |
+| top-10 tokens | identical, same order |
+
+Sustained over 12 generated tokens the C engine produces:
+
+> The capital of France is Paris, and the capital of Italy is Rome. The
+> capital of
+
+— the same continuation the oracle gives.
+
+*Performance (honest, unoptimized):* 2.15 s/token, 208 expert reads per
+token as predicted by Gate 2. The matvec is a naive f32 triple loop with
+no OpenMP on this build, weights are dequantized to f32 rather than kept
+quantized, and nothing is threaded — this measures correctness, not speed.
+Optimizing it is the next body of work, and now it has a reference to stay
+correct against.
