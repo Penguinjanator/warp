@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdlib.h>
 #include <time.h>
 
 #include "../src/model.h"
@@ -69,6 +70,19 @@ int main(int argc, char **argv)
         cur = best;
     }
 
+    extern double waste_prof[8];
+    if (getenv("WASTE_PROFILE")) {
+        const char *names[8] = {"proj","kda","mla","moe(all)","  expert deq",
+                                "  expert mm","lm_head","other"};
+        double tot = 0;
+        for (int i = 0; i < 8; i++) tot += (i == 4 || i == 5) ? 0 : waste_prof[i];
+        printf("\n-- profile (s, %d steps) --\n", n + n_gen);
+        for (int i = 0; i < 8; i++)
+            if (waste_prof[i] > 0)
+                printf("  %-14s %7.2f  %5.1f%%\n", names[i], waste_prof[i],
+                       100.0 * waste_prof[i] / tot);
+        printf("  %-14s %7.2f\n", "accounted", tot);
+    }
     waste_model_free(&m);
     return 0;
 }

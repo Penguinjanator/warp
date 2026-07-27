@@ -115,6 +115,53 @@ That equivalence is the contract every future backend must meet: **same
 results, only faster.** The Windows branches are written but not yet
 exercised — they need a CI runner before we claim Windows support.
 
+## Machine-specific optimization: measured, not guessed (2026-07-27)
+
+Optimizing started from a profile of the C forward pass on Kimi-Linear
+(`WASTE_PROFILE=1`), not from intuition. The order the profile dictated:
+
+| step | s/token | what the profile then said |
+|---|---|---|
+| first correct version | 2.15 | MoE 71%, of which dequant 37% + matmul 30% |
+| NEON f32 dot + thread pool | 0.93 | expert **dequantization 87.5%** |
+| fused VQ matvec (no dequant) | 0.22 | expert matmul 67%, KDA 12%, I/O 12% |
+| hoist gate/up tables out of the expert loop | **0.18** | expert matmul 56%, I/O 17%, KDA 15% |
+
+**11.9x, and the logits still match the oracle** (max abs diff 4.6e-05,
+relative 1.5e-06, argmax and top-10 identical) — the same check is rerun
+after every step, because an optimization that changes results is not an
+optimization.
+
+The two that mattered:
+
+1. **Never dequantize an expert.** The first version expanded VQ indices
+   into f32 weights and then multiplied — 87% of the time. Instead, note
+   that `sum_s C_s[i] . x_v` depends only on (stage, code, vector
+   position), never on the output row: tabulate it once per matrix and
+   every row becomes 3 table lookups per 8 weights. This is
+   sqlite-vector's turbo-LUT idea applied to a weight matrix rather than a
+   distance. Dequantization dropped from 87.5% to nothing, and the
+   remaining 16% under "expert deq" is now purely file I/O.
+2. **Hoist what does not vary.** Every routed expert in a layer sees the
+   same input and the same per-layer codebooks for its gate and up
+   matrices, so those two tables are built once per token instead of once
+   per expert — 8x less table-building on two of the three matrices.
+
+**Thread scaling** on this M5 Pro (18 logical cores, 6 performance):
+
+| threads | 1 | 4 | 8 | 12 | 18 |
+|---|---|---|---|---|---|
+| s/token | 0.45 | 0.20 | 0.20 | 0.18 | 0.18 |
+
+2.5x, flattening after ~4 — consistent with the performance-core count and
+with a workload that is becoming memory-bound. The pool splits by row, so
+results are bit-identical at any thread count; `WASTE_THREADS` overrides.
+
+Still on the table for this machine: int8 activations with SDOT/i8mm for
+the trunk projections (the hardware has both, and `waste_cpu_features()`
+already reports them), a NEON pass over the LUT accumulation, and Metal
+for the prefill GEMMs.
+
 ## Not yet done
 
 AVX2/AVX-512 modules, the CUDA/Metal/BLAS backends themselves, the platform

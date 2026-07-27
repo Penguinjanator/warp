@@ -56,7 +56,7 @@ typedef struct {
 
     /* scratch */
     float *x, *h, *tmp, *att, *logits;
-    float *e_gate, *e_up, *e_down, *ff;
+    float *e_gate, *e_up, *e_down, *ff, *lut;
     uint64_t expert_reads;
 } waste_model;
 
