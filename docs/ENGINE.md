@@ -31,11 +31,44 @@ server mode, and file I/O. **Rule: if the CLI needs a capability, it goes
 into `waste.h` first.** That keeps the embedded path honest — anything a
 user can do from the shell, a host program can do from C.
 
-Planned commands: `run` (one-shot / piped), `chat` (REPL with state
-persistence), `serve` (HTTP), `bench` (throughput + cache stats),
-`plan` (print the memory plan for a model and budget — the CLI face of
-`waste_plan_memory`), `convert` (MXFP4 → WASTE container), `inspect`
-(container/manifest dump).
+Shipped in 0.1.0: `run`, `chat` (state kept across turns, `/reset`,
+`/stats`), `bench`, `plan`, `info`, `version`. Still to come: `serve`
+(HTTP) and `convert` (the converter is Python for now).
+
+Every one of them goes through `waste.h`. `plan` is the CLI face of
+`waste_plan_memory`, `bench` of `waste_get_stats`, `run`/`chat` of
+`waste_generate` and its per-token callback — the same callback an
+embedding host would use to draw a progress UI.
+
+```
+$ waste plan model.waste --budget 4G
+  resident trunk             1.91 GB
+  KDA state + KV cache       1.14 GB
+  scratch                      65 MB
+  minimum expert cache         41 MB
+  ---------------------------------
+  FLOOR                      3.15 GB
+  recommended                4.75 GB
+  budget 4.00 GB -> expert cache 916 MB
+
+$ waste run model.waste "The capital of France is" -n 30 --budget 6G
+The capital of France is Paris, and the capital of Italy is Rome. ...
+[30 tokens, 3.44 s, 8.72 tok/s | experts 4919 hit / 1321 miss = 79%]
+```
+
+A budget under the floor fails at open with `WASTE_E_RAM_BUDGET` and a
+pointer to `waste plan`, rather than swapping the machine.
+
+### Tokenizer
+
+`src/tokenizer.c` implements the model's tiktoken BPE in C: base64 vocab,
+the pre-tokenization pattern (its Unicode classes coded directly rather
+than pulling in a regex engine), and rank-ordered byte-pair merging. The
+converter copies `tokenizer.model` into the container, so a container is
+self-contained. Checked against Python `tiktoken` on English, Italian,
+code, whitespace, digits and contractions: **12/12 identical**. The class
+tables cover Latin, Greek, Cyrillic, Hebrew/Arabic, Kana, Hangul and Han;
+scripts outside those ranges are not yet exact.
 
 ## 3. RAM budget: the floor, then the ceiling
 

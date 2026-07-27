@@ -1,0 +1,401 @@
+/*
+ * waste.c — the public API, implemented over model.c.
+ *
+ * Everything the CLI can do goes through here; the CLI links this and
+ * nothing private. Errors are returned, never printed, and nothing calls
+ * exit().
+ */
+
+#include "waste.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "json.h"
+#include "model.h"
+#include "tokenizer.h"
+#include "waste_backend.h"
+
+struct waste_ctx {
+    waste_model m;
+    waste_tok *tok;
+    waste_cfg cfg;
+    waste_memplan plan;
+    char path[512];
+    int pos;                 /* next position in the sequence */
+    waste_stats stats;
+};
+
+const char *waste_strerror(waste_status s)
+{
+    switch (s) {
+    case WASTE_OK:             return "ok";
+    case WASTE_E_IO:           return "I/O error";
+    case WASTE_E_FORMAT:       return "malformed container";
+    case WASTE_E_RAM_BUDGET:   return "RAM budget below the model's floor";
+    case WASTE_E_OOM:          return "out of memory";
+    case WASTE_E_ARG:          return "invalid argument";
+    case WASTE_E_UNSUPPORTED:  return "unsupported";
+    case WASTE_E_CANCELLED:    return "cancelled by callback";
+    }
+    return "unknown error";
+}
+
+void waste_cfg_init(waste_cfg *cfg)
+{
+    if (!cfg) return;
+    memset(cfg, 0, sizeof *cfg);
+    cfg->cache_policy = WASTE_CACHE_LFRU;
+    cfg->use_direct_io = 1;
+    cfg->ctx_tokens = 4096;
+}
+
+void waste_gen_params_init(waste_gen_params *p)
+{
+    if (!p) return;
+    memset(p, 0, sizeof *p);
+    p->temperature = 0.0f;      /* greedy */
+    p->top_p = 1.0f;
+    p->max_tokens = 256;
+}
+
+static double nowf(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+/* ---- memory planning ---------------------------------------------------- */
+
+static char *slurp_all(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *b = (char *)malloc((size_t)n + 1);
+    if (!b || fread(b, 1, (size_t)n, f) != (size_t)n) { free(b); fclose(f); return NULL; }
+    b[n] = 0;
+    fclose(f);
+    return b;
+}
+
+waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
+                               waste_memplan *out)
+{
+    if (!model_path || !out) return WASTE_E_ARG;
+    char p[512];
+    snprintf(p, sizeof p, "%s/manifest.json", model_path);
+    char *src = slurp_all(p);
+    if (!src) return WASTE_E_IO;
+    js_doc d;
+    if (js_parse(&d, src) < 0) { free(src); return WASTE_E_FORMAT; }
+
+    memset(out, 0, sizeof *out);
+
+    /* trunk: sum the tensor payloads as they are stored */
+    const int trunk = js_get(&d, 0, "trunk");
+    for (int i = 0; i < d.tok[trunk].size; i++) {
+        const int e = js_at(&d, trunk, i);
+        out->trunk_bytes += (uint64_t)js_int(&d, js_get(&d, e, "bytes"), 0);
+    }
+
+    const int cfg = js_get(&d, 0, "config");
+    const int layers = (int)js_int(&d, js_get(&d, cfg, "num_hidden_layers"), 0);
+    const int hidden = (int)js_int(&d, js_get(&d, cfg, "hidden_size"), 0);
+    const int nheads = (int)js_int(&d, js_get(&d, cfg, "num_attention_heads"), 0);
+    const int kv_lora = (int)js_int(&d, js_get(&d, cfg, "kv_lora_rank"), 0);
+    const int qk_rope = (int)js_int(&d, js_get(&d, cfg, "qk_rope_head_dim"), 0);
+    const int qk_nope = (int)js_int(&d, js_get(&d, cfg, "qk_nope_head_dim"), 0);
+    const int v_head = (int)js_int(&d, js_get(&d, cfg, "v_head_dim"), 0);
+    const int lac = js_get(&d, cfg, "linear_attn_config");
+    const int kh = (int)js_int(&d, js_get(&d, lac, "num_heads"), 0);
+    const int kd = (int)js_int(&d, js_get(&d, lac, "head_dim"), 0);
+    const int ck = (int)js_int(&d, js_get(&d, lac, "short_conv_kernel_size"), 4);
+    const int kl = js_get(&d, lac, "kda_layers");
+    const int n_kda = kl >= 0 ? d.tok[kl].size : 0;
+    const int n_mla = layers - n_kda;
+
+    out->state_bytes = (uint64_t)n_kda * kh * kd * kd * 4                /* S */
+                     + (uint64_t)n_kda * 3 * (ck - 1) * kh * kd * 4      /* conv */
+                     + (uint64_t)n_mla * ctx_tokens * nheads *
+                       ((uint64_t)(qk_nope + qk_rope) + v_head) * 4;     /* KV */
+    (void)kv_lora;
+    out->scratch_bytes = (uint64_t)64 * 1024 * 1024 + (uint64_t)hidden * 64 * 4;
+
+    /* one layer's top-k experts, double buffered */
+    const int top_k = (int)js_int(&d, js_get(&d, cfg, "num_experts_per_token"), 8);
+    const int lyr = js_get(&d, 0, "layers");
+    uint64_t rec = 0;
+    if (lyr >= 0 && d.tok[lyr].size > 0) {
+        const int first = lyr + 2;   /* first member's value */
+        const uint64_t bytes = (uint64_t)js_int(&d, js_get(&d, first, "bytes"), 0);
+        const uint64_t n = (uint64_t)js_int(&d, js_get(&d, first, "experts"), 1);
+        rec = n ? bytes / n : 0;
+    }
+    out->min_expert_cache = rec * (uint64_t)top_k * 2;
+    out->floor_bytes = out->trunk_bytes + out->state_bytes +
+                       out->scratch_bytes + out->min_expert_cache;
+    /* A cache below one token's working set keeps nothing alive to the
+     * next token (Gate 5), so "recommended" starts at 3x that. */
+    out->recommended_bytes = out->floor_bytes +
+                             rec * (uint64_t)top_k * (uint64_t)layers * 3;
+
+    js_free(&d);
+    free(src);
+    return WASTE_OK;
+}
+
+/* ---- lifecycle ---------------------------------------------------------- */
+
+waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
+                        waste_ctx **out)
+{
+    if (!model_path || !out) return WASTE_E_ARG;
+    *out = NULL;
+
+    waste_cfg cfg;
+    if (cfg_in) cfg = *cfg_in;
+    else waste_cfg_init(&cfg);
+    if (!cfg.ctx_tokens) cfg.ctx_tokens = 4096;
+
+    waste_ctx *c = (waste_ctx *)calloc(1, sizeof *c);
+    if (!c) return WASTE_E_OOM;
+    c->cfg = cfg;
+    snprintf(c->path, sizeof c->path, "%s", model_path);
+
+    waste_status st = waste_plan_memory(model_path, cfg.ctx_tokens, &c->plan);
+    if (st != WASTE_OK) { free(c); return st; }
+
+    uint64_t budget = cfg.ram_budget_bytes;
+    if (!budget) budget = c->plan.recommended_bytes;
+    if (budget < c->plan.floor_bytes) { free(c); return WASTE_E_RAM_BUDGET; }
+
+    const uint64_t cache_bytes = budget - c->plan.floor_bytes +
+                                 c->plan.min_expert_cache;
+    if (waste_model_load(&c->m, model_path, (int)cfg.ctx_tokens,
+                         (size_t)cache_bytes)) {
+        free(c);
+        return WASTE_E_IO;
+    }
+    c->tok = waste_tok_open(model_path);      /* optional */
+    *out = c;
+    return WASTE_OK;
+}
+
+void waste_close(waste_ctx *c)
+{
+    if (!c) return;
+    waste_model_free(&c->m);
+    waste_tok_free(c->tok);
+    free(c);
+}
+
+waste_status waste_memory_used(const waste_ctx *c, waste_memplan *out)
+{
+    if (!c || !out) return WASTE_E_ARG;
+    *out = c->plan;
+    out->min_expert_cache = (uint64_t)c->m.cache.n_slots * c->m.cache.rec_bytes;
+    return WASTE_OK;
+}
+
+/* ---- tokenizer ---------------------------------------------------------- */
+
+waste_status waste_tokenize(waste_ctx *c, const char *text, int add_bos,
+                            int32_t *out, size_t cap, size_t *n_out)
+{
+    if (!c || !text || !out || !n_out) return WASTE_E_ARG;
+    if (!c->tok) return WASTE_E_UNSUPPORTED;
+    size_t n = 0;
+    if (add_bos && cap > 0) out[n++] = (int32_t)waste_tok_bos(c->tok);
+    const int got = waste_tok_encode(c->tok, text, out + n, (int)(cap - n));
+    if (got < 0) return WASTE_E_ARG;
+    *n_out = n + (size_t)got;
+    return WASTE_OK;
+}
+
+waste_status waste_detokenize(waste_ctx *c, const int32_t *ids, size_t n,
+                              char *out, size_t cap, size_t *n_out)
+{
+    if (!c || !ids || !out || !n_out) return WASTE_E_ARG;
+    if (!c->tok) return WASTE_E_UNSUPPORTED;
+    const int got = waste_tok_decode(c->tok, ids, (int)n, out, (int)cap - 1);
+    out[got < 0 ? 0 : got] = 0;
+    *n_out = (size_t)(got < 0 ? 0 : got);
+    return WASTE_OK;
+}
+
+/* ---- generation --------------------------------------------------------- */
+
+waste_status waste_eval(waste_ctx *c, const int32_t *tokens, size_t n,
+                        const float **logits_out, size_t *vocab_out)
+{
+    if (!c || !tokens || !n) return WASTE_E_ARG;
+    const float *lg = NULL;
+    for (size_t i = 0; i < n; i++)
+        lg = waste_model_step(&c->m, tokens[i], c->pos++, NULL);
+    if (logits_out) *logits_out = lg;
+    if (vocab_out) *vocab_out = (size_t)c->m.cfg.vocab;
+    return WASTE_OK;
+}
+
+static int sample(const float *logits, int vocab, const waste_gen_params *p,
+                  uint64_t *rng)
+{
+    if (p->temperature <= 0.0f) {
+        int best = 0;
+        for (int i = 1; i < vocab; i++) if (logits[i] > logits[best]) best = i;
+        return best;
+    }
+    /* top-k / top-p over a temperature-scaled softmax */
+    int k = p->top_k > 0 && p->top_k < vocab ? p->top_k : vocab;
+    int *idx = (int *)malloc((size_t)vocab * sizeof(int));
+    float *pr = (float *)malloc((size_t)vocab * sizeof(float));
+    if (!idx || !pr) { free(idx); free(pr); return 0; }
+    for (int i = 0; i < vocab; i++) idx[i] = i;
+
+    /* partial selection of the top k */
+    for (int i = 0; i < k; i++) {
+        int best = i;
+        for (int j = i + 1; j < vocab; j++)
+            if (logits[idx[j]] > logits[idx[best]]) best = j;
+        const int t = idx[i]; idx[i] = idx[best]; idx[best] = t;
+    }
+    float mx = logits[idx[0]], sum = 0;
+    for (int i = 0; i < k; i++) {
+        pr[i] = expf((logits[idx[i]] - mx) / p->temperature);
+        sum += pr[i];
+    }
+    float cum = 0;
+    int last = k;
+    for (int i = 0; i < k; i++) {
+        cum += pr[i] / sum;
+        if (cum >= p->top_p) { last = i + 1; break; }
+    }
+    *rng = *rng * 6364136223846793005ULL + 1442695040888963407ULL;
+    const float r = (float)((*rng >> 11) * 0x1.0p-53) * cum;
+    float acc = 0;
+    int pick = idx[0];
+    for (int i = 0; i < last; i++) {
+        acc += pr[i] / sum;
+        if (r <= acc) { pick = idx[i]; break; }
+    }
+    free(idx); free(pr);
+    return pick;
+}
+
+waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
+                            const waste_gen_params *params,
+                            waste_token_cb cb, void *user)
+{
+    if (!c || !prompt || !n) return WASTE_E_ARG;
+    waste_gen_params p;
+    if (params) p = *params; else waste_gen_params_init(&p);
+    uint64_t rng = p.seed ? p.seed : 0x853c49e6748fea9bULL;
+
+    const uint64_t h0 = c->m.cache.hits, m0 = c->m.cache.misses;
+    const float *lg = NULL;
+    double t0 = nowf();
+    for (size_t i = 0; i < n; i++)
+        lg = waste_model_step(&c->m, prompt[i], c->pos++, NULL);
+    c->stats.sec_total += nowf() - t0;
+
+    char piece[64];
+    int cur = sample(lg, c->m.cfg.vocab, &p, &rng);
+    for (uint32_t t = 0; t < p.max_tokens; t++) {
+        const uint64_t hb = c->m.cache.hits, mb = c->m.cache.misses;
+        const uint64_t bb = c->m.cache.bytes_read;
+        t0 = nowf();
+        lg = waste_model_step(&c->m, cur, c->pos++, NULL);
+        const double dt = nowf() - t0;
+        c->stats.sec_total += dt;
+        c->stats.tokens_generated++;
+
+        int stop = 0;
+        for (size_t s = 0; s < p.n_stop; s++) if (p.stop_tokens[s] == cur) stop = 1;
+        if (c->tok && cur == waste_tok_eos(c->tok)) stop = 1;
+
+        if (cb) {
+            waste_token_info info;
+            memset(&info, 0, sizeof info);
+            info.token_index = t;
+            info.token = cur;
+            info.experts_hit = (uint32_t)(c->m.cache.hits - hb);
+            info.experts_missed = (uint32_t)(c->m.cache.misses - mb);
+            info.bytes_read = c->m.cache.bytes_read - bb;
+            info.ms_total = dt * 1000.0;
+            int pn = 0;
+            if (c->tok) pn = waste_tok_decode1(c->tok, cur, piece, (int)sizeof piece - 1);
+            piece[pn] = 0;
+            if (cb(&info, piece, user) != 0) return WASTE_E_CANCELLED;
+        }
+        if (stop) break;
+        cur = sample(lg, c->m.cfg.vocab, &p, &rng);
+    }
+    c->stats.experts_hit += c->m.cache.hits - h0;
+    c->stats.experts_missed += c->m.cache.misses - m0;
+    c->stats.bytes_read = c->m.cache.bytes_read;
+    return WASTE_OK;
+}
+
+/* ---- state & introspection ---------------------------------------------- */
+
+void waste_state_reset(waste_ctx *c)
+{
+    if (!c) return;
+    c->pos = 0;
+    const waste_config *cf = &c->m.cfg;
+    for (int L = 0; L < cf->n_layers; L++) {
+        if (c->m.S[L])
+            memset(c->m.S[L], 0, (size_t)cf->kda_heads * cf->kda_dim * cf->kda_dim * sizeof(float));
+        if (c->m.conv[L])
+            memset(c->m.conv[L], 0,
+                   (size_t)3 * cf->kda_heads * cf->kda_dim * (cf->conv_k - 1) * sizeof(float));
+        c->m.n_kv[L] = 0;
+    }
+}
+
+waste_status waste_state_save(waste_ctx *c, const char *path)
+{
+    (void)c; (void)path;
+    return WASTE_E_UNSUPPORTED;      /* 0.2.0 */
+}
+
+waste_status waste_state_load(waste_ctx *c, const char *path)
+{
+    (void)c; (void)path;
+    return WASTE_E_UNSUPPORTED;
+}
+
+waste_status waste_model_get_info(const waste_ctx *c, waste_model_info *out)
+{
+    if (!c || !out) return WASTE_E_ARG;
+    const waste_config *cf = &c->m.cfg;
+    memset(out, 0, sizeof *out);
+    out->n_layers = (uint32_t)cf->n_layers;
+    out->n_experts = (uint32_t)cf->n_experts;
+    out->top_k = (uint32_t)cf->top_k;
+    out->hidden = (uint32_t)cf->hidden;
+    out->ctx_max = c->cfg.ctx_tokens;
+    const uint64_t pe = 3ULL * cf->hidden * cf->moe_inter;
+    out->params_total = pe * (uint64_t)cf->n_experts * (uint64_t)(cf->n_layers - cf->first_dense);
+    out->params_active = pe * (uint64_t)cf->top_k * (uint64_t)(cf->n_layers - cf->first_dense);
+    out->arch = "kimi-linear";
+    out->quant_summary = "experts VQ3R, trunk Q8G/F32";
+    return WASTE_OK;
+}
+
+waste_status waste_get_stats(const waste_ctx *c, waste_stats *out)
+{
+    if (!c || !out) return WASTE_E_ARG;
+    *out = c->stats;
+    out->experts_hit = c->m.cache.hits;
+    out->experts_missed = c->m.cache.misses;
+    out->bytes_read = c->m.cache.bytes_read;
+    return WASTE_OK;
+}

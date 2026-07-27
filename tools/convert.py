@@ -282,6 +282,15 @@ def main():
 
     cb_f.close()
 
+    # ---- tokenizer: copy it in so the container is self-contained -------
+    import shutil
+    for name in ("tiktoken.model", "tokenizer.model"):
+        src_tok = os.path.join(args.src, name)
+        if os.path.exists(src_tok):
+            shutil.copyfile(src_tok, os.path.join(args.out, "tokenizer.model"))
+            print(f"tokenizer: copied {name}")
+            break
+
     # ---- trunk ----------------------------------------------------------
     trunk_path = os.path.join(args.out, "trunk.bin")
     tindex = []

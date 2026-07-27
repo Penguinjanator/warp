@@ -8,3 +8,6 @@ test_kda
 *.o
 test_container
 test_forward
+waste
+libwaste.a
+*.a
