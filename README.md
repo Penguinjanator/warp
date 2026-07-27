@@ -5,6 +5,19 @@ Run **Kimi K3** (2.8T params, 896 experts / 16 active) locally on a 64 GB machin
 WASTE is a highly optimized model file format plus a pure-C inference engine,
 built on the lessons of two prior engines:
 
+**Scope:**
+
+- an **embeddable** engine — [src/waste.h](src/waste.h) is the whole
+  contract: opaque context, no global state, errors returned not printed,
+  no dependencies beyond C11 + libc;
+- a **fully featured CLI** built *on* that API, with no private access —
+  if the CLI can do it, an embedding host can too;
+- a **configurable RAM ceiling**: `waste_cfg.ram_budget_bytes` bounds
+  every allocation, and the engine refuses to open below the model's
+  floor instead of swapping. See [docs/ENGINE.md](docs/ENGINE.md) — the
+  measured floor for a K3-shaped config is **~11.4 GB**, and RAM above
+  the floor buys cache hit rate, not headroom.
+
 - earlier work — three-tier expert streaming
   (VRAM → RAM → NVMe), LFRU learned expert cache, router-lookahead pilot,
   MLA compressed KV, MTP speculative decoding, token-exact oracle validation.
