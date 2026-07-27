@@ -1,5 +1,5 @@
 /*
- * backend.c — runtime CPU detection, kernel dispatch, plugin loading.
+ * backend.c — runtime CPU detection and kernel dispatch.
  * See waste_backend.h. Structure follows sqlite-vector's
  * init_distance_functions(): baseline first, best backend overwrites.
  */
@@ -12,18 +12,6 @@
 
 #if defined(_WIN32)
   #include <windows.h>
-  #define WASTE_DLOPEN(p)      ((void *)LoadLibraryA(p))
-  #define WASTE_DLSYM(h, s)    ((void *)GetProcAddress((HMODULE)(h), (s)))
-  #define WASTE_DLEXT          ".dll"
-#else
-  #include <dlfcn.h>
-  #define WASTE_DLOPEN(p)      dlopen((p), RTLD_NOW | RTLD_LOCAL)
-  #define WASTE_DLSYM(h, s)    dlsym((h), (s))
-  #if defined(__APPLE__)
-    #define WASTE_DLEXT        ".dylib"
-  #else
-    #define WASTE_DLEXT        ".so"
-  #endif
 #endif
 
 #if defined(__APPLE__)
@@ -47,10 +35,20 @@ waste_kernels waste_k;
 static const char *g_backend_name = "uninitialized";
 static int g_initialized = 0;
 
-/* implemented in kda.c / kda_neon.c / kda_avx2.c ... */
+/* Backend registration functions, linked in only when their translation
+ * unit is compiled. Each returns a name, or NULL to decline at runtime. */
 const char *waste_kda_register_cpu(waste_kernels *t);
 #if defined(__ARM_NEON) || defined(__aarch64__)
 const char *waste_kda_register_neon(waste_kernels *t);
+#endif
+#if defined(WASTE_ENABLE_METAL)
+const char *waste_register_metal(waste_kernels *t);
+#endif
+#if defined(WASTE_ENABLE_CUDA)
+const char *waste_register_cuda(waste_kernels *t);
+#endif
+#if defined(WASTE_ENABLE_BLAS)
+const char *waste_register_blas(waste_kernels *t);
 #endif
 
 /* ---- CPU feature detection --------------------------------------------- */
@@ -153,30 +151,6 @@ uint32_t waste_cpu_features(void)
     return f;
 }
 
-/* ---- plugin loading ---------------------------------------------------- */
-
-int waste_backend_load(const char *path_or_name)
-{
-    if (!path_or_name || !*path_or_name) return -1;
-
-    char buf[512];
-    void *h = WASTE_DLOPEN(path_or_name);
-    if (!h) {   /* try the conventional plugin name */
-        snprintf(buf, sizeof(buf), "libwaste_%s%s", path_or_name, WASTE_DLEXT);
-        h = WASTE_DLOPEN(buf);
-    }
-    if (!h) return -1;
-
-    waste_backend_register_fn reg =
-        (waste_backend_register_fn)WASTE_DLSYM(h, "waste_backend_register");
-    if (!reg) return -1;           /* leave the handle open: harmless, rare */
-
-    const char *name = reg(&waste_k);
-    if (!name) return -1;          /* backend declined (no device, too old) */
-    g_backend_name = name;
-    return 0;
-}
-
 /* ---- init -------------------------------------------------------------- */
 
 void waste_backend_init(unsigned flags)
@@ -200,10 +174,20 @@ void waste_backend_init(unsigned flags)
     /* AVX2 / AVX-512 / SVE / RVV modules register here as they land, in
      * best-first order, each overwriting only what it implements. */
 
-    /* 3. external accelerator plugins (never required, never fatal) */
-    if (flags & WASTE_BE_NO_EXTERNAL) return;
-    if (env && strcmp(env, "cpu") != 0 && strcmp(env, "neon") != 0)
-        waste_backend_load(env);
+    /* 3. accelerators: compiled in only when enabled at build time, and
+     * still free to decline if this machine has no usable device. */
+    if (flags & WASTE_BE_NO_DEVICE) return;
+    const char *n = NULL;
+#if defined(WASTE_ENABLE_CUDA)
+    if ((n = waste_register_cuda(&waste_k))) g_backend_name = n;
+#endif
+#if defined(WASTE_ENABLE_METAL)
+    if ((n = waste_register_metal(&waste_k))) g_backend_name = n;
+#endif
+#if defined(WASTE_ENABLE_BLAS)
+    if ((n = waste_register_blas(&waste_k))) g_backend_name = n;
+#endif
+    (void)n;
 }
 
 const char *waste_backend_name(void)

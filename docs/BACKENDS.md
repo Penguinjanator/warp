@@ -2,9 +2,16 @@
 
 Scope requirement (Marco, 2026-07-27): the engine runs on **macOS, Windows
 and Linux**; acceleration backends (BLAS, CUDA, Metal, NEON, AVX-512, …)
-are **loaded dynamically**, with a **universal CPU version always
-available**. The loading and dispatch discipline follows
+are selected without burdening a build that does not want them, over a
+**universal CPU version always available**. The dispatch discipline follows
 [sqlite-vector](file:///Users/marco/GitHub/sqlite-vector).
+
+**No dynamic loading.** An earlier draft resolved accelerators with
+`dlopen`/`LoadLibrary`; that was complexity without a matching problem, and
+sqlite-vector — the model here — uses none. Backends are chosen by
+**conditional compilation plus runtime feature detection**: one binary
+still adapts to the CPU it runs on, and a build without CUDA simply has no
+CUDA code in it.
 
 ## The sqlite-vector pattern, and what we take from it
 
@@ -35,32 +42,34 @@ function pointers** (`waste_kernels` in
 [src/waste_backend.h](../src/waste_backend.h)). Same idea, C-idiomatic for
 heterogeneous ops.
 
-## Two tiers
+## How a backend gets in
 
-**Tier 1 — in-process SIMD** (NEON, dotprod/i8mm, AVX2, AVX-512, SVE, RVV).
-Compiled into the library, one translation unit per ISA
-(`kda.c`, `kda_neon.c`, `kda_avx2.c`, …), each built with its own flags and
-guarded by `#if defined(__ARM_NEON)`-style fences so a build for another
-architecture simply compiles them away. Selected by
-`waste_cpu_features()`; no loading step, no failure mode.
+**SIMD** (NEON, dotprod/i8mm, AVX2, AVX-512, SVE, RVV): one translation
+unit per ISA (`kda.c`, `kda_neon.c`, `kda_avx2.c`, …), each guarded by
+`#if defined(__ARM_NEON)`-style fences so a build for another architecture
+compiles them away, and each built with its own flags. All the ones valid
+for the target architecture are compiled in, and `waste_cpu_features()`
+picks at runtime — that is what lets a single x86 binary use AVX-512 on a
+machine that has it and AVX2 on one that does not.
 
-**Tier 2 — external accelerators** (CUDA, Metal, ROCm, Vulkan, BLAS).
-These *must* be genuinely dynamic: a binary that links CUDA cannot start on
-a machine without it. Each ships as a separate shared object exporting one
-symbol:
+**Accelerators** (CUDA, Metal, BLAS, ROCm): build-time options.
 
-```c
-const char *waste_backend_register(waste_kernels *table);
+```
+make                     # CPU + SIMD only, zero extra dependencies
+make WASTE_ENABLE_METAL=1
+make WASTE_ENABLE_CUDA=1
 ```
 
-`waste_backend_load()` resolves it with `dlopen`/`LoadLibraryA`, calls it,
-and the plugin overwrites the slots it can accelerate — **or returns NULL
-to decline** (no compatible GPU, driver too old). Declining is normal, not
-an error: the engine keeps whatever it already had. A missing plugin file
-is equally non-fatal.
+A build without `WASTE_ENABLE_CUDA` contains no CUDA code and no link
+dependency — which is the whole reason dlopen looked tempting, solved more
+simply by not linking it. A build *with* it still calls
+`waste_register_cuda()` at init, which probes for a usable device and
+**returns NULL to decline** if there is none; the engine then keeps the
+backend it already had. Declining is normal, not an error.
 
-Plugin naming: `libwaste_<name>.{so,dylib,dll}`, so `WASTE_BACKEND=cuda`
-finds `libwaste_cuda.so` without the caller knowing platform conventions.
+Metal deserves a note: it is present on every Mac that can run this engine,
+so on macOS it is a plain `#ifdef __APPLE__` decision with no runtime
+uncertainty beyond device selection.
 
 ## Platform abstraction
 
@@ -69,7 +78,6 @@ wrappers rather than sprinkled through the engine:
 
 | concern | macOS | Linux | Windows |
 |---|---|---|---|
-| dynamic load | `dlopen`/`dlsym` | `dlopen`/`dlsym` | `LoadLibraryA`/`GetProcAddress` |
 | cache-bypass read | `fcntl(F_NOCACHE)` | `O_DIRECT` | `FILE_FLAG_NO_BUFFERING` |
 | positional read | `pread` | `pread` | `ReadFile` + `OVERLAPPED` |
 | mapping | `mmap` | `mmap` | `CreateFileMapping`/`MapViewOfFile` |
@@ -88,10 +96,8 @@ Implemented and verified today:
   state, as sqlite-vector does), aarch64 with per-OS dot-product/i8mm
   detection (macOS `sysctlbyname`, Linux `getauxval`, Windows
   `IsProcessorFeaturePresent`);
-- `waste_backend_init()` — CPU baseline, then NEON override, then optional
-  plugin via `WASTE_BACKEND`;
-- `waste_backend_load()` — dlopen/LoadLibrary wrapper with the
-  `libwaste_<name>` naming convention;
+- `waste_backend_init()` — CPU baseline, then the best SIMD backend for the
+  machine, then any accelerator compiled into this build;
 - first kernel family (KDA) wired through the table:
   [src/kda.c](../src/kda.c) is the universal baseline,
   [src/kda_neon.c](../src/kda_neon.c) the NEON specialization.
@@ -111,6 +117,6 @@ exercised — they need a CI runner before we claim Windows support.
 
 ## Not yet done
 
-AVX2/AVX-512 modules, the CUDA/Metal/BLAS plugins themselves, the platform
+AVX2/AVX-512 modules, the CUDA/Metal/BLAS backends themselves, the platform
 I/O wrapper (currently `pread`/`F_NOCACHE` only, in `tools/diskbench.c`),
 and a CI matrix across the three OSes.

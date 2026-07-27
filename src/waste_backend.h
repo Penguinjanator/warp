@@ -5,14 +5,17 @@
  * a baseline CPU implementation that is always compiled in, then lets the
  * best backend detected at runtime overwrite the entries it implements
  * (see src/distance-cpu.c:init_distance_functions there). WASTE uses the
- * same discipline, with two tiers:
+ * same discipline — and, like sqlite-vector, no dynamic loading at all:
+ * every backend is selected by conditional compilation and enabled at
+ * runtime by feature detection.
  *
- *   tier 1 — in-process SIMD (NEON, AVX2, AVX-512, SVE, RVV): compiled into
- *            the library, selected by runtime CPU detection. No load step.
- *   tier 2 — external accelerators (CUDA, Metal, BLAS, ROCm, Vulkan):
- *            separate shared objects opened with dlopen/LoadLibrary at
- *            runtime. Absent library, or absent hardware = no acceleration,
- *            never a link error and never a failed start.
+ *   - SIMD (NEON, AVX2, AVX-512, SVE, RVV) is compiled in when the target
+ *     architecture supports it and chosen by runtime CPU detection, so one
+ *     binary adapts to the machine it lands on.
+ *   - Accelerators (CUDA, Metal, BLAS) are build-time options
+ *     (-DWASTE_ENABLE_CUDA=1, ...). A build without them has no link
+ *     dependency on them; a build with them still probes at runtime and
+ *     declines when no usable device is present.
  *
  * Invariants:
  *   - the universal CPU path is ALWAYS available and always correct; every
@@ -83,27 +86,22 @@ extern waste_kernels waste_k;
 typedef enum {
     WASTE_BE_AUTO      = 0,
     WASTE_BE_FORCE_CPU = 1u << 0,  /* baseline only — the numeric reference */
-    WASTE_BE_NO_EXTERNAL = 1u << 1, /* skip dlopen of accelerator plugins   */
+    WASTE_BE_NO_DEVICE = 1u << 1,  /* skip GPU/accelerator backends         */
 } waste_backend_flags;
 
-/* Fills the table: CPU baseline first, then the best in-process SIMD
- * backend for this machine, then any external plugin that claims to be
- * faster. Idempotent. Honours the WASTE_BACKEND environment variable
- * ("cpu", "neon", "avx2", "avx512", "cuda", "metal", ...). */
+/* Fills the table: CPU baseline first, then the best backend compiled into
+ * this build and supported by this machine. Idempotent. Honours the
+ * WASTE_BACKEND environment variable ("cpu" to pin the baseline). */
 void waste_backend_init(unsigned flags);
 
-/* e.g. "CPU", "NEON+dotprod", "AVX-512", "CUDA (sm_90)". Never NULL. */
+/* e.g. "CPU", "NEON+dotprod", "AVX-512", "Metal". Never NULL. */
 const char *waste_backend_name(void);
 
-/* Load an accelerator plugin explicitly (a .so/.dylib/.dll exporting
- * waste_backend_register). Returns 0 on success. Safe to call with a name
- * that does not exist: the engine keeps running on what it already has. */
-int waste_backend_load(const char *path_or_name);
-
-/* Every backend module exports this symbol; it overwrites the slots it
- * implements and returns a human-readable name, or NULL to decline (e.g.
- * no compatible GPU present). */
-typedef const char *(*waste_backend_register_fn)(waste_kernels *table);
+/* Each backend module defines a registration function with this shape:
+ * it overwrites the slots it implements and returns a name, or NULL to
+ * decline (compiled in, but no usable device on this machine). They are
+ * called directly from waste_backend_init under #if guards — there is no
+ * plugin ABI and nothing is resolved by name at runtime. */
 
 #ifdef __cplusplus
 }
