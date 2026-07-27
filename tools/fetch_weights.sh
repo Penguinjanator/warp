@@ -108,20 +108,31 @@ PY
 
 echo
 echo "downloading $NSHARDS shards with $JOBS parallel streams (resumable)..."
-# shellcheck disable=SC2016
-xargs -P "$JOBS" -I{} sh -c '
-  f="{}"; dest="'"$DEST"'"; raw="'"$RAW"'"
-  # skip if already complete (size matches remote)
-  want=$(curl -sIL "$raw/$f" | awk -F": " "/^[Cc]ontent-[Ll]ength/ {print \$2}" | tr -d "\r" | tail -1)
-  have=$(stat -f%z "$dest/$f" 2>/dev/null || echo 0)
-  if [ -n "$want" ] && [ "$have" = "$want" ]; then echo "  ok   $f"; exit 0; fi
-  echo "  pull $f"
-  curl -sfL -C - --retry 5 --retry-delay 5 -o "$dest/$f" "$raw/$f" || {
-    echo "  FAIL $f" >&2; exit 1; }
-  echo "  done $f"
-' < "$DEST/.shards"
 
-rm -f "$DEST/.shards"
+# The per-shard worker lives in its own file: passing it inline to xargs -I
+# blows macOS's command-line assembly limit.
+WORKER="$DEST/.worker.sh"
+cat > "$WORKER" <<WORKEREOF
+#!/bin/sh
+f="\$1"
+dest="$DEST"
+raw="$RAW"
+want=\$(curl -sIL "\$raw/\$f" | awk -F': ' '/^[Cc]ontent-[Ll]ength/ {print \$2}' | tr -d '\r' | tail -1)
+have=\$(stat -f%z "\$dest/\$f" 2>/dev/null || echo 0)
+if [ -n "\$want" ] && [ "\$have" = "\$want" ]; then echo "  ok   \$f (\$((have/1024/1024)) MB)"; exit 0; fi
+echo "  pull \$f"
+if curl -sfL -C - --retry 5 --retry-delay 5 -o "\$dest/\$f" "\$raw/\$f"; then
+  echo "  done \$f"
+else
+  echo "  FAIL \$f" >&2
+  exit 1
+fi
+WORKEREOF
+chmod +x "$WORKER"
+
+xargs -P "$JOBS" -n1 "$WORKER" < "$DEST/.shards"
+
+rm -f "$DEST/.shards" "$WORKER"
 echo
 echo "download complete: $DEST"
 echo "Next: tools/routing_stats.py math --data $DEST   (freeze the format TBDs)"

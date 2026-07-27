@@ -70,9 +70,15 @@ Structural facts that shape the C kernel:
 ## Recurrence
 
 ```
-S_t = S_{t-1} · Diag(g_t) + β_t · k_t (v_t − S_{t-1}ᵀ k_t)ᵀ
-o_t = S_tᵀ q_t                    (q, k L2-normalized first)
+S'   = Diag(exp(g_t)) · S_{t-1}          # decay first, along the K axis
+S_t  = S' + β_t · k_t (v_t − S'ᵀ k_t)ᵀ   # delta uses the DECAYED state
+o_t  = S_tᵀ q_t                          # q L2-normalized, then × K^-0.5
 ```
+
+**Correction over the first draft:** the delta term is computed against the
+*decayed* state `S'`, not `S_{t-1}`, and `g` is log-space (the kernel
+exponentiates). Confirmed against `fla/ops/kda/naive.py`
+(`naive_recurrent_kda`), which is the reference shipped with Kimi-Linear.
 
 Per token per head: two GEMVs + one rank-1 update + a diagonal scale ≈
 `3·d_k·d_v` MACs. For 32 heads × 128×128: ~1.6 MFLOP/token/layer — the
@@ -122,15 +128,27 @@ reads used for MTP verification.
 `trunk.bin` at Q8G/Q4G — reuse earlier work's int8-activation IDOT kernels
 (NEON SDOT / AVX-VNNI). No new matmul work.
 
-## Validation (Gate 4) — runnable now, no K3 needed
+## Validation (Gate 4)
 
-1. Port the recurrence + short conv + gated output norm to standalone C.
-2. Diff against `fused_recurrent_kda` from the reference on random
-   weights, f32, tolerance ~1e-5. The delta rule subtracts near-equal
-   terms, so accumulation order matters.
-3. Then token-exact greedy comparison on **real Kimi-Linear-48B weights**
-   (public, 20 shards) — a full-scale rehearsal of the K3 oracle bar, at
-   1/60 the size.
+**Step 1 and 2: DONE (2026-07-27).** [src/kda.c](../src/kda.c) implements
+the decode step (NEON/AVX2/scalar), short conv and gated RMSNorm;
+[tools/kda_ref.py](../tools/kda_ref.py) diffs it against fla's own
+`naive_recurrent_kda`. Results, f32:
+
+| dims | output max\|diff\| | state max\|diff\| |
+|---|---|---|
+| T=24, H=4, K=V=32 | 3.7e-08 | 2.4e-07 |
+| T=64, H=32, K=V=128 (Kimi-Linear's real shape) | 4.1e-08 | 1.8e-07 |
+
+Note `fla/ops/__init__.py` imports Triton-backed kernels, which do not
+exist on macOS; `kda_ref.py` loads `naive.py` directly by path, so the
+official reference runs on Apple Silicon.
+
+**Step 3 (token-exact on real weights) needs a Linux+CUDA box**: the HF
+modeling code hard-requires `fla-core`, which requires Triton. Plan: one
+rented GPU session dumps per-layer KDA inputs/outputs *and* the batch-1
+routing trace (Gate 2) in the same run, then both are checked offline
+here. One rental, two gates.
 
 ## Remaining unknowns (Gate 1, from K3's own config)
 
