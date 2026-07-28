@@ -209,3 +209,38 @@ It exists because this project twice lost hours to checks that silently
 did not run — once to objects compiled against a stale header, once to a
 stale test binary. So it rebuilds first, and a missing prerequisite is
 reported as SKIP, never as a pass.
+
+
+## CLI surface (2026-07-28)
+
+Nine commands, and every public API function reachable from at least one
+of them:
+
+| command | uses |
+|---|---|
+| `run` | `waste_generate`, `waste_tokenize`, `waste_save_usage` |
+| `chat` | plus `waste_state_save/load/reset` |
+| `eval` | `waste_eval`, `waste_detokenize` |
+| `tokenize` / `detokenize` | `waste_tokenize`, `waste_detokenize` |
+| `bench` | `waste_get_stats` |
+| `plan` | `waste_plan_memory` |
+| `info` | `waste_model_get_info`, `waste_memory_used` |
+
+`eval` is the one worth knowing about: it runs the prompt and prints the
+next-token distribution without generating, which is how you get a logit
+or a log-probability out of the engine.
+
+The prompt is an argument, a file (`--file`), or stdin — either as `-` or
+simply piped, so `echo hi | waste run M` does the obvious thing. `--json`
+makes `eval`, `tokenize`, `plan`, `info` and `bench` machine-readable.
+`--stop STR` ends generation when the text appears, matched against a
+rolling tail so a stop string split across two tokens still fires.
+
+**The parser used to be wrong in a way that produced no error.** The
+prompt was `argv[3]` unconditionally and options were only looked for
+after it, so `waste run M --temp 0 "hi"` generated from the string
+"--temp", `waste run M -n 3` generated from "-n", and a second positional
+was dropped silently. Positionals are collected properly now, an
+unexpected one is an error, a value that looks like an option is a
+missing value, and the sampling parameters are range-checked instead of
+producing empty output when set to nonsense.

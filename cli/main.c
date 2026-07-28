@@ -17,7 +17,10 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
+#include <math.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "../src/waste.h"
 
@@ -45,12 +48,17 @@ static void human(uint64_t b, char *out, size_t cap)
 
 /* ---- shared option parsing --------------------------------------------- */
 
+#define MAX_POS 2
+
 typedef struct {
     uint64_t budget;
     uint32_t ctx, max_tokens;
     float temperature, top_p;
-    int top_k, threads, quiet, learn;
+    int top_k, threads, quiet, learn, json;
     uint64_t seed;
+    const char *file, *stop;
+    const char *pos[MAX_POS];      /* MODEL, then the command's argument */
+    int n_pos;
 } opts;
 
 static void opts_init(opts *o)
@@ -61,22 +69,110 @@ static void opts_init(opts *o)
     o->top_p = 1.0f;
 }
 
+/* Options and positionals in any order.
+ *
+ * The prompt used to be argv[3] unconditionally, with options only looked
+ * for after it. `waste run M --temp 0 "hi"` therefore generated from the
+ * string "--temp", `waste run M -n 3` generated from "-n", and a second
+ * positional was dropped without a word. Silently doing the wrong thing is
+ * worse than refusing, so positionals are collected here and anything
+ * unexpected is an error. */
 static int parse_opts(int argc, char **argv, int from, opts *o)
 {
     for (int i = from; i < argc; i++) {
-        if (!strcmp(argv[i], "--budget") && i + 1 < argc) o->budget = parse_size(argv[++i]);
-        else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) o->ctx = (uint32_t)atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-n") && i + 1 < argc) o->max_tokens = (uint32_t)atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--temp") && i + 1 < argc) o->temperature = (float)atof(argv[++i]);
-        else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) o->top_p = (float)atof(argv[++i]);
-        else if (!strcmp(argv[i], "--top-k") && i + 1 < argc) o->top_k = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--seed") && i + 1 < argc) o->seed = strtoull(argv[++i], NULL, 10);
-        else if (!strcmp(argv[i], "--threads") && i + 1 < argc) o->threads = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-q") || !strcmp(argv[i], "--quiet")) o->quiet = 1;
-        else if (!strcmp(argv[i], "--learn")) o->learn = 1;
-        else if (argv[i][0] == '-') { fprintf(stderr, "unknown option %s\n", argv[i]); return -1; }
+        const char *a = argv[i];
+        int need = 0;                              /* option takes a value */
+        if (!strcmp(a, "--budget") || !strcmp(a, "--ctx") || !strcmp(a, "-n") ||
+            !strcmp(a, "--temp") || !strcmp(a, "--top-p") || !strcmp(a, "--top-k") ||
+            !strcmp(a, "--seed") || !strcmp(a, "--threads") ||
+            !strcmp(a, "--file") || !strcmp(a, "--stop")) {
+            need = 1;
+            /* `--temp --budget 8G` used to make "--budget" the temperature
+             * and then complain about 8G. A value that looks like an option
+             * is a missing value. */
+            if (i + 1 >= argc || (argv[i + 1][0] == '-' && argv[i + 1][1] &&
+                                  !isdigit((unsigned char)argv[i + 1][1]) &&
+                                  argv[i + 1][1] != '.')) {
+                fprintf(stderr, "%s needs a value\n", a);
+                return -1;
+            }
+        }
+        const char *v = need ? argv[i + 1] : NULL;
+        if (!strcmp(a, "--budget")) o->budget = parse_size(v);
+        else if (!strcmp(a, "--ctx")) o->ctx = (uint32_t)atoi(v);
+        else if (!strcmp(a, "-n")) o->max_tokens = (uint32_t)atoi(v);
+        else if (!strcmp(a, "--temp")) o->temperature = (float)atof(v);
+        else if (!strcmp(a, "--top-p")) o->top_p = (float)atof(v);
+        else if (!strcmp(a, "--top-k")) o->top_k = atoi(v);
+        else if (!strcmp(a, "--seed")) o->seed = strtoull(v, NULL, 10);
+        else if (!strcmp(a, "--threads")) o->threads = atoi(v);
+        else if (!strcmp(a, "--file")) o->file = v;
+        else if (!strcmp(a, "--stop")) o->stop = v;
+        else if (!strcmp(a, "-q") || !strcmp(a, "--quiet")) o->quiet = 1;
+        else if (!strcmp(a, "--learn")) o->learn = 1;
+        else if (!strcmp(a, "--json")) o->json = 1;
+        else if (!strcmp(a, "-")) {                /* explicit stdin */
+            if (o->n_pos >= MAX_POS) { fprintf(stderr, "too many arguments\n"); return -1; }
+            o->pos[o->n_pos++] = "-";
+        } else if (a[0] == '-' && a[1]) {
+            fprintf(stderr, "unknown option %s\n", a);
+            return -1;
+        } else {
+            if (o->n_pos >= MAX_POS) {
+                fprintf(stderr, "unexpected argument \"%s\"\n", a);
+                return -1;
+            }
+            o->pos[o->n_pos++] = a;
+        }
+        i += need;
     }
+    /* A sampler set to nonsense produces empty output and no complaint. */
+    if (o->temperature < 0.0f) { fprintf(stderr, "--temp must be >= 0\n"); return -1; }
+    if (!(o->top_p > 0.0f) || o->top_p > 1.0f) { fprintf(stderr, "--top-p must be in (0, 1]\n"); return -1; }
+    if (o->top_k < 0) { fprintf(stderr, "--top-k must be >= 0\n"); return -1; }
+    if (o->ctx == 0) { fprintf(stderr, "--ctx must be > 0\n"); return -1; }
+    if (o->max_tokens == 0) { fprintf(stderr, "-n must be > 0\n"); return -1; }
+    if (o->threads < 0) { fprintf(stderr, "--threads must be >= 0\n"); return -1; }
     return 0;
+}
+
+/* The prompt: an argument, a file, or stdin — the last both when asked for
+ * with "-" and when nothing else was given and stdin is not a terminal, so
+ * `echo hi | waste run M` does what it obviously means. Caller frees. */
+static char *read_prompt(const opts *o)
+{
+    FILE *f = NULL;
+    const char *arg = o->n_pos > 1 ? o->pos[1] : NULL;
+    if (o->file) {
+        f = strcmp(o->file, "-") ? fopen(o->file, "rb") : stdin;
+        if (!f) { fprintf(stderr, "cannot read %s\n", o->file); return NULL; }
+    } else if (arg && strcmp(arg, "-")) {
+        char *d = (char *)malloc(strlen(arg) + 1);
+        if (d) memcpy(d, arg, strlen(arg) + 1);
+        return d;
+    } else if (arg || !isatty(fileno(stdin))) {
+        f = stdin;
+    } else {
+        return NULL;                               /* nothing to read */
+    }
+
+    size_t cap = 4096, n = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) { if (f != stdin) fclose(f); return NULL; }
+    for (;;) {
+        if (n + 1 >= cap) {
+            char *g = (char *)realloc(buf, cap *= 2);
+            if (!g) { free(buf); if (f != stdin) fclose(f); return NULL; }
+            buf = g;
+        }
+        const size_t got = fread(buf + n, 1, cap - n - 1, f);
+        n += got;
+        if (got == 0) break;
+    }
+    buf[n] = 0;
+    while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = 0;
+    if (f != stdin) fclose(f);
+    return buf;
 }
 
 static waste_status open_model(const char *path, const opts *o, waste_ctx **ctx)
@@ -99,8 +195,22 @@ static int fail(const char *what, waste_status s)
 
 /* ---- token callback ----------------------------------------------------- */
 
-typedef struct { int quiet; uint32_t n; uint64_t hit, miss; double ms; } sink;
+#define TAILCAP 256
 
+typedef struct {
+    int quiet;
+    uint32_t n;
+    uint64_t hit, miss;
+    double ms;
+    const char *stop;              /* --stop, or NULL                       */
+    char tail[TAILCAP];            /* recent output, for matching `stop`    */
+    size_t tail_n;
+} sink;
+
+/* A stop sequence can straddle two pieces, so match against a rolling tail
+ * rather than the piece just produced. Returning nonzero cancels the
+ * generation; waste_generate reports that as WASTE_E_CANCELLED, which the
+ * caller treats as a normal finish. */
 static int on_token(const waste_token_info *i, const char *piece, void *user)
 {
     sink *s = (sink *)user;
@@ -109,6 +219,24 @@ static int on_token(const waste_token_info *i, const char *piece, void *user)
     s->hit += i->experts_hit;
     s->miss += i->experts_missed;
     s->ms += i->ms_total;
+
+    if (s->stop && *s->stop) {
+        const size_t pl = strlen(piece);
+        if (pl >= TAILCAP) {
+            memcpy(s->tail, piece + pl - (TAILCAP - 1), TAILCAP - 1);
+            s->tail_n = TAILCAP - 1;
+        } else {
+            if (s->tail_n + pl > TAILCAP - 1) {
+                const size_t drop = s->tail_n + pl - (TAILCAP - 1);
+                memmove(s->tail, s->tail + drop, s->tail_n - drop);
+                s->tail_n -= drop;
+            }
+            memcpy(s->tail + s->tail_n, piece, pl);
+            s->tail_n += pl;
+        }
+        s->tail[s->tail_n] = 0;
+        if (strstr(s->tail, s->stop)) return 1;
+    }
     return 0;
 }
 
@@ -116,19 +244,38 @@ static int on_token(const waste_token_info *i, const char *piece, void *user)
 
 static int cmd_plan(int argc, char **argv)
 {
-    if (argc < 3) { fprintf(stderr, "usage: waste plan MODEL [--budget N] [--ctx N]\n"); return 2; }
     opts o; opts_init(&o);
-    if (parse_opts(argc, argv, 3, &o)) return 2;
+    if (parse_opts(argc, argv, 2, &o)) return 2;
+    if (o.n_pos < 1) { fprintf(stderr, "usage: waste plan MODEL [options]\n"); return 2; }
 
     waste_memplan p;
-    const waste_status st = waste_plan_memory(argv[2], o.ctx, &p);
+    const waste_status st = waste_plan_memory(o.pos[0], o.ctx, &p);
     if (st != WASTE_OK) return fail("plan", st);
+
+    if (o.json) {
+        printf("{\"ctx\":%u,\"trunk_bytes\":%llu,\"state_bytes\":%llu,"
+               "\"scratch_bytes\":%llu,\"min_expert_cache\":%llu,"
+               "\"floor_bytes\":%llu,\"recommended_bytes\":%llu",
+               o.ctx, (unsigned long long)p.trunk_bytes,
+               (unsigned long long)p.state_bytes,
+               (unsigned long long)p.scratch_bytes,
+               (unsigned long long)p.min_expert_cache,
+               (unsigned long long)p.floor_bytes,
+               (unsigned long long)p.recommended_bytes);
+        if (o.budget)
+            printf(",\"budget_bytes\":%llu,\"expert_cache_bytes\":%lld",
+                   (unsigned long long)o.budget,
+                   o.budget < p.floor_bytes ? -1LL
+                     : (long long)(o.budget - p.floor_bytes + p.min_expert_cache));
+        printf("}\n");
+        return o.budget && o.budget < p.floor_bytes ? 1 : 0;
+    }
 
     char b[5][32];
     human(p.trunk_bytes, b[0], 32); human(p.state_bytes, b[1], 32);
     human(p.scratch_bytes, b[2], 32); human(p.min_expert_cache, b[3], 32);
     human(p.floor_bytes, b[4], 32);
-    printf("memory plan for %s (ctx %u)\n\n", argv[2], o.ctx);
+    printf("memory plan for %s (ctx %u)\n\n", o.pos[0], o.ctx);
     printf("  resident trunk        %12s\n", b[0]);
     printf("  KDA state + KV cache  %12s\n", b[1]);
     printf("  scratch               %12s\n", b[2]);
@@ -154,17 +301,29 @@ static int cmd_plan(int argc, char **argv)
 
 static int cmd_info(int argc, char **argv)
 {
-    if (argc < 3) { fprintf(stderr, "usage: waste info MODEL\n"); return 2; }
     opts o; opts_init(&o);
-    if (parse_opts(argc, argv, 3, &o)) return 2;
+    if (parse_opts(argc, argv, 2, &o)) return 2;
+    if (o.n_pos < 1) { fprintf(stderr, "usage: waste info MODEL [options]\n"); return 2; }
     waste_ctx *c;
-    const waste_status st = open_model(argv[2], &o, &c);
+    const waste_status st = open_model(o.pos[0], &o, &c);
     if (st != WASTE_OK) return fail("open", st);
 
     waste_model_info mi;
     waste_model_get_info(c, &mi);
     waste_memplan used;
     waste_memory_used(c, &used);
+    if (o.json) {
+        printf("{\"engine\":\"%s\",\"arch\":\"%s\",\"layers\":%u,"
+               "\"experts\":%u,\"top_k\":%u,\"hidden\":%u,"
+               "\"params_total\":%llu,\"params_active\":%llu,"
+               "\"quantization\":\"%s\",\"expert_cache_bytes\":%llu}\n",
+               waste_version(), mi.arch, mi.n_layers, mi.n_experts, mi.top_k,
+               mi.hidden, (unsigned long long)mi.params_total,
+               (unsigned long long)mi.params_active, mi.quant_summary,
+               (unsigned long long)used.min_expert_cache);
+        waste_close(c);
+        return 0;
+    }
     char cb[32];
     human(used.min_expert_cache, cb, 32);
     printf("%s\n\n", waste_build_info());
@@ -195,7 +354,10 @@ static int run_prompt(waste_ctx *c, const opts *o, const char *prompt, int show_
     p.top_k = o->top_k;
     p.seed = o->seed;
 
-    sink s = { o->quiet, 0, 0, 0, 0.0 };
+    sink s;
+    memset(&s, 0, sizeof s);
+    s.quiet = o->quiet;
+    s.stop = o->stop;
     if (!o->quiet) fputs(prompt, stdout);
     st = waste_generate(c, ids, n, &p, on_token, &s);
     printf("\n");
@@ -214,25 +376,36 @@ static int run_prompt(waste_ctx *c, const opts *o, const char *prompt, int show_
 
 static int cmd_run(int argc, char **argv)
 {
-    if (argc < 4) { fprintf(stderr, "usage: waste run MODEL \"prompt\" [options]\n"); return 2; }
     opts o; opts_init(&o);
-    if (parse_opts(argc, argv, 4, &o)) return 2;
+    if (parse_opts(argc, argv, 2, &o)) return 2;
+    if (o.n_pos < 1) {
+        fprintf(stderr, "usage: waste run MODEL [\"prompt\" | - | --file F] [options]\n");
+        return 2;
+    }
+    char *prompt = read_prompt(&o);
+    if (!prompt || !*prompt) {
+        free(prompt);
+        fprintf(stderr, "no prompt: give one as an argument, with --file, "
+                        "or on stdin\n");
+        return 2;
+    }
     waste_ctx *c;
-    const waste_status st = open_model(argv[2], &o, &c);
-    if (st != WASTE_OK) return fail("open", st);
-    const int r = run_prompt(c, &o, argv[3], !o.quiet);
+    const waste_status st = open_model(o.pos[0], &o, &c);
+    if (st != WASTE_OK) { free(prompt); return fail("open", st); }
+    const int r = run_prompt(c, &o, prompt, !o.quiet);
     if (o.learn) waste_save_usage(c);
     waste_close(c);
+    free(prompt);
     return r;
 }
 
 static int cmd_chat(int argc, char **argv)
 {
-    if (argc < 3) { fprintf(stderr, "usage: waste chat MODEL [options]\n"); return 2; }
     opts o; opts_init(&o);
-    if (parse_opts(argc, argv, 3, &o)) return 2;
+    if (parse_opts(argc, argv, 2, &o)) return 2;
+    if (o.n_pos < 1) { fprintf(stderr, "usage: waste chat MODEL [options]\n"); return 2; }
     waste_ctx *c;
-    const waste_status st = open_model(argv[2], &o, &c);
+    const waste_status st = open_model(o.pos[0], &o, &c);
     if (st != WASTE_OK) return fail("open", st);
 
     printf("%s\n/reset clears state, /save FILE and /load FILE persist it, "
@@ -280,12 +453,12 @@ static int cmd_chat(int argc, char **argv)
 
 static int cmd_bench(int argc, char **argv)
 {
-    if (argc < 3) { fprintf(stderr, "usage: waste bench MODEL [-n N] [--budget N]\n"); return 2; }
     opts o; opts_init(&o);
     o.max_tokens = 64;
-    if (parse_opts(argc, argv, 3, &o)) return 2;
+    if (parse_opts(argc, argv, 2, &o)) return 2;
+    if (o.n_pos < 1) { fprintf(stderr, "usage: waste bench MODEL [-n N] [--budget N]\n"); return 2; }
     waste_ctx *c;
-    const waste_status st = open_model(argv[2], &o, &c);
+    const waste_status st = open_model(o.pos[0], &o, &c);
     if (st != WASTE_OK) return fail("open", st);
 
     waste_memplan used;
@@ -303,6 +476,18 @@ static int cmd_bench(int argc, char **argv)
     waste_get_stats(c, &s);
     const double tps = s.sec_total > 0 ? s.tokens_generated / s.sec_total : 0;
     const uint64_t acc = s.experts_hit + s.experts_missed;
+    if (o.json) {
+        printf("{\"tokens\":%llu,\"tok_per_s\":%.4f,\"experts_hit\":%llu,"
+               "\"experts_missed\":%llu,\"bytes_read\":%llu,"
+               "\"direct_io\":%s}\n",
+               (unsigned long long)s.tokens_generated, tps,
+               (unsigned long long)s.experts_hit,
+               (unsigned long long)s.experts_missed,
+               (unsigned long long)s.bytes_read,
+               s.direct_io ? "true" : "false");
+        waste_close(c);
+        return 0;
+    }
     printf("  %.2f tok/s (%.0f ms/token)\n", tps, 1000.0 / (tps > 0 ? tps : 1));
     if (!s.direct_io)
         printf("  note      page cache not bypassed on this filesystem — the hit\n"
@@ -318,18 +503,142 @@ static int cmd_bench(int argc, char **argv)
     return 0;
 }
 
+/* Tokenize and detokenize: the round trip the engine does on every prompt,
+ * exposed because debugging a container without it means guessing. */
+static int cmd_tokens(int argc, char **argv, int decode)
+{
+    opts o; opts_init(&o);
+    if (parse_opts(argc, argv, 2, &o)) return 2;
+    if (o.n_pos < 1) {
+        fprintf(stderr, "usage: waste %s MODEL [text|ids | - | --file F]\n",
+                decode ? "detokenize" : "tokenize");
+        return 2;
+    }
+    char *text = read_prompt(&o);
+    if (!text || !*text) { free(text); fprintf(stderr, "nothing to read\n"); return 2; }
+    waste_ctx *c;
+    const waste_status st = open_model(o.pos[0], &o, &c);
+    if (st != WASTE_OK) { free(text); return fail("open", st); }
+
+    int rc = 0;
+    if (decode) {
+        int32_t ids[MAXTOK];
+        size_t n = 0;
+        for (char *t = strtok(text, " ,\t\n"); t && n < MAXTOK; t = strtok(NULL, " ,\t\n"))
+            ids[n++] = (int32_t)atoi(t);
+        char out[8192];
+        size_t used = 0;
+        const waste_status d = waste_detokenize(c, ids, n, out, sizeof out, &used);
+        if (d != WASTE_OK) rc = fail("detokenize", d);
+        else printf("%.*s\n", (int)used, out);
+    } else {
+        int32_t ids[MAXTOK];
+        size_t n = 0;
+        const waste_status t = waste_tokenize(c, text, 0, ids, MAXTOK, &n);
+        if (t != WASTE_OK) rc = fail("tokenize", t);
+        else if (o.json) {
+            printf("{\"n\":%zu,\"ids\":[", n);
+            for (size_t i = 0; i < n; i++) printf("%s%d", i ? "," : "", ids[i]);
+            printf("]}\n");
+        } else {
+            for (size_t i = 0; i < n; i++) printf("%s%d", i ? " " : "", ids[i]);
+            printf("\n");
+        }
+    }
+    waste_close(c);
+    free(text);
+    return rc;
+}
+
+/* Next-token distribution without generating: what waste_eval is for, and
+ * the only way to get a logit out of the CLI. */
+static int cmd_eval(int argc, char **argv)
+{
+    opts o; opts_init(&o);
+    if (parse_opts(argc, argv, 2, &o)) return 2;
+    if (o.n_pos < 1) {
+        fprintf(stderr, "usage: waste eval MODEL [\"prompt\" | - | --file F] "
+                        "[--top-k N] [--json]\n");
+        return 2;
+    }
+    char *prompt = read_prompt(&o);
+    if (!prompt || !*prompt) { free(prompt); fprintf(stderr, "no prompt\n"); return 2; }
+    waste_ctx *c;
+    const waste_status st = open_model(o.pos[0], &o, &c);
+    if (st != WASTE_OK) { free(prompt); return fail("open", st); }
+
+    int32_t ids[MAXTOK];
+    size_t n = 0;
+    waste_status t = waste_tokenize(c, prompt, 0, ids, MAXTOK, &n);
+    if (t != WASTE_OK) { waste_close(c); free(prompt); return fail("tokenize", t); }
+
+    const float *lg = NULL;
+    size_t vocab = 0;
+    t = waste_eval(c, ids, n, &lg, &vocab);
+    if (t != WASTE_OK) { waste_close(c); free(prompt); return fail("eval", t); }
+
+    /* softmax over the whole vocabulary, then report the top few */
+    int k = o.top_k > 0 ? o.top_k : 10;
+    if ((size_t)k > vocab) k = (int)vocab;
+    float mx = lg[0];
+    for (size_t v = 1; v < vocab; v++) if (lg[v] > mx) mx = lg[v];
+    double sum = 0;
+    for (size_t v = 0; v < vocab; v++) sum += exp((double)(lg[v] - mx));
+
+    /* Its own array: borrowing the tail of `ids` would collide with the
+     * prompt as soon as the prompt got long. */
+    int32_t *picked = (int32_t *)malloc((size_t)k * sizeof *picked);
+    if (!picked) { waste_close(c); free(prompt); return fail("eval", WASTE_E_OOM); }
+
+    if (o.json) printf("{\"prompt_tokens\":%zu,\"vocab\":%zu,\"top\":[", n, vocab);
+    for (int i = 0; i < k; i++) {
+        size_t best = 0;
+        float bv = -3.4e38f;
+        for (size_t v = 0; v < vocab; v++) {
+            int seen = 0;
+            for (int j = 0; j < i; j++) if (picked[j] == (int32_t)v) seen = 1;
+            if (!seen && lg[v] > bv) { bv = lg[v]; best = v; }
+        }
+        picked[i] = (int32_t)best;
+        const double pr = exp((double)(bv - mx)) / sum;
+        char piece[64] = "";
+        size_t used = 0;
+        const int32_t one = (int32_t)best;
+        waste_detokenize(c, &one, 1, piece, sizeof piece, &used);
+        if (o.json)
+            printf("%s{\"id\":%zu,\"logit\":%.4f,\"prob\":%.6f}", i ? "," : "", best, bv, pr);
+        else
+            printf("  %6zu  %8.4f  %7.4f  %.*s\n", best, bv, pr, (int)used, piece);
+    }
+    if (o.json) printf("]}\n");
+
+    free(picked);
+    waste_close(c);
+    free(prompt);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2 || !strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
         printf("waste %s — run large MoE models from a streaming container\n\n"
-               "  waste run    MODEL \"prompt\"   generate\n"
-               "  waste chat   MODEL            interactive, state kept\n"
-               "  waste bench  MODEL            throughput and cache stats\n"
-               "  waste plan   MODEL            memory floor and budget\n"
-               "  waste info   MODEL            container details\n"
+               "  waste run        MODEL \"prompt\"   generate\n"
+               "  waste chat       MODEL            interactive, state kept\n"
+               "  waste eval       MODEL \"prompt\"   next-token distribution\n"
+               "  waste tokenize   MODEL \"text\"     text -> token ids\n"
+               "  waste detokenize MODEL \"1 2 3\"    token ids -> text\n"
+               "  waste bench      MODEL            throughput and cache stats\n"
+               "  waste plan       MODEL            memory floor and budget\n"
+               "  waste info       MODEL            container details\n"
                "  waste version\n\n"
+               "The prompt may be an argument, a file (--file F), or stdin —\n"
+               "given as - or simply piped in.\n\n"
                "options: --budget 8G  --ctx N  -n N  --temp F  --top-p F\n"
-               "         --top-k N  --seed N  --threads N  -q  --learn\n"
+               "         --top-k N  --seed N  --threads N  --stop STR\n"
+               "         --file F  --json  -q  --learn\n"
+         "  --stop  ends generation when the text appears\n"
+         "  --json  machine-readable output for eval, tokenize, plan,\n"
+         "          info and bench\n"
          "  --learn records which experts the run used, so the next open\n"
          "  starts with a warm cache instead of an empty one\n",
                waste_version());
@@ -344,6 +653,9 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "bench")) return cmd_bench(argc, argv);
     if (!strcmp(argv[1], "plan"))  return cmd_plan(argc, argv);
     if (!strcmp(argv[1], "info"))  return cmd_info(argc, argv);
+    if (!strcmp(argv[1], "eval"))  return cmd_eval(argc, argv);
+    if (!strcmp(argv[1], "tokenize"))   return cmd_tokens(argc, argv, 0);
+    if (!strcmp(argv[1], "detokenize")) return cmd_tokens(argc, argv, 1);
     fprintf(stderr, "unknown command '%s' (try --help)\n", argv[1]);
     return 2;
 }
