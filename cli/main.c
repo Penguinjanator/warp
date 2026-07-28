@@ -54,9 +54,10 @@ typedef struct {
     uint64_t budget;
     uint32_t ctx, max_tokens;
     float temperature, top_p;
-    int top_k, threads, quiet, learn, json;
+    int top_k, threads, quiet, learn, json, no_echo;
     uint64_t seed;
-    const char *file, *stop;
+    const char *file, *stop, *system;
+    int raw;
     const char *pos[MAX_POS];      /* MODEL, then the command's argument */
     int n_pos;
 } opts;
@@ -85,7 +86,8 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
         if (!strcmp(a, "--budget") || !strcmp(a, "--ctx") || !strcmp(a, "-n") ||
             !strcmp(a, "--temp") || !strcmp(a, "--top-p") || !strcmp(a, "--top-k") ||
             !strcmp(a, "--seed") || !strcmp(a, "--threads") ||
-            !strcmp(a, "--file") || !strcmp(a, "--stop")) {
+            !strcmp(a, "--file") || !strcmp(a, "--stop") ||
+            !strcmp(a, "--system")) {
             need = 1;
             /* `--temp --budget 8G` used to make "--budget" the temperature
              * and then complain about 8G. A value that looks like an option
@@ -108,9 +110,11 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
         else if (!strcmp(a, "--threads")) o->threads = atoi(v);
         else if (!strcmp(a, "--file")) o->file = v;
         else if (!strcmp(a, "--stop")) o->stop = v;
+        else if (!strcmp(a, "--system")) o->system = v;
         else if (!strcmp(a, "-q") || !strcmp(a, "--quiet")) o->quiet = 1;
         else if (!strcmp(a, "--learn")) o->learn = 1;
         else if (!strcmp(a, "--json")) o->json = 1;
+        else if (!strcmp(a, "--raw")) o->raw = 1;
         else if (!strcmp(a, "-")) {                /* explicit stdin */
             if (o->n_pos >= MAX_POS) { fprintf(stderr, "too many arguments\n"); return -1; }
             o->pos[o->n_pos++] = "-";
@@ -205,6 +209,8 @@ typedef struct {
     const char *stop;              /* --stop, or NULL                       */
     char tail[TAILCAP];            /* recent output, for matching `stop`    */
     size_t tail_n;
+    char pend[TAILCAP];            /* held back until the stop can't match  */
+    size_t pend_n;
 } sink;
 
 /* A stop sequence can straddle two pieces, so match against a rolling tail
@@ -214,7 +220,29 @@ typedef struct {
 static int on_token(const waste_token_info *i, const char *piece, void *user)
 {
     sink *s = (sink *)user;
-    if (!s->quiet) { fputs(piece, stdout); fflush(stdout); }
+    /* With a stop sequence, hold back the last strlen(stop)-1 characters:
+     * once the marker is printed it cannot be unprinted, and a chat reply
+     * ending in a visible <|im_end|> is not a reply. */
+    if (!s->quiet) {
+        if (!s->stop || !*s->stop) { fputs(piece, stdout); fflush(stdout); }
+        else {
+            /* the whole marker, not one short: at match time it has
+             * to be entirely still in the buffer to be cut off */
+            const size_t hold = strlen(s->stop);
+            const size_t have = s->pend_n + strlen(piece);
+            if (s->pend_n + strlen(piece) + 1 < sizeof s->pend) {
+                memcpy(s->pend + s->pend_n, piece, strlen(piece) + 1);
+                s->pend_n += strlen(piece);
+            }
+            if (have > hold) {
+                const size_t emit = s->pend_n - hold;
+                fwrite(s->pend, 1, emit, stdout);
+                fflush(stdout);
+                memmove(s->pend, s->pend + emit, s->pend_n - emit + 1);
+                s->pend_n -= emit;
+            }
+        }
+    }
     s->n++;
     s->hit += i->experts_hit;
     s->miss += i->experts_missed;
@@ -235,9 +263,102 @@ static int on_token(const waste_token_info *i, const char *piece, void *user)
             s->tail_n += pl;
         }
         s->tail[s->tail_n] = 0;
-        if (strstr(s->tail, s->stop)) return 1;
+        if (strstr(s->tail, s->stop)) {
+            /* flush whatever was held back, minus the marker itself */
+            if (!s->quiet) {
+                char *cut = strstr(s->pend, s->stop);
+                fwrite(s->pend, 1, cut ? (size_t)(cut - s->pend) : 0, stdout);
+                fflush(stdout);
+            }
+            s->pend_n = 0; s->pend[0] = 0;
+            return 1;
+        }
     }
     return 0;
+}
+
+/* ---- chat formatting -----------------------------------------------------
+ *
+ * An instruct model is trained on a conversation format, and feeding it a
+ * bare line is asking it to continue text rather than to answer. HF ships
+ * the format as a Jinja template; interpreting Jinja in C is a project of
+ * its own, and the templates that matter reduce to a prefix and a suffix
+ * per role, so that is what is read here. The converter copies the raw
+ * .jinja into the container for tools that do interpret it.
+ *
+ * chat.json in the container, all fields optional:
+ *   {"system":["<|im_start|>system\n","<|im_end|>\n"],
+ *    "user":  ["<|im_start|>user\n","<|im_end|>\n"],
+ *    "assistant":["<|im_start|>assistant\n","<|im_end|>\n"],
+ *    "open":  "<|im_start|>assistant\n"}
+ *
+ * Without one the CLI says so and continues raw, which is honest: a
+ * guessed format is worse than a visible absence. --raw forces it. */
+typedef struct {
+    char sys_p[128], sys_s[128];
+    char usr_p[128], usr_s[128];
+    char asst_p[128], asst_s[128];
+    char open[128];
+    int  have;
+} chatfmt;
+
+static void jstr_field(const char *js, const char *key, int idx,
+                       char *out, size_t cap)
+{
+    out[0] = 0;
+    const char *k = strstr(js, key);
+    if (!k) return;
+    const char *p = strchr(k + strlen(key), '[');
+    if (!p) return;
+    for (int i = 0; i <= idx; i++) {
+        p = strchr(p, '"');
+        if (!p) return;
+        if (i < idx) { p = strchr(p + 1, '"'); if (!p) return; p++; }
+    }
+    p++;
+    size_t n = 0;
+    while (*p && *p != '"' && n + 1 < cap) {
+        if (*p == '\\' && p[1]) {           /* \n and friends */
+            p++;
+            out[n++] = *p == 'n' ? '\n' : *p == 't' ? '\t' : *p;
+        } else out[n++] = *p;
+        p++;
+    }
+    out[n] = 0;
+}
+
+static int load_chatfmt(const char *model, chatfmt *f)
+{
+    memset(f, 0, sizeof *f);
+    char path[1024];
+    snprintf(path, sizeof path, "%s/chat.json", model);
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return 0;
+    char buf[8192];
+    const size_t n = fread(buf, 1, sizeof buf - 1, fp);
+    fclose(fp);
+    buf[n] = 0;
+    jstr_field(buf, "\"system\"", 0, f->sys_p, sizeof f->sys_p);
+    jstr_field(buf, "\"system\"", 1, f->sys_s, sizeof f->sys_s);
+    jstr_field(buf, "\"user\"", 0, f->usr_p, sizeof f->usr_p);
+    jstr_field(buf, "\"user\"", 1, f->usr_s, sizeof f->usr_s);
+    jstr_field(buf, "\"assistant\"", 0, f->asst_p, sizeof f->asst_p);
+    jstr_field(buf, "\"assistant\"", 1, f->asst_s, sizeof f->asst_s);
+    /* "open" is a bare string, not a pair; reuse the scanner on a fake array */
+    const char *o = strstr(buf, "\"open\"");
+    if (o) {
+        const char *q = strchr(o + 6, '"');
+        if (q) {
+            size_t i = 0;
+            for (q++; *q && *q != '"' && i + 1 < sizeof f->open; q++) {
+                if (*q == '\\' && q[1]) { q++; f->open[i++] = *q == 'n' ? '\n' : *q == 't' ? '\t' : *q; }
+                else f->open[i++] = *q;
+            }
+            f->open[i] = 0;
+        }
+    }
+    f->have = f->usr_p[0] || f->asst_p[0] || f->open[0];
+    return f->have;
 }
 
 /* ---- commands ----------------------------------------------------------- */
@@ -358,8 +479,11 @@ static int run_prompt(waste_ctx *c, const opts *o, const char *prompt, int show_
     memset(&s, 0, sizeof s);
     s.quiet = o->quiet;
     s.stop = o->stop;
-    if (!o->quiet) fputs(prompt, stdout);
+    /* chat already showed the user what they typed, and with a
+     * template the prompt is mostly role markers */
+    if (!o->quiet && !o->no_echo) fputs(prompt, stdout);
     st = waste_generate(c, ids, n, &p, on_token, &s);
+    if (!o->quiet && s.pend_n) fwrite(s.pend, 1, s.pend_n, stdout);
     printf("\n");
     if (st != WASTE_OK && st != WASTE_E_CANCELLED) return fail("generate", st);
 
@@ -408,8 +532,31 @@ static int cmd_chat(int argc, char **argv)
     const waste_status st = open_model(o.pos[0], &o, &c);
     if (st != WASTE_OK) return fail("open", st);
 
-    printf("%s\n/reset clears state, /save FILE and /load FILE persist it, "
-           "/stats prints counters, Ctrl-D exits\n", waste_build_info());
+    chatfmt fmt;
+    const int templated = !o.raw && load_chatfmt(o.pos[0], &fmt);
+    printf("%s\n", waste_build_info());
+    if (templated)
+        printf("chat format from %s/chat.json\n", o.pos[0]);
+    else if (o.raw)
+        printf("raw continuation (--raw)\n");
+    else
+        printf("no chat.json in the container: raw continuation, so an "
+               "instruct model is being asked to continue text rather than "
+               "to answer\n");
+    printf("/reset clears state, /save FILE and /load FILE persist it, "
+           "/stats prints counters, Ctrl-D exits\n");
+
+    /* The system turn goes in once, before anything else. */
+    if (templated && o.system && *o.system) {
+        char sysbuf[4096];
+        snprintf(sysbuf, sizeof sysbuf, "%s%s%s",
+                 fmt.sys_p, o.system, fmt.sys_s);
+        opts q = o;
+        q.quiet = 1;
+        q.max_tokens = 1;
+        run_prompt(c, &q, sysbuf, 0);
+        waste_state_reset(c);       /* keep the text, drop the sampled token */
+    }
     char line[8192];
     while (1) {
         fputs("\n> ", stdout);
@@ -445,7 +592,18 @@ static int cmd_chat(int argc, char **argv)
             continue;
         }
         printf("\n");
-        run_prompt(c, &o, line, 0);
+        if (templated) {
+            char turn[8192 + 512];
+            snprintf(turn, sizeof turn, "%s%s%s%s",
+                     fmt.usr_p, line, fmt.usr_s,
+                     fmt.open[0] ? fmt.open : fmt.asst_p);
+            opts t = o;
+            t.no_echo = 1;
+            if (!t.stop && fmt.asst_s[0]) t.stop = fmt.asst_s;
+            run_prompt(c, &t, turn, 0);
+        } else {
+            run_prompt(c, &o, line, 0);
+        }
     }
     waste_close(c);
     return 0;

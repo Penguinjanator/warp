@@ -218,6 +218,11 @@ typedef struct {
 
 waste_status waste_get_stats(const waste_ctx *ctx, waste_stats *out);
 
+/* Physical RAM of this machine, or 0 if it cannot be determined. A budget
+ * near this number is counterproductive: the OS pages out the engine's own
+ * expert cache, and a hit then costs a page fault. */
+uint64_t waste_physical_ram(void);
+
 #ifdef __cplusplus
 }
 #endif

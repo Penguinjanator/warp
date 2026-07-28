@@ -23,6 +23,7 @@ more than one layer of experts in memory.
 """
 
 import argparse
+import io
 import json
 import os
 import struct
@@ -475,6 +476,29 @@ def main():
             shutil.copyfile(src_tok, os.path.join(args.out, "tokenizer.model"))
             print(f"tokenizer: copied {name}")
             break
+
+    # ---- chat template ---------------------------------------------------
+    # HF keeps it either as a field in tokenizer_config.json or, more
+    # recently, as its own .jinja file. Copy whichever exists so `waste chat`
+    # can address an instruct model in the format it was trained on instead
+    # of as raw continuation. Not every release ships one — K3 describes its
+    # template in the technical report without distributing it — so a
+    # container without a template is normal and the CLI falls back.
+    tpl = None
+    for name in ("chat_template.jinja", "chat_template.json"):
+        p_tpl = os.path.join(args.src, name)
+        if os.path.exists(p_tpl):
+            tpl = io.open(p_tpl, encoding="utf-8").read()
+            break
+    if tpl is None:
+        p_cfg = os.path.join(args.src, "tokenizer_config.json")
+        if os.path.exists(p_cfg):
+            tpl = json.load(open(p_cfg)).get("chat_template")
+    if tpl:
+        with io.open(os.path.join(args.out, "chat_template.jinja"), "w",
+                     encoding="utf-8") as f:
+            f.write(tpl)
+        print(f"chat template: copied ({len(tpl)} bytes)")
 
     # ---- trunk ----------------------------------------------------------
     trunk_path = os.path.join(args.out, "trunk.bin")

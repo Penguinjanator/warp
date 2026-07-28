@@ -476,3 +476,36 @@ same lesson pointing at the tests.
 Note that RSS budget checks are skipped under a sanitizer
 (`WASTE_SANITIZED=1`): shadow memory makes peak RSS meaningless, and a
 check that cannot be true is worse than no check.
+
+## 16. Too much cache is worse than too little (2026-07-28)
+
+Gate 5 established a floor: below one token's working set the expert cache
+holds nothing between tokens and the hit rate is zero. Publishing the
+README's performance table found the other end of the curve.
+
+| budget | expert cache | hit rate | decode |
+|---|---|---|---|
+| 32 GB | 3.1 GB | 0% | 0.31 tok/s |
+| 46 GB | 17.1 GB | 12% | 0.32 tok/s |
+| 52 GB | 23 GB | 25% | 0.33 tok/s |
+| 58 GB | 29.1 GB | 37% | **0.04 tok/s** |
+
+The last row is not a typo and not a fluke — reproduced twice, 384 s and
+310 s for sixteen tokens, with the best hit rate of the run. Peak RSS was
+42.8 and 48.0 GiB against a resident trunk of 27.5 plus 29.1 of cache:
+the OS had already paged part of it out. The engine stayed inside its
+budget; the machine did not, so a cache "hit" became a page fault instead
+of the `pread` the engine was managing, and every layer paid for it.
+
+What makes it sharp is how little it took. The commit that moved
+`embed_tokens` off the resident set freed 1.11 GB, which at a fixed 58 GB
+budget went straight into the cache — 27.99 GB to 29.1 — and turned
+0.32 tok/s into 0.04. An optimization that frees memory made things
+eight times slower, because the freed memory went somewhere the OS could
+take it back.
+
+`waste_open` now warns when a budget leaves the machine under 12% of its
+RAM, and `waste_physical_ram()` is public so an embedding host can size
+its own ceiling. The warning is the cheap part. The lesson is that the
+whole cache argument assumes the engine controls its own memory, and that
+assumption has an upper bound nobody had measured.

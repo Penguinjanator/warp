@@ -15,6 +15,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 #include <time.h>
 
 #include "json.h"
@@ -87,6 +91,22 @@ static char *slurp_all(const char *path)
     b[n] = 0;
     fclose(f);
     return b;
+}
+
+/* Physical RAM, or 0 when it cannot be determined. */
+uint64_t waste_physical_ram(void)
+{
+#if defined(__APPLE__)
+    uint64_t v = 0;
+    size_t n = sizeof v;
+    if (sysctlbyname("hw.memsize", &v, &n, NULL, 0) == 0) return v;
+    return 0;
+#elif defined(__linux__)
+    const long p = sysconf(_SC_PHYS_PAGES), z = sysconf(_SC_PAGESIZE);
+    return (p > 0 && z > 0) ? (uint64_t)p * (uint64_t)z : 0;
+#else
+    return 0;
+#endif
 }
 
 waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
@@ -216,6 +236,21 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
 
     waste_status st = waste_plan_memory(model_path, cfg.ctx_tokens, &c->plan);
     if (st != WASTE_OK) { free(c); return st; }
+
+    /* A budget close to physical RAM backfires: the OS starts paging out
+     * the engine's own expert cache, and a "hit" then costs a page fault
+     * instead of the disk read the engine was managing. Measured on K3:
+     * 29.1 GB of cache on a 64 GB machine ran at 0.04 tok/s against 0.32
+     * with 28.0 GB — a better hit rate and eight times slower. */
+    {
+        const uint64_t phys = waste_physical_ram();
+        if (phys && cfg.ram_budget_bytes > phys - phys / 8)
+            fprintf(stderr,
+                    "waste: budget %.1f GB leaves under 12%% of this machine's "
+                    "%.1f GB free\n       the OS will page out the expert cache "
+                    "and throughput collapses\n",
+                    cfg.ram_budget_bytes / 1073741824.0, phys / 1073741824.0);
+    }
 
     uint64_t budget = cfg.ram_budget_bytes;
     if (!budget) budget = c->plan.recommended_bytes;
