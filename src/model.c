@@ -365,13 +365,32 @@ static void softmax(float *x, int n)
 
 /* ---- loading ----------------------------------------------------------- */
 
+/* pread until the whole range lands; short reads are legal. */
+static int pread_all(int fd, void *dst, size_t n, long off)
+{
+    uint8_t *p = (uint8_t *)dst;
+    while (n) {
+        const ssize_t r = pread(fd, p, n, (off_t)off);
+        if (r <= 0) return -1;
+        p += r; n -= (size_t)r; off += r;
+    }
+    return 0;
+}
+
+/* Reads the trunk one tensor at a time.
+ *
+ * This used to slurp trunk.bin whole and then copy each tensor out of the
+ * buffer, so peak RSS during load was twice the trunk — 57 GB on K3, over
+ * the configured budget before the first token was produced, and enough to
+ * push a 64 GB machine into memory compression. Nothing needed the whole
+ * file resident at once: every tensor knows its own offset. */
 static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trunk)
 {
     char path[MAXP];
     snprintf(path, sizeof path, "%s/trunk.bin", dir);
-    size_t blen;
-    char *blob = slurp(path, &blen);
-    if (!blob) return -1;
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+#define TRUNK_FAIL do { close(fd); return -1; } while (0)
 
     m->n_tensors = d->tok[trunk].size;
     m->t = (waste_tensor *)calloc((size_t)m->n_tensors, sizeof *m->t);
@@ -393,16 +412,22 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
         }
         if (fmt == 0) {                                   /* F32 */
             t->data = (float *)malloc(t->n * sizeof(float));
-            if (!t->data) { free(blob); return -1; }
-            memcpy(t->data, blob + off, t->n * sizeof(float));
+            if (!t->data) TRUNK_FAIL;
+            if (pread_all(fd, t->data, t->n * sizeof(float), off)) TRUNK_FAIL;
         } else if (!q8_off) {                             /* Q8G -> f32 */
             const int N = t->shape[t->ndim - 1];
             const long rows = (long)(t->n / (size_t)N);
             const int ng = (N + g - 1) / g;
             t->data = (float *)malloc(t->n * sizeof(float));
-            if (!t->data) { free(blob); return -1; }
-            const int8_t *q = (const int8_t *)(blob + off);
-            const uint16_t *sc = (const uint16_t *)(blob + soff);
+            int8_t *qbuf = (int8_t *)malloc((size_t)rows * ng * g);
+            uint16_t *sbuf = (uint16_t *)malloc((size_t)rows * ng * sizeof(uint16_t));
+            if (!t->data || !qbuf || !sbuf ||
+                pread_all(fd, qbuf, (size_t)rows * ng * g, off) ||
+                pread_all(fd, sbuf, (size_t)rows * ng * sizeof(uint16_t), soff)) {
+                free(qbuf); free(sbuf); TRUNK_FAIL;
+            }
+            const int8_t *q = qbuf;
+            const uint16_t *sc = sbuf;
             for (long r = 0; r < rows; r++) {
                 for (int b = 0; b < ng; b++) {
                     /* fp16 -> float without <arm_fp16.h> assumptions */
@@ -420,6 +445,7 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
                     }
                 }
             }
+            free(qbuf); free(sbuf);
         } else {                             /* Q8G or Q4G, kept quantized */
             const int N = t->shape[t->ndim - 1];
             const long rows = (long)(t->n / (size_t)N);
@@ -433,12 +459,14 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
             const size_t payload = (size_t)rows * t->rowbytes;
             t->q = (int8_t *)malloc(payload);
             t->qs = (uint16_t *)malloc((size_t)rows * ng * sizeof(uint16_t));
-            if (!t->q || !t->qs) { free(blob); return -1; }
-            memcpy(t->q, blob + off, payload);
-            memcpy(t->qs, blob + soff, (size_t)rows * ng * sizeof(uint16_t));
+            if (!t->q || !t->qs) TRUNK_FAIL;
+            if (pread_all(fd, t->q, payload, off) ||
+                pread_all(fd, t->qs, (size_t)rows * ng * sizeof(uint16_t), soff))
+                TRUNK_FAIL;
         }
     }
-    free(blob);
+    close(fd);
+#undef TRUNK_FAIL
     return 0;
 }
 
@@ -1344,9 +1372,7 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
  * each distinct expert is read from disk exactly once.
  */
 
-#define CHUNK_MAX 64
-
-int waste_model_chunk_max(const waste_model *m) { (void)m; return CHUNK_MAX; }
+int waste_model_chunk_max(const waste_model *m) { (void)m; return WASTE_CHUNK_MAX; }
 
 /* Y[T][out] = X[T][in] . W^T, parallel over output rows. */
 typedef struct {
@@ -1663,7 +1689,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     const int hid = c->hidden;
     if (n <= 0) return m->logits;
     if (n == 1) return waste_model_step(m, tokens[0], pos0, NULL);
-    if (n > CHUNK_MAX) n = CHUNK_MAX;
+    if (n > WASTE_CHUNK_MAX) n = WASTE_CHUNK_MAX;
     if (prefill_alloc(m, n)) return NULL;
 
     const waste_tensor *emb = waste_find(m, tname("%smodel.embed_tokens.weight", c->prefix));

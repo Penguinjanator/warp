@@ -129,8 +129,41 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
                      + (uint64_t)n_kda * 3 * (ck - 1) * kh * kd * 4      /* conv */
                      + (uint64_t)n_mla * ctx_tokens *
                        ((uint64_t)kv_lora + qk_rope) * 4;                /* KV */
-    (void)nheads; (void)qk_nope; (void)v_head;
-    out->scratch_bytes = (uint64_t)64 * 1024 * 1024 + (uint64_t)hidden * 64 * 4;
+    (void)qk_nope; (void)v_head;
+
+    /* Scratch, counted rather than guessed. The old flat 64 MB was out by
+     * 4x on the decode buffers alone (e_gate/e_up/e_down are 252 MB on K3)
+     * and ignored the chunked-prefill buffers entirely, which is why peak
+     * RSS ran over the budget near the floor. */
+    const int moe_inter = (int)js_int(&d, js_get(&d, cfg, "moe_intermediate_size"), 0);
+    const int dense_inter = (int)js_int(&d, js_get(&d, cfg, "intermediate_size"), moe_inter);
+    const int vocab = (int)js_int(&d, js_get(&d, cfg, "vocab_size"), 0);
+    const int lat = (int)js_int(&d, js_get(&d, cfg, "routed_expert_hidden_size"), hidden);
+    const int n_shared = (int)js_int(&d, js_get(&d, cfg, "num_shared_experts"), 1);
+    const int ares = (int)js_int(&d, js_get(&d, cfg, "attn_res_block_size"), 0);
+    const int nb = ares ? layers / ares + 2 : 1;
+    const int big = hidden > kh * kd ? hidden : kh * kd;
+    const int wide = hidden > lat ? hidden : lat;
+    const int T = WASTE_CHUNK_MAX;
+
+    uint64_t sc = 0;
+    sc += (uint64_t)3 * moe_inter * hidden * 4;             /* expert staging  */
+    sc += (uint64_t)2 * (dense_inter > moe_inter ? dense_inter : moe_inter) * 4;
+    sc += ((uint64_t)ctx_tokens * nheads + 1024) * 4;       /* attention rows  */
+    sc += (uint64_t)vocab * 4;                              /* logits          */
+    sc += ((uint64_t)8 * big + 8 * moe_inter + 8 * dense_inter + 512) * 4;
+    sc += (uint64_t)3 * nheads * (kv_lora ? kv_lora : 1) * 4;   /* MLA absorb  */
+    sc += (uint64_t)(nb + 4) * hidden * 4;                  /* AttnRes buffers */
+    /* chunked prefill, allocated on first use and never freed */
+    sc += (uint64_t)T * hidden * 4 * 3;                     /* cx/cnorm/cresid */
+    sc += ((uint64_t)(2 * T + 1) * (wide / 8) * 3 * 256 + 64) * 4;   /* LUTs   */
+    sc += ((uint64_t)T * (2 * moe_inter * n_shared + hidden) + 64) * 4;
+    sc += (uint64_t)T * (2 * lat + 2 * hidden) * 4;
+    sc += (uint64_t)2 * T * dense_inter * 4;
+    sc += (uint64_t)3 * moe_inter * lat * 4;                /* one expert      */
+    sc += (uint64_t)T * nb * hidden * 4 + (uint64_t)T * hidden * 4;
+    sc += (uint64_t)T * 64 * 8;
+    out->scratch_bytes = sc;
 
     /* one layer's top-k experts, double buffered */
     const int top_k = (int)js_int(&d, js_get(&d, cfg, "num_experts_per_token"), 8);

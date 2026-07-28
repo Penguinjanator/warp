@@ -7,9 +7,15 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 MODEL="${1:-/Users/marco/models/kimi-linear.waste}"
 BUDGET_GB="${2:-6}"
+# A short prompt never allocates the chunked-prefill scratch, which is the
+# largest single thing the plan has to size. Pass "long" to force a chunk.
+case "${3:-}" in
+    long) PROMPT=$(python3 -c "print(' '.join(['token'] * 90))");;
+    *)    PROMPT="hello";;
+esac
 
 # /usr/bin/time -l reports peak RSS in bytes on macOS, KB on Linux
-OUT=$(/usr/bin/time -l ./waste run "$MODEL" "hello" -n 4 --budget "${BUDGET_GB}G" -q 2>&1)
+OUT=$(/usr/bin/time -l ./waste run "$MODEL" "$PROMPT" -n 2 --budget "${BUDGET_GB}G" -q 2>&1)
 RSS=$(echo "$OUT" | grep -E "maximum resident set size" | tr -s ' ' | cut -d' ' -f2)
 [ -z "$RSS" ] && { echo "could not read peak RSS"; exit 1; }
 case "$(uname)" in Linux) RSS=$((RSS * 1024));; esac

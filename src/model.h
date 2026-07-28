@@ -109,6 +109,10 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed);
  * instead of once per token. */
 const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
                                  int pos0);
+/* Prefill chunk size. Declared here because waste_plan_memory has to size
+ * the chunk scratch into the RAM budget, and that must be the same number
+ * the engine actually allocates. */
+#define WASTE_CHUNK_MAX 64
 int waste_model_chunk_max(const waste_model *m);
 
 /* Session state: KDA recurrent state + short-conv rings + MLA KV + the

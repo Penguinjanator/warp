@@ -206,6 +206,20 @@ else
     sk "budget checks" "no container at $MODEL"
 fi
 
+# The small model cannot catch budget accounting that is wrong in
+# proportion to the model: K3 overran by 2-3 GB on scratch that Kimi-Linear
+# sizes in single megabytes. Run the same check against K3 when it is here.
+BIG="${BIG_MODEL:-/Users/marco/models/k3.waste}"
+if [ -f "$BIG/manifest.json" ]; then
+    if tests/check_budget.sh "$BIG" 32 long 2>/dev/null | grep -q "^BUDGET OK"; then
+        ok "peak RSS stays inside the budget on K3 too"
+    else
+        no "peak RSS exceeded the budget on K3"
+    fi
+else
+    sk "K3 budget check" "no container at $BIG"
+fi
+
 # ------------------------------------------------------------ tokenizer ----
 head_ "tokenizer"
 
