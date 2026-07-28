@@ -32,10 +32,17 @@ int main(int argc, char **argv)
     waste_ctx *c;
     if (waste_open(argv[1], &cfg, &c) != WASTE_OK) { fprintf(stderr, "open\n"); return 1; }
 
+    /* A container built by tools/make_test_container.py carries no
+     * tokenizer — the round-trip this checks does not need one, so fall
+     * back to fixed ids small enough to be valid in any vocabulary. */
     int32_t prompt[64];
     size_t n = 0;
     if (waste_tokenize(c, "The capital of France is Paris, and the capital of Italy is",
-                       0, prompt, 64, &n) != WASTE_OK) { fprintf(stderr, "tok\n"); return 1; }
+                       0, prompt, 64, &n) != WASTE_OK) {
+        static const int32_t fixed[] = {3, 7, 11, 5, 9, 13, 2, 17, 4, 8};
+        n = sizeof fixed / sizeof *fixed;
+        memcpy(prompt, fixed, sizeof fixed);
+    }
 
     waste_gen_params p;
     waste_gen_params_init(&p);

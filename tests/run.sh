@@ -25,6 +25,19 @@ SRC="${WASTE_REF_SRC:-/Volumes/WasteDisk/kimi-linear}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# Without a reference container, build a synthetic one: a few megabytes of
+# deterministic noise in the real format. It cannot check the engine against
+# the oracle — those logits belong to actual Kimi-Linear weights — but every
+# check that compares the engine against itself works on it, which is what
+# lets CI and a fresh clone run the engine at all instead of skipping it.
+SYNTHETIC=0
+if [ ! -d "$MODEL" ]; then
+    if python3 tools/make_test_container.py "$TMP/tiny.waste" >/dev/null 2>&1; then
+        MODEL="$TMP/tiny.waste"
+        SYNTHETIC=1
+    fi
+fi
+
 pass=0; fail=0; skip=0
 ok()   { printf "  \033[32mPASS\033[0m  %s\n" "$1"; pass=$((pass+1)); }
 no()   { printf "  \033[31mFAIL\033[0m  %s\n" "$1"; fail=$((fail+1)); }
@@ -73,7 +86,9 @@ if [ -d "$MODEL" ]; then
         no "expert record layout"
     fi
 
-    if [ -d "$SRC" ] && command -v uv >/dev/null 2>&1; then
+    if [ "$SYNTHETIC" = 1 ]; then
+        sk "container round-trip" "synthetic container has no source weights"
+    elif [ -d "$SRC" ] && command -v uv >/dev/null 2>&1; then
         if uv run --quiet --with torch --no-project python tools/verify_container.py \
                --container "$MODEL" --src "$SRC" --experts 1 2>/dev/null \
                | grep -q "^PASS"; then
@@ -92,7 +107,14 @@ fi
 head_ "engine"
 
 if [ -d "$MODEL" ]; then
-    IDS=1008,10484,318,15383,387,11,316,276,10484,318,19509,387,31082,13,646,10484
+    # The oracle fixture pins these to Kimi-Linear's vocabulary; a synthetic
+    # container has 256 entries, and an id past the table is an out-of-range
+    # read rather than a different answer.
+    if [ "$SYNTHETIC" = 1 ]; then
+        IDS=3,7,11,5,9,13,2,17,4,8,19,23,6,29,12,31
+    else
+        IDS=1008,10484,318,15383,387,11,316,276,10484,318,19509,387,31082,13,646,10484
+    fi
 
     ./test_forward "$MODEL" "$IDS" "$TMP/seq.bin" 0 >/dev/null 2>&1
     WASTE_CHUNK=1 ./test_forward "$MODEL" "$IDS" "$TMP/chunk.bin" 0 >/dev/null 2>&1
@@ -148,7 +170,9 @@ PY
     fi
 
     ORACLE="${WASTE_ORACLE:-tests/fixtures/oracle_kimilinear_16tok.bin}"
-    if [ -f "$ORACLE" ]; then
+    if [ "$SYNTHETIC" = 1 ]; then
+        sk "engine vs the PyTorch oracle" "synthetic container has no reference logits"
+    elif [ -f "$ORACLE" ]; then
         if python3 - "$TMP/seq.bin" "$ORACLE" <<'PY'
 import struct, sys
 def L(p):
@@ -171,6 +195,9 @@ PY
     fi
 
     # learned hotlist: a second run should start warmer than the first
+    if [ "$SYNTHETIC" = 1 ]; then
+        sk "learned hotlist" "synthetic container carries no tokenizer"
+    else
     rm -f "$MODEL/usage.waste"
     cold=$(./waste run "$MODEL" "The capital of France is" -n 12 --budget 5G --learn 2>&1 \
            | grep -oE "[0-9]+ miss" | grep -oE "[0-9]+" || echo 0)
@@ -181,6 +208,7 @@ PY
         ok "learned hotlist warms the cache ($cold -> $warm misses)"
     else
         no "hotlist did not reduce misses ($cold -> $warm)"
+    fi
     fi
 else
     sk "engine checks" "no container at $MODEL"
@@ -224,7 +252,9 @@ PYFV
         no "format_version not enforced (rc=$rc rc2=$rc2)"
     fi
 
-    if tests/check_budget.sh "$MODEL" 2>/dev/null | grep -q "^BUDGET OK"; then
+    if [ "$SYNTHETIC" = 1 ]; then
+        sk "peak RSS inside the budget" "needs a tokenizer to drive the CLI"
+    elif tests/check_budget.sh "$MODEL" 2>/dev/null | grep -q "^BUDGET OK"; then
         ok "peak RSS stays inside the configured budget"
     else
         no "peak RSS exceeded the budget"
@@ -250,7 +280,9 @@ fi
 # ------------------------------------------------------------ tokenizer ----
 head_ "tokenizer"
 
-if [ -d "$MODEL" ] && command -v uv >/dev/null 2>&1 && [ -d "$SRC" ]; then
+if [ "$SYNTHETIC" = 1 ]; then
+    sk "tokenizer diff" "synthetic container carries no tokenizer"
+elif [ -d "$MODEL" ] && command -v uv >/dev/null 2>&1 && [ -d "$SRC" ]; then
     if uv run --quiet --with tiktoken --no-project python tools/tokdiff.py \
            "$MODEL" "$SRC" 2>/dev/null | tail -1 | grep -q "identical"; then
         ok "C tokenizer matches Python tiktoken"

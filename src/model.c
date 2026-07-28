@@ -1973,6 +1973,22 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
 /* Prefill a chunk. KDA and MLA still walk the tokens in order — the
  * recurrence and the causal mask demand it, and both are cheap — but every
  * projection is a GEMM and the MoE sees the whole chunk at once. */
+/* The public API rejects out-of-range ids; this is the backstop for the
+ * internal entry points, because the id indexes the embedding table
+ * directly and a miss is an out-of-bounds read rather than a wrong
+ * answer. Clamp and say so once, instead of reading past the table. */
+static int clamp_token(const waste_model *m, int token)
+{
+    if (token >= 0 && token < m->cfg.vocab) return token;
+    static int warned = 0;
+    if (!warned) {
+        warned = 1;
+        fprintf(stderr, "waste: token id %d outside vocabulary of %d, clamped\n",
+                token, m->cfg.vocab);
+    }
+    return 0;
+}
+
 const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
                                  int pos0)
 {
@@ -1990,7 +2006,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         else {
             const int g = emb->group, ng = (hid + g - 1) / g;
             const int8_t *row; const uint16_t *sc;
-            trunk_row(m, emb, tokens[t], &row, &sc);
+            trunk_row(m, emb, clamp_token(m, tokens[t]), &row, &sc);
             for (int k = 0; k < ng; k++) {
                 const float sv = f16_to_f32(sc[k]);
                 for (int i = 0; i < g && k * g + i < hid; i++) {
@@ -2123,7 +2139,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     } else {
         const int g = emb->group, ng = (hid + g - 1) / g;
         const int8_t *row; const uint16_t *sc;
-        trunk_row(m, emb, token, &row, &sc);
+        trunk_row(m, emb, clamp_token(m, token), &row, &sc);
         for (int k = 0; k < ng; k++) {
             const float s = f16_to_f32(sc[k]);
             for (int i = 0; i < g && k * g + i < hid; i++) {

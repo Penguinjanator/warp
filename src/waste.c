@@ -282,10 +282,24 @@ waste_status waste_detokenize(waste_ctx *c, const int32_t *ids, size_t n,
 
 /* ---- generation --------------------------------------------------------- */
 
+/* Token ids come from the caller and index the embedding table directly,
+ * so an out-of-range one is an out-of-bounds read, not a wrong answer.
+ * Nothing checked them until a synthetic container with a 256-entry
+ * vocabulary was fed ids from a 163840-entry one and quietly returned
+ * whatever was past the end of the table. */
+static waste_status check_ids(const waste_ctx *c, const int32_t *ids, size_t n)
+{
+    const int32_t vocab = (int32_t)c->m.cfg.vocab;
+    for (size_t i = 0; i < n; i++)
+        if (ids[i] < 0 || ids[i] >= vocab) return WASTE_E_ARG;
+    return WASTE_OK;
+}
+
 waste_status waste_eval(waste_ctx *c, const int32_t *tokens, size_t n,
                         const float **logits_out, size_t *vocab_out)
 {
     if (!c || !tokens || !n) return WASTE_E_ARG;
+    { const waste_status st = check_ids(c, tokens, n); if (st) return st; }
     const float *lg = NULL;
     const int cmax = waste_model_chunk_max(&c->m);
     for (size_t i = 0; i < n; ) {
@@ -351,6 +365,7 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
                             waste_token_cb cb, void *user)
 {
     if (!c || !prompt || !n) return WASTE_E_ARG;
+    { const waste_status st = check_ids(c, prompt, n); if (st) return st; }
     waste_gen_params p;
     if (params) p = *params; else waste_gen_params_init(&p);
     uint64_t rng = p.seed ? p.seed : 0x853c49e6748fea9bULL;

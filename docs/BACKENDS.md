@@ -395,9 +395,16 @@ on a platform nobody develops on. Verified in a Linux arm64 container:
 with `uv` present those two checks run and pass; `tests/run.sh` skips the
 rest and exits 0.
 
-Closing the remaining gap means a **synthetic container generator** — a
-script that writes a valid few-megabyte container from random weights, so
-chunked prefill, the expert cache, session state and the RAM budget can
-all be exercised on every platform, and so a contributor can run the
-suite without downloading 19 GB. That is the single highest-value thing
-left in the test story.
+**The gap is now closed**, by `tools/make_test_container.py`: a valid
+1 MB container of deterministic noise, stdlib-only so it needs neither
+torch nor the converter's C extension. `tests/run.sh` builds one whenever
+no real container is given, which takes the model-less run from 4 checks
+to 13 — chunked prefill against token-at-a-time, int8 storage against
+f32, the SIMD backend against the CPU baseline, the expert cache against
+no cache, session-state round-trip, the RAM plan and the format-version
+guard all now run on every platform and in CI.
+
+What still needs real weights, and skips: the oracle diff (those logits
+belong to actual Kimi-Linear weights), the container round-trip against
+the source shards, and anything that drives the CLI with text — the
+synthetic container deliberately carries no tokenizer.
