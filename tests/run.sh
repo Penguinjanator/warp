@@ -248,13 +248,14 @@ PY
 }
 
 # params_total is the number that ends up in a model card, and it is
-# derived rather than stored: three matrices per expert, each as wide as
-# the expert's input. In a latent MoE that width is the latent, not the
-# hidden — K3 reported 5.44 T instead of 2.72 T for exactly one wrong
-# field. Mirroring the formula here would only prove this script and the
-# engine agree, so the count is also weighed against the bytes on disk:
-# at 3 bits per weight the experts have to fit their bank, give or take
-# one fp16 scale per output row and the record's 4 KiB alignment.
+# derived rather than stored: the routed experts, three matrices each and
+# each as wide as the expert's input, plus the trunk that runs on every
+# token. In a latent MoE that width is the latent, not the hidden — K3
+# reported 5.44 T instead of 2.72 T for exactly one wrong field. Mirroring
+# the engine's arithmetic here would only prove this script and the engine
+# agree, so the expert count is also weighed against the bytes on disk: at
+# 3 bits per weight the experts have to fit their bank, give or take one
+# fp16 scale per output row and the record's 4 KiB alignment.
 params_rule() {
     python3 - "$1" <<'PY'
 import json, subprocess, sys
@@ -269,8 +270,23 @@ width = c.get("routed_expert_hidden_size") or c["hidden_size"]
 inter = c["moe_intermediate_size"]
 per_expert = 3 * width * inter
 moe_layers = c["num_hidden_layers"] - c.get("first_k_dense_replace", 0)
-total = per_expert * c["num_experts"] * moe_layers
-active = per_expert * info["top_k"] * moe_layers
+
+# the trunk, as the engine counts it: the language model only, and a token
+# reads one row of the embedding table rather than all of it
+pref = man.get("tensor_prefix", "")
+trunk = trunk_active = 0
+for t in man["trunk"]:
+    if pref and not t["name"].startswith(pref):
+        continue
+    n = 1
+    for s in t["shape"]:
+        n *= s
+    trunk += n
+    if "embed_tokens.weight" not in t["name"]:
+        trunk_active += n
+
+total = per_expert * c["num_experts"] * moe_layers + trunk
+active = per_expert * info["top_k"] * moe_layers + trunk_active
 
 bits = man["expert_quant"]["bits_per_weight"]
 rec = lay[next(iter(lay))]
@@ -278,8 +294,12 @@ on_disk = rec["bytes"] // rec["experts"]
 lo = per_expert * bits // 8
 hi = lo + 2 * (2 * inter + width) + 4096          # scales, then alignment
 
-T = 1e12
-print(f"{total/T:.2f} T total, {active/1e9:.1f} B active, "
+def h(x):
+    if x >= 1e12: return f"{x/1e12:.2f} T"
+    if x >= 1e9:  return f"{x/1e9:.2f} B"
+    return f"{x/1e6:.2f} M"
+
+print(f"{h(total)} total, {h(active)} active, {h(trunk)} trunk, "
       f"{on_disk/(1<<20):.2f} MiB/expert on disk")
 sys.exit(0 if (moe_layers == len(lay)
                and info["params_total"] == total

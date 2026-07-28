@@ -50,7 +50,17 @@ static inline float waste_f16(uint16_t h)
 {
     const uint32_t sign = (uint32_t)(h >> 15) << 31;
     const uint32_t e = (h >> 10) & 0x1f, mn = h & 0x3ff;
-    const uint32_t bits = e ? (sign | ((e + 112u) << 23) | (mn << 13)) : sign;
+    if (e == 0) {
+        /* Subnormal, value mantissa * 2^-24 — not zero. Flushing these
+         * killed a whole group of 128 weights wherever a per-group scale
+         * fell below 6.1e-05, which is exactly what happens in rows whose
+         * weights are uniformly small. Found in K3's vision tower, where
+         * one row of fc0 came out 27% wrong; the same bug was silently
+         * degrading any quantized tensor with a tiny group. */
+        float f = (float)mn * 5.9604644775390625e-08f;   /* 2^-24 */
+        return sign ? -f : f;
+    }
+    const uint32_t bits = sign | ((e + 112u) << 23) | (mn << 13);
     float f;
     memcpy(&f, &bits, 4);
     return f;

@@ -18,6 +18,11 @@ int main(int argc, char **argv)
     waste_model m;
     if (waste_model_load(&m, argv[1], 512, 0, 1)) { fprintf(stderr, "load\n"); return 1; }
     if (!waste_vision_available(&m)) { fprintf(stderr, "no vision tower\n"); return 1; }
+    fprintf(stderr, "vcfg: hidden %d heads %d qkv %d inter %d layers %d "
+                    "pos %dx%d text %d eps %g\n",
+            m.vcfg.hidden, m.vcfg.heads, m.vcfg.qkv_hidden, m.vcfg.inter,
+            m.vcfg.layers, m.vcfg.pos_h, m.vcfg.pos_w, m.vcfg.text_hidden,
+            (double)m.vcfg.eps);
 
     const int L = h * w, PX = 3 * 14 * 14;
     float *px = (float *)malloc((size_t)L * PX * sizeof(float));

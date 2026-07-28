@@ -253,9 +253,28 @@ int waste_vision_encode(waste_model *m, const float *pixels, int h, int w,
 
         for (int i = 0; i < L; i++)
             waste_rmsnorm(y + (size_t)i * D, x + (size_t)i * D, n1->data, D, c->eps);
+        {   char want[32]; snprintf(want, sizeof want, "n1_%d", b);
+            if (stage_is(want)) { memcpy(out, y, (size_t)L * D * sizeof(float)); goto done; } }
+
         waste_matmul_t(m, ff, f0, y, c->inter, D, L);
+        {   char want[32]; snprintf(want, sizeof want, "fc0_%d", b);
+            if (stage_is(want)) {          /* wide: first D columns per row */
+                for (int i = 0; i < L; i++)
+                    memcpy(out + (size_t)i * D, ff + (size_t)i * c->inter,
+                           (size_t)D * sizeof(float));
+                goto done; } }
+
         for (size_t i = 0; i < (size_t)L * c->inter; i++) ff[i] = gelu_tanh(ff[i]);
+        {   char want[32]; snprintf(want, sizeof want, "act_%d", b);
+            if (stage_is(want)) {
+                for (int i = 0; i < L; i++)
+                    memcpy(out + (size_t)i * D, ff + (size_t)i * c->inter,
+                           (size_t)D * sizeof(float));
+                goto done; } }
+
         waste_matmul_t(m, y, f1, ff, D, c->inter, L);
+        {   char want[32]; snprintf(want, sizeof want, "fc1_%d", b);
+            if (stage_is(want)) { memcpy(out, y, (size_t)L * D * sizeof(float)); goto done; } }
         for (size_t i = 0; i < (size_t)L * D; i++) x[i] += y[i];
         {
             char want[32];

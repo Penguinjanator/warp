@@ -535,8 +535,25 @@ waste_status waste_model_get_info(const waste_ctx *c, waste_model_info *out)
     const uint64_t ew = cf->latent_dim ? (uint64_t)cf->latent_dim
                                        : (uint64_t)cf->hidden;
     const uint64_t pe = 3ULL * ew * cf->moe_inter;
-    out->params_total = pe * (uint64_t)cf->n_experts * (uint64_t)(cf->n_layers - cf->first_dense);
-    out->params_active = pe * (uint64_t)cf->top_k * (uint64_t)(cf->n_layers - cf->first_dense);
+    const uint64_t moe_layers = (uint64_t)(cf->n_layers - cf->first_dense);
+
+    /* The routed experts are the model's bulk but not the model: the trunk
+     * carries attention, the shared experts, the latent projections, the
+     * norms and the embeddings, and every token runs all of it. So it
+     * counts in both figures — the exception being the embedding table, of
+     * which a token reads one row. Tensors outside `prefix` are the vision
+     * tower, which this reports on as little as it runs it. */
+    uint64_t trunk = 0, trunk_active = 0;
+    const size_t plen = strlen(cf->prefix);
+    for (int i = 0; i < c->m.n_tensors; i++) {
+        const waste_tensor *t = &c->m.t[i];
+        if (plen && strncmp(t->name, cf->prefix, plen) != 0) continue;
+        trunk += (uint64_t)t->n;
+        if (!strstr(t->name, "embed_tokens.weight")) trunk_active += (uint64_t)t->n;
+    }
+
+    out->params_total  = pe * (uint64_t)cf->n_experts * moe_layers + trunk;
+    out->params_active = pe * (uint64_t)cf->top_k * moe_layers + trunk_active;
     out->arch = "kimi-linear";
     out->quant_summary = "experts VQ3R, trunk Q8G/F32";
     return WASTE_OK;

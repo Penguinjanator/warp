@@ -199,6 +199,12 @@ void         waste_state_reset(waste_ctx *ctx);
 
 typedef struct {
     uint32_t n_layers, n_experts, top_k, hidden, ctx_max;
+    /* The language model: every routed expert plus the trunk, which is
+     * attention, the shared experts, the latent projections, the norms and
+     * the embeddings. A multimodal container's vision tower is not in
+     * either figure. `params_active` is what one token touches — the whole
+     * trunk except the embedding table, of which it reads a single row,
+     * plus `top_k` experts per MoE layer. */
     uint64_t params_total, params_active;
     const char *arch;           /* e.g. "kimi-k3"                          */
     const char *quant_summary;  /* e.g. "experts VQ2R/VQ3R, trunk Q4G/Q8G" */

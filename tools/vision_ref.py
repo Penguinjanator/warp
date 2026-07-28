@@ -157,8 +157,18 @@ def vision_forward(t, pixels, h, w, cfg, dump_stage=None):
 
         res = x
         y = rms_norm(x, t[p + "norm1.weight"], eps)
-        y = gelu_tanh(y @ t[p + "mlp.fc0.weight"].T)
-        x = res + y @ t[p + "mlp.fc1.weight"].T
+        if dump_stage == f"n1_{b}":
+            return y
+        y = y @ t[p + "mlp.fc0.weight"].T
+        if dump_stage == f"fc0_{b}":
+            return y[:, :D]                       # wide: first D columns
+        y = gelu_tanh(y)
+        if dump_stage == f"act_{b}":
+            return y[:, :D]
+        y = y @ t[p + "mlp.fc1.weight"].T
+        if dump_stage == f"fc1_{b}":
+            return y
+        x = res + y
         if dump_stage == f"block{b}":
             return x
 
