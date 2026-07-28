@@ -49,12 +49,37 @@ def load_naive_kda():
 
 # ------------------------------------------------------------- container ---
 
+class _LazyTrunk:
+    """dict-like view over the trunk; materializes on first access."""
+
+    def __init__(self, owner, cap=64):
+        self.o, self.cap, self.cache = owner, cap, {}
+
+    def __contains__(self, k):
+        return k in self.o._meta
+
+    def __getitem__(self, k):
+        v = self.cache.get(k)
+        if v is None:
+            v = self.o._materialize(k)
+            if v is None:
+                raise KeyError(k)
+            if len(self.cache) >= self.cap:
+                self.cache.pop(next(iter(self.cache)))
+            self.cache[k] = v
+        return v
+
+    def get(self, k, d=None):
+        return self[k] if k in self else d
+
+
 class Container:
     def __init__(self, path, device="cpu"):
         self.path = path
         self.dev = device
         self.man = json.load(open(os.path.join(path, "manifest.json")))
         self.cfg = self.man["config"]
+        self.prefix = self.man.get("tensor_prefix", "")
         self.stages = self.man["expert_quant"]["stages"]
         self.iblock = self.man["expert_quant"].get("index_block", 0)
         self._load_codebooks()
@@ -74,9 +99,20 @@ class Container:
             self.books.append(t.float().to(self.dev))
 
     def _load_trunk(self):
-        blob = open(os.path.join(self.path, "trunk.bin"), "rb").read()
-        self.t = {}
-        for e in self.man["trunk"]:
+        """Keep the raw blob and dequantize on demand.
+
+        Expanding everything to f32 costs 4x the stored size — fine for a
+        2 GB trunk, impossible for K3's 31 GB (it would want ~124 GB). The
+        blob stays as read and each tensor is materialized the first time
+        it is asked for, with a bounded cache of the big ones."""
+        self._blob = open(os.path.join(self.path, "trunk.bin"), "rb").read()
+        self._meta = {e["name"]: e for e in self.man["trunk"]}
+        self.t = _LazyTrunk(self)
+
+    def _materialize(self, name):
+        e = self._meta[name]
+        blob = self._blob
+        if True:
             shape, off = e["shape"], e["off"]
             if e["fmt"] == 0:                                  # F32
                 n = 1
@@ -96,8 +132,8 @@ class Container:
                     bytearray(blob[e["scale_off"]:e["scale_off"] + rows * ng * 2]),
                     dtype=torch.float16).view(rows, ng, 1).float()
                 x = (q * sc).view(rows, ng * g)[:, :N].reshape(*shape)
-            self.t[e["name"]] = x.to(self.dev)
-        del blob
+            return x.to(self.dev)
+        return None
 
     def expert(self, L, eid):
         """Dequantize one expert: exactly one pread of its 4 KiB-aligned record."""
@@ -135,7 +171,8 @@ class Container:
         return out
 
     def expert_shapes(self):
-        h, i = self.cfg["hidden_size"], self.cfg["moe_intermediate_size"]
+        h = self.cfg.get("routed_expert_hidden_size") or self.cfg["hidden_size"]
+        i = self.cfg["moe_intermediate_size"]
         return [(i, h), (i, h), (h, i)]          # gate, up, down
 
 
@@ -157,10 +194,35 @@ def short_conv(x, w, state):
     return F.silu(y), new_state
 
 
+def situ(g, u, beta, lbeta):
+    """K3's SituAndMul."""
+    a = beta * torch.tanh(g / beta) * torch.sigmoid(g)
+    return a * (lbeta * torch.tanh(u / lbeta) if lbeta else u)
+
+
+def apply_attn_res(prefix_sum, blocks, norm_w, proj_w, eps):
+    """_apply_attn_res: softmax attention over the block-residual history."""
+    v = torch.cat([blocks, prefix_sum.unsqueeze(-2)], -2)     # [..., nb+1, hid]
+    k = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
+    scores = (k * (norm_w * proj_w)).sum(-1)
+    return (scores.softmax(-1).unsqueeze(-2) @ v).squeeze(-2)
+
+
 class KimiRef:
     def __init__(self, c: Container):
         self.c, self.t, self.cfg = c, c.t, c.cfg
+        self.p = c.prefix
         self.eps = self.cfg["rms_norm_eps"]
+        self.latent = self.cfg.get("routed_expert_hidden_size")
+        self.latent_norm = self.cfg.get("latent_moe_use_norm", False)
+        self.ares = self.cfg.get("attn_res_block_size")
+        self.full_gate = (self.cfg.get("linear_attn_config", {})
+                          .get("use_full_rank_gate", False))
+        self.gate_lb = (self.cfg.get("linear_attn_config", {})
+                        .get("gate_lower_bound"))
+        self.situ = self.cfg.get("hidden_act") == "situ"
+        self.sb = self.cfg.get("activation_situ_beta", 1.0)
+        self.slb = self.cfg.get("activation_situ_linear_beta")
         lac = self.cfg["linear_attn_config"]
         self.kda_set = set(lac["kda_layers"])
         self.kda_h, self.kda_d = lac["num_heads"], lac["head_dim"]
@@ -178,7 +240,7 @@ class KimiRef:
         self.kv = {}
 
     def kda(self, L, x):
-        p = f"model.layers.{L}.self_attn."
+        p = f"{self.p}model.layers.{L}.self_attn."
         T = x.shape[0]
         H, D = self.kda_h, self.kda_d
         if L not in self.conv:
@@ -194,7 +256,11 @@ class KimiRef:
         g = (x @ self.t[p + "f_a_proj.weight"].T) @ self.t[p + "f_b_proj.weight"].T
         g = g.view(T, H, D)
         A_log = self.t[p + "A_log"].view(H, 1)
-        g = -A_log.exp() * F.softplus(g + self.t[p + "dt_bias"].view(H, D))
+        z = g + self.t[p + "dt_bias"].view(H, D)
+        if self.gate_lb is not None:
+            g = self.gate_lb * torch.sigmoid(A_log.exp() * z)
+        else:
+            g = -A_log.exp() * F.softplus(z)
         beta = torch.sigmoid(x @ self.t[p + "b_proj.weight"].T)          # [T, H]
 
         qn = F.normalize(q, dim=-1, p=2)
@@ -206,13 +272,16 @@ class KimiRef:
                               output_final_state=True)
         self.S[L] = S
         o = o[0]                                                          # [T,H,D]
-        gate = ((x @ self.t[p + "g_a_proj.weight"].T)
-                @ self.t[p + "g_b_proj.weight"].T).view(T, H, D)
+        if self.full_gate:
+            gate = (x @ self.t[p + "g_proj.weight"].T).view(T, H, D)
+        else:
+            gate = ((x @ self.t[p + "g_a_proj.weight"].T)
+                    @ self.t[p + "g_b_proj.weight"].T).view(T, H, D)
         o = rms_norm(o, self.t[p + "o_norm.weight"], self.eps) * torch.sigmoid(gate)
         return o.reshape(T, H * D) @ self.t[p + "o_proj.weight"].T
 
     def mla(self, L, x):
-        p = f"model.layers.{L}.self_attn."
+        p = f"{self.p}model.layers.{L}.self_attn."
         cfg, T = self.cfg, x.shape[0]
         nh = cfg["num_attention_heads"]
         qk_n, qk_r, vh = cfg["qk_nope_head_dim"], cfg["qk_rope_head_dim"], cfg["v_head_dim"]
@@ -237,7 +306,7 @@ class KimiRef:
         return o @ self.t[p + "o_proj.weight"].T
 
     def moe(self, L, x, trace=None):
-        p = f"model.layers.{L}.block_sparse_moe."
+        p = f"{self.p}model.layers.{L}.block_sparse_moe."
         cfg, T = self.cfg, x.shape[0]
         logits = x.float() @ self.t[p + "gate.weight"].float().T
         scores = torch.sigmoid(logits)
@@ -250,34 +319,69 @@ class KimiRef:
         w = w * cfg["routed_scaling_factor"]
         if trace is not None:
             trace.append(sorted(topk_idx[-1].tolist()))
-        y = torch.zeros_like(x)
+        xin = x
+        if self.latent:
+            xin = x @ self.t[p + "routed_expert_down_proj.weight"].T
+        y = torch.zeros_like(xin)
         for t in range(T):
             for j in range(k):
                 e = int(topk_idx[t, j])
                 E = self.c.expert(L, e)
-                h = F.silu(x[t] @ E["gate"].T) * (x[t] @ E["up"].T)
+                a, b = xin[t] @ E["gate"].T, xin[t] @ E["up"].T
+                h = situ(a, b, self.sb, self.slb) if self.situ else F.silu(a) * b
                 y[t] += w[t, j] * (h @ E["down"].T)
+        if self.latent:
+            if self.latent_norm:
+                y = rms_norm(y, self.t[p + "routed_expert_norm.weight"], self.eps)
+            y = y @ self.t[p + "routed_expert_up_proj.weight"].T
         sg = self.t[p + "shared_experts.gate_proj.weight"]
         su = self.t[p + "shared_experts.up_proj.weight"]
         sd = self.t[p + "shared_experts.down_proj.weight"]
-        return y + (F.silu(x @ sg.T) * (x @ su.T)) @ sd.T
+        sa, sbv = x @ sg.T, x @ su.T
+        sh = situ(sa, sbv, self.sb, self.slb) if self.situ else F.silu(sa) * sbv
+        return y + sh @ sd.T
 
     def dense_mlp(self, L, x):
-        p = f"model.layers.{L}.mlp."
-        return (F.silu(x @ self.t[p + "gate_proj.weight"].T)
-                * (x @ self.t[p + "up_proj.weight"].T)) @ self.t[p + "down_proj.weight"].T
+        p = f"{self.p}model.layers.{L}.mlp."
+        a, b = x @ self.t[p + "gate_proj.weight"].T, x @ self.t[p + "up_proj.weight"].T
+        h = situ(a, b, self.sb, self.slb) if self.situ else F.silu(a) * b
+        return h @ self.t[p + "down_proj.weight"].T
 
     def forward(self, ids, trace=None):
-        x = self.t["model.embed_tokens.weight"][ids]
+        x = self.t[self.p + "model.embed_tokens.weight"][ids]
+        blocks, ps = None, None
         for L in range(self.n_layers):
-            pre = f"model.layers.{L}."
+            pre = f"{self.p}model.layers.{L}."
+            if self.ares:
+                ps = x
+                if blocks is not None and blocks.shape[-2] > 0:
+                    x = apply_attn_res(ps, blocks,
+                                       self.t[pre + "self_attention_res_norm.weight"],
+                                       self.t[pre + "self_attention_res_proj.weight"],
+                                       self.eps)
+                if L % self.ares == 0:
+                    b = ps.unsqueeze(-2)
+                    blocks = b if blocks is None else torch.cat([blocks, b], -2)
+                    ps = None
             h = rms_norm(x, self.t[pre + "input_layernorm.weight"], self.eps)
-            x = x + (self.kda(L, h) if self.is_kda(L) else self.mla(L, h))
+            att = self.kda(L, h) if self.is_kda(L) else self.mla(L, h)
+            if self.ares:
+                ps = att if ps is None else ps + att
+                x = apply_attn_res(ps, blocks,
+                                   self.t[pre + "mlp_res_norm.weight"],
+                                   self.t[pre + "mlp_res_proj.weight"], self.eps)
+            else:
+                x = x + att
             h = rms_norm(x, self.t[pre + "post_attention_layernorm.weight"], self.eps)
             has_moe = f"{pre}block_sparse_moe.gate.weight" in self.t
-            x = x + (self.moe(L, h, trace) if has_moe else self.dense_mlp(L, h))
-        x = rms_norm(x, self.t["model.norm.weight"], self.eps)
-        return x @ self.t["lm_head.weight"].T
+            ffn = self.moe(L, h, trace) if has_moe else self.dense_mlp(L, h)
+            if self.ares:
+                ps = ps + ffn
+                x = ps
+            else:
+                x = x + ffn
+        x = rms_norm(x, self.t[self.p + "model.norm.weight"], self.eps)
+        return x @ self.t[self.p + "lm_head.weight"].T
 
 
 def main():

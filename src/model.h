@@ -21,9 +21,10 @@ extern "C" {
 typedef struct {
     char name[128];
     float *data;          /* F32 tensors, or NULL when kept quantized       */
-    int8_t *q;            /* Q8G payload: int8, row-major                   */
-    uint16_t *qs;         /* Q8G scales: one fp16 per group of `group`      */
+    int8_t *q;            /* quantized payload, row-major                   */
+    uint16_t *qs;         /* scales: one fp16 per group of `group`          */
     int group;
+    int bits;             /* 8 = one int8 per weight, 4 = two per byte      */
     int shape[4], ndim;
     size_t n;
 } waste_tensor;
@@ -31,7 +32,7 @@ typedef struct {
 typedef struct {
     int n_layers, hidden, n_experts, top_k, moe_inter, dense_inter;
     int n_shared, first_dense, vocab, n_heads;
-    int kv_lora, qk_nope, qk_rope, v_head;
+    int kv_lora, q_lora, qk_nope, qk_rope, v_head;
     int kda_heads, kda_dim, conv_k;
     int kda_layer[128];              /* 1 if layer is KDA                   */
     float eps, routed_scale;

@@ -145,7 +145,7 @@ static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
  */
 typedef struct {
     float *y; const int8_t *W; const uint16_t *ws;
-    const int8_t *xq; const float *xs; int in, ng, group;
+    const int8_t *xq; const float *xs; int in, ng, group, bits;
 } mvq_arg;
 
 static inline int32_t idot(const int8_t *a, const int8_t *b, int n)
@@ -173,12 +173,29 @@ static void mvq_rows_f32(int b, int e, void *p)
     mvq_arg *a = (mvq_arg *)p;
     const int ng = a->ng, g = a->group;
     const float *x = (const float *)a->xs;      /* raw activations */
+    int8_t *unp = NULL;
+    if (a->bits == 4) {
+        unp = (int8_t *)malloc((size_t)g);
+        if (!unp) return;
+    }
     for (int o = b; o < e; o++) {
-        const int8_t *row = a->W + (size_t)o * ng * g;
+        const int8_t *row = a->W + (size_t)o * ng * g * a->bits / 8;
         const uint16_t *ws = a->ws + (size_t)o * ng;
         float acc = 0;
         for (int k = 0; k < ng; k++) {
-            const int8_t *w = row + (size_t)k * g;
+            const int8_t *w;
+            if (a->bits == 4) {
+                /* two signed nibbles per byte, low first */
+                const uint8_t *p4 = (const uint8_t *)row + (size_t)k * g / 2;
+                for (int i = 0; i < g / 2; i++) {
+                    const uint8_t byte = p4[i];
+                    unp[2 * i]     = (int8_t)(byte & 0x0F) - 8;
+                    unp[2 * i + 1] = (int8_t)(byte >> 4) - 8;
+                }
+                w = unp;
+            } else {
+                w = row + (size_t)k * g;
+            }
             const float *xx = x + (size_t)k * g;
             const int lim = (k * g + g <= a->in) ? g : a->in - k * g;
 #if defined(__ARM_NEON) || defined(__aarch64__)
@@ -201,6 +218,7 @@ static void mvq_rows_f32(int b, int e, void *p)
         }
         a->y[o] = acc;
     }
+    free(unp);
 }
 
 static void mvq_rows(int b, int e, void *p)
@@ -264,12 +282,12 @@ static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
     if (!t || (!t->q && !t->data)) { memset(y, 0, (size_t)out * sizeof(float)); return; }
     if (!t->q) { matvec(y, t->data, x, out, in); return; }
     const int g = t->group, ng = (in + g - 1) / g;
-    if (sdot_on) {
+    if (sdot_on && t->bits == 8) {
         quant_act(x, in, g, m->xq, m->xs);
-        mvq_arg a = { y, t->q, t->qs, m->xq, m->xs, in, ng, g };
+        mvq_arg a = { y, t->q, t->qs, m->xq, m->xs, in, ng, g, 8 };
         waste_parallel_for(out, 64, mvq_rows, &a);
     } else {
-        mvq_arg a = { y, t->q, t->qs, NULL, x, in, ng, g };
+        mvq_arg a = { y, t->q, t->qs, NULL, x, in, ng, g, t->bits };
         waste_parallel_for(out, 64, mvq_rows_f32, &a);
     }
 }
@@ -350,15 +368,17 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
                     }
                 }
             }
-        } else {                                          /* Q8G, kept int8 */
+        } else {                             /* Q8G or Q4G, kept quantized */
             const int N = t->shape[t->ndim - 1];
             const long rows = (long)(t->n / (size_t)N);
             const int ng = (N + g - 1) / g;
             t->group = g;
-            t->q = (int8_t *)malloc((size_t)rows * ng * g);
+            t->bits = (fmt == 3) ? 4 : 8;   /* FMT_Q4G = 3 */
+            const size_t payload = (size_t)rows * ng * g * t->bits / 8;
+            t->q = (int8_t *)malloc(payload);
             t->qs = (uint16_t *)malloc((size_t)rows * ng * sizeof(uint16_t));
             if (!t->q || !t->qs) { free(blob); return -1; }
-            memcpy(t->q, blob + off, (size_t)rows * ng * g);
+            memcpy(t->q, blob + off, payload);
             memcpy(t->qs, blob + soff, (size_t)rows * ng * sizeof(uint16_t));
         }
     }
@@ -379,6 +399,7 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     c->vocab = (int)js_int(d, js_get(d, cfg, "vocab_size"), 0);
     c->n_heads = (int)js_int(d, js_get(d, cfg, "num_attention_heads"), 0);
     c->kv_lora = (int)js_int(d, js_get(d, cfg, "kv_lora_rank"), 0);
+    c->q_lora = (int)js_int(d, js_get(d, cfg, "q_lora_rank"), 0);
     c->qk_nope = (int)js_int(d, js_get(d, cfg, "qk_nope_head_dim"), 0);
     c->qk_rope = (int)js_int(d, js_get(d, cfg, "qk_rope_head_dim"), 0);
     c->v_head = (int)js_int(d, js_get(d, cfg, "v_head_dim"), 0);
@@ -435,9 +456,18 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
 
     {
         int cfg = js_get(&d, 0, "config");
-        const int tc = js_get(&d, cfg, "text_config");   /* K3 nests it */
-        if (tc >= 0) { cfg = tc; snprintf(m->cfg.prefix, sizeof m->cfg.prefix,
-                                          "language_model."); }
+        /* The converter flattens K3's nested text_config into `config` and
+         * records the tensor-name prefix separately, so read that — probing
+         * for a nested text_config here finds nothing and silently leaves
+         * every tensor lookup one prefix short. */
+        js_str(&d, js_get(&d, 0, "tensor_prefix"), m->cfg.prefix,
+               sizeof m->cfg.prefix);
+        const int tc = js_get(&d, cfg, "text_config");   /* raw HF config */
+        if (tc >= 0) {
+            cfg = tc;
+            if (!m->cfg.prefix[0])
+                snprintf(m->cfg.prefix, sizeof m->cfg.prefix, "language_model.");
+        }
         cfg_from_json(&m->cfg, &d, cfg);
     }
     const waste_config *c = &m->cfg;
@@ -511,7 +541,10 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     const int big = c->hidden > C ? c->hidden : C;
     m->x = (float *)calloc((size_t)c->hidden, sizeof(float));
     m->h = (float *)calloc((size_t)c->hidden, sizeof(float));
-    m->tmp = (float *)calloc((size_t)8 * big + 8 * c->moe_inter + 8 * c->dense_inter, sizeof(float));
+    m->tmp = (float *)calloc((size_t)8 * big + 8 * c->moe_inter + 8 * c->dense_inter
+                             + (size_t)4 * c->n_heads * (c->v_head + c->qk_nope + c->qk_rope)
+                             + (size_t)2 * (c->q_lora ? c->q_lora : 1) + 256,
+                             sizeof(float));
     m->att = (float *)calloc((size_t)kv_cap * c->n_heads + 1024, sizeof(float));
     m->logits = (float *)calloc((size_t)c->vocab, sizeof(float));
     m->ff = (float *)calloc((size_t)2 * (c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter), sizeof(float));
@@ -796,7 +829,19 @@ static void mla_layer(waste_model *m, int L, const float *in, float *out, int po
     float *q = m->tmp, *ckv = q + nh * qd, *kb = ckv + c->kv_lora + c->qk_rope;
     float *o = kb + nh * (c->qk_nope + vh);
 
-    matvec_t(m, q, waste_find(m, tname("%smodel.layers.%d.self_attn.q_proj.weight", c->prefix, L)), in, nh * qd, hid);
+    if (c->q_lora) {
+        /* K3 LoRAs the query too: q_a -> RMSNorm -> q_b */
+        float *qa = o + (size_t)nh * vh;
+        matvec_t(m, qa, waste_find(m, tname("%smodel.layers.%d.self_attn.q_a_proj.weight",
+                                            c->prefix, L)), in, c->q_lora, hid);
+        rmsnorm(qa, qa, waste_find(m, tname("%smodel.layers.%d.self_attn.q_a_layernorm.weight",
+                                            c->prefix, L))->data, c->q_lora, c->eps);
+        matvec_t(m, q, waste_find(m, tname("%smodel.layers.%d.self_attn.q_b_proj.weight",
+                                           c->prefix, L)), qa, nh * qd, c->q_lora);
+    } else {
+        matvec_t(m, q, waste_find(m, tname("%smodel.layers.%d.self_attn.q_proj.weight",
+                                           c->prefix, L)), in, nh * qd, hid);
+    }
     matvec_t(m, ckv, waste_find(m, tname("%smodel.layers.%d.self_attn.kv_a_proj_with_mqa.weight", c->prefix, L)),
              in, c->kv_lora + c->qk_rope, hid);
     float *kpass = ckv, *krot = ckv + c->kv_lora;
@@ -833,6 +878,13 @@ static void mla_layer(waste_model *m, int L, const float *in, float *out, int po
             const float w = a[s];
             for (int i = 0; i < vh; i++) oh[i] += w * vv[i];
         }
+    }
+    if (c->mla_output_gate) {
+        /* sigmoid gate on the attention output, before o_proj */
+        float *g = o + (size_t)nh * vh + (c->q_lora ? c->q_lora : 0);
+        matvec_t(m, g, waste_find(m, tname("%smodel.layers.%d.self_attn.g_proj.weight",
+                                           c->prefix, L)), in, nh * vh, hid);
+        for (int i = 0; i < nh * vh; i++) o[i] *= 1.0f / (1.0f + expf(-g[i]));
     }
     matvec_t(m, out, waste_find(m, tname("%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L)), o, hid, nh * vh);
 }
@@ -1159,7 +1211,7 @@ static void matmul_f32(float *Y, const float *W, const float *X,
 /* Tensor-aware batched matmul; dequantizes a Q8G row on the fly. */
 typedef struct {
     float *Y; const int8_t *W; const uint16_t *ws; const float *X;
-    int in, out, T, ng, group;
+    int in, out, T, ng, group, bits;
 } mmq_arg;
 
 static void mmq_rows(int b, int e, void *p)
@@ -1169,12 +1221,22 @@ static void mmq_rows(int b, int e, void *p)
     float *row = (float *)malloc((size_t)a->in * sizeof(float));
     if (!row) return;
     for (int o = b; o < e; o++) {
-        const int8_t *q = a->W + (size_t)o * ng * g;
+        const int8_t *q = a->W + (size_t)o * ng * g * a->bits / 8;
         const uint16_t *sc = a->ws + (size_t)o * ng;
         for (int k = 0; k < ng; k++) {
             const float s = f16_to_f32(sc[k]);
             const int lim = (k * g + g <= a->in) ? g : a->in - k * g;
-            for (int i = 0; i < lim; i++) row[k * g + i] = (float)q[(size_t)k * g + i] * s;
+            if (a->bits == 4) {
+                const uint8_t *p4 = (const uint8_t *)q + (size_t)k * g / 2;
+                for (int i = 0; i < lim; i++) {
+                    const uint8_t byte = p4[i / 2];
+                    const int v = (i & 1) ? (byte >> 4) - 8 : (byte & 0x0F) - 8;
+                    row[k * g + i] = (float)v * s;
+                }
+            } else {
+                for (int i = 0; i < lim; i++)
+                    row[k * g + i] = (float)q[(size_t)k * g + i] * s;
+            }
         }
         for (int t = 0; t < a->T; t++)
             a->Y[(size_t)t * a->out + o] = dotf(row, a->X + (size_t)t * a->in, a->in);
@@ -1192,7 +1254,7 @@ static void matmul_t(waste_model *m, float *Y, const waste_tensor *t,
     }
     if (!t->q) { matmul_f32(Y, t->data, X, out, in, T); return; }
     const int g = t->group, ng = (in + g - 1) / g;
-    mmq_arg a = { Y, t->q, t->qs, X, in, out, T, ng, g };
+    mmq_arg a = { Y, t->q, t->qs, X, in, out, T, ng, g, t->bits };
     waste_parallel_for(out, 32, mmq_rows, &a);
 }
 
@@ -1443,12 +1505,18 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         if (emb->data) memcpy(dst, emb->data + (size_t)tokens[t] * hid, (size_t)hid * 4);
         else {
             const int g = emb->group, ng = (hid + g - 1) / g;
-            const int8_t *row = emb->q + (size_t)tokens[t] * ng * g;
+            const int8_t *row = emb->q + (size_t)tokens[t] * ng * g * emb->bits / 8;
             const uint16_t *sc = emb->qs + (size_t)tokens[t] * ng;
             for (int k = 0; k < ng; k++) {
                 const float sv = f16_to_f32(sc[k]);
-                for (int i = 0; i < g && k * g + i < hid; i++)
-                    dst[k * g + i] = (float)row[k * g + i] * sv;
+                for (int i = 0; i < g && k * g + i < hid; i++) {
+                    int v;
+                    if (emb->bits == 4) {
+                        const uint8_t byte = ((const uint8_t *)row)[(k * g + i) / 2];
+                        v = (i & 1) ? (byte >> 4) - 8 : (byte & 0x0F) - 8;
+                    } else v = row[k * g + i];
+                    dst[k * g + i] = (float)v * sv;
+                }
             }
         }
     }
@@ -1560,12 +1628,18 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         memcpy(m->x, emb->data + (size_t)token * hid, (size_t)hid * sizeof(float));
     } else {
         const int g = emb->group, ng = (hid + g - 1) / g;
-        const int8_t *row = emb->q + (size_t)token * ng * g;
+        const int8_t *row = emb->q + (size_t)token * ng * g * emb->bits / 8;
         const uint16_t *sc = emb->qs + (size_t)token * ng;
         for (int k = 0; k < ng; k++) {
             const float s = f16_to_f32(sc[k]);
-            for (int i = 0; i < g && k * g + i < hid; i++)
-                m->x[k * g + i] = (float)row[k * g + i] * s;
+            for (int i = 0; i < g && k * g + i < hid; i++) {
+                int v;
+                if (emb->bits == 4) {
+                    const uint8_t byte = ((const uint8_t *)row)[(k * g + i) / 2];
+                    v = (i & 1) ? (byte >> 4) - 8 : (byte & 0x0F) - 8;
+                } else v = row[k * g + i];
+                m->x[k * g + i] = (float)v * s;
+            }
         }
     }
 

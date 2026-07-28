@@ -183,6 +183,26 @@ def quantize_vq(W, books, dev):
     return torch.stack(idxs), scale.half().flatten().cpu()
 
 
+def quantize_q4g(W, group=128):
+    """int4 packed two per byte (low nibble first), fp16 scale per group.
+
+    The trunk is the RAM floor and K3's is 54 B parameters — at 8 bits that
+    is 54 GB, over the budget of the machine this is meant to run on. At
+    4 bits it is 27."""
+    orig = W.shape
+    X = W.reshape(-1, orig[-1])
+    N = X.shape[-1]
+    pad = (-N) % group
+    if pad:
+        X = torch.nn.functional.pad(X, (0, pad))
+    Xg = X.view(X.shape[0], -1, group)
+    scale = Xg.abs().amax(-1, keepdim=True).clamp(min=1e-8) / 7.0
+    Q = torch.clamp(torch.round(Xg / scale), -8, 7).to(torch.int32).flatten()
+    nib = (Q + 8).to(torch.uint8) & 0x0F                 # 0..15, biased
+    packed = (nib[0::2] | (nib[1::2] << 4)).contiguous()
+    return packed, scale.half().flatten(), list(orig)
+
+
 def quantize_q8g(W, group=128):
     """int8 + fp16 scale per group of `group` inputs. Returns (bytes, meta)."""
     orig = W.shape
@@ -252,7 +272,11 @@ def convert_layer(job):
     import time as _t
     bank = os.path.join(out, f"experts-L{L}.bin")
     cbf = os.path.join(out, f"codebooks-L{L}.bin")
-    if os.path.exists(bank) and os.path.exists(cbf):
+    # A finished bank means the layer is done. The per-layer codebook file
+    # is gone by then because the parent merged it into codebooks.bin — an
+    # earlier version also required it here, which made every resume
+    # re-convert the whole model.
+    if os.path.exists(bank):
         return (L, os.path.getsize(bank), cb_base, "cached")
 
     st = ST(src)
@@ -311,6 +335,8 @@ def main():
     ap.add_argument("--stages", type=int, default=3, help="3 = VQ3R, 2 = VQ2R")
     ap.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu")
     ap.add_argument("--experts", type=int, default=0, help="limit experts (debug)")
+    ap.add_argument("--trunk8", action="store_true",
+                    help="keep the whole trunk at 8 bits (needs the RAM)")
     ap.add_argument("--skip-trunk", action="store_true",
                     help="experts only (the trunk is unchanged between runs)")
     ap.add_argument("--jobs", type=int, default=3,
@@ -379,14 +405,21 @@ def main():
                                        "codebook_base": base}
 
     # merge the per-layer codebook files in layer order; ids were handed out
-    # from the same order, so the concatenation is already indexed correctly
-    with open(os.path.join(args.out, "codebooks.bin"), "wb") as cb_out:
-        for L in layers:
-            part = os.path.join(args.out, f"codebooks-L{L}.bin")
-            if os.path.exists(part):
-                with open(part, "rb") as pf:
-                    cb_out.write(pf.read())
-                os.remove(part)
+    # from the same order, so the concatenation is already indexed correctly.
+    # If none are present every layer came from cache, and codebooks.bin is
+    # already correct — rewriting it would truncate it to nothing.
+    parts = [os.path.join(args.out, f"codebooks-L{L}.bin") for L in layers]
+    if any(os.path.exists(p) for p in parts):
+        merged = os.path.join(args.out, "codebooks.bin")
+        with open(merged + ".tmp", "wb") as cb_out:
+            for part in parts:
+                if os.path.exists(part):
+                    with open(part, "rb") as pf:
+                        cb_out.write(pf.read())
+                    os.remove(part)
+        os.replace(merged + ".tmp", merged)
+    else:
+        print("codebooks: all layers cached, keeping existing codebooks.bin")
 
 
     # ---- tokenizer: copy it in so the container is self-contained -------
@@ -418,12 +451,18 @@ def main():
                                "shape": list(t.shape),
                                "bytes": tf.tell() - off})
             else:
-                q, sc, shape = quantize_q8g(t)
+                # 4 bits for the bulk; the embedding table and the output
+                # head keep 8, they are small and sit at both ends of the
+                # network where error is least forgiving
+                big = not (name.endswith("embed_tokens.weight")
+                           or name.endswith("lm_head.weight"))
+                use4 = big and not args.trunk8
+                q, sc, shape = (quantize_q4g(t) if use4 else quantize_q8g(t))
                 tf.write(raw_bytes(q))
                 sc_off = tf.tell()
                 tf.write(raw_bytes(sc))
-                tindex.append({"name": name, "fmt": FMT_Q8G, "off": off,
-                               "shape": shape, "group": 128,
+                tindex.append({"name": name, "fmt": FMT_Q4G if use4 else FMT_Q8G,
+                               "off": off, "shape": shape, "group": 128,
                                "scale_off": sc_off, "bytes": tf.tell() - off})
     print(f"trunk: {os.path.getsize(trunk_path)/2**20:.0f} MB, "
           f"{len(tindex)} tensors")
