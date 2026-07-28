@@ -206,6 +206,11 @@ waste_status waste_save_usage(waste_ctx *ctx);
 typedef struct {
     uint64_t tokens_generated, experts_hit, experts_missed, bytes_read;
     double   sec_total, sec_io;
+    /* 0 when a bank could not bypass the page cache (no O_DIRECT support on
+     * the filesystem, or a container whose records are not page multiples).
+     * The hit rate is then partly the kernel's, not the engine's, and the
+     * numbers do not transfer to a machine that cannot cache the model. */
+    int      direct_io;
 } waste_stats;
 
 waste_status waste_get_stats(const waste_ctx *ctx, waste_stats *out);

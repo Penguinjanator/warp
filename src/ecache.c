@@ -10,6 +10,16 @@
 
 #define EC_SAMPLE 16      /* victims sampled per eviction (Redis-style)     */
 
+void *waste_dio_alloc(size_t n)
+{
+    void *p = NULL;
+    const size_t pad = (n + WASTE_DIO_ALIGN - 1) / WASTE_DIO_ALIGN * WASTE_DIO_ALIGN;
+    if (posix_memalign(&p, WASTE_DIO_ALIGN, pad) != 0) return NULL;
+    return p;
+}
+
+void waste_dio_free(void *p) { free(p); }
+
 static int32_t ec_key(int layer, int expert) { return (layer << 16) | expert; }
 
 static uint32_t ec_hash(int32_t k)
@@ -43,7 +53,7 @@ int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
 
     for (int i = 0; i < c->n_slots; i++) {
         c->slot[i].key = -1;
-        c->slot[i].data = (uint8_t *)malloc(rec_bytes);
+        c->slot[i].data = (uint8_t *)waste_dio_alloc(rec_bytes);
         if (!c->slot[i].data) { waste_ecache_free(c); return -1; }
     }
     return 0;
@@ -52,7 +62,7 @@ int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
 void waste_ecache_free(waste_ecache *c)
 {
     if (c->slot) {
-        for (int i = 0; i < c->n_slots; i++) free(c->slot[i].data);
+        for (int i = 0; i < c->n_slots; i++) waste_dio_free(c->slot[i].data);
         free(c->slot);
     }
     free(c->hash);

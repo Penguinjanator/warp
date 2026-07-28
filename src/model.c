@@ -55,6 +55,8 @@ static char *slurp(const char *path, size_t *len)
     return b;
 }
 
+static int bank_open(const char *path, size_t rec_bytes, int *direct);
+
 /* pread until the whole range lands; short reads are legal. */
 static int pread_all(int fd, void *dst, size_t n, long off)
 {
@@ -556,6 +558,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     memset(m, 0, sizeof *m);
     if (prof_on < 0) { const char *e = getenv("WASTE_PROFILE"); prof_on = e && *e != '0'; }
     m->kv_cap = kv_cap;
+    m->direct_io = 1;
     waste_backend_init(WASTE_BE_AUTO);
     {
         const char *e = getenv("WASTE_THREADS");
@@ -648,17 +651,11 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         char fn[64];
         js_str(&d, js_get(&d, e, "file"), fn, sizeof fn);
         snprintf(path, sizeof path, "%s/%s", dir, fn);
-        m->bank[L].fd = open(path, O_RDONLY);
-#ifdef __APPLE__
-        if (m->bank[L].fd >= 0) {
-            fcntl(m->bank[L].fd, F_NOCACHE, 1);   /* the engine owns caching */
-            fcntl(m->bank[L].fd, F_RDAHEAD, 0);
-        }
-#endif
         m->bank[L].n_experts = (int)js_int(&d, js_get(&d, e, "experts"), 0);
         m->bank[L].cb_base = (int)js_int(&d, js_get(&d, e, "codebook_base"), 0);
         const long bytes = js_int(&d, js_get(&d, e, "bytes"), 0);
         m->bank[L].rec_bytes = m->bank[L].n_experts ? bytes / m->bank[L].n_experts : 0;
+        m->bank[L].fd = bank_open(path, m->bank[L].rec_bytes, &m->direct_io);
     }
     js_free(&d);
     free(src);
@@ -737,7 +734,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         for (int L = 0; L < c->n_layers; L++)
             if (m->bank[L].rec_bytes > rec) rec = m->bank[L].rec_bytes;
         if (waste_ecache_init(&m->cache, cache_bytes, (size_t)rec, 0)) return -1;
-        m->miss_buf = (uint8_t *)malloc((size_t)rec);
+        m->miss_buf = (uint8_t *)waste_dio_alloc((size_t)rec);
         if (!m->miss_buf) return -1;
     }
     return (m->x && m->logits && m->e_gate && m->e_up && m->e_down) ? 0 : -1;
@@ -760,7 +757,7 @@ void waste_model_free(waste_model *m)
     }
     free(m->x); free(m->h); free(m->tmp); free(m->att); free(m->logits);
     free(m->ff); free(m->e_gate); free(m->e_up); free(m->e_down); free(m->lut);
-    free(m->xq); free(m->xs); free(m->miss_buf);
+    free(m->xq); free(m->xs); waste_dio_free(m->miss_buf);
     free(m->blockres); free(m->prefix_sum); free(m->ares);
     free(m->cx); free(m->cnorm); free(m->cresid); free(m->cq); free(m->ckv);
     free(m->clat); free(m->cff); free(m->cexp); free(m->cblockres);
@@ -769,6 +766,50 @@ void waste_model_free(waste_model *m)
 }
 
 /* ---- expert dequant ---------------------------------------------------- */
+
+/* Opens an expert bank with the page cache out of the way.
+ *
+ * The whole hit-rate argument depends on this: with a 17 GB container on a
+ * 64 GB machine the kernel would cache the banks and every number we
+ * measure would be about the kernel's cache, not ours. K3's ~900 GB gets no
+ * such help, so the engine must not depend on it.
+ *
+ * macOS says so with fcntl. Linux needs O_DIRECT, which additionally
+ * demands that the offset, the length and the destination buffer all be
+ * multiples of the device's logical block size. Offsets and lengths are
+ * whole 4 KiB pages by construction — but only if this container was
+ * written that way, so check rather than assume, because a misaligned
+ * record makes every read fail EINVAL rather than merely run slow. The
+ * buffers come from waste_dio_alloc. Filesystems may still refuse O_DIRECT
+ * (tmpfs does), so fall back and at least turn readahead off.
+ *
+ * `*direct` is set to 0 if any bank ends up without the bypass, so `waste
+ * info` can say the hit rates are being measured against a warm page
+ * cache. Not validated on Linux from this machine — see LEARNED.md §14. */
+static int bank_open(const char *path, size_t rec_bytes, int *direct)
+{
+    (void)rec_bytes; (void)direct;
+#if defined(__linux__) && defined(O_DIRECT)
+    if (rec_bytes && rec_bytes % WASTE_DIO_ALIGN == 0 &&
+        !(getenv("WASTE_DIRECT") && getenv("WASTE_DIRECT")[0] == '0')) {
+        const int fd = open(path, O_RDONLY | O_DIRECT);
+        if (fd >= 0) return fd;
+    }
+    *direct = 0;
+#endif
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) return fd;
+#ifdef __APPLE__
+    fcntl(fd, F_NOCACHE, 1);          /* the engine owns caching */
+    fcntl(fd, F_RDAHEAD, 0);
+#elif defined(__linux__)
+    /* No bypass available: at least stop the kernel reading ahead into
+     * pages nothing will ask for. */
+    posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+    *direct = 0;
+#endif
+    return fd;
+}
 
 /* One pread of a 4 KiB-aligned record — what the layout exists for. */
 static int bank_fetch(void *user, int layer, int expert, uint8_t *dst)

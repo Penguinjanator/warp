@@ -301,6 +301,9 @@ static int cmd_bench(int argc, char **argv)
     const double tps = s.sec_total > 0 ? s.tokens_generated / s.sec_total : 0;
     const uint64_t acc = s.experts_hit + s.experts_missed;
     printf("  %.2f tok/s (%.0f ms/token)\n", tps, 1000.0 / (tps > 0 ? tps : 1));
+    if (!s.direct_io)
+        printf("  note      page cache not bypassed on this filesystem — the hit\n"
+               "            rate below is partly the kernel's, not the engine's\n");
     printf("  experts   %llu hit / %llu miss = %.1f%% hit\n",
            (unsigned long long)s.experts_hit, (unsigned long long)s.experts_missed,
            100.0 * (double)s.experts_hit / (double)(acc ? acc : 1));

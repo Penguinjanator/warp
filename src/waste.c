@@ -472,5 +472,6 @@ waste_status waste_get_stats(const waste_ctx *c, waste_stats *out)
     out->experts_hit = c->m.cache.hits;
     out->experts_missed = c->m.cache.misses;
     out->bytes_read = c->m.cache.bytes_read;
+    out->direct_io = c->m.direct_io;
     return WASTE_OK;
 }

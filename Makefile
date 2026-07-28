@@ -5,7 +5,10 @@
 #   make WASTE_ENABLE_METAL=1     (accelerators are build-time options)
 
 CC      ?= cc
-CFLAGS  ?= -O2 -std=c11 -Wall -Wextra
+# gnu11, not c11: with -std=c11 glibc sets __STRICT_ANSI__ and hides every
+# POSIX extension, so pread, fcntl, posix_memalign and pthread_* would all
+# be implicitly declared on Linux. Only model.c defines _GNU_SOURCE itself.
+CFLAGS  ?= -O2 -std=gnu11 -Wall -Wextra
 LDLIBS  := -lm -lpthread
 # Shared-library suffix: convert.py already looks for both through ctypes.
 ifeq ($(shell uname -s),Darwin)

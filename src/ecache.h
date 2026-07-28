@@ -12,7 +12,8 @@
  * Gate 2 also showed why: at small cache fractions plain LRU collapses to
  * 5% where LFRU still gets 29%.
  *
- * Reads bypass the page cache (F_NOCACHE / O_DIRECT). That is deliberate:
+ * Reads bypass the page cache (F_NOCACHE on macOS, O_DIRECT on Linux).
+ * That is deliberate:
  * with a 17 GB container on a 64 GB machine the kernel would cache
  * everything and the hit rate we measure would be a fiction. K3's ~900 GB
  * gets no such help, so the engine must not depend on it.
@@ -44,6 +45,14 @@ typedef struct {
     unsigned rng;
     int policy;          /* 0 = LFRU, 1 = LRU                               */
 } waste_ecache;
+
+/* O_DIRECT requires the destination buffer to be aligned to the device's
+ * logical block size, so record buffers come from here rather than malloc.
+ * Expert records are whole 4 KiB pages by construction, which covers both
+ * the 512- and 4096-byte cases; on macOS the alignment is merely harmless. */
+#define WASTE_DIO_ALIGN 4096
+void *waste_dio_alloc(size_t n);
+void  waste_dio_free(void *p);
 
 /* budget_bytes 0 disables caching (every access reads). Returns 0 on ok. */
 int  waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,

@@ -388,3 +388,46 @@ non-expert component in higher precision, so the trunk has no trained
 tolerance for being squeezed. **Correct the earlier lead: vectorizing the
 3-bit unpack would not make Q3G viable for the trunk.** The quality wall
 sits in front of the speed wall.
+
+## 14. O_DIRECT on Linux, written blind (2026-07-28)
+
+`ecache.h` has always said reads must bypass the page cache, because with
+a 17 GB container on a 64 GB machine the kernel would cache the banks and
+every hit rate measured would be the kernel's rather than the engine's.
+macOS said so with `fcntl(F_NOCACHE)`. Linux said so **in a comment
+only** — `O_DIRECT` appeared in the header text and nowhere in the code.
+Every number in this file would have been fiction on Linux.
+
+O_DIRECT wants three alignments: offset, length and destination buffer.
+The first two come free — expert records are 12 406 784 bytes, exactly
+3029 pages — but that is a property of *this* container, so `bank_open`
+checks it rather than assuming, because a misaligned record makes every
+read fail EINVAL instead of merely running slow. The buffers came from
+`malloc`; cache slots and the miss buffer now come from `waste_dio_alloc`
+(posix_memalign, 4 KiB).
+
+Filesystems can refuse O_DIRECT — tmpfs does — so there is a fallback to
+a plain open plus `posix_fadvise(POSIX_FADV_RANDOM)`, which at least
+stops readahead. When any bank falls back, `waste_stats.direct_io` goes
+to 0 and `waste bench` says the hit rate is partly the kernel's. A
+measurement that quietly means something different is worse than one that
+is missing.
+
+Found on the way, and a harder blocker than the missing O_DIRECT: the
+build used `-std=c11`, which sets `__STRICT_ANSI__`, under which glibc
+hides every POSIX extension. `pread`, `fcntl`, `posix_memalign` and all
+of `pthread_*` would have been implicitly declared — only `model.c`
+defines `_GNU_SOURCE` for itself. The Makefile now uses `-std=gnu11`.
+`libwastevq.dylib` was hardcoded too, so `make` could not have finished
+on Linux at all.
+
+**None of this is validated on Linux.** Docker is installed here but has
+no registry access — no local images and `docker pull` hangs on both
+amd64 and arm64 — so the platform has still never run the engine. What
+was verified: macOS unchanged and 17/17; every file passes
+`-fsyntax-only` for an x86_64 target, which compiles the CPUID branch no
+ARM build ever sees; and `bank_open`'s Linux body compiles and runs
+against stub declarations of `O_DIRECT` and `posix_fadvise`. That catches
+typos and wrong signatures. It does not catch a filesystem that refuses
+O_DIRECT in a way I guessed wrong about, and the first real Linux run
+should be treated as the actual test.

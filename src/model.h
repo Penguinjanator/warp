@@ -104,6 +104,7 @@ typedef struct {
     uint64_t expert_reads;
     waste_ecache cache;
     uint8_t *miss_buf;               /* used when the cache is disabled     */
+    int      direct_io;              /* 0 = a bank fell back to page cache  */
 } waste_model;
 
 /* cache_bytes: hard ceiling for the expert cache; 0 = no cache. */
