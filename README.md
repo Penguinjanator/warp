@@ -196,11 +196,13 @@ source is [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3)
 exactly as published — 96 safetensors shards, 1.42 TB, nothing patched:
 
 ```bash
-# 1. download the weights: resumable, safe to kill and re-run
-tools/fetch_weights.sh --dest /Volumes/staging/k3 --dry-run   # preflight
+# 1. preflight: reachable? how big? does it fit?
+tools/fetch_weights.sh --dest /Volumes/staging/k3 --dry-run
+
+# 2. download — resumable, safe to kill, safe to re-run
 tools/fetch_weights.sh --dest /Volumes/staging/k3
 
-# 2. convert them into a container
+# 3. convert into a container
 uv run --with torch --with safetensors python tools/convert.py \
     --src /Volumes/staging/k3 \
     --out ~/models/k3.waste --jobs 3
@@ -209,10 +211,26 @@ uv run --with torch --with safetensors python tools/convert.py \
 That produces the 982 GB container every number above was measured on. It
 takes about **4.7 hours** with three processes on the M5 Pro (23.7 with
 the pure-torch encoder — see [docs/K3.md](docs/K3.md)), and wants ~1.0 TB
-free on the target volume. Both steps are resumable: a shard already
-downloaded is not refetched, a layer whose bank is already written is
-skipped, so an interrupted run costs only the layer it was in the middle
-of.
+free on the target volume. The converter is resumable too: a layer whose
+bank is already written is skipped, so an interrupted run costs only the
+layer it was in the middle of.
+
+The download is the part that goes wrong. A 1.42 TB pull over hours will
+hit dropped connections, CDN 5xx and at least one interrupted run, so
+every shard resumes mid-file rather than restarting, retries with
+exponential backoff and jitter, and counts as done only when its size
+matches Content-Length — recorded in a state file, so a re-run skips
+finished shards without even a HEAD request. `--check` re-verifies
+everything on disk against the remote and downloads nothing (96 shards in
+34 s). `--repo` points it at another model, `HF_TOKEN` at a gated one.
+macOS and Linux.
+
+Give `--dest` a staging disk rather than the volume that will hold the
+container. The shards are read once, by the converter; the container is
+read continuously, at every token. On this machine the external enclosure
+measures **0.94 GB/s** against the internal NVMe's **12.78** — see
+[docs/GATES.md](docs/GATES.md), Gate H — which is the difference between
+a model that streams and one that stalls.
 
 `tools/pipeline.sh` chains the whole thing unattended — download, convert,
 round-trip the container against the source weights, generate, then diff
