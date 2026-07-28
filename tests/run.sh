@@ -76,6 +76,17 @@ else
     sk "kernel checks" "uv not installed"
 fi
 
+# ---------------------------------------------------------------- image ----
+head_ "image"
+
+# No model needed: the loader is checked against closed-form arithmetic on
+# a solid colour it writes itself.
+if ./test_image "$TMP" 2>/dev/null | grep -q "^IMAGE OK"; then
+    ok "decode, patch grid, normalization and rejection of non-images"
+else
+    no "image loader"
+fi
+
 # ------------------------------------------------------------ container ----
 head_ "container"
 
@@ -392,7 +403,44 @@ fi
 # ----------------------------------------------------------- parameters ----
 head_ "parameter counts"
 
+# The other two things `info` says about a container were string constants
+# until a second model existed, and both were wrong about it: K3 announced
+# itself as kimi-linear with a Q8G trunk, being neither. They are derived
+# now, so check them against the manifest — the architecture K3 records
+# under `_outer`, and every trunk format the language model actually uses.
+info_rule() {
+    python3 - "$1" <<'PY'
+import json, subprocess, sys
+
+d = sys.argv[1]
+man = json.load(open(f"{d}/manifest.json"))
+r = subprocess.run(["./waste", "info", d, "--json"], capture_output=True, text=True)
+info = json.loads(r.stdout)
+c = man["config"]
+
+hf = ((c.get("_outer", {}).get("architectures") or c.get("architectures")
+       or [""]))[0]
+arch = ("kimi-k3" if "KimiK3" in hf else "kimi-linear" if "KimiLinear" in hf
+        else hf or "unknown")     # a container that names nothing gets that
+
+NAMES = {0: "F32", 1: "F16", 2: "Q8G", 3: "Q4G", 7: "Q3G"}
+pref = man.get("tensor_prefix", "")
+used = {t["fmt"] for t in man["trunk"]
+        if not pref or t["name"].startswith(pref)}
+quant = (f"experts VQ{man['expert_quant']['stages']}R, trunk "
+         + "/".join(NAMES[f] for f in (7, 3, 2, 1, 0) if f in used))
+
+print(f"{info['arch']}, {info['quantization']}")
+sys.exit(0 if info["arch"] == arch and info["quantization"] == quant else 1)
+PY
+}
+
 if [ -d "$MODEL" ]; then
+    if out=$(info_rule "$MODEL" 2>/dev/null); then
+        ok "info describes the container it opened ($out)"
+    else
+        no "info describes something else (${out:-no output})"
+    fi
     if out=$(params_rule "$MODEL" 2>/dev/null); then
         ok "params_total is what the container holds ($out)"
     else
@@ -402,9 +450,15 @@ else
     sk "parameter counts" "no container at $MODEL"
 fi
 
-# The only latent MoE here, so the only model on which the expert width and
-# the hidden differ at all: without it the check passes either way.
+# K3 is the model both rules were wrong about, and the only latent MoE
+# here: without it the expert width and the hidden never differ, and the
+# two descriptive fields pass on the constants they used to be.
 if [ -f "$BIG/manifest.json" ]; then
+    if out=$(info_rule "$BIG" 2>/dev/null); then
+        ok "info names K3 and its trunk, not the model before it ($out)"
+    else
+        no "info describes something else on K3 (${out:-no output})"
+    fi
     if out=$(params_rule "$BIG" 2>/dev/null); then
         ok "params_total counts K3's experts at the latent ($out)"
     else

@@ -45,6 +45,9 @@ KINDS = ("gate", "up", "down")
 H_KDA, D_KDA = 4, 32                      # KDA heads, head dim -> C = 128
 CFG = {
     "model_type": "kimi_linear",
+    # a real converted config carries this, and `info` names the model from
+    # it — model_type says kimi_linear on every model in the family
+    "architectures": ["KimiLinearForCausalLM"],
     "hidden_size": 128,
     "num_hidden_layers": 4,
     "first_k_dense_replace": 1,           # layer 0 dense, the rest MoE

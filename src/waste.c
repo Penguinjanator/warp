@@ -26,6 +26,10 @@
 #include "tokenizer.h"
 #include "waste_backend.h"
 
+/* Enough for any prompt a person assembles by hand; a batch host that
+ * wants more should run more contexts. */
+#define WASTE_MAX_IMAGES 32
+
 struct waste_ctx {
     waste_model m;
     waste_tok *tok;
@@ -36,7 +40,17 @@ struct waste_ctx {
     int warmed;              /* experts preloaded from the hotlist */
     char quant[64];          /* composed at open, reported by get_info */
     waste_stats stats;
+
+    /* Queued image embeddings, concatenated: img_each[] is how many rows
+     * each queued image contributed, which is what expand needs to know
+     * to size each placeholder's run. */
+    float   *img;
+    size_t   img_rows;
+    size_t   img_each[WASTE_MAX_IMAGES];
+    int      img_n;
 };
+
+
 
 /* What the container is actually stored as, composed once at open. It used
  * to be one string constant, which was true of the first model converted
@@ -324,6 +338,7 @@ void waste_close(waste_ctx *c)
     if (!c) return;
     waste_model_free(&c->m);
     waste_tok_free(c->tok);
+    free(c->img);
     free(c);
 }
 
@@ -376,6 +391,87 @@ static waste_status check_ids(const waste_ctx *c, const int32_t *ids, size_t n)
     return WASTE_OK;
 }
 
+
+/* ---- images ------------------------------------------------------------- */
+
+void waste_image_clear(waste_ctx *c)
+{
+    if (!c) return;
+    free(c->img);
+    c->img = NULL;
+    c->img_rows = 0;
+    c->img_n = 0;
+}
+
+waste_status waste_image_add(waste_ctx *c, const char *path, size_t *n_out)
+{
+    if (!c || !path) return WASTE_E_ARG;
+    if (!c->m.want_vision || !c->m.vcfg.layers) return WASTE_E_UNSUPPORTED;
+    if (c->img_n >= WASTE_MAX_IMAGES) return WASTE_E_ARG;
+
+    int gh = 0, gw = 0;
+    float *px = waste_image_load(path, c->m.vcfg.max_patches,
+                                 c->m.vcfg.mean, c->m.vcfg.std, &gh, &gw);
+    if (!px) return WASTE_E_IO;
+
+    const size_t rows = (size_t)(gh / 2) * (size_t)(gw / 2);
+    const size_t th = (size_t)c->m.vcfg.text_hidden;
+    float *nb = (float *)realloc(c->img, (c->img_rows + rows) * th * sizeof(float));
+    if (!nb) { free(px); return WASTE_E_OOM; }
+    c->img = nb;
+
+    const int rc = waste_vision_encode(&c->m, px, gh, gw,
+                                       c->img + c->img_rows * th);
+    free(px);
+    if (rc) return WASTE_E_IO;
+
+    c->img_each[c->img_n++] = rows;
+    c->img_rows += rows;
+    if (n_out) *n_out = rows;
+    return WASTE_OK;
+}
+
+waste_status waste_image_expand(waste_ctx *c, const int32_t *tokens, size_t n,
+                                int32_t *out, size_t cap, size_t *n_out)
+{
+    if (!c || !tokens || !out) return WASTE_E_ARG;
+    if (!c->m.want_vision || !c->m.vcfg.layers) return WASTE_E_UNSUPPORTED;
+    const int32_t pad = (int32_t)c->m.vcfg.media_token;
+
+    size_t seen = 0;
+    for (size_t i = 0; i < n; i++) if (tokens[i] == pad) seen++;
+    /* A mismatch is a prompt-assembly bug, and a silent one would show up
+     * much later as an image the model never saw. Refuse it here. */
+    if (seen != (size_t)c->img_n) return WASTE_E_ARG;
+
+    size_t k = 0, img = 0;
+    for (size_t i = 0; i < n; i++) {
+        const size_t rep = (tokens[i] == pad) ? c->img_each[img++] : 1;
+        if (k + rep > cap) { if (n_out) *n_out = 0; return WASTE_E_ARG; }
+        for (size_t r = 0; r < rep; r++) out[k++] = tokens[i];
+    }
+    if (n_out) *n_out = k;
+    return WASTE_OK;
+}
+
+/* The model reads embeddings from m.media as it walks the prompt, so the
+ * queue has to be armed before any prefill and released after, or a
+ * follow-up turn would splice the same picture in again. */
+static void media_arm(waste_ctx *c)
+{
+    c->m.media = c->img;
+    c->m.media_n = (int)c->img_rows;
+    c->m.media_used = 0;
+    c->m.cfg_media_token = c->m.vcfg.media_token;
+}
+
+static void media_release(waste_ctx *c)
+{
+    if (c->m.media_used > 0) waste_image_clear(c);
+    c->m.media = NULL;
+    c->m.media_n = c->m.media_used = 0;
+}
+
 waste_status waste_eval(waste_ctx *c, const int32_t *tokens, size_t n,
                         const float **logits_out, size_t *vocab_out)
 {
@@ -383,6 +479,7 @@ waste_status waste_eval(waste_ctx *c, const int32_t *tokens, size_t n,
     { const waste_status st = check_ids(c, tokens, n); if (st) return st; }
     const float *lg = NULL;
     const int cmax = waste_model_chunk_max(&c->m);
+    media_arm(c);
     for (size_t i = 0; i < n; ) {
         int k = (int)(n - i);
         if (k > cmax) k = cmax;
@@ -391,6 +488,7 @@ waste_status waste_eval(waste_ctx *c, const int32_t *tokens, size_t n,
         c->pos += k;
         i += (size_t)k;
     }
+    media_release(c);
     if (logits_out) *logits_out = lg;
     if (vocab_out) *vocab_out = (size_t)c->m.cfg.vocab;
     return WASTE_OK;
@@ -460,6 +558,7 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
     {
         const int cmax = waste_model_chunk_max(&c->m);
         size_t i = 0;
+        media_arm(c);
         while (i < n) {
             int k = (int)(n - i);
             if (k > cmax) k = cmax;
@@ -468,6 +567,7 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
             c->pos += k;
             i += (size_t)k;
         }
+        media_release(c);
     }
     c->stats.sec_total += nowf() - t0;
 

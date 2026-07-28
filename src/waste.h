@@ -146,6 +146,38 @@ waste_status waste_tokenize(waste_ctx *ctx, const char *text, int add_bos,
 waste_status waste_detokenize(waste_ctx *ctx, const int32_t *tokens, size_t n,
                               char *out, size_t cap, size_t *n_out);
 
+/* ---- images ------------------------------------------------------------ */
+
+/* Requires cfg.vision at open; without the tower these return
+ * WASTE_E_UNSUPPORTED.
+ *
+ * An image is not a token. It becomes a run of them: the tower turns a
+ * patch grid into one embedding per merged 2x2 patch, and each of those
+ * occupies a position in the sequence. So the flow is three steps, in
+ * this order:
+ *
+ *   waste_image_add(ctx, "photo.png", &n);   -- encode, queue, learn n
+ *   waste_image_expand(...)                  -- one placeholder -> n slots
+ *   waste_generate(...)                      -- consumes the queue
+ *
+ * The placeholder is whatever the container names as its media token
+ * (<|media_pad|> on K3), and the prompt needs exactly one per queued
+ * image; expand rewrites each into as many copies as that image needs,
+ * in queue order. Skipping expand is not a shortcut — the model would
+ * see one image position and the rest of the embeddings would go
+ * nowhere.
+ *
+ * Encoding happens in add, so its cost is paid before generation starts
+ * and a bad file is reported as a load error rather than mid-prompt.
+ * The queue is consumed by the next eval or generate: a second turn
+ * about the same picture needs no re-add, because the first turn's
+ * positions are already in the attention state. */
+waste_status waste_image_add(waste_ctx *ctx, const char *path,
+                             size_t *n_tokens_out);
+waste_status waste_image_expand(waste_ctx *ctx, const int32_t *tokens, size_t n,
+                                int32_t *out, size_t cap, size_t *n_out);
+void waste_image_clear(waste_ctx *ctx);
+
 /* ---- generation -------------------------------------------------------- */
 
 typedef struct {

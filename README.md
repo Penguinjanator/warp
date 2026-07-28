@@ -174,7 +174,7 @@ the next steps are about memory rather than arithmetic.
 ```bash
 git clone <this repo> && cd waste
 make                          # libwaste.a, waste, libwastevq
-make check                    # 21 checks, about three minutes
+make check                    # 25 checks, about three minutes
 ```
 
 No configure step and no dependency resolution. `make check` needs no
@@ -209,6 +209,45 @@ waste: no --budget, using 55.99 GB of 64.00 GB (expert cache 27.32 GB)
 
 `waste --help` lists all nine commands. `--json` makes `eval`, `tokenize`,
 `plan`, `info` and `bench` machine-readable.
+
+### Images
+
+K3 is multimodal, and so is the engine. `--image` puts a picture in front
+of the prompt; repeat it for several:
+
+```bash
+waste run model.waste "What is in this picture?" --image photo.png
+```
+
+PNG, JPEG, GIF, BMP and TGA, decoded by the one vendored header in
+`third_party/`. The 27-layer ViT is loaded only when an image is present,
+because its 438 MB otherwise come straight out of the expert cache.
+
+An image is not one token. The tower turns a 14-pixel patch grid into one
+embedding per merged 2×2 patch, and each occupies a position in the
+sequence — a 700×700 photo at the default budget is a few hundred of them,
+which is worth knowing before wondering where a context window went. The
+CLI prints the count:
+
+```
+[photo.png: 256 image tokens]
+```
+
+Through the library it is three calls, because a host needs to size the
+prompt before committing to it:
+
+```c
+size_t rows;
+waste_image_add(ctx, "photo.png", &rows);          /* encode and queue   */
+waste_image_expand(ctx, raw, n, ids, cap, &n_ids); /* placeholder -> N   */
+waste_generate(ctx, ids, n_ids, &params, cb, u);   /* consumes the queue */
+```
+
+One caveat, stated plainly because it is the thing most likely to be
+wrong: **K3 ships no preprocessor config**, so the pixel normalization is
+the CLIP convention this lineage of towers uses rather than a value read
+out of the release. It lives in `vision.json` and can be corrected without
+rebuilding.
 
 ## Platforms
 

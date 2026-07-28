@@ -46,9 +46,21 @@ static void human(uint64_t b, char *out, size_t cap)
     else snprintf(out, cap, "%.0f MB", (double)b / (1ULL << 20));
 }
 
+/* Parameter counts here span 47 B to 2.78 T, so the unit follows the
+ * number rather than printing K3 as 2777.4 B. */
+static void params_human(uint64_t n, char *out, size_t cap)
+{
+    if (n >= 1000000000000ULL) snprintf(out, cap, "%.2f T", (double)n / 1e12);
+    else snprintf(out, cap, "%.2f B", (double)n / 1e9);
+}
+
 /* ---- shared option parsing --------------------------------------------- */
 
 #define MAX_POS 2
+
+/* Matches the engine's own queue limit; more images than this in one
+ * prompt is a batch job, not a command line. */
+#define WASTE_MAX_IMAGES_CLI 32
 
 typedef struct {
     uint64_t budget;
@@ -57,6 +69,8 @@ typedef struct {
     int top_k, threads, quiet, learn, json, no_echo;
     uint64_t seed;
     const char *file, *stop, *system;
+    const char *image[WASTE_MAX_IMAGES_CLI];
+    int n_image;
     int raw;
     const char *pos[MAX_POS];      /* MODEL, then the command's argument */
     int n_pos;
@@ -87,7 +101,7 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
             !strcmp(a, "--temp") || !strcmp(a, "--top-p") || !strcmp(a, "--top-k") ||
             !strcmp(a, "--seed") || !strcmp(a, "--threads") ||
             !strcmp(a, "--file") || !strcmp(a, "--stop") ||
-            !strcmp(a, "--system")) {
+            !strcmp(a, "--system") || !strcmp(a, "--image")) {
             need = 1;
             /* `--temp --budget 8G` used to make "--budget" the temperature
              * and then complain about 8G. A value that looks like an option
@@ -111,6 +125,13 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
         else if (!strcmp(a, "--file")) o->file = v;
         else if (!strcmp(a, "--stop")) o->stop = v;
         else if (!strcmp(a, "--system")) o->system = v;
+        else if (!strcmp(a, "--image")) {
+            if (o->n_image >= WASTE_MAX_IMAGES_CLI) {
+                fprintf(stderr, "at most %d images\n", WASTE_MAX_IMAGES_CLI);
+                return -1;
+            }
+            o->image[o->n_image++] = v;
+        }
         else if (!strcmp(a, "-q") || !strcmp(a, "--quiet")) o->quiet = 1;
         else if (!strcmp(a, "--learn")) o->learn = 1;
         else if (!strcmp(a, "--json")) o->json = 1;
@@ -186,6 +207,9 @@ static waste_status open_model(const char *path, const opts *o, waste_ctx **ctx)
     cfg.ram_budget_bytes = o->budget;
     cfg.ctx_tokens = o->ctx;
     cfg.n_threads = o->threads;
+    /* The tower is 438 MB that a text prompt would never touch, so it is
+     * loaded only when there is an image to put through it. */
+    cfg.vision = o->n_image > 0;
     return waste_open(path, &cfg, ctx);
 }
 
@@ -452,20 +476,69 @@ static int cmd_info(int argc, char **argv)
     printf("  layers        %u\n", mi.n_layers);
     printf("  experts       %u (top-%u)\n", mi.n_experts, mi.top_k);
     printf("  hidden        %u\n", mi.hidden);
-    printf("  routed params %.1f B total, %.1f B active/token\n",
-           mi.params_total / 1e9, mi.params_active / 1e9);
+    char pt[32], pa[32];
+    params_human(mi.params_total, pt, sizeof pt);
+    params_human(mi.params_active, pa, sizeof pa);
+    printf("  parameters    %s total, %s active/token\n", pt, pa);
     printf("  quantization  %s\n", mi.quant_summary);
     printf("  expert cache  %s\n", cb);
     waste_close(c);
     return 0;
 }
 
+/* The prompt the tokenizer sees carries one placeholder per image, and the
+ * engine expands each into as many positions as that image encodes to. The
+ * wrapper tokens around it are the container's own names for the parts of a
+ * media block; only the pad is load-bearing.
+ *
+ * Images go in front of the text. That is the convention every VLM prompt
+ * follows and the only ordering a single --image flag can express; a caller
+ * that needs a picture in the middle of a sentence should write the
+ * placeholder itself and use the library. */
+static int prefix_images(waste_ctx *c, const opts *o, char *buf, size_t cap)
+{
+    size_t k = 0;
+    for (int i = 0; i < o->n_image; i++) {
+        size_t rows = 0;
+        const waste_status st = waste_image_add(c, o->image[i], &rows);
+        if (st != WASTE_OK) return fail(o->image[i], st);
+        if (!o->quiet)
+            fprintf(stderr, "[%s: %zu image tokens]\n", o->image[i], rows);
+        const int w = snprintf(buf + k, cap - k, "%s%s%s%s",
+                               "<|media_begin|>", "<|media_content|>",
+                               "<|media_pad|>", "<|media_end|>");
+        if (w < 0 || (size_t)w >= cap - k) {
+            fprintf(stderr, "prompt too long\n");
+            return 1;
+        }
+        k += (size_t)w;
+    }
+    buf[k] = 0;
+    return 0;
+}
+
 static int run_prompt(waste_ctx *c, const opts *o, const char *prompt, int show_stats)
 {
-    int32_t ids[MAXTOK];
+    int32_t ids[MAXTOK], raw[MAXTOK];
     size_t n = 0;
-    waste_status st = waste_tokenize(c, prompt, 0, ids, MAXTOK, &n);
-    if (st != WASTE_OK) return fail("tokenize", st);
+    waste_status st;
+
+    if (o->n_image) {
+        char head[512], *full;
+        if (prefix_images(c, o, head, sizeof head)) return 1;
+        const size_t need = strlen(head) + strlen(prompt) + 1;
+        if (!(full = (char *)malloc(need))) return fail("prompt", WASTE_E_OOM);
+        snprintf(full, need, "%s%s", head, prompt);
+        size_t rn = 0;
+        st = waste_tokenize(c, full, 0, raw, MAXTOK, &rn);
+        free(full);
+        if (st != WASTE_OK) return fail("tokenize", st);
+        st = waste_image_expand(c, raw, rn, ids, MAXTOK, &n);
+        if (st != WASTE_OK) return fail("image expand", st);
+    } else {
+        st = waste_tokenize(c, prompt, 0, ids, MAXTOK, &n);
+        if (st != WASTE_OK) return fail("tokenize", st);
+    }
 
     waste_gen_params p;
     waste_gen_params_init(&p);
