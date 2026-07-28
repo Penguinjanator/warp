@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SQLite Cloud, Inc.
 """
 routing_stats.py — answer WASTE open question #1 without downloading 1.5 TB.
 

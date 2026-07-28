@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 SQLite Cloud, Inc.
+ */
 /*
  * kda_neon.c — ARM NEON specialization of the KDA kernels.
  *

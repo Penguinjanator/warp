@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 SQLite Cloud, Inc.
+ */
 /*
  * model.c — container loading + forward pass. See model.h.
  *

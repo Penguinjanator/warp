@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 SQLite Cloud, Inc.
+ */
 /* test_state.c — a saved session must resume exactly where it left off.
  *
  *   ./test_state MODEL

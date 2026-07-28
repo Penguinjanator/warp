@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SQLite Cloud, Inc.
 """
 verify_container.py — read a WASTE container back and check it against the
 source weights. This is the test that the format actually works: it parses

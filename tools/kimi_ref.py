@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SQLite Cloud, Inc.
 """
 kimi_ref.py — pure-PyTorch Kimi-Linear, running off a WASTE container.
 

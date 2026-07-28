@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 SQLite Cloud, Inc.
+ */
 /*
  * waste_backend.h — kernel dispatch, modelled on sqlite-vector.
  *

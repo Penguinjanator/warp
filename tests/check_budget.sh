@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SQLite Cloud, Inc.
 # Does the engine actually stay inside waste_cfg.ram_budget_bytes?
 #
 # waste.h calls the budget a hard ceiling on everything the engine

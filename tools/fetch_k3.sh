@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SQLite Cloud, Inc.
 # fetch_k3.sh — long-haul download of a very large model, built to survive.
 #
 # A 1.4 TB pull over hours will hit dropped connections, 5xx from the CDN,

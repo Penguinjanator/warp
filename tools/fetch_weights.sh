@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SQLite Cloud, Inc.
 # fetch_weights.sh — download K3 weight shards to the staging disk.
 #
 # Storage split (docs/GATES.md, Gate H): raw shards land on the external

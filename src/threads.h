@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 SQLite Cloud, Inc.
+ */
 /*
  * threads.h — minimal fork-join pool for row-parallel kernels.
  *

@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 SQLite Cloud, Inc.
+ */
 /*
  * test_k3parts.c — exercise the three K3 components whose maths is new,
  * and dump inputs + outputs so tools/k3parts_ref.py can recompute them

@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 SQLite Cloud, Inc.
+ */
 /*
  * simd.h — the two range kernels that carry the engine's arithmetic, in a
  * form other translation units can implement.

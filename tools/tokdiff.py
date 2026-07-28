@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SQLite Cloud, Inc.
 """tokdiff.py — C tokenizer vs Python tiktoken on a fixed corpus.
 
   uv run --with tiktoken python tools/tokdiff.py CONTAINER SRC_WEIGHTS

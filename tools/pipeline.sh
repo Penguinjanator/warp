@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SQLite Cloud, Inc.
 # pipeline.sh — download -> convert -> verify -> first K3 run, unattended.
 #
 # Every stage is resumable and refuses to start on a failed predecessor, so

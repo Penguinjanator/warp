@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SQLite Cloud, Inc.
 """
 quant_lab.py — Gate 3: does sub-4-bit expert quantization actually hold up
 on real Kimi MoE weights?

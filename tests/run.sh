@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SQLite Cloud, Inc.
 # tests/run.sh — every check we have, in one place, exiting non-zero on the
 # first real failure.
 #

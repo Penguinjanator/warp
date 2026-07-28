@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 SQLite Cloud, Inc.
+ */
 /*
  * test_kda.c — run the KDA kernel over a fixture produced by
  * tools/kda_ref.py and write the outputs back for comparison against

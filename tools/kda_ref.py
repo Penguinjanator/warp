@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SQLite Cloud, Inc.
 """
 kda_ref.py — Gate 4: validate the C KDA kernel against the official
 reference.

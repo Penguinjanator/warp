@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SQLite Cloud, Inc.
 """
 k3parts_ref.py — recompute the K3 components from the released reference
 source and diff against the C engine.

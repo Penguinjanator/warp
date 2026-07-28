@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 SQLite Cloud, Inc.
+ */
 /*
  * tokenizer.h — tiktoken-style BPE for the Kimi family, in C.
  *

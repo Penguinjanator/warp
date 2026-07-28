@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 SQLite Cloud, Inc.
+ */
 /*
  * simd_avx512.c — AVX-512 versions of the two range kernels (see simd.h).
  *

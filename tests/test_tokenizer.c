@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 SQLite Cloud, Inc.
+ */
 /* test_tokenizer.c — encode/decode round-trip and id dump for the Python diff. */
 #include <stdio.h>
 #include <stdlib.h>

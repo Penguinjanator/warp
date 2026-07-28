@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright 2026 SQLite Cloud, Inc.
+ */
 /*
  * backend.c — runtime CPU detection and kernel dispatch.
  * See waste_backend.h. Structure follows sqlite-vector's

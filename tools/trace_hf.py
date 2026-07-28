@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SQLite Cloud, Inc.
 """Batch-1 routing trace from any HF MoE model, for routing_stats.py simulate.
 
 Registers a hook on every layer's router gate, generates N tokens greedy,

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SQLite Cloud, Inc.
 """
 kimi_tok.py — minimal Kimi tokenizer (tiktoken BPE), enough to drive the
 reference and the engine end to end.

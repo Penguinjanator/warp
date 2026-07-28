@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SQLite Cloud, Inc.
 """
 memplan.py — what is the minimum RAM needed to run this model, and what
 does a given RAM budget buy?
