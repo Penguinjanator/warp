@@ -188,3 +188,75 @@ lands.
   call.
 - **Numbers that look too neat deserve suspicion.** "165 GB/s, exactly the
   machine's ceiling" was a coincidence, not an explanation.
+
+## 10. Where a K3 decode step actually goes (2026-07-28)
+
+First real profile, 5 decode steps, `--budget 46G`:
+
+| stage | share | note |
+|---|---|---|
+| expert I/O | 39.0% | 17.0 GB/token at ~9.9 GB/s |
+| expert matmul | 26.1% | LUT build 8.2 + apply 17.5 |
+| KDA layers | 19.1% | dominated by q/k/v/o/gate projections |
+| MLA layers | 3.3% | |
+| lm_head | 1.4% | |
+
+17.0 GB/token is exactly the working set Gate 5 predicted, and 9.9 GB/s
+is close to the internal SSD's measured 12.78 GB/s: **the I/O is already
+near the hardware limit**, so it only gets cheaper by being read less
+often, which means cache, which means RAM.
+
+And RAM is where the real finding is. `waste plan` at a 46 GB budget:
+
+```
+resident trunk       28.61 GB
+KDA state + KV       11.68 GB
+minimum expert cache  0.38 GB
+budget 46 GB -> expert cache 5.64 GB
+```
+
+5.64 GB against a 17.0 GB per-token working set is 0.33x — well under
+the Gate 5 floor, which is exactly why the measured hit rate is 0.0%
+across 8832 accesses. The cache is not underperforming; it was never
+given enough room to hold anything.
+
+**The KV cache is 53x larger than MLA requires.** The engine caches K and
+V expanded per head — 96 x 192 + 96 x 128 floats per token per layer,
+120 KB — when MLA's whole point is that only the 512-wide latent plus
+the 64 rope dims need storing, 2.25 KB. Absorbing `kv_b_proj` into the
+query (score against the latent directly, accumulate in latent space,
+project once at the end) gives:
+
+| ctx | cached now | absorbed |
+|---|---|---|
+| 4,096 | 11.25 GB | 0.21 GB |
+| 32,768 | 90.00 GB | 1.69 GB |
+| 131,072 | 360.00 GB | 6.75 GB |
+| 1,048,576 | 2.81 TB | 54.00 GB |
+
+It costs 3.2x the attention arithmetic (3.32 -> 10.57 GMAC/token, against
+48.6 GMAC for the experts) and saves 53x the attention memory traffic
+(11.25 -> 0.21 GB/token). At a 58 GB budget it turns 5.64 GB of expert
+cache into ~29 GB — 1.7x a token's working set, the first time the cache
+would be above the floor. It is also the only thing that makes long
+context possible at all: the current layout wants 360 GB at 128K.
+
+**The report says the trunk should not be 4-bit.** QAT covered the expert
+weights at MXFP4 with everything else in higher precision, so the model
+has no trained tolerance for a quantized trunk — and mine is 26.33 GiB
+of Q4G measuring 11.8% off the source weights (Q8G measures 0.64%). This
+is a quality risk, not a speed one, and it trades directly against the
+cache: raising the whole trunk to Q8G would cost the 11 GB that
+absorbing the KV cache frees.
+
+**No speculative decoding is available.** The report fine-tunes K3's MTP
+layer into an EAGLE-3 draft whose input fuses the 1st, 4th and final
+AttnRes blocks — representations this engine already materializes in
+`m->blockres`. But the open release ships no MTP, draft, or fusion
+tensors, so there is nothing to run.
+
+Method note to add to §9: **WASTE_THREADS=1 is not a serial baseline on
+this machine.** 6 of 18 logical cores are performance cores, and a
+single-threaded process lands on an E-core; the same KDA kernel reads
+17.21s that way against 4.23s with the pool merely available. The
+parallel-vs-serial comparison has to be made with the pool alive.
