@@ -1,0 +1,10 @@
+.git
+*.o
+*.d
+*.dSYM
+waste
+waste_asan*
+test_*
+lib*.a
+lib*.dylib
+lib*.so

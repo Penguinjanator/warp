@@ -14,11 +14,19 @@ case "${3:-}" in
     *)    PROMPT="hello";;
 esac
 
-# /usr/bin/time -l reports peak RSS in bytes on macOS, KB on Linux
-OUT=$(/usr/bin/time -l ./waste run "$MODEL" "$PROMPT" -n 2 --budget "${BUDGET_GB}G" -q 2>&1)
-RSS=$(echo "$OUT" | grep -E "maximum resident set size" | tr -s ' ' | cut -d' ' -f2)
+# Peak RSS of the child, through getrusage. /usr/bin/time was the obvious
+# tool and the wrong one: its flags differ between BSD and GNU, and it is
+# not installed in a plain debian image at all — which is how this check
+# first "failed" on Linux. ru_maxrss is bytes on macOS, kilobytes elsewhere.
+RSS=$(python3 -c '
+import resource, subprocess, sys
+subprocess.run(["./waste", "run", sys.argv[1], sys.argv[2], "-n", "2",
+                "--budget", sys.argv[3] + "G", "-q"],
+               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+r = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+print(r if sys.platform == "darwin" else r * 1024)
+' "$MODEL" "$PROMPT" "$BUDGET_GB")
 [ -z "$RSS" ] && { echo "could not read peak RSS"; exit 1; }
-case "$(uname)" in Linux) RSS=$((RSS * 1024));; esac
 
 python3 - "$RSS" "$BUDGET_GB" <<'PY'
 import sys

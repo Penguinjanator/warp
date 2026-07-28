@@ -1,0 +1,8 @@
+FROM debian:bookworm-slim
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+      build-essential python3 file >/dev/null && rm -rf /var/lib/apt/lists/*
+# Copy rather than bind-mount: a shared working tree means the Linux build
+# clobbers the macOS objects and binaries, and vice versa.
+WORKDIR /src
+COPY . /src
+RUN make clean >/dev/null 2>&1 || true

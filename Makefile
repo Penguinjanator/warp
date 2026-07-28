@@ -25,7 +25,12 @@ CFLAGS  += -MMD -MP
 
 SRC := src/model.c src/kda.c src/backend.c src/ecache.c src/version.c \
        src/tokenizer.c src/waste.c src/vq.c
-ifneq (,$(findstring arm,$(shell uname -m)))
+# Match what backend.c tests for. Linux/aarch64 reports "aarch64", which
+# does not contain "arm" — the old findstring left kda_neon.c out of the
+# build while backend.c still emitted the call to it, so the link failed
+# with an undefined waste_kda_register_neon.
+UNAME_M := $(shell uname -m)
+ifneq (,$(filter arm% aarch64%,$(UNAME_M)))
 SRC += src/kda_neon.c
 endif
 
