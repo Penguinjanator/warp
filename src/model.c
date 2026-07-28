@@ -410,8 +410,14 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
     const int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
 #define TRUNK_FAIL do { close(fd); return -1; } while (0)
+    /* Every offset and length below comes from the manifest, so bound them
+     * by the one thing that is not a claim: how big the file actually is.
+     * Without it a declared shape of [2^20, 2^20] asks for a 4 TB
+     * allocation before anything notices. */
+    const off_t fsize = lseek(fd, 0, SEEK_END);
+    if (fsize < 0) TRUNK_FAIL;
 
-    m->n_tensors = d->tok[trunk].size;
+    m->n_tensors = js_size(d, trunk);
     m->t = (waste_tensor *)calloc((size_t)m->n_tensors, sizeof *m->t);
 
     for (int i = 0; i < m->n_tensors; i++) {
@@ -423,11 +429,21 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
         const int g = (int)js_int(d, js_get(d, e, "group"), 128);
         const long soff = js_int(d, js_get(d, e, "scale_off"), 0);
         int sh = js_get(d, e, "shape");
-        t->ndim = d->tok[sh].size;
+        t->ndim = js_size(d, sh);
+        /* Shapes and the group size divide and index below, so a manifest
+         * declaring [] or [0] or group 0 has to stop here rather than reach
+         * `t->n / N`. A fuzzer found all three. */
+        if (t->ndim < 1 || t->ndim > 4 || g < 1) TRUNK_FAIL;
+        if (off < 0 || off > fsize || soff < 0 || soff > fsize) TRUNK_FAIL;
         t->n = 1;
         for (int k = 0; k < t->ndim && k < 4; k++) {
             t->shape[k] = (int)js_int(d, js_at(d, sh, k), 1);
+            if (t->shape[k] < 1 || t->shape[k] > (1 << 26)) TRUNK_FAIL;
             t->n *= (size_t)t->shape[k];
+            /* One element per byte is already generous — nothing in this
+             * format stores less than a bit per weight — so a tensor with
+             * more elements than the file has bytes is a lie. */
+            if (t->n > (size_t)fsize) TRUNK_FAIL;
         }
         if (fmt == 0) {                                   /* F32 */
             t->data = (float *)waste_dio_alloc(t->n * sizeof(float));
@@ -499,6 +515,37 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
     return 0;
 }
 
+/* A manifest is untrusted input, and these numbers size allocations and
+ * bound loops that index fixed arrays. A config claiming 200 layers walks
+ * off the end of waste_model's [WASTE_MAX_LAYERS] arrays; one claiming
+ * zero of anything produces empty allocations that later get written.
+ * Neither is a wrong answer — both are memory corruption — so refuse. */
+static int cfg_sane(const waste_config *c)
+{
+    if (c->n_layers < 1 || c->n_layers > WASTE_MAX_LAYERS) return 0;
+    if (c->hidden   < 1 || c->hidden   > (1 << 20)) return 0;
+    if (c->vocab    < 1 || c->vocab    > (1 << 24)) return 0;
+    if (c->n_heads  < 1 || c->n_heads  > (1 << 16)) return 0;
+    if (c->eps <= 0.0f || !(c->eps < 1.0f)) return 0;      /* also catches NaN */
+    /* MoE is optional, but if there are experts the routing has to make
+     * sense: top_k above the pool overruns the per-token index array. */
+    if (c->n_experts < 0 || c->n_experts > (1 << 20)) return 0;
+    if (c->n_experts && (c->top_k < 1 || c->top_k > c->n_experts ||
+                         c->top_k > 64)) return 0;
+    if (c->moe_inter < 0 || c->moe_inter > (1 << 20)) return 0;
+    if (c->dense_inter < 0 || c->dense_inter > (1 << 20)) return 0;
+    if (c->kda_heads < 0 || c->kda_heads > (1 << 16)) return 0;
+    if (c->kda_dim   < 0 || c->kda_dim   > (1 << 16)) return 0;
+    if (c->conv_k    < 0 || c->conv_k    > 64) return 0;
+    if (c->kv_lora   < 0 || c->q_lora    < 0) return 0;
+    if (c->qk_nope   < 0 || c->qk_rope   < 0 || c->v_head < 0) return 0;
+    if (c->first_dense < 0 || c->first_dense > c->n_layers) return 0;
+    if (c->n_shared  < 0 || c->n_shared  > 64) return 0;
+    if (c->latent_dim < 0 || c->latent_dim > (1 << 20)) return 0;
+    if (c->attn_res_block < 0 || c->attn_res_block > c->n_layers) return 0;
+    return 1;
+}
+
 static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
 {
     c->n_layers = (int)js_int(d, js_get(d, cfg, "num_hidden_layers"), 0);
@@ -540,7 +587,7 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     c->conv_k = (int)js_int(d, js_get(d, lac, "short_conv_kernel_size"), 4);
     memset(c->kda_layer, 0, sizeof c->kda_layer);
     int kl = js_get(d, lac, "kda_layers");
-    for (int i = 0; i < d->tok[kl].size; i++) {
+    for (int i = 0; i < js_size(d, kl); i++) {
         int v = (int)js_int(d, js_at(d, kl, i), -1) - 1;   /* list is 1-based */
         if (v >= 0 && v < 128) c->kda_layer[v] = 1;
     }
@@ -609,6 +656,14 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                 snprintf(m->cfg.prefix, sizeof m->cfg.prefix, "language_model.");
         }
         cfg_from_json(&m->cfg, &d, cfg);
+    }
+    if (!cfg_sane(&m->cfg)) {
+        fprintf(stderr, "waste: manifest config is out of range "
+                        "(%d layers, hidden %d, vocab %d, %d experts top-%d)\n",
+                m->cfg.n_layers, m->cfg.hidden, m->cfg.vocab,
+                m->cfg.n_experts, m->cfg.top_k);
+        js_free(&d); free(src);
+        return -2;                        /* -> WASTE_E_FORMAT */
     }
     const waste_config *c = &m->cfg;
 

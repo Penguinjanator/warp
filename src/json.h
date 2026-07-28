@@ -160,6 +160,20 @@ static inline int js_get(const js_doc *d, int obj, const char *key)
     return -1;
 }
 
+/* Members of an object or elements of an array, and 0 for anything else.
+ *
+ * js_get and js_at return -1 when a key is missing or a token is not the
+ * container the caller assumed. Reading d->tok[-1].size then indexes
+ * before the allocation — a heap read a malformed manifest can reach, and
+ * did: three call sites had it before a fuzzer found them. Use this
+ * instead of touching d->tok directly. */
+static inline int js_size(const js_doc *d, int tok)
+{
+    if (tok < 0 || tok >= d->n) return 0;
+    if (d->tok[tok].type != JS_OBJ && d->tok[tok].type != JS_ARR) return 0;
+    return d->tok[tok].size;
+}
+
 /* Element `i` of array `arr`, or -1. */
 static inline int js_at(const js_doc *d, int arr, int i)
 {

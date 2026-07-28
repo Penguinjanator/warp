@@ -143,4 +143,40 @@ clean:
 check: test
 	@tests/run.sh
 
+# Sanitizers. Separate targets rather than a flag on `make`, because they
+# need a full rebuild: mixing instrumented and uninstrumented objects
+# produces false reports and missed ones. ASan's own allocator refuses
+# very large mappings, so these run against a synthetic container, which
+# is what tests/run.sh falls back to when given a path that does not exist.
+SAN_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer \
+             -fno-sanitize-recover=all -g -O1
+
+asan:
+	@$(MAKE) --no-print-directory clean
+	@$(MAKE) --no-print-directory all test \
+	    CFLAGS="-std=gnu11 -Wall -Wextra -DVQ_SUPER=$(VQ_SUPER) -MMD -MP $(SAN_FLAGS)" \
+	    LDLIBS="-lm -lpthread $(SAN_FLAGS)"
+	@rc=0; ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
+	    WASTE_SANITIZED=1 \
+	    tests/run.sh /nonexistent-container-use-synthetic || rc=$$?; \
+	 $(MAKE) --no-print-directory clean; exit $$rc
+
+fuzz: test
+	@python3 tools/fuzz_container.py --runs $(FUZZ_RUNS)
+
+FUZZ_RUNS ?= 200
+
+# What CI runs: the fuzzer against an instrumented build, so a read past
+# the end of a buffer aborts instead of returning plausible garbage.
+fuzz-asan:
+	@$(MAKE) --no-print-directory clean
+	@$(MAKE) --no-print-directory all test \
+	    CFLAGS="-std=gnu11 -Wall -Wextra -DVQ_SUPER=$(VQ_SUPER) -MMD -MP $(SAN_FLAGS)" \
+	    LDLIBS="-lm -lpthread $(SAN_FLAGS)"
+	@rc=0; ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
+	    python3 tools/fuzz_container.py --runs $(FUZZ_RUNS) || rc=$$?; \
+	 $(MAKE) --no-print-directory clean; exit $$rc
+
+.PHONY: all test check clean asan fuzz fuzz-asan
+
 .PHONY: all test check clean

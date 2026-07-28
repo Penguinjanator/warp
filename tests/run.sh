@@ -252,7 +252,9 @@ PYFV
         no "format_version not enforced (rc=$rc rc2=$rc2)"
     fi
 
-    if [ "$SYNTHETIC" = 1 ]; then
+    if [ -n "${WASTE_SANITIZED:-}" ]; then
+        sk "peak RSS inside the budget" "sanitizer shadow memory makes RSS meaningless"
+    elif [ "$SYNTHETIC" = 1 ]; then
         sk "peak RSS inside the budget" "needs a tokenizer to drive the CLI"
     elif tests/check_budget.sh "$MODEL" 2>/dev/null | grep -q "^BUDGET OK"; then
         ok "peak RSS stays inside the configured budget"
@@ -268,7 +270,9 @@ fi
 # sizes in single megabytes. Run the same check against K3 when it is here.
 BIG="${BIG_MODEL:-/Users/marco/models/k3.waste}"
 if [ -f "$BIG/manifest.json" ]; then
-    if tests/check_budget.sh "$BIG" 32 long 2>/dev/null | grep -q "^BUDGET OK"; then
+    if [ -n "${WASTE_SANITIZED:-}" ]; then
+        sk "K3 budget check" "sanitizer shadow memory makes RSS meaningless"
+    elif tests/check_budget.sh "$BIG" 32 long 2>/dev/null | grep -q "^BUDGET OK"; then
         ok "peak RSS stays inside the budget on K3 too"
     else
         no "peak RSS exceeded the budget on K3"

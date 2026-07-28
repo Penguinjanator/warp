@@ -43,7 +43,8 @@ typedef struct {
     int n_shared, first_dense, vocab, n_heads;
     int kv_lora, q_lora, qk_nope, qk_rope, v_head;
     int kda_heads, kda_dim, conv_k;
-    int kda_layer[128];              /* 1 if layer is KDA                   */
+#define WASTE_MAX_LAYERS 128
+    int kda_layer[WASTE_MAX_LAYERS]; /* 1 if layer is KDA                   */
     float eps, routed_scale;
     int renorm;
 
@@ -72,16 +73,16 @@ typedef struct {
     float *codebooks;                /* [n_books][256][8]                   */
     float *codebooksT;               /* [n_books][8][256], for the LUT build*/
     int n_books, vec_dim, cb_entries, stages;
-    waste_bank bank[128];
+    waste_bank bank[WASTE_MAX_LAYERS];
     int expert_m[3], expert_n[3];    /* gate, up, down shapes               */
 
     /* per-layer state */
-    float *S[128];                   /* KDA recurrent state                 */
-    float *conv[128];                /* KDA short-conv rings (3 x C x K-1)  */
+    float *S[WASTE_MAX_LAYERS];                   /* KDA recurrent state                 */
+    float *conv[WASTE_MAX_LAYERS];                /* KDA short-conv rings (3 x C x K-1)  */
     /* MLA caches the latent, not the expanded per-head K and V: kv_b_proj
      * is absorbed into the query and the output instead (see mla_layer). */
-    float *latcache[128];            /* [kv_cap][kv_lora + qk_rope]         */
-    int n_kv[128], kv_cap;
+    float *latcache[WASTE_MAX_LAYERS];            /* [kv_cap][kv_lora + qk_rope]         */
+    int n_kv[WASTE_MAX_LAYERS], kv_cap;
 
     /* scratch */
     float *x, *h, *tmp, *att, *logits;

@@ -431,3 +431,48 @@ against stub declarations of `O_DIRECT` and `posix_fadvise`. That catches
 typos and wrong signatures. It does not catch a filesystem that refuses
 O_DIRECT in a way I guessed wrong about, and the first real Linux run
 should be treated as the actual test.
+
+## 15. What a fuzzer found in an afternoon (2026-07-28)
+
+`make asan`, `make fuzz`, `make fuzz-asan`. The fuzzer is structure-aware:
+it starts from a synthetic container and breaks one thing at a time — a
+JSON field retyped, an offset moved past the end, a file truncated
+mid-record, a bit flipped in a header. Random bytes would be rejected by
+the parser before reaching anything interesting.
+
+Five defects, all reachable from a manifest, none of them a wrong answer:
+
+**`d->tok[-1]` in three places.** `js_get` returns -1 for a missing key,
+and `d->tok[trunk].size`, `d->tok[sh].size` and `d->tok[kl].size` all
+indexed the token array with it — a heap read before the allocation,
+triggered by removing `config` or `shape`. Fixed by the class rather than
+the instance: `js_size()` returns 0 for anything that is not a valid
+container, and no code outside the parser touches `d->tok` any more.
+
+**No config validation.** A manifest claiming 200 layers walks off the end
+of `waste_model`'s `[WASTE_MAX_LAYERS]` arrays; one claiming zero of
+anything produces empty allocations that later get written. `cfg_sane()`
+bounds every dimension now.
+
+**Unbounded allocation from a declared shape.** `shape: [2^20, 2^20]`
+asked for 4 TB. `posix_memalign` would have failed and the error path
+handled it, but nothing should size an allocation from an unchecked
+claim: tensor sizes are now bounded by the size of the file that is
+supposed to contain them.
+
+**Division by zero** on a zero last dimension or a zero group size.
+
+**Token ids were never range-checked** — found earlier the same day, by
+the same synthetic container. They index the embedding table directly.
+
+The pattern worth keeping: every one of these was invisible against the
+real container, because a valid 19 GB model never asks for a tensor
+bigger than its file or a layer past 128. **The small fake input is what
+made the checks fail loudly.** Two of the five were in the test code
+rather than the engine — `test_state` had the vocabulary hardcoded to
+163840 and read off the end of a 256-entry logits buffer — which is the
+same lesson pointing at the tests.
+
+Note that RSS budget checks are skipped under a sanitizer
+(`WASTE_SANITIZED=1`): shadow memory makes peak RSS meaningless, and a
+check that cannot be true is worse than no check.

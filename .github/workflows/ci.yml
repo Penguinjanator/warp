@@ -87,6 +87,20 @@ jobs:
       - name: The backend registers
         run: ./waste version | grep -q Metal
 
+  sanitizers:
+    name: asan + fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Both run against the synthetic container, so neither needs a model.
+      # The fuzzer is where this pays: every finding so far came from it,
+      # and only the instrumented build turns them into failures instead of
+      # plausible garbage.
+      - name: Suite under ASan/UBSan
+        run: make asan
+      - name: Fuzz the container parser under ASan/UBSan
+        run: make fuzz-asan FUZZ_RUNS=400
+
   guards:
     name: build guards
     runs-on: ubuntu-latest

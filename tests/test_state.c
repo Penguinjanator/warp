@@ -52,10 +52,14 @@ int main(int argc, char **argv)
     const char *path = "/tmp/waste_state_test.bin";
     sink a = {{0}, 0};
     const float *lg;
-    if (waste_eval(c, prompt, n, &lg, NULL) != WASTE_OK) return 1;
+    size_t vocab = 0;
+    if (waste_eval(c, prompt, n, &lg, &vocab) != WASTE_OK) return 1;
     if (waste_state_save(c, path) != WASTE_OK) { fprintf(stderr, "save\n"); return 1; }
     int32_t nxt[1] = { 0 };
-    for (int v = 1; v < 163840; v++) if (lg[v] > lg[nxt[0]]) nxt[0] = v;
+    /* vocab comes from the model, not from a constant: a synthetic
+     * container has 256 entries and the hardcoded 163840 read right off
+     * the end of the logits buffer. */
+    for (size_t v = 1; v < vocab; v++) if (lg[v] > lg[nxt[0]]) nxt[0] = (int32_t)v;
     waste_generate(c, nxt, 1, &p, on_tok, &a);
 
     /* fresh context, load the save, continue from the same token */

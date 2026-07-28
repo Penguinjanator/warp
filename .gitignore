@@ -12,3 +12,6 @@ libwaste.a
 
 # compiler-generated dependency files (-MMD)
 *.d
+
+# containers a fuzzer kept for reproduction
+fuzz-case-*/

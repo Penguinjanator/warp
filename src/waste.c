@@ -105,7 +105,7 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
     /* trunk: sum the tensor payloads as they are stored, minus the ones the
      * engine deliberately leaves on disk (embed_tokens — one row per token) */
     const int trunk = js_get(&d, 0, "trunk");
-    for (int i = 0; i < d.tok[trunk].size; i++) {
+    for (int i = 0; i < js_size(&d, trunk); i++) {
         const int e = js_at(&d, trunk, i);
         char nm[160];
         js_str(&d, js_get(&d, e, "name"), nm, sizeof nm);
@@ -127,7 +127,7 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
     const int kd = (int)js_int(&d, js_get(&d, lac, "head_dim"), 0);
     const int ck = (int)js_int(&d, js_get(&d, lac, "short_conv_kernel_size"), 4);
     const int kl = js_get(&d, lac, "kda_layers");
-    const int n_kda = kl >= 0 ? d.tok[kl].size : 0;
+    const int n_kda = js_size(&d, kl);
     const int n_mla = layers - n_kda;
 
     /* MLA caches the latent plus the rope dims, not the expanded per-head
@@ -177,7 +177,7 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
     const int top_k = (int)js_int(&d, js_get(&d, cfg, "num_experts_per_token"), 8);
     const int lyr = js_get(&d, 0, "layers");
     uint64_t rec = 0;
-    if (lyr >= 0 && d.tok[lyr].size > 0) {
+    if (js_size(&d, lyr) > 0) {
         const int first = lyr + 2;   /* first member's value */
         const uint64_t bytes = (uint64_t)js_int(&d, js_get(&d, first, "bytes"), 0);
         const uint64_t n = (uint64_t)js_int(&d, js_get(&d, first, "experts"), 1);
