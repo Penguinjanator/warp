@@ -212,3 +212,41 @@ over the LUT accumulation, and Metal for the prefill GEMMs.
 AVX2/AVX-512 modules, the CUDA/Metal/BLAS backends themselves, the platform
 I/O wrapper (currently `pread`/`F_NOCACHE` only, in `tools/diskbench.c`),
 and a CI matrix across the three OSes.
+
+## i8mm/SMMLA for the batched matmul: 2x on its own work, 1.2% overall
+
+SMMLA multiplies a 2x8 int8 tile by an 8x2 tile into a 2x2 int32
+accumulator — 32 MACs per instruction against 4 for an fp32 FMA. The
+natural target is `mmq_rows`, the batched trunk matmul the chunked
+prefill uses for the latent projections, the shared experts and the
+dense FFN. `src/model.c` now has `mmq_rows_i8mm`, tiling two weight rows
+by two tokens and accumulating per quantization group so each group's
+pair of scales applies once.
+
+It works, and it is off by default. Measured on a 19-token chunked
+prefill of K3:
+
+| | batched mm | total prefill |
+|---|---|---|
+| f32 path | 2.38 s (6.0%) | 46.20 s |
+| SMMLA | 1.15 s (3.0%) | 45.66 s |
+
+**2.07x on the kernel, 1.2% end to end** — because the batched matmul is
+only 6% of prefill to begin with. The time is in the VQ path: LUT apply
+37.0% plus LUT build 17.7%, then expert I/O 37.6%. That is where the
+next SIMD work belongs, and it is gather-shaped rather than GEMM-shaped,
+so SMMLA does not reach it.
+
+It also is not free numerically. SMMLA needs int8 on both sides, so the
+activations get quantized per group, which the f32 path deliberately
+avoids. Logits move by 6.8e-02 relative — argmax and top-5 held on the
+prompt tested, but that is a real change, not fp noise.
+
+Hence two switches, both off: build with `make WASTE_NATIVE=1` (the
+default build targets baseline ARM, where `__ARM_FEATURE_MATMUL_INT8` is
+not defined and the kernel compiles away) and run with `WASTE_I8MM=1`.
+Turning it on by default would trade measurable accuracy for 1.2%. If
+the VQ path ever gets fast enough that the batched matmul's share grows,
+revisit — and at that point move the kernel into its own translation
+unit so runtime dispatch can pick it, instead of requiring a native
+build.

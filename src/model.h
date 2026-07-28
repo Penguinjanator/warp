@@ -91,6 +91,9 @@ typedef struct {
     float *blockres;                 /* AttnRes history: [nblocks][hidden]  */
     int    n_blockres;
     float *prefix_sum, *ares;
+    int8_t  *mmxq;                  /* int8 activations for the SMMLA path */
+    float   *mmxs;
+    size_t   mmx_cap, mms_cap;
     int      trunk_fd;              /* stays open for the on-disk tensors  */
     int8_t  *embrow;                /* one embedding row, read per token   */
     uint16_t *embsc;

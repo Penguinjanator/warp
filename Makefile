@@ -19,6 +19,14 @@ SRC := src/model.c src/kda.c src/backend.c src/ecache.c src/version.c \
 ifneq (,$(findstring arm,$(shell uname -m)))
 SRC += src/kda_neon.c
 endif
+
+# WASTE_NATIVE=1 builds for this exact CPU, which on ARMv8.6 turns on the
+# SMMLA batched matmul (still opt-in at runtime with WASTE_I8MM=1 — it
+# quantizes activations to int8, so it does not produce the f32 numbers).
+# The default build stays portable across ARM.
+ifdef WASTE_NATIVE
+CFLAGS += -mcpu=native
+endif
 # Accelerator backends are build-time options, and each needs a source file
 # that registers it. None exists yet: the flags below were reachable but
 # only produced "Undefined symbols: _waste_register_metal" at link time.

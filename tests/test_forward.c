@@ -87,15 +87,18 @@ int main(int argc, char **argv)
         cur = best;
     }
 
-    extern double waste_prof[8];
+    extern double waste_prof[16];
     if (getenv("WASTE_PROFILE")) {
-        const char *names[8] = {"  LUT build","kda","mla","moe(all)",
+        /* indented names are sub-totals of the line above and are excluded
+         * from `tot`, so the percentages add to 100 */
+        const char *names[9] = {"  LUT build","kda","mla","moe(all)",
                                 "  expert I/O","  expert mm","lm_head",
-                                "  LUT apply"};
+                                "  LUT apply","  batched mm"};
         double tot = 0;
-        for (int i = 0; i < 8; i++) tot += (i == 0 || i == 4 || i == 5 || i == 7) ? 0 : waste_prof[i];
+        for (int i = 0; i < 9; i++)
+            tot += (i == 0 || i == 4 || i == 5 || i == 7 || i == 8) ? 0 : waste_prof[i];
         printf("\n-- profile (s, %d steps) --\n", n + n_gen);
-        for (int i = 0; i < 8; i++)
+        for (int i = 0; i < 9; i++)
             if (waste_prof[i] > 0)
                 printf("  %-14s %7.2f  %5.1f%%\n", names[i], waste_prof[i],
                        100.0 * waste_prof[i] / tot);

@@ -28,9 +28,9 @@
 
 /* ---- lightweight phase profiling (WASTE_PROFILE=1) --------------------- */
 #include <time.h>
-double waste_prof[8];
-uint64_t waste_prof_n[8];
-enum { P_LUTB, P_KDA, P_MLA, P_ROUTE, P_EDEQ, P_EMM, P_HEAD, P_LUTA };
+double waste_prof[16];
+uint64_t waste_prof_n[16];
+enum { P_LUTB, P_KDA, P_MLA, P_ROUTE, P_EDEQ, P_EMM, P_HEAD, P_LUTA, P_MM };
 static int prof_on = -1;
 static double pnow(void)
 {
@@ -147,6 +147,7 @@ static inline float dotf(const float *a, const float *b, int n)
 
 static int q8_off = 1;     /* 1 = keep the trunk stored as int8          */
 static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
+static int i8mm_on = 0;    /* SMMLA batched matmul; costs activation int8 */
 
 /* One weight from a 3-bit stream: values sit LSB-first at bit offset 3*i,
  * biased by +4, with a guard byte so two loads are always safe. Identical
@@ -567,6 +568,10 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     if (!src) return -1;
     { const char *e = getenv("WASTE_Q8"); if (e && *e == '0') q8_off = 0; }
     { const char *e = getenv("WASTE_SDOT"); sdot_on = e && *e != '0'; }
+    { const char *e = getenv("WASTE_I8MM");
+      i8mm_on = e ? (*e != '0')
+                  : 0;   /* off by default until it earns it — see below */
+      if (i8mm_on && !(waste_cpu_features() & WASTE_CPU_I8MM)) i8mm_on = 0; }
     js_doc d;
     if (js_parse(&d, src) < 0) { free(src); return -1; }
 
@@ -661,6 +666,14 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                              + (size_t)2 * (c->q_lora ? c->q_lora : 1) + 256,
                              sizeof(float));
     m->att = (float *)calloc((size_t)kv_cap * c->n_heads + 1024, sizeof(float));
+    {   /* int8 activations for the SMMLA batched matmul: a full chunk of
+         * the widest input the trunk has (the dense FFN's 33792) */
+        const int widest = c->dense_inter > c->hidden ? c->dense_inter : c->hidden;
+        m->mmx_cap = (size_t)WASTE_CHUNK_MAX * widest;
+        m->mms_cap = (size_t)WASTE_CHUNK_MAX * ((widest + 127) / 128 + 1);
+        m->mmxq = (int8_t *)malloc(m->mmx_cap);
+        m->mmxs = (float *)malloc(m->mms_cap * sizeof(float));
+    }
     {   /* one row of whichever tensors were left on disk */
         size_t rb = 0, sb = 0;
         for (int i = 0; i < m->n_tensors; i++) {
@@ -722,6 +735,7 @@ void waste_model_free(waste_model *m)
     free(m->t);
     if (m->trunk_fd > 0) close(m->trunk_fd);
     free(m->embrow); free(m->embsc);
+    free(m->mmxq); free(m->mmxs);
     free(m->codebooks);
     for (int L = 0; L < 128; L++) {
         free(m->S[L]); free(m->conv[L]); free(m->latcache[L]);
@@ -1453,7 +1467,95 @@ typedef struct {
     float *Y; const int8_t *W; const uint16_t *ws; const float *X;
     int in, out, T, ng, group, bits;
     size_t rowbytes;
+    const int8_t *xq;        /* activations, int8 per group (i8mm path)    */
+    const float  *xs;        /* their scales, [T][ng]                      */
 } mmq_arg;
+
+/* Unpack one weight row to int8, whatever it is stored as. */
+static void unpack_row_i8(const mmq_arg *a, int o, int8_t *dst)
+{
+    const int8_t *q = a->W + (size_t)o * a->rowbytes;
+    if (a->bits == 8) { memcpy(dst, q, (size_t)a->in); return; }
+    if (a->bits == 4) {
+        const uint8_t *p4 = (const uint8_t *)q;
+        for (int i = 0; i < a->in; i++) {
+            const uint8_t byte = p4[i >> 1];
+            dst[i] = (int8_t)((i & 1) ? (byte >> 4) - 8 : (byte & 0x0F) - 8);
+        }
+        return;
+    }
+    for (int i = 0; i < a->in; i++) dst[i] = (int8_t)q3_at((const uint8_t *)q, i);
+}
+
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+/* SMMLA: one instruction multiplies a 2x8 int8 tile by an 8x2 int8 tile
+ * into a 2x2 int32 accumulator — 32 MACs, against 4 for an fp32 FMA. The
+ * tiles here are two weight rows by two tokens, accumulated per
+ * quantization group so each group's pair of scales applies once.
+ *
+ * Only reachable when the activations have been quantized to int8, which
+ * the f32 path deliberately avoids, so it stays behind waste_cpu_features
+ * and a measured decision rather than being the default. */
+static void mmq_rows_i8mm(int b, int e, void *p)
+{
+    mmq_arg *a = (mmq_arg *)p;
+    const int g = a->group, ng = a->ng, T = a->T, in = a->in;
+    int8_t *w0 = (int8_t *)malloc((size_t)in * 2);
+    if (!w0) return;
+    int8_t *w1 = w0 + in;
+
+    for (int o = b; o < e; o += 2) {
+        const int have2 = (o + 1 < e);
+        unpack_row_i8(a, o, w0);
+        if (have2) unpack_row_i8(a, o + 1, w1); else memset(w1, 0, (size_t)in);
+        const uint16_t *s0 = a->ws + (size_t)o * ng;
+        const uint16_t *s1 = have2 ? a->ws + (size_t)(o + 1) * ng : s0;
+
+        for (int t = 0; t < T; t += 2) {
+            const int havet2 = (t + 1 < T);
+            const int8_t *x0 = a->xq + (size_t)t * in;
+            const int8_t *x1 = havet2 ? x0 + in : x0;
+            const float *sx0 = a->xs + (size_t)t * ng;
+            const float *sx1 = havet2 ? sx0 + ng : sx0;
+            float acc00 = 0, acc01 = 0, acc10 = 0, acc11 = 0;
+
+            for (int k = 0; k < ng; k++) {
+                const int base = k * g;
+                const int lim = (base + g <= in) ? g : in - base;
+                int32x4_t r = vdupq_n_s32(0);
+                int i = 0;
+                for (; i + 8 <= lim; i += 8) {
+                    const int8x16_t wt = vcombine_s8(vld1_s8(w0 + base + i),
+                                                     vld1_s8(w1 + base + i));
+                    const int8x16_t xt = vcombine_s8(vld1_s8(x0 + base + i),
+                                                     vld1_s8(x1 + base + i));
+                    r = vmmlaq_s32(r, wt, xt);
+                }
+                int32_t p00 = vgetq_lane_s32(r, 0), p01 = vgetq_lane_s32(r, 1);
+                int32_t p10 = vgetq_lane_s32(r, 2), p11 = vgetq_lane_s32(r, 3);
+                for (; i < lim; i++) {           /* tail, groups need not be x8 */
+                    p00 += (int32_t)w0[base + i] * x0[base + i];
+                    p01 += (int32_t)w0[base + i] * x1[base + i];
+                    p10 += (int32_t)w1[base + i] * x0[base + i];
+                    p11 += (int32_t)w1[base + i] * x1[base + i];
+                }
+                const float f0 = f16_to_f32(s0[k]), f1 = f16_to_f32(s1[k]);
+                acc00 += (float)p00 * f0 * sx0[k];
+                acc01 += (float)p01 * f0 * sx1[k];
+                acc10 += (float)p10 * f1 * sx0[k];
+                acc11 += (float)p11 * f1 * sx1[k];
+            }
+            a->Y[(size_t)t * a->out + o] = acc00;
+            if (have2)  a->Y[(size_t)t * a->out + o + 1] = acc10;
+            if (havet2) {
+                a->Y[(size_t)(t + 1) * a->out + o] = acc01;
+                if (have2) a->Y[(size_t)(t + 1) * a->out + o + 1] = acc11;
+            }
+        }
+    }
+    free(w0);
+}
+#endif
 
 static void mmq_rows(int b, int e, void *p)
 {
@@ -1489,6 +1591,9 @@ static void mmq_rows(int b, int e, void *p)
     free(row);
 }
 
+/* Batched trunk matmul. Instrumented separately because it hides inside
+ * the MoE bucket during prefill — the latent projections and the shared
+ * experts go through here, the routed experts do not. */
 static void matmul_t(waste_model *m, float *Y, const waste_tensor *t,
                      const float *X, int out, int in, int T)
 {
@@ -1497,10 +1602,25 @@ static void matmul_t(waste_model *m, float *Y, const waste_tensor *t,
         memset(Y, 0, (size_t)T * out * sizeof(float));
         return;
     }
-    if (!t->q) { matmul_f32(Y, t->data, X, out, in, T); return; }
+    PROF_START(P_MM);
+    if (!t->q) { matmul_f32(Y, t->data, X, out, in, T); PROF_END(P_MM); return; }
     const int g = t->group, ng = (in + g - 1) / g;
-    mmq_arg a = { Y, t->q, t->qs, X, in, out, T, ng, g, t->bits, t->rowbytes };
+    mmq_arg a = { Y, t->q, t->qs, X, in, out, T, ng, g, t->bits, t->rowbytes,
+                  NULL, NULL };
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    if (i8mm_on && T >= 2 && m->mmxq &&
+        (size_t)T * in <= m->mmx_cap && (size_t)T * ng <= m->mms_cap) {
+        for (int t2 = 0; t2 < T; t2++)
+            quant_act(X + (size_t)t2 * in, in, g,
+                      m->mmxq + (size_t)t2 * in, m->mmxs + (size_t)t2 * ng);
+        a.xq = m->mmxq; a.xs = m->mmxs;
+        waste_parallel_for(out, 32, mmq_rows_i8mm, &a);
+        PROF_END(P_MM);
+        return;
+    }
+#endif
     waste_parallel_for(out, 32, mmq_rows, &a);
+    PROF_END(P_MM);
 }
 
 /* Expand one expert's VQ indices into f32 [M][N]. */
