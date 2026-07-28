@@ -28,7 +28,7 @@ CFLAGS  += -DVQ_SUPER=$(VQ_SUPER)
 CFLAGS  += -MMD -MP
 
 SRC := src/model.c src/kda.c src/backend.c src/ecache.c src/version.c \
-       src/tokenizer.c src/waste.c src/vq.c
+       src/tokenizer.c src/waste.c src/vq.c src/vision.c
 # Match what backend.c tests for. Linux/aarch64 reports "aarch64", which
 # does not contain "arm" — the old findstring left kda_neon.c out of the
 # build while backend.c still emitted the call to it, so the link failed
@@ -115,7 +115,7 @@ libwaste.a: $(OBJ)
 waste: cli/main.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-test: test_kda test_container test_forward test_tokenizer test_k3parts test_state
+test: test_kda test_container test_forward test_tokenizer test_k3parts test_state test_vision
 
 test_kda: tests/test_kda.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
@@ -126,6 +126,8 @@ test_forward: tests/test_forward.o libwaste.a
 test_tokenizer: tests/test_tokenizer.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 test_k3parts: tests/test_k3parts.o libwaste.a
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+test_vision: tests/test_vision.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 test_state: tests/test_state.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)

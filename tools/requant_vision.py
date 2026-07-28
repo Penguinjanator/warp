@@ -66,7 +66,8 @@ def main():
     wm = index["weight_map"]
 
     targets = [e for e in man["trunk"]
-               if e["name"].startswith(PREFIXES) and e["fmt"] not in (FMT_F32, FMT_Q8G)]
+               if e["name"].startswith(PREFIXES) and
+               (e["fmt"] not in (FMT_F32, FMT_Q8G) or len(e["shape"]) > 2)]
     if not targets:
         print("nothing to do: vision weights are already f32 or int8")
         return 0
@@ -85,6 +86,21 @@ def main():
             name = e["name"]
             with safe_open(os.path.join(args.src, wm[name]), framework="pt") as sf:
                 W = sf.get_tensor(name).float()
+            # A conv kernel is [out, in, kh, kw] and the engine uses it as a
+            # matrix [out, in*kh*kw]. Quantizing along the stored last axis
+            # gives rows of 14, which the engine then reads as rows of 588 —
+            # the patch embedding comes out garbage and every layer after it
+            # inherits that. Flatten to how it is used, and say so in the
+            # manifest.
+            if W.dim() == 4:
+                # conv kernel [out, in, kh, kw] used as a matrix [out, in*kh*kw]
+                W = W.reshape(W.shape[0], -1)
+                e["shape"] = list(W.shape)
+            elif W.dim() == 3:
+                # a stack of vectors, e.g. the [h, w, D] position grid: the
+                # row is the vector, not the first axis
+                W = W.reshape(-1, W.shape[-1])
+                e["shape"] = list(W.shape)
             flat = W.reshape(-1, W.shape[-1]) if W.dim() > 1 else W.reshape(1, -1)
             q, sc = quantize_q8g(flat)
 

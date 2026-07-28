@@ -247,6 +247,47 @@ sys.exit(0 if want - rec - 1 <= held <= want else 1)
 PY
 }
 
+# params_total is the number that ends up in a model card, and it is
+# derived rather than stored: three matrices per expert, each as wide as
+# the expert's input. In a latent MoE that width is the latent, not the
+# hidden — K3 reported 5.44 T instead of 2.72 T for exactly one wrong
+# field. Mirroring the formula here would only prove this script and the
+# engine agree, so the count is also weighed against the bytes on disk:
+# at 3 bits per weight the experts have to fit their bank, give or take
+# one fp16 scale per output row and the record's 4 KiB alignment.
+params_rule() {
+    python3 - "$1" <<'PY'
+import json, subprocess, sys
+
+d = sys.argv[1]
+man = json.load(open(f"{d}/manifest.json"))
+r = subprocess.run(["./waste", "info", d, "--json"], capture_output=True, text=True)
+info = json.loads(r.stdout)
+c, lay = man["config"], man["layers"]
+
+width = c.get("routed_expert_hidden_size") or c["hidden_size"]
+inter = c["moe_intermediate_size"]
+per_expert = 3 * width * inter
+moe_layers = c["num_hidden_layers"] - c.get("first_k_dense_replace", 0)
+total = per_expert * c["num_experts"] * moe_layers
+active = per_expert * info["top_k"] * moe_layers
+
+bits = man["expert_quant"]["bits_per_weight"]
+rec = lay[next(iter(lay))]
+on_disk = rec["bytes"] // rec["experts"]
+lo = per_expert * bits // 8
+hi = lo + 2 * (2 * inter + width) + 4096          # scales, then alignment
+
+T = 1e12
+print(f"{total/T:.2f} T total, {active/1e9:.1f} B active, "
+      f"{on_disk/(1<<20):.2f} MiB/expert on disk")
+sys.exit(0 if (moe_layers == len(lay)
+               and info["params_total"] == total
+               and info["params_active"] == active
+               and lo <= on_disk <= hi) else 1)
+PY
+}
+
 if [ -d "$MODEL" ]; then
     if ./waste plan "$MODEL" >/dev/null 2>&1; then ok "waste plan"; else no "waste plan"; fi
     # capture first: `set -o pipefail` would otherwise propagate the
@@ -326,6 +367,31 @@ if [ -f "$BIG/manifest.json" ]; then
     fi
 else
     sk "K3 budget check" "no container at $BIG"
+fi
+
+# ----------------------------------------------------------- parameters ----
+head_ "parameter counts"
+
+if [ -d "$MODEL" ]; then
+    if out=$(params_rule "$MODEL" 2>/dev/null); then
+        ok "params_total is what the container holds ($out)"
+    else
+        no "params_total off the rule (${out:-no output})"
+    fi
+else
+    sk "parameter counts" "no container at $MODEL"
+fi
+
+# The only latent MoE here, so the only model on which the expert width and
+# the hidden differ at all: without it the check passes either way.
+if [ -f "$BIG/manifest.json" ]; then
+    if out=$(params_rule "$BIG" 2>/dev/null); then
+        ok "params_total counts K3's experts at the latent ($out)"
+    else
+        no "params_total off the rule on K3 (${out:-no output})"
+    fi
+else
+    sk "K3 parameter counts" "no container at $BIG"
 fi
 
 # ------------------------------------------------------------ tokenizer ----

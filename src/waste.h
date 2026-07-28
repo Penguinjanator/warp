@@ -115,6 +115,7 @@ typedef struct {
 
     waste_cache_policy cache_policy;
     int      use_direct_io;     /* bypass page cache (F_NOCACHE/O_DIRECT)  */
+    int      vision;            /* load the vision tower (438 MB on K3)    */
     int      allow_substitutes; /* low-bit expert on cache miss (HOBBIT);
                                    breaks bit-exactness, off by default    */
     int      expert_deferral;   /* overlap expert fetch with next layer    */

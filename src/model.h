@@ -66,8 +66,17 @@ typedef struct {
     int n_experts, cb_base;
 } waste_bank;
 
+/* Read from vision.json when the container has a tower. */
+typedef struct {
+    int hidden, heads, qkv_hidden, inter, layers;
+    int pos_h, pos_w, text_hidden, patch;
+    float eps, proj_eps;
+} waste_vision_cfg;
+
 typedef struct {
     waste_config cfg;
+    waste_vision_cfg vcfg;
+    int  want_vision;                /* load the tower's 438 MB or not     */
     waste_tensor *t;
     int n_tensors;
     float *codebooks;                /* [n_books][256][8]                   */
@@ -112,8 +121,10 @@ typedef struct {
 } waste_model;
 
 /* cache_bytes: hard ceiling for the expert cache; 0 = no cache. */
+/* want_vision loads the 438 MB vision tower; it has to be a parameter
+ * because the first thing load does is zero the struct. */
 int  waste_model_load(waste_model *m, const char *dir, int kv_cap,
-                      size_t cache_bytes);
+                      size_t cache_bytes, int want_vision);
 void waste_model_free(waste_model *m);
 /* Runs one token; returns logits (vocab floats, owned by the model).
  * `pos` is the position in the sequence (0-based). */
@@ -143,6 +154,21 @@ int waste_model_save_usage(const waste_model *m, const char *dir);
 int waste_model_state_save(const waste_model *m, const char *path, int pos);
 int waste_model_state_load(waste_model *m, const char *path, int *pos);
 const waste_tensor *waste_find(const waste_model *m, const char *name);
+
+/* Internal primitives the vision tower reuses: same numerics, same
+ * threading, no second implementation to keep in step. */
+void waste_rmsnorm(float *o, const float *x, const float *w, int n, float eps);
+void waste_matmul_t(waste_model *m, float *Y, const waste_tensor *t,
+                    const float *X, int out, int in, int T);
+void waste_deq_row(const waste_tensor *t, long r, int cols, float *dst);
+
+/* Vision: encodes one image's patches into text-embedding space.
+ * `pixels` is [h*w][3*14*14] already patchified and normalized, the result
+ * [h/2 * w/2][hidden]. Returns 0, or -1 when the container has no vision
+ * tower or it was not loaded. */
+int waste_vision_encode(waste_model *m, const float *pixels, int h, int w,
+                        float *out);
+int waste_vision_available(const waste_model *m);
 
 /* Exposed for unit tests (tests/test_k3parts.c) — these are the pieces of
  * K3 whose maths is new, so they are checked against the reference

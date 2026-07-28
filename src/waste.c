@@ -281,7 +281,7 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
                                  c->plan.min_expert_cache;
     {
         const int rc = waste_model_load(&c->m, model_path, (int)cfg.ctx_tokens,
-                                        (size_t)cache_bytes);
+                                        (size_t)cache_bytes, cfg.vision);
         if (rc) {
             free(c);
             return rc == -2 ? WASTE_E_FORMAT : WASTE_E_IO;
@@ -528,7 +528,13 @@ waste_status waste_model_get_info(const waste_ctx *c, waste_model_info *out)
     out->top_k = (uint32_t)cf->top_k;
     out->hidden = (uint32_t)cf->hidden;
     out->ctx_max = c->cfg.ctx_tokens;
-    const uint64_t pe = 3ULL * cf->hidden * cf->moe_inter;
+    /* An expert's matrices are as wide as its input, and in a latent MoE
+     * that is not the hidden: K3 projects 7168 down to a 3584-wide latent
+     * and runs the experts there, so counting them at hidden width reports
+     * exactly twice the parameters the container actually stores. */
+    const uint64_t ew = cf->latent_dim ? (uint64_t)cf->latent_dim
+                                       : (uint64_t)cf->hidden;
+    const uint64_t pe = 3ULL * ew * cf->moe_inter;
     out->params_total = pe * (uint64_t)cf->n_experts * (uint64_t)(cf->n_layers - cf->first_dense);
     out->params_active = pe * (uint64_t)cf->top_k * (uint64_t)(cf->n_layers - cf->first_dense);
     out->arch = "kimi-linear";

@@ -112,7 +112,7 @@ static const float *T(const waste_model *m, const char *fmt, ...)
 
 /* ---- kernels used only here (dispatchable later) ----------------------- */
 
-static void rmsnorm(float *o, const float *x, const float *w, int n, float eps)
+void waste_rmsnorm(float *o, const float *x, const float *w, int n, float eps)
 {
     float s = 0;
     for (int i = 0; i < n; i++) s += x[i] * x[i];
@@ -322,8 +322,12 @@ static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
  * feeds the same activation vector. MLA's absorbed path does not: each of
  * kv_b_proj's rows is scaled by a different query component and summed the
  * other way round, so the row has to be materialized first. */
-static void deq_row(const waste_tensor *t, long r, int cols, float *dst)
+void waste_deq_row(const waste_tensor *t, long r, int cols, float *dst)
 {
+    if (!t->q && !t->data) {          /* skipped at load, e.g. vision off */
+        memset(dst, 0, (size_t)cols * sizeof(float));
+        return;
+    }
     if (!t->q) {
         memcpy(dst, t->data + (size_t)r * cols, (size_t)cols * sizeof(float));
         return;
@@ -450,7 +454,9 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
          * only — every lookup goes through cfg.prefix — so loading them
          * spends the one resource the whole design is fighting for. The
          * bytes stay in trunk.bin for the day vision lands. */
-        if (m->cfg.prefix[0] &&
+        const int is_vision = !strncmp(t->name, "vision_tower.", 13) ||
+                              !strncmp(t->name, "mm_projector.", 13);
+        if (m->cfg.prefix[0] && !(is_vision && m->want_vision) &&
             strncmp(t->name, m->cfg.prefix, strlen(m->cfg.prefix)) != 0) {
             t->on_disk = 1;
             t->file_off = off;
@@ -607,9 +613,10 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
 }
 
 int waste_model_load(waste_model *m, const char *dir, int kv_cap,
-                     size_t cache_bytes)
+                     size_t cache_bytes, int want_vision)
 {
     memset(m, 0, sizeof *m);
+    m->want_vision = want_vision;
     if (prof_on < 0) { const char *e = getenv("WASTE_PROFILE"); prof_on = e && *e != '0'; }
     m->kv_cap = kv_cap;
     m->direct_io = 1;
@@ -686,6 +693,33 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     m->cb_entries = (int)js_int(&d, js_get(&d, eq, "entries"), 256);
 
     if (load_trunk(m, dir, &d, js_get(&d, 0, "trunk")) < 0) { js_free(&d); free(src); return -1; }
+
+    /* vision config, when the container carries a tower */
+    {
+        snprintf(path, sizeof path, "%s/vision.json", dir);
+        char *vs = slurp(path, NULL);
+        if (vs) {
+            js_doc vd;
+            if (js_parse(&vd, vs) >= 0) {
+                waste_vision_cfg *v = &m->vcfg;
+                v->hidden      = (int)js_int(&vd, js_get(&vd, 0, "vt_hidden_size"), 1024);
+                v->heads       = (int)js_int(&vd, js_get(&vd, 0, "vt_num_attention_heads"), 12);
+                v->qkv_hidden  = (int)js_int(&vd, js_get(&vd, 0, "qkv_hidden_size"), 1536);
+                v->inter       = (int)js_int(&vd, js_get(&vd, 0, "vt_intermediate_size"), 4096);
+                v->layers      = (int)js_int(&vd, js_get(&vd, 0, "vt_num_hidden_layers"), 27);
+                v->pos_h       = (int)js_int(&vd, js_get(&vd, 0, "init_pos_emb_height"), 64);
+                v->pos_w       = (int)js_int(&vd, js_get(&vd, 0, "init_pos_emb_width"), 64);
+                v->text_hidden = (int)js_int(&vd, js_get(&vd, 0, "text_hidden_size"), c->hidden);
+                v->patch       = (int)js_int(&vd, js_get(&vd, 0, "patch_size"), 14);
+                /* the tower's RMSNorms are built as nn.RMSNorm(dim) with no
+                 * eps, so PyTorch uses finfo(float32).eps */
+                v->eps         = 1.1920928955078125e-07f;
+                v->proj_eps    = 1e-5f;
+                js_free(&vd);
+            }
+            free(vs);
+        }
+    }
 
     /* codebooks */
     snprintf(path, sizeof path, "%s/codebooks.bin", dir);
@@ -1248,7 +1282,7 @@ static void mla_head_range(int lo, int hi, void *ap)
         for (int i = 0; i < nope; i++) {
             const float qi = qh[i];
             if (qi == 0.0f) continue;
-            deq_row(a->kvb, (long)h * wrows + i, kl, rw);
+            waste_deq_row(a->kvb, (long)h * wrows + i, kl, rw);
             for (int j = 0; j < kl; j++) qa[j] += qi * rw[j];
         }
 
@@ -1270,7 +1304,7 @@ static void mla_head_range(int lo, int hi, void *ap)
         /* o = W_vb c~ */
         float *oh = a->o + (size_t)h * vh;
         for (int i = 0; i < vh; i++) {
-            deq_row(a->kvb, (long)h * wrows + nope + i, kl, rw);
+            waste_deq_row(a->kvb, (long)h * wrows + nope + i, kl, rw);
             oh[i] = dotf(rw, ca, kl);
         }
     }
@@ -1289,7 +1323,7 @@ static void mla_layer(waste_model *m, int L, const float *in, float *out, int po
         float *qa = o + (size_t)nh * vh;
         matvec_t(m, qa, waste_find(m, tname("%smodel.layers.%d.self_attn.q_a_proj.weight",
                                             c->prefix, L)), in, c->q_lora, hid);
-        rmsnorm(qa, qa, waste_find(m, tname("%smodel.layers.%d.self_attn.q_a_layernorm.weight",
+        waste_rmsnorm(qa, qa, waste_find(m, tname("%smodel.layers.%d.self_attn.q_a_layernorm.weight",
                                             c->prefix, L))->data, c->q_lora, c->eps);
         matvec_t(m, q, waste_find(m, tname("%smodel.layers.%d.self_attn.q_b_proj.weight",
                                            c->prefix, L)), qa, nh * qd, c->q_lora);
@@ -1299,7 +1333,7 @@ static void mla_layer(waste_model *m, int L, const float *in, float *out, int po
     }
     matvec_t(m, ckv, waste_find(m, tname("%smodel.layers.%d.self_attn.kv_a_proj_with_mqa.weight", c->prefix, L)),
              in, c->kv_lora + c->qk_rope, hid);
-    rmsnorm(ckv, ckv, T(m, "%smodel.layers.%d.self_attn.kv_a_layernorm.weight", c->prefix, L),
+    waste_rmsnorm(ckv, ckv, T(m, "%smodel.layers.%d.self_attn.kv_a_layernorm.weight", c->prefix, L),
             c->kv_lora, c->eps);
     /* Cache the latent as-is — normalized kpass followed by the raw rope
      * dims. kv_b_proj is not applied here at all; it is absorbed below. */
@@ -1435,7 +1469,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     }
     if (c->latent_dim) {
         if (c->latent_norm)
-            rmsnorm(ysum, ysum, waste_find(m, tname(
+            waste_rmsnorm(ysum, ysum, waste_find(m, tname(
                         "%smodel.layers.%d.block_sparse_moe.routed_expert_norm.weight",
                         c->prefix, L))->data, lat, c->eps);
         matvec_t(m, out, waste_find(m, tname(
@@ -1458,7 +1492,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
  * layers the current sum is appended to the history.
  *
  *   v      = [block_residual..., prefix_sum]        (nb+1) x hidden
- *   k      = rmsnorm(v)                             (no weight yet)
+ *   k      = waste_rmsnorm(v)                             (no weight yet)
  *   scores = sum(k * (norm.weight * proj.weight))   (nb+1)
  *   out    = softmax(scores) . v
  */
@@ -1781,7 +1815,7 @@ static void mmq_rows(int b, int e, void *p)
 /* Batched trunk matmul. Instrumented separately because it hides inside
  * the MoE bucket during prefill — the latent projections and the shared
  * experts go through here, the routed experts do not. */
-static void matmul_t(waste_model *m, float *Y, const waste_tensor *t,
+void waste_matmul_t(waste_model *m, float *Y, const waste_tensor *t,
                      const float *X, int out, int in, int T)
 {
     (void)m;
@@ -1941,7 +1975,7 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
     const float *xin = in;
     float *lat_in = m->clat, *ysum = lat_in + (size_t)nT * lat;
     if (c->latent_dim) {
-        matmul_t(m, lat_in, waste_find(m, tname(
+        waste_matmul_t(m, lat_in, waste_find(m, tname(
                      "%smodel.layers.%d.block_sparse_moe.routed_expert_down_proj.weight",
                      c->prefix, L)), in, lat, hid, nT);
         xin = lat_in;
@@ -2011,9 +2045,9 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
                 "%smodel.layers.%d.block_sparse_moe.routed_expert_norm.weight",
                 c->prefix, L))->data;
             for (int t = 0; t < nT; t++)
-                rmsnorm(ysum + (size_t)t * lat, ysum + (size_t)t * lat, nw, lat, c->eps);
+                waste_rmsnorm(ysum + (size_t)t * lat, ysum + (size_t)t * lat, nw, lat, c->eps);
         }
-        matmul_t(m, out, waste_find(m, tname(
+        waste_matmul_t(m, out, waste_find(m, tname(
                      "%smodel.layers.%d.block_sparse_moe.routed_expert_up_proj.weight",
                      c->prefix, L)), ysum, hid, lat, nT);
     } else {
@@ -2023,16 +2057,16 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
     /* shared experts, on the full hidden state */
     const int si = inter * (c->n_shared ? c->n_shared : 1);
     float *sa = m->ckv, *sb = sa + (size_t)nT * si, *sh = sb + (size_t)nT * si;
-    matmul_t(m, sa, waste_find(m, tname(
+    waste_matmul_t(m, sa, waste_find(m, tname(
                  "%smodel.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight",
                  c->prefix, L)), in, si, hid, nT);
-    matmul_t(m, sb, waste_find(m, tname(
+    waste_matmul_t(m, sb, waste_find(m, tname(
                  "%smodel.layers.%d.block_sparse_moe.shared_experts.up_proj.weight",
                  c->prefix, L)), in, si, hid, nT);
     for (int i = 0; i < nT * si; i++)
         sa[i] = c->act_situ ? waste_situ_pair(sa[i], sb[i], c->situ_beta, c->situ_linear_beta)
                             : silu(sa[i]) * sb[i];
-    matmul_t(m, sh, waste_find(m, tname(
+    waste_matmul_t(m, sh, waste_find(m, tname(
                  "%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight",
                  c->prefix, L)), sa, hid, si, nT);
     for (int i = 0; i < nT * hid; i++) out[i] += sh[i];
@@ -2119,7 +2153,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
 
         const float *iln = waste_find(m, tname("%smodel.layers.%d.input_layernorm.weight", c->prefix, L))->data;
         for (int t = 0; t < n; t++)
-            rmsnorm(m->cnorm + (size_t)t * hid, m->cx + (size_t)t * hid, iln, hid, c->eps);
+            waste_rmsnorm(m->cnorm + (size_t)t * hid, m->cx + (size_t)t * hid, iln, hid, c->eps);
 
         /* attention: per token, but on the batched norm buffer */
         for (int t = 0; t < n; t++) {
@@ -2145,7 +2179,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
 
         const float *pln = waste_find(m, tname("%smodel.layers.%d.post_attention_layernorm.weight", c->prefix, L))->data;
         for (int t = 0; t < n; t++)
-            rmsnorm(m->cnorm + (size_t)t * hid, m->cx + (size_t)t * hid, pln, hid, c->eps);
+            waste_rmsnorm(m->cnorm + (size_t)t * hid, m->cx + (size_t)t * hid, pln, hid, c->eps);
 
         if (waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L))) {
             PROF_START(P_ROUTE);
@@ -2154,12 +2188,12 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         } else {
             const int inter = c->dense_inter;
             float *a = m->cff, *b = a + (size_t)n * inter;
-            matmul_t(m, a, waste_find(m, tname("%smodel.layers.%d.mlp.gate_proj.weight", c->prefix, L)), m->cnorm, inter, hid, n);
-            matmul_t(m, b, waste_find(m, tname("%smodel.layers.%d.mlp.up_proj.weight", c->prefix, L)), m->cnorm, inter, hid, n);
+            waste_matmul_t(m, a, waste_find(m, tname("%smodel.layers.%d.mlp.gate_proj.weight", c->prefix, L)), m->cnorm, inter, hid, n);
+            waste_matmul_t(m, b, waste_find(m, tname("%smodel.layers.%d.mlp.up_proj.weight", c->prefix, L)), m->cnorm, inter, hid, n);
             for (int i = 0; i < n * inter; i++)
                 a[i] = c->act_situ ? waste_situ_pair(a[i], b[i], c->situ_beta, c->situ_linear_beta)
                                    : silu(a[i]) * b[i];
-            matmul_t(m, m->cresid, waste_find(m, tname("%smodel.layers.%d.mlp.down_proj.weight", c->prefix, L)), a, hid, inter, n);
+            waste_matmul_t(m, m->cresid, waste_find(m, tname("%smodel.layers.%d.mlp.down_proj.weight", c->prefix, L)), a, hid, inter, n);
         }
 
         if (ares_on) {
@@ -2189,7 +2223,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     }
     const float *fnw = waste_find(m, tname("%smodel.norm.weight", c->prefix))->data;
     float *last = m->cnorm;
-    rmsnorm(last, m->cx + (size_t)(n - 1) * hid, fnw, hid, c->eps);
+    waste_rmsnorm(last, m->cx + (size_t)(n - 1) * hid, fnw, hid, c->eps);
     matvec_t(m, m->logits, waste_find(m, tname("%slm_head.weight", c->prefix)), last,
              c->vocab, hid);
     memcpy(m->x, m->cx + (size_t)(n - 1) * hid, (size_t)hid * sizeof(float));
@@ -2249,7 +2283,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         }
 
         snprintf(b, sizeof b, "%smodel.layers.%d.input_layernorm.weight", c->prefix, L);
-        rmsnorm(norm, m->x, waste_find(m, b)->data, hid, c->eps);
+        waste_rmsnorm(norm, m->x, waste_find(m, b)->data, hid, c->eps);
         if (c->kda_layer[L]) { PROF_START(P_KDA); kda_layer(m, L, norm, resid); PROF_END(P_KDA); }
         else { PROF_START(P_MLA); mla_layer(m, L, norm, resid, pos); PROF_END(P_MLA); }
 
@@ -2265,7 +2299,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         }
 
         snprintf(b, sizeof b, "%smodel.layers.%d.post_attention_layernorm.weight", c->prefix, L);
-        rmsnorm(norm, m->x, waste_find(m, b)->data, hid, c->eps);
+        waste_rmsnorm(norm, m->x, waste_find(m, b)->data, hid, c->eps);
         snprintf(b, sizeof b, "%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L);
         if (waste_find(m, b)) {
             PROF_START(P_ROUTE);
@@ -2300,7 +2334,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
             waste_find(m, tname("%smodel.output_attn_res_norm.weight", c->prefix))->data,
             waste_find(m, tname("%smodel.output_attn_res_proj.weight", c->prefix))->data,
             m->x);
-    rmsnorm(norm, m->x, waste_find(m, tname("%smodel.norm.weight", c->prefix))->data, hid, c->eps);
+    waste_rmsnorm(norm, m->x, waste_find(m, tname("%smodel.norm.weight", c->prefix))->data, hid, c->eps);
     PROF_START(P_HEAD);
     matvec_t(m, m->logits, waste_find(m, tname("%slm_head.weight", c->prefix)), norm, c->vocab, hid);
     PROF_END(P_HEAD);
