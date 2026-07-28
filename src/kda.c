@@ -109,9 +109,16 @@ void waste_rmsnorm_gated(int C, const float *x, const float *gate,
 
 /* Universal baseline registration: fills every slot. Other backends
  * overwrite only what they implement (sqlite-vector discipline). */
+void waste_mvq_rows_f32(int b, int e, void *p);
+void waste_lutb_range(int lo, int hi, void *p);
+
 const char *waste_kda_register_cpu(waste_kernels *t)
 {
     t->kda_step = waste_kda_step;
+    /* The portable range kernels live in model.c, next to the code that
+     * builds their arguments; an ISA backend overwrites these two. */
+    t->mvq_rows_f32 = waste_mvq_rows_f32;
+    t->lutb_range = waste_lutb_range;
     t->short_conv_step = waste_short_conv_step;
     t->rmsnorm_gated = waste_rmsnorm_gated;
     return "CPU";

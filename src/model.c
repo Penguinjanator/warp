@@ -21,6 +21,7 @@
 #include "json.h"
 #include "threads.h"
 #include "kda.h"
+#include "simd.h"
 #include "waste_backend.h"
 #include "waste_format.h"
 
@@ -104,15 +105,7 @@ static const float *T(const waste_model *m, const char *fmt, ...)
     return t ? t->data : NULL;
 }
 
-static inline float f16_to_f32(uint16_t h)
-{
-    const uint32_t sign = (uint32_t)(h >> 15) << 31;
-    const uint32_t e = (h >> 10) & 0x1f, mn = h & 0x3ff;
-    const uint32_t bits = e ? (sign | ((e + 112u) << 23) | (mn << 13)) : sign;
-    float f;
-    memcpy(&f, &bits, 4);
-    return f;
-}
+#define f16_to_f32 waste_f16
 
 /* ---- kernels used only here (dispatchable later) ----------------------- */
 
@@ -154,12 +147,7 @@ static int i8mm_on = 0;    /* SMMLA batched matmul; costs activation int8 */
 /* One weight from a 3-bit stream: values sit LSB-first at bit offset 3*i,
  * biased by +4, with a guard byte so two loads are always safe. Identical
  * indexing to tools/convert.py's quantize_q3g. */
-static inline int q3_at(const uint8_t *p, long i)
-{
-    const long off = i * 3;
-    const int v = (p[off >> 3] >> (off & 7)) | (p[(off >> 3) + 1] << (8 - (off & 7)));
-    return (v & 7) - 4;
-}
+#define q3_at waste_q3_at
 
 /* ---- int8 x int8 matvec (SDOT / dotprod) --------------------------------
  * The trunk is already stored Q8G: int8 weights with one fp16 scale per
@@ -168,11 +156,6 @@ static inline int q3_at(const uint8_t *p, long i)
  * Activations are quantized per group with the same geometry, so a group
  * contributes scale_w * scale_x * <int32 dot>.
  */
-typedef struct {
-    float *y; const int8_t *W; const uint16_t *ws;
-    const int8_t *xq; const float *xs; int in, ng, group, bits;
-    size_t rowbytes;
-} mvq_arg;
 
 static inline int32_t idot(const int8_t *a, const int8_t *b, int n)
 {
@@ -194,7 +177,7 @@ static inline int32_t idot(const int8_t *a, const int8_t *b, int n)
 /* int8 weights, f32 activations: dequantize the row inline. Keeps the
  * 4x memory saving of int8 storage while producing exactly the numbers the
  * f32 path does — no activation quantization error. */
-static void mvq_rows_f32(int b, int e, void *p)
+void waste_mvq_rows_f32(int b, int e, void *p)
 {
     mvq_arg *a = (mvq_arg *)p;
     const int ng = a->ng, g = a->group;
@@ -318,7 +301,7 @@ static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
         waste_parallel_for(out, 64, mvq_rows, &a);
     } else {
         mvq_arg a = { y, t->q, t->qs, NULL, x, in, ng, g, t->bits, t->rowbytes };
-        waste_parallel_for(out, 64, mvq_rows_f32, &a);
+        waste_parallel_for(out, 64, waste_k.mvq_rows_f32, &a);
     }
 }
 
@@ -843,10 +826,6 @@ static const uint8_t *read_expert(waste_model *m, int L, int eid)
  * lut layout: [v][stage][code] — the 3 values a row needs for vector v sit
  * in one contiguous 3 KiB block.
  */
-typedef struct {
-    float *lut; const float *booksT; const float *x;
-    int cb_base, stages, entries, vec_dim;
-} lutb_arg;
 
 /* dst[c] = sum_d x[d] * C[c][d], for all `entries` codes at once.
  *
@@ -855,7 +834,7 @@ typedef struct {
  * lanes. The previous shape — `entries` separate eight-element dot
  * products, each ending in vaddvq_f32 — spent more time folding four
  * lanes into one than multiplying. */
-static void lutb_range(int lo, int hi, void *p)
+void waste_lutb_range(int lo, int hi, void *p)
 {
     const lutb_arg *a = (const lutb_arg *)p;
     const int en = a->entries, vd = a->vec_dim, st = a->stages;
@@ -905,7 +884,7 @@ static void vq_build_lut(waste_model *m, float *lut, int cb_base,
     /* Vectors are independent. The build was serial while everything around
      * it used the pool, and on K3 it is 8.0 GFLOP per token — 7.0 of them
      * for the down projections, which are rebuilt once per routed expert. */
-    waste_parallel_for(N / vec_dim, 16, lutb_range, &a);
+    waste_parallel_for(N / vec_dim, 16, waste_k.lutb_range, &a);
     PROF_END(P_LUTB);
 }
 

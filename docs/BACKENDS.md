@@ -294,3 +294,35 @@ now exercised, which is more than the macOS-only build could do.
 CUDA remains untested and untestable here on two counts: there is no
 NVIDIA GPU on this machine, and there is still no CUDA source to compile
 — `WASTE_ENABLE_CUDA=1` stops the build with a message saying so.
+
+## AVX2 and AVX-512 (2026-07-28)
+
+x86 ran pure scalar C until now. Two translation units, `src/simd_avx2.c`
+and `src/simd_avx512.c`, each built with its own `-mavx*` flags and
+selected by `waste_backend_init` from CPUID — so one binary adapts, which
+is why they are separate files rather than `#ifdef`s inside model.c.
+
+They implement the two range kernels that carry the arithmetic:
+`mvq_rows_f32` (every trunk projection) and `lutb_range` (the VQ table).
+Those moved behind the dispatch table for this, with their argument
+structs and the two shared inlines in a new `src/simd.h`. The third hot
+path, the VQ gather, gets nothing — no x86 SIMD helps it either, for the
+same reason NEON does not.
+
+**AVX2 is verified.** On Linux/x86_64 the engine reports `backend AVX2`,
+the suite is 12 passed / 0 failed, and *SIMD backend matches the CPU
+baseline* passes — that check runs `WASTE_BACKEND=cpu` against the
+dispatched path and compares logits, so it is exactly the claim that
+matters. It is now "within fp noise" rather than bit-identical, because
+AVX2 accumulates in a different order.
+
+**AVX-512 is compiled and dispatched, never executed.** No machine here
+has it: the container's CPU reports `AVX512F=0` in CPUID leaf 7, and so
+does `qemu-x86_64 -cpu max` under Rosetta, whose XCR0 leaves the opmask
+and ZMM bits clear. The detection is doing the right thing by declining —
+that much is confirmed — but the kernels themselves have never run an
+instruction. Treat the first AVX-512 machine as the test, and expect the
+same "matches the CPU baseline" check to be the thing that decides it.
+
+No performance numbers from any of this: x86 here is emulated, so timings
+would measure Rosetta.

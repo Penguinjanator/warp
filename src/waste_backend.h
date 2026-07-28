@@ -72,9 +72,13 @@ typedef struct {
     void (*rmsnorm_gated)(int C, const float *x, const float *gate,
                           const float *weight, float eps, float *y);
 
-    /* quantized matmul / dequant slots land here as the engine grows:
-     *   dot_vq2, dot_vq3, matmul_q4g, dequant_expert, ...
-     * A backend implementing only some of them leaves the rest at CPU. */
+    /* The two range kernels that carry the arithmetic (see simd.h). They
+     * take (begin, end, arg) because that is what the thread pool hands
+     * out, so dispatch costs one indirect call per range, not per row. */
+    void (*mvq_rows_f32)(int b, int e, void *arg);
+    void (*lutb_range)(int lo, int hi, void *arg);
+
+    /* A backend implementing only some slots leaves the rest at CPU. */
 } waste_kernels;
 
 /* The live table. Read it after waste_backend_init(); never mutate it from

@@ -41,6 +41,10 @@ const char *waste_kda_register_cpu(waste_kernels *t);
 #if defined(__ARM_NEON) || defined(__aarch64__)
 const char *waste_kda_register_neon(waste_kernels *t);
 #endif
+#if defined(__x86_64__) || defined(_M_X64)
+const char *waste_register_avx2(waste_kernels *t);
+const char *waste_register_avx512(waste_kernels *t);
+#endif
 #if defined(WASTE_ENABLE_METAL)
 const char *waste_register_metal(waste_kernels *t);
 #endif
@@ -170,6 +174,14 @@ void waste_backend_init(unsigned flags)
     (void)f;
 #if defined(__ARM_NEON) || defined(__aarch64__)
     if (f & WASTE_CPU_NEON) g_backend_name = waste_kda_register_neon(&waste_k);
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+    /* Widest first: a machine with AVX-512 also reports AVX2. FMA is
+     * checked with AVX2 because the kernels use fmadd. */
+    if ((f & WASTE_CPU_AVX512F) && (f & WASTE_CPU_AVX512BW))
+        g_backend_name = waste_register_avx512(&waste_k);
+    else if ((f & WASTE_CPU_AVX2) && (f & WASTE_CPU_FMA))
+        g_backend_name = waste_register_avx2(&waste_k);
 #endif
     /* AVX2 / AVX-512 / SVE / RVV modules register here as they land, in
      * best-first order, each overwriting only what it implements. */
