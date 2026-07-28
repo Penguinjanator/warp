@@ -498,6 +498,32 @@ static int run_prompt(waste_ctx *c, const opts *o, const char *prompt, int show_
     return 0;
 }
 
+/* Without --budget the engine picks the ceiling itself, and since that
+ * choice depends on the machine as well as the model, the same command on
+ * two laptops runs under two different ceilings. Say which one. To stderr,
+ * so a piped generation stays just the generation. */
+static void show_chosen_budget(waste_ctx *c, const opts *o)
+{
+    if (o->budget || o->quiet) return;
+    waste_memplan u;
+    if (waste_memory_used(c, &u) != WASTE_OK) return;
+    /* waste_memory_used reports the cache the engine really allocated, so
+     * this is what is held, not what was allowed. */
+    const uint64_t used = u.trunk_bytes + u.state_bytes + u.scratch_bytes +
+                          u.min_expert_cache;
+    const uint64_t phys = waste_physical_ram();
+    char ub[32], cb[32], pb[32];
+    human(used, ub, 32);
+    human(u.min_expert_cache, cb, 32);
+    if (phys) {
+        human(phys, pb, 32);
+        fprintf(stderr, "waste: no --budget, using %s of %s (expert cache %s)\n",
+                ub, pb, cb);
+    } else {
+        fprintf(stderr, "waste: no --budget, using %s (expert cache %s)\n", ub, cb);
+    }
+}
+
 static int cmd_run(int argc, char **argv)
 {
     opts o; opts_init(&o);
@@ -516,6 +542,7 @@ static int cmd_run(int argc, char **argv)
     waste_ctx *c;
     const waste_status st = open_model(o.pos[0], &o, &c);
     if (st != WASTE_OK) { free(prompt); return fail("open", st); }
+    show_chosen_budget(c, &o);
     const int r = run_prompt(c, &o, prompt, !o.quiet);
     if (o.learn) waste_save_usage(c);
     waste_close(c);
@@ -531,6 +558,7 @@ static int cmd_chat(int argc, char **argv)
     waste_ctx *c;
     const waste_status st = open_model(o.pos[0], &o, &c);
     if (st != WASTE_OK) return fail("open", st);
+    show_chosen_budget(c, &o);
 
     chatfmt fmt;
     const int templated = !o.raw && load_chatfmt(o.pos[0], &fmt);

@@ -217,6 +217,36 @@ fi
 # --------------------------------------------------------------- budget ----
 head_ "RAM budget"
 
+# The default budget is the one path check_budget.sh cannot reach, because
+# it always passes --budget. With no flag the engine chooses, and that
+# choice is all that stands between a model whose recommendation exceeds
+# the machine — K3 asks for 80.63 GB — and a swap storm. So assert the
+# rule, not a number, and it holds on any host: the ceiling is the
+# recommendation capped at 88% of physical RAM, or the floor when even
+# that does not fit, less at most one expert record of slot rounding.
+default_budget() {
+    python3 - "$1" <<'PY'
+import json, os, subprocess, sys
+
+def j(*a):
+    r = subprocess.run(["./waste", *a, "--json"], capture_output=True, text=True)
+    return json.loads(r.stdout)
+
+plan, info = j("plan", sys.argv[1]), j("info", sys.argv[1])
+phys = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+cap = phys - phys // 8
+# what the engine actually holds: the plan's mandatory parts plus the
+# cache it really allocated, which is what `info` reports
+held = plan["floor_bytes"] - plan["min_expert_cache"] + info["expert_cache_bytes"]
+want = (plan["floor_bytes"] if plan["floor_bytes"] > cap
+        else min(plan["recommended_bytes"], cap))
+rec = plan["min_expert_cache"] // (2 * info["top_k"]) if info["top_k"] else 0
+G = 1 << 30
+print(f"{held/G:.2f} GB held, ceiling {want/G:.2f} GB, machine {phys/G:.2f} GB")
+sys.exit(0 if want - rec - 1 <= held <= want else 1)
+PY
+}
+
 if [ -d "$MODEL" ]; then
     if ./waste plan "$MODEL" >/dev/null 2>&1; then ok "waste plan"; else no "waste plan"; fi
     # capture first: `set -o pipefail` would otherwise propagate the
@@ -226,6 +256,12 @@ if [ -d "$MODEL" ]; then
         ok "a budget under the floor is refused, not swapped into"
     else
         no "under-floor budget not refused"
+    fi
+
+    if out=$(default_budget "$MODEL" 2>/dev/null); then
+        ok "no --budget picks a ceiling the machine can hold ($out)"
+    else
+        no "default budget off the rule (${out:-no output})"
     fi
     # A container from a future layout must be refused, not read against the
     # old rules — the field was written from the first converter and read by
@@ -276,6 +312,17 @@ if [ -f "$BIG/manifest.json" ]; then
         ok "peak RSS stays inside the budget on K3 too"
     else
         no "peak RSS exceeded the budget on K3"
+    fi
+
+    # K3 is the only model here whose recommendation can exceed the
+    # machine, so it is the one that makes the cap bite at all: on a 64 GB
+    # host the default lands on 56.00 GB rather than the 80.63 GB asked
+    # for. On a host large enough to hold the recommendation this still
+    # passes — it checks the rule, not the clamp.
+    if out=$(default_budget "$BIG" 2>/dev/null); then
+        ok "no --budget is capped to the machine on K3 ($out)"
+    else
+        no "default budget not capped on K3 (${out:-no output})"
     fi
 else
     sk "K3 budget check" "no container at $BIG"
