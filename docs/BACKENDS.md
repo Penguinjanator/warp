@@ -250,3 +250,47 @@ the VQ path ever gets fast enough that the batched matmul's share grows,
 revisit — and at that point move the kernel into its own translation
 unit so runtime dispatch can pick it, instead of requiring a native
 build.
+
+## First Linux runs (2026-07-28)
+
+The engine had never been built on Linux. Docker, both architectures,
+`tests/run.sh` against the Kimi-Linear container:
+
+| | build | suite | backend | generation |
+|---|---|---|---|---|
+| Linux arm64 | ok | 12 pass, 0 fail, 4 skip | `NEON` | correct |
+| Linux x86_64 | ok | 12 pass, 0 fail, 4 skip | `CPU` | correct |
+| macOS arm64 | ok | 17 pass | `NEON` | correct |
+
+Both Linux targets produce "The capital of France is Paris, and the
+capital of Italy is Rome" — the same continuation as macOS — and both
+pass *engine matches the PyTorch oracle*, so the numerics carry across
+platforms and architectures. The four skips need `uv` or the source
+weights, neither of which is in the image.
+
+x86_64 names itself `CPU`, not AVX2, even though `waste_cpu_features()
+`detects AVX2 there. That is the version string doing its job: detection
+is not a kernel, and there is no x86 SIMD in this engine.
+
+Three defects turned up, none in the engine and all invisible from macOS:
+
+- The Makefile added `kda_neon.c` when `uname -m` contained "arm". Linux
+  on aarch64 reports **aarch64**, which does not, so the translation unit
+  was dropped while `backend.c` — which tests `__aarch64__` — still
+  emitted the call. Undefined `waste_kda_register_neon` at link.
+- `check_budget.sh` measured peak RSS with `/usr/bin/time -l`: a BSD-only
+  flag, and the tool is not in a plain debian image at all. It reported
+  the budget as exceeded when it had simply measured nothing. Now
+  `getrusage(RUSAGE_CHILDREN)` through python3.
+- The first attempt bind-mounted the working tree, so the Linux build
+  overwrote the macOS objects and `./waste` became "Exec format error"
+  on the host. `Dockerfile.test` copies instead.
+
+O_DIRECT works on Docker's volumes: `waste_stats.direct_io` stays 1 and
+no warning prints, while `WASTE_DIRECT=0` produces the fallback and the
+"hit rate is partly the kernel's" note. Both directions of that path are
+now exercised, which is more than the macOS-only build could do.
+
+CUDA remains untested and untestable here on two counts: there is no
+NVIDIA GPU on this machine, and there is still no CUDA source to compile
+— `WASTE_ENABLE_CUDA=1` stops the build with a message saying so.
