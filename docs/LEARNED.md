@@ -236,10 +236,25 @@ project once at the end) gives:
 
 It costs 3.2x the attention arithmetic (3.32 -> 10.57 GMAC/token, against
 48.6 GMAC for the experts) and saves 53x the attention memory traffic
-(11.25 -> 0.21 GB/token). At a 58 GB budget it turns 5.64 GB of expert
-cache into ~29 GB — 1.7x a token's working set, the first time the cache
-would be above the floor. It is also the only thing that makes long
-context possible at all: the current layout wants 360 GB at 128K.
+(11.25 -> 0.21 GB/token).
+
+**Implemented, and it behaves as predicted.** Measured on K3:
+
+| | expert cache | hit rate | tok/s |
+|---|---|---|---|
+| expanded, budget 46G | 5.64 GB | 0% | 0.28 |
+| latent, budget 46G | 16.68 GB | 11% | 0.30 |
+| latent, budget 56G | 26.68 GB | 32% | 0.34 |
+
+The 0% was never the cache underperforming — 5.64 GB against a 17.0 GB
+working set is a third of the floor, so nothing could survive from one
+token to the next. Given room, it behaves exactly as Gate 2's simulation
+said it would. Logits are unchanged (max|diff| 1.19e-05 against the
+expanded path, argmax and top-5 identical).
+
+And long context stops being impossible: at 128K tokens the expanded
+layout wanted 360 GB of KV, the latent wants 7.18 GB and still leaves
+20.14 GB of expert cache inside a 56 GB budget.
 
 **The report says the trunk should not be 4-bit.** QAT covered the expert
 weights at MXFP4 with everything else in higher precision, so the model
