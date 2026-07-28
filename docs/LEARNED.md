@@ -246,6 +246,10 @@ It costs 3.2x the attention arithmetic (3.32 -> 10.57 GMAC/token, against
 | latent, budget 46G | 16.68 GB | 11% | 0.30 |
 | latent, budget 56G | 26.68 GB | 32% | 0.34 |
 
+(Re-measured after §11 corrected the scratch accounting, which costs
+~0.7 GB of cache at every budget: 46G -> 9% and 0.29, 52G -> 24% and
+0.31, 58G -> 34% and 0.32. Same curve, honest numbers.)
+
 The 0% was never the cache underperforming — 5.64 GB against a 17.0 GB
 working set is a third of the floor, so nothing could survive from one
 token to the next. Given room, it behaves exactly as Gate 2's simulation
@@ -310,3 +314,29 @@ Two method notes worth keeping:
   It is good enough as a guard and not good enough as a proof, which is
   why the accounting is now derived from the config rather than inferred
   from a measurement.
+
+
+## 12. Where K3 stands, measured end to end (2026-07-28)
+
+Everything below is on the 64 GB M5 Pro, container on the internal SSD.
+
+| budget | expert cache | hit | decode | peak RSS |
+|---|---|---|---|---|
+| 32G | 1.99 GB | 0% | 0.28 tok/s | 30.9 GB |
+| 36G | 5.99 GB | 0% | 0.28 tok/s | 34.9 GB |
+| 40G | 9.99 GB | 0% | 0.28 tok/s | 38.9 GB |
+| 46G | 15.99 GB | 9% | 0.29 tok/s | 43.8 GB |
+| 52G | 21.99 GB | 24% | 0.31 tok/s | 49.8 GB |
+| 58G | 27.99 GB | 34% | 0.32 tok/s | 55.7 GB |
+
+Floor 30.38 GB at ctx 4096, 31.86 at 32K, 36.96 at 128K. Load 20s.
+Prefill 0.47 tok/s chunked, 0.29 sequential.
+
+Decode profile, no cache: MoE 88.6% (expert I/O 48.6, expert matmul
+34.0), KDA 9.3%, MLA 1.9%, lm_head 0.2%.
+
+The cache does nothing at all below ~16 GB and the curve only bends
+once it passes one token's working set — the Gate 5 floor, still the
+single most predictive number in this project. Nothing about the
+architecture work changed that; it changed how much RAM was left over
+to spend on it.
