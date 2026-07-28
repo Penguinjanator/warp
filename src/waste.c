@@ -34,8 +34,32 @@ struct waste_ctx {
     char path[512];
     int pos;                 /* next position in the sequence */
     int warmed;              /* experts preloaded from the hotlist */
+    char quant[64];          /* composed at open, reported by get_info */
     waste_stats stats;
 };
+
+/* What the container is actually stored as, composed once at open. It used
+ * to be one string constant, which was true of the first model converted
+ * and wrong about the second: K3's trunk is mostly Q4G where Kimi-Linear's
+ * is Q8G. Narrowest quantization first, f32 last. */
+static void quant_summary(waste_ctx *c)
+{
+    static const struct { int fmt; const char *name; } tbl[] = {
+        { 7, "Q3G" }, { 3, "Q4G" }, { 2, "Q8G" }, { 1, "F16" }, { 0, "F32" },
+    };
+    int n = snprintf(c->quant, sizeof c->quant, "experts VQ%dR, trunk",
+                     c->m.stages);
+    size_t off = (n > 0 && (size_t)n < sizeof c->quant) ? (size_t)n : 0;
+    const char *sep = " ";
+    for (size_t i = 0; i < sizeof tbl / sizeof *tbl; i++) {
+        if (!(c->m.trunk_fmts & (1u << tbl[i].fmt))) continue;
+        n = snprintf(c->quant + off, sizeof c->quant - off, "%s%s",
+                     sep, tbl[i].name);
+        if (n < 0 || (size_t)n >= sizeof c->quant - off) break;
+        off += (size_t)n;
+        sep = "/";
+    }
+}
 
 const char *waste_strerror(waste_status s)
 {
@@ -287,6 +311,7 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
             return rc == -2 ? WASTE_E_FORMAT : WASTE_E_IO;
         }
     }
+    quant_summary(c);
     c->tok = waste_tok_open(model_path);      /* optional */
     /* warm the cache from what previous runs learned, if anything */
     c->warmed = waste_model_warm_cache(&c->m, model_path);
@@ -554,8 +579,14 @@ waste_status waste_model_get_info(const waste_ctx *c, waste_model_info *out)
 
     out->params_total  = pe * (uint64_t)cf->n_experts * moe_layers + trunk;
     out->params_active = pe * (uint64_t)cf->top_k * moe_layers + trunk_active;
-    out->arch = "kimi-linear";
-    out->quant_summary = "experts VQ3R, trunk Q8G/F32";
+    /* Both containers declare model_type "kimi_linear", so the name comes
+     * from the architecture they were converted from. One the engine does
+     * not recognize is reported verbatim rather than guessed at. */
+    out->arch = strstr(cf->arch, "KimiK3")     ? "kimi-k3"
+              : strstr(cf->arch, "KimiLinear") ? "kimi-linear"
+              : cf->arch[0]                    ? cf->arch
+                                               : "unknown";
+    out->quant_summary = c->quant;
     return WASTE_OK;
 }
 

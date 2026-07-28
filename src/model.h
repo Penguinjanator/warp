@@ -58,6 +58,10 @@ typedef struct {
     int   act_situ;                  /* 1 = SiTU instead of SiLU            */
     float situ_beta, situ_linear_beta;
     char  prefix[64];                /* "" or "language_model." (K3)        */
+    /* The HF architecture the container was built from. Both models call
+     * themselves model_type "kimi_linear", so this is the only field that
+     * tells them apart by name rather than by feature. */
+    char  arch[64];
 } waste_config;
 
 typedef struct {
@@ -71,17 +75,28 @@ typedef struct {
     int hidden, heads, qkv_hidden, inter, layers;
     int pos_h, pos_w, text_hidden, patch;
     float eps, proj_eps;
+    float mean[3], std[3];       /* pixel normalization — see image.c      */
+    int   media_token;           /* the id an image expands from           */
+    int   max_patches;
 } waste_vision_cfg;
 
 typedef struct {
     waste_config cfg;
     waste_vision_cfg vcfg;
     int  want_vision;                /* load the tower's 438 MB or not     */
+    /* Image embeddings for the prefill about to run: one row per merged
+     * patch, consumed in order at each media placeholder. */
+    const float *media;
+    int      media_n, media_used, cfg_media_token;
     waste_tensor *t;
     int n_tensors;
     float *codebooks;                /* [n_books][256][8]                   */
     float *codebooksT;               /* [n_books][8][256], for the LUT build*/
     int n_books, vec_dim, cb_entries, stages;
+    /* 1 << fmt for every trunk format the language model actually uses,
+     * recorded at load because the tensors left on disk never reach the
+     * branch that fills in t->bits. */
+    uint32_t trunk_fmts;
     waste_bank bank[WASTE_MAX_LAYERS];
     int expert_m[3], expert_n[3];    /* gate, up, down shapes               */
 
@@ -169,6 +184,13 @@ void waste_deq_row(const waste_tensor *t, long r, int cols, float *dst);
 int waste_vision_encode(waste_model *m, const float *pixels, int h, int w,
                         float *out);
 int waste_vision_available(const waste_model *m);
+
+/* Decodes an image and lays it out as [gh*gw][3*14*14], normalized. The
+ * grid is chosen to keep the aspect ratio under `max_patches` and to be
+ * even on both axes, because the tower merges 2x2. Caller frees. */
+float *waste_image_load(const char *path, int max_patches,
+                        const float *mean, const float *std,
+                        int *out_h, int *out_w);
 
 /* Exposed for unit tests (tests/test_k3parts.c) — these are the pieces of
  * K3 whose maths is new, so they are checked against the reference

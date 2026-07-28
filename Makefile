@@ -28,7 +28,7 @@ CFLAGS  += -DVQ_SUPER=$(VQ_SUPER)
 CFLAGS  += -MMD -MP
 
 SRC := src/model.c src/kda.c src/backend.c src/ecache.c src/version.c \
-       src/tokenizer.c src/waste.c src/vq.c src/vision.c
+       src/tokenizer.c src/waste.c src/vq.c src/vision.c src/image.c
 # Match what backend.c tests for. Linux/aarch64 reports "aarch64", which
 # does not contain "arm" — the old findstring left kda_neon.c out of the
 # build while backend.c still emitted the call to it, so the link failed

@@ -454,6 +454,13 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
          * only — every lookup goes through cfg.prefix — so loading them
          * spends the one resource the whole design is fighting for. The
          * bytes stay in trunk.bin for the day vision lands. */
+        /* Record the storage format before the skip below: embed_tokens
+         * and the vision tower never reach the code that sets t->bits, and
+         * `info` reports the trunk's formats from this. */
+        if (!m->cfg.prefix[0] ||
+            !strncmp(t->name, m->cfg.prefix, strlen(m->cfg.prefix)))
+            m->trunk_fmts |= 1u << (fmt & 31);
+
         const int is_vision = !strncmp(t->name, "vision_tower.", 13) ||
                               !strncmp(t->name, "mm_projector.", 13);
         if (m->cfg.prefix[0] && !(is_vision && m->want_vision) &&
@@ -598,6 +605,16 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     c->situ_beta = (float)js_num(d, js_get(d, cfg, "activation_situ_beta"), 1.0);
     c->situ_linear_beta = (float)js_num(d, js_get(d, cfg, "activation_situ_linear_beta"), 0.0);
 
+    /* K3 is a KimiK3ForConditionalGeneration wrapped around a Kimi-Linear
+     * block, and the converter keeps the wrapper's config under `_outer`.
+     * The inner `architectures` says KimiLinearForCausalLM on both models,
+     * so the outer one is the only place K3 names itself. */
+    {
+        int a = js_get(d, js_get(d, cfg, "_outer"), "architectures");
+        if (a < 0) a = js_get(d, cfg, "architectures");
+        js_str(d, js_at(d, a, 0), c->arch, sizeof c->arch);
+    }
+
     int lac = js_get(d, cfg, "linear_attn_config");
     c->full_rank_gate = js_get(d, lac, "use_full_rank_gate") >= 0;
     c->gate_lower_bound = (float)js_num(d, js_get(d, lac, "gate_lower_bound"), 0.0);
@@ -715,6 +732,21 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                  * eps, so PyTorch uses finfo(float32).eps */
                 v->eps         = 1.1920928955078125e-07f;
                 v->proj_eps    = 1e-5f;
+                v->media_token = (int)js_int(&vd, js_get(&vd, 0,
+                                     "media_placeholder_token_id"), -1);
+                v->max_patches = (int)js_int(&vd, js_get(&vd, 0,
+                                     "max_patches"), 1024);
+                {   /* no preprocessor config ships with K3; these are the
+                     * CLIP constants, overridable in vision.json */
+                    static const float dm[3] = {0.48145466f, 0.4578275f, 0.40821073f};
+                    static const float ds[3] = {0.26862954f, 0.26130258f, 0.27577711f};
+                    const int mi = js_get(&vd, 0, "image_mean");
+                    const int si = js_get(&vd, 0, "image_std");
+                    for (int k = 0; k < 3; k++) {
+                        v->mean[k] = mi >= 0 ? (float)js_num(&vd, js_at(&vd, mi, k), dm[k]) : dm[k];
+                        v->std[k]  = si >= 0 ? (float)js_num(&vd, js_at(&vd, si, k), ds[k]) : ds[k];
+                    }
+                }
                 js_free(&vd);
             }
             free(vs);
@@ -2104,6 +2136,18 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     const waste_tensor *emb = waste_find(m, tname("%smodel.embed_tokens.weight", c->prefix));
     for (int t = 0; t < n; t++) {
         float *dst = m->cx + (size_t)t * hid;
+        /* An image token has no embedding of its own: the vision tower
+         * supplies one per merged patch, and the caller expanded the
+         * placeholder into that many positions before getting here. Rows
+         * are consumed in order, which is what makes several images in one
+         * prompt work without tracking which is which. */
+        if (m->media && m->media_used < m->media_n &&
+            tokens[t] == m->cfg_media_token) {
+            memcpy(dst, m->media + (size_t)m->media_used * hid,
+                   (size_t)hid * sizeof(float));
+            m->media_used++;
+            continue;
+        }
         if (emb->data) memcpy(dst, emb->data + (size_t)tokens[t] * hid, (size_t)hid * 4);
         else {
             const int g = emb->group, ng = (hid + g - 1) / g;
