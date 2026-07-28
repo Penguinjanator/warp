@@ -67,6 +67,7 @@ typedef struct {
     waste_tensor *t;
     int n_tensors;
     float *codebooks;                /* [n_books][256][8]                   */
+    float *codebooksT;               /* [n_books][8][256], for the LUT build*/
     int n_books, vec_dim, cb_entries, stages;
     waste_bank bank[128];
     int expert_m[3], expert_n[3];    /* gate, up, down shapes               */

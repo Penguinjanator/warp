@@ -619,6 +619,22 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         }
     }
     free(cb);
+    /* Transposed copy, [book][dim][entry]. The LUT build wants
+     * dst[c] = sum_d x[d]*C[c][d] for 256 entries at once; with the entries
+     * innermost that is an axpy per dimension instead of 256 eight-element
+     * dot products each ending in a cross-lane reduction. 6.5 MB on K3. */
+    {
+        const size_t per = (size_t)m->cb_entries * m->vec_dim;
+        m->codebooksT = (float *)malloc((size_t)m->n_books * per * sizeof(float));
+        if (!m->codebooksT) { js_free(&d); free(src); return -1; }
+        for (int b = 0; b < m->n_books; b++) {
+            const float *src_b = m->codebooks + (size_t)b * per;
+            float *dst_b = m->codebooksT + (size_t)b * per;
+            for (int c = 0; c < m->cb_entries; c++)
+                for (int dim = 0; dim < m->vec_dim; dim++)
+                    dst_b[(size_t)dim * m->cb_entries + c] = src_b[(size_t)c * m->vec_dim + dim];
+        }
+    }
 
     /* expert banks */
     m->expert_m[0] = m->expert_m[1] = c->moe_inter; m->expert_n[0] = m->expert_n[1] = c->hidden;
@@ -737,6 +753,7 @@ void waste_model_free(waste_model *m)
     free(m->embrow); free(m->embsc);
     free(m->mmxq); free(m->mmxs);
     free(m->codebooks);
+    free(m->codebooksT);
     for (int L = 0; L < 128; L++) {
         free(m->S[L]); free(m->conv[L]); free(m->latcache[L]);
         if (m->bank[L].fd > 0) close(m->bank[L].fd);
@@ -785,21 +802,69 @@ static const uint8_t *read_expert(waste_model *m, int L, int eid)
  * lut layout: [v][stage][code] — the 3 values a row needs for vector v sit
  * in one contiguous 3 KiB block.
  */
-static void vq_build_lut(float *lut, const float *books, int cb_base,
+typedef struct {
+    float *lut; const float *booksT; const float *x;
+    int cb_base, stages, entries, vec_dim;
+} lutb_arg;
+
+/* dst[c] = sum_d x[d] * C[c][d], for all `entries` codes at once.
+ *
+ * With the codebook transposed to [dim][entry] this is one axpy per
+ * dimension: every lane does useful work and nothing is reduced across
+ * lanes. The previous shape — `entries` separate eight-element dot
+ * products, each ending in vaddvq_f32 — spent more time folding four
+ * lanes into one than multiplying. */
+static void lutb_range(int lo, int hi, void *p)
+{
+    const lutb_arg *a = (const lutb_arg *)p;
+    const int en = a->entries, vd = a->vec_dim, st = a->stages;
+    for (int v = lo; v < hi; v++) {
+        const float *xv = a->x + (size_t)v * vd;
+        for (int s = 0; s < st; s++) {
+            const float *CT = a->booksT + (size_t)(a->cb_base + s) * en * vd;
+            float *dst = a->lut + ((size_t)v * st + s) * en;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+            int c = 0;
+            for (; c + 16 <= en; c += 16) {
+                float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0),
+                            a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
+                for (int d = 0; d < vd; d++) {
+                    const float32x4_t xd = vdupq_n_f32(xv[d]);
+                    const float *cr = CT + (size_t)d * en + c;
+                    a0 = vfmaq_f32(a0, xd, vld1q_f32(cr));
+                    a1 = vfmaq_f32(a1, xd, vld1q_f32(cr + 4));
+                    a2 = vfmaq_f32(a2, xd, vld1q_f32(cr + 8));
+                    a3 = vfmaq_f32(a3, xd, vld1q_f32(cr + 12));
+                }
+                vst1q_f32(dst + c, a0);      vst1q_f32(dst + c + 4, a1);
+                vst1q_f32(dst + c + 8, a2);  vst1q_f32(dst + c + 12, a3);
+            }
+            for (; c < en; c++) {
+                float t = 0;
+                for (int d = 0; d < vd; d++) t += xv[d] * CT[(size_t)d * en + c];
+                dst[c] = t;
+            }
+#else
+            for (int c = 0; c < en; c++) {
+                float t = 0;
+                for (int d = 0; d < vd; d++) t += xv[d] * CT[(size_t)d * en + c];
+                dst[c] = t;
+            }
+#endif
+        }
+    }
+}
+
+static void vq_build_lut(waste_model *m, float *lut, int cb_base,
                          const float *x, int N, int stages, int entries,
                          int vec_dim)
 {
     PROF_START(P_LUTB);
-    const int nv = N / vec_dim;
-    for (int v = 0; v < nv; v++) {
-        const float *xv = x + (size_t)v * vec_dim;
-        for (int s = 0; s < stages; s++) {
-            const float *C = books + (size_t)(cb_base + s) * entries * vec_dim;
-            float *dst = lut + ((size_t)v * stages + s) * entries;
-            for (int c = 0; c < entries; c++)
-                dst[c] = dotf(C + (size_t)c * vec_dim, xv, vec_dim);
-        }
-    }
+    lutb_arg a = { lut, m->codebooksT, x, cb_base, stages, entries, vec_dim };
+    /* Vectors are independent. The build was serial while everything around
+     * it used the pool, and on K3 it is 8.0 GFLOP per token — 7.0 of them
+     * for the down projections, which are rebuilt once per routed expert. */
+    waste_parallel_for(N / vec_dim, 16, lutb_range, &a);
     PROF_END(P_LUTB);
 }
 
@@ -893,7 +958,7 @@ static void vq_matvec(waste_model *m, float *y, const uint8_t *idx,
                       const uint16_t *scale, const float *x, int M, int N,
                       int cb_base, float *lut)
 {
-    vq_build_lut(lut, m->codebooks, cb_base, x, N, m->stages, m->cb_entries,
+    vq_build_lut(m, lut, cb_base, x, N, m->stages, m->cb_entries,
                  m->vec_dim);
     vq_apply(m, y, idx, scale, M, N, lut);
 }
@@ -1227,9 +1292,9 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
         /* gate/up see the same input and the same per-layer codebooks for
          * every routed expert, so their tables are built once per token. */
         if (!lut_ready) {
-            vq_build_lut(lut_gate, m->codebooks, h->codebook_id + 0 * m->stages,
+            vq_build_lut(m, lut_gate, h->codebook_id + 0 * m->stages,
                          xin, lat, m->stages, m->cb_entries, m->vec_dim);
-            vq_build_lut(lut_up, m->codebooks, h->codebook_id + 1 * m->stages,
+            vq_build_lut(m, lut_up, h->codebook_id + 1 * m->stages,
                          xin, lat, m->stages, m->cb_entries, m->vec_dim);
             lut_ready = 1;
         }
@@ -1471,6 +1536,7 @@ typedef struct {
     const float  *xs;        /* their scales, [T][ng]                      */
 } mmq_arg;
 
+#if defined(__ARM_FEATURE_MATMUL_INT8)
 /* Unpack one weight row to int8, whatever it is stored as. */
 static void unpack_row_i8(const mmq_arg *a, int o, int8_t *dst)
 {
@@ -1487,7 +1553,6 @@ static void unpack_row_i8(const mmq_arg *a, int o, int8_t *dst)
     for (int i = 0; i < a->in; i++) dst[i] = (int8_t)q3_at((const uint8_t *)q, i);
 }
 
-#if defined(__ARM_FEATURE_MATMUL_INT8)
 /* SMMLA: one instruction multiplies a 2x8 int8 tile by an 8x2 int8 tile
  * into a 2x2 int32 accumulator — 32 MACs, against 4 for an fp32 FMA. The
  * tiles here are two weight rows by two tokens, accumulated per
@@ -1784,11 +1849,11 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
         PROF_START(P_EMM);
         if (!lut_ready) {
             for (int t = 0; t < nT; t++) {
-                vq_build_lut(lut_gu + (size_t)(2 * t) * lut_sz, m->codebooks,
+                vq_build_lut(m, lut_gu + (size_t)(2 * t) * lut_sz,
                              h->codebook_id + 0 * m->stages,
                              xin + (size_t)t * lat, lat, m->stages,
                              m->cb_entries, m->vec_dim);
-                vq_build_lut(lut_gu + (size_t)(2 * t + 1) * lut_sz, m->codebooks,
+                vq_build_lut(m, lut_gu + (size_t)(2 * t + 1) * lut_sz,
                              h->codebook_id + 1 * m->stages,
                              xin + (size_t)t * lat, lat, m->stages,
                              m->cb_entries, m->vec_dim);
