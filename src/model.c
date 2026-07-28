@@ -758,13 +758,17 @@ static void vq_matvec(waste_model *m, float *y, const uint8_t *idx,
  * The second is not a clamp of the first — it is a different function, and
  * it confines the decay exp(g) to (exp(lower_bound), 1).
  */
-void waste_kda_decay_gate(float *g, const float *A_log, const float *dt_bias,
-                          int H, int D, float lower_bound)
+/* `per_channel`: K3 ships A_log with head_dim entries (one per channel,
+ * broadcast over heads); Kimi-Linear ships one per head. The tensor's own
+ * length says which, so the caller passes that rather than guessing. */
+void waste_kda_decay_gate_ex(float *g, const float *A_log, const float *dt_bias,
+                             int H, int D, float lower_bound, int per_channel)
 {
     for (int h = 0; h < H; h++) {
-        const float ea = expf(A_log[h]);
+        const float ea_head = per_channel ? 0.0f : expf(A_log[h]);
         for (int j = 0; j < D; j++) {
             const int i = h * D + j;
+            const float ea = per_channel ? expf(A_log[j]) : ea_head;
             const float z = g[i] + (dt_bias ? dt_bias[i] : 0.0f);
             if (lower_bound < 0.0f)
                 g[i] = lower_bound / (1.0f + expf(-ea * z));
@@ -774,6 +778,12 @@ void waste_kda_decay_gate(float *g, const float *A_log, const float *dt_bias,
             }
         }
     }
+}
+
+void waste_kda_decay_gate(float *g, const float *A_log, const float *dt_bias,
+                          int H, int D, float lower_bound)
+{
+    waste_kda_decay_gate_ex(g, A_log, dt_bias, H, D, lower_bound, 0);
 }
 
 static void kda_layer(waste_model *m, int L, const float *in, float *out)
@@ -797,9 +807,11 @@ static void kda_layer(waste_model *m, int L, const float *in, float *out)
 
     matvec_t(m, lo, waste_find(m, tname("%smodel.layers.%d.self_attn.f_a_proj.weight", c->prefix, L)), in, D, hid);
     matvec_t(m, g, waste_find(m, tname("%smodel.layers.%d.self_attn.f_b_proj.weight", c->prefix, L)), lo, C, D);
-    const float *A_log = T(m, "%smodel.layers.%d.self_attn.A_log", c->prefix, L);
+    const waste_tensor *At = waste_find(m, tname("%smodel.layers.%d.self_attn.A_log",
+                                                 c->prefix, L));
     const float *dt = T(m, "%smodel.layers.%d.self_attn.dt_bias", c->prefix, L);
-    waste_kda_decay_gate(g, A_log, dt, H, D, c->gate_lower_bound);
+    waste_kda_decay_gate_ex(g, At->data, dt, H, D, c->gate_lower_bound,
+                            (int)At->n == D && D != H);
     matvec_t(m, beta, waste_find(m, tname("%smodel.layers.%d.self_attn.b_proj.weight", c->prefix, L)), in, H, hid);
     for (int h = 0; h < H; h++) beta[h] = 1.0f / (1.0f + expf(-beta[h]));
 

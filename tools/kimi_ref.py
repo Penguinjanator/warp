@@ -255,7 +255,10 @@ class KimiRef:
 
         g = (x @ self.t[p + "f_a_proj.weight"].T) @ self.t[p + "f_b_proj.weight"].T
         g = g.view(T, H, D)
-        A_log = self.t[p + "A_log"].view(H, 1)
+        # K3 ships A_log with head_dim entries (per channel, broadcast over
+        # heads); Kimi-Linear ships one per head. Let the shape decide.
+        A_raw = self.t[p + "A_log"].flatten()
+        A_log = A_raw.view(1, D) if A_raw.numel() == D and D != H else A_raw.view(H, 1)
         z = g + self.t[p + "dt_bias"].view(H, D)
         if self.gate_lb is not None:
             g = self.gate_lb * torch.sigmoid(A_log.exp() * z)

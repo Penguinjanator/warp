@@ -125,6 +125,8 @@ const waste_tensor *waste_find(const waste_model *m, const char *name);
 float waste_situ_pair(float gate, float up, float beta, float linear_beta);
 void  waste_kda_decay_gate(float *g, const float *A_log, const float *dt_bias,
                            int H, int D, float lower_bound);
+void  waste_kda_decay_gate_ex(float *g, const float *A_log, const float *dt_bias,
+                              int H, int D, float lower_bound, int per_channel);
 void  waste_apply_attn_res(waste_model *m, const float *blockres, int nb,
                            const float *prefix_sum, const float *norm_w,
                            const float *proj_w, float *out);
