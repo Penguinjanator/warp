@@ -4,10 +4,8 @@ __pycache__/
 .DS_Store
 model.waste/
 *.waste
-test_kda
 *.o
-test_container
-test_forward
+/test_*
 waste
 libwaste.a
 *.a
