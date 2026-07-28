@@ -9,3 +9,6 @@ model.waste/
 waste
 libwaste.a
 *.a
+
+# compiler-generated dependency files (-MMD)
+*.d
