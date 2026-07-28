@@ -307,6 +307,43 @@ static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
     }
 }
 
+/* Dequantize one row of a trunk tensor into dst[cols].
+ *
+ * matvec_t fuses this with the dot product, which is right when every row
+ * feeds the same activation vector. MLA's absorbed path does not: each of
+ * kv_b_proj's rows is scaled by a different query component and summed the
+ * other way round, so the row has to be materialized first. */
+static void deq_row(const waste_tensor *t, long r, int cols, float *dst)
+{
+    if (!t->q) {
+        memcpy(dst, t->data + (size_t)r * cols, (size_t)cols * sizeof(float));
+        return;
+    }
+    const int g = t->group, ng = (cols + g - 1) / g;
+    const int8_t *row = t->q + (size_t)r * t->rowbytes;
+    const uint16_t *ws = t->qs + (size_t)r * ng;
+    for (int k = 0; k < ng; k++) {
+        const float s = f16_to_f32(ws[k]);
+        const int base = k * g;
+        const int lim = (base + g <= cols) ? g : cols - base;
+        if (t->bits == 8) {
+            const int8_t *w = row + (size_t)base;
+            for (int i = 0; i < lim; i++) dst[base + i] = s * (float)w[i];
+        } else if (t->bits == 4) {
+            const uint8_t *p4 = (const uint8_t *)row + (size_t)base / 2;
+            for (int i = 0; i < lim; i++) {
+                const uint8_t byte = p4[i >> 1];
+                const int v = (i & 1) ? (byte >> 4) - 8 : (byte & 0x0F) - 8;
+                dst[base + i] = s * (float)v;
+            }
+        } else {
+            const uint8_t *p3 = (const uint8_t *)row;
+            for (int i = 0; i < lim; i++)
+                dst[base + i] = s * (float)q3_at(p3, (long)base + i);
+        }
+    }
+}
+
 static inline float silu(float v) { return v / (1.0f + expf(-v)); }
 
 /* SiTU (K3): beta*tanh(g/beta)*sigmoid(g) * [linear_beta*tanh(u/linear_beta)]
@@ -552,9 +589,8 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
             m->S[L] = (float *)calloc((size_t)H * D * D, sizeof(float));
             m->conv[L] = (float *)calloc((size_t)3 * C * (c->conv_k - 1), sizeof(float));
         } else {
-            const int kd = c->qk_nope + c->qk_rope;
-            m->kcache[L] = (float *)calloc((size_t)kv_cap * c->n_heads * kd, sizeof(float));
-            m->vcache[L] = (float *)calloc((size_t)kv_cap * c->n_heads * c->v_head, sizeof(float));
+            m->latcache[L] = (float *)calloc(
+                (size_t)kv_cap * (c->kv_lora + c->qk_rope), sizeof(float));
         }
     }
     const int big = c->hidden > C ? c->hidden : C;
@@ -565,6 +601,13 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                              + (size_t)2 * (c->q_lora ? c->q_lora : 1) + 256,
                              sizeof(float));
     m->att = (float *)calloc((size_t)kv_cap * c->n_heads + 1024, sizeof(float));
+    {   /* MLA absorption scratch: one q~, one accumulated latent and one
+         * dequantized weight row per head, so the head loop needs no locks */
+        const size_t n = (size_t)c->n_heads * (c->kv_lora ? c->kv_lora : 1);
+        m->qabs = (float *)calloc(n, sizeof(float));
+        m->cacc = (float *)calloc(n, sizeof(float));
+        m->mrow = (float *)calloc(n, sizeof(float));
+    }
     m->logits = (float *)calloc((size_t)c->vocab, sizeof(float));
     m->ff = (float *)calloc((size_t)2 * (c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter), sizeof(float));
     m->e_gate = (float *)malloc((size_t)c->moe_inter * c->hidden * sizeof(float));
@@ -607,7 +650,7 @@ void waste_model_free(waste_model *m)
     free(m->t);
     free(m->codebooks);
     for (int L = 0; L < 128; L++) {
-        free(m->S[L]); free(m->conv[L]); free(m->kcache[L]); free(m->vcache[L]);
+        free(m->S[L]); free(m->conv[L]); free(m->latcache[L]);
         if (m->bank[L].fd > 0) close(m->bank[L].fd);
     }
     free(m->x); free(m->h); free(m->tmp); free(m->att); free(m->logits);
@@ -884,13 +927,87 @@ static void kda_layer(waste_model *m, int L, const float *in, float *out)
     matvec_t(m, out, waste_find(m, tname("%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L)), o, hid, C);
 }
 
+/* MLA with kv_b_proj absorbed into the query and the output.
+ *
+ * The cache holds only what MLA is designed to cache: the kv_lora-wide
+ * latent plus the rope dims, 2.25 KB per token per layer against the
+ * 120 KB the expanded per-head K and V used to take. The scores are the
+ * same numbers because
+ *     q_nope . (W_kb c) == (W_kb^T q_nope) . c
+ * and the values because
+ *     sum_s a_s (W_vb c_s) == W_vb (sum_s a_s c_s),
+ * so both halves of kv_b_proj move off the per-cached-token path and onto
+ * the per-step one. Arithmetic goes up (the dots are 576 and 512 wide
+ * instead of 192 and 128) and memory traffic goes down by the same 53x
+ * the cache shrinks by.
+ *
+ * Heads are independent all the way through, so one parallel_for covers
+ * the absorption, the scores, the softmax and the output projection —
+ * the old expanded path ran that loop on one core.
+ */
+typedef struct {
+    waste_model *m;
+    const waste_tensor *kvb;
+    const float *q, *lat;
+    float *o;
+    int S, qd, qk_nope, qk_rope, vh, kv_lora, latd;
+    float scale;
+} mla_par;
+
+static void mla_head_range(int lo, int hi, void *ap)
+{
+    const mla_par *a = (const mla_par *)ap;
+    const int kl = a->kv_lora, latd = a->latd, S = a->S;
+    const int nope = a->qk_nope, rope = a->qk_rope, vh = a->vh;
+    const int wrows = nope + vh;                 /* kv_b_proj rows per head */
+
+    for (int h = lo; h < hi; h++) {
+        const float *qh = a->q + (size_t)h * a->qd;
+        float *qa  = a->m->qabs + (size_t)h * kl;
+        float *ca  = a->m->cacc + (size_t)h * kl;
+        float *rw  = a->m->mrow + (size_t)h * kl;
+        float *sc  = a->m->att  + (size_t)h * S;
+
+        /* q~ = W_kb^T q_nope */
+        memset(qa, 0, (size_t)kl * sizeof(float));
+        for (int i = 0; i < nope; i++) {
+            const float qi = qh[i];
+            if (qi == 0.0f) continue;
+            deq_row(a->kvb, (long)h * wrows + i, kl, rw);
+            for (int j = 0; j < kl; j++) qa[j] += qi * rw[j];
+        }
+
+        for (int s = 0; s < S; s++) {
+            const float *cs = a->lat + (size_t)s * latd;
+            float acc = dotf(qa, cs, kl);
+            acc += dotf(qh + nope, cs + kl, rope);
+            sc[s] = acc * a->scale;
+        }
+        softmax(sc, S);
+
+        memset(ca, 0, (size_t)kl * sizeof(float));
+        for (int s = 0; s < S; s++) {
+            const float w = sc[s];
+            const float *cs = a->lat + (size_t)s * latd;
+            for (int j = 0; j < kl; j++) ca[j] += w * cs[j];
+        }
+
+        /* o = W_vb c~ */
+        float *oh = a->o + (size_t)h * vh;
+        for (int i = 0; i < vh; i++) {
+            deq_row(a->kvb, (long)h * wrows + nope + i, kl, rw);
+            oh[i] = dotf(rw, ca, kl);
+        }
+    }
+}
+
 static void mla_layer(waste_model *m, int L, const float *in, float *out, int pos)
 {
     const waste_config *c = &m->cfg;
     const int nh = c->n_heads, qd = c->qk_nope + c->qk_rope, vh = c->v_head;
     const int hid = c->hidden;
-    float *q = m->tmp, *ckv = q + nh * qd, *kb = ckv + c->kv_lora + c->qk_rope;
-    float *o = kb + nh * (c->qk_nope + vh);
+    const int latd = c->kv_lora + c->qk_rope;
+    float *q = m->tmp, *ckv = q + nh * qd, *o = ckv + latd;
 
     if (c->q_lora) {
         /* K3 LoRAs the query too: q_a -> RMSNorm -> q_b */
@@ -907,40 +1024,24 @@ static void mla_layer(waste_model *m, int L, const float *in, float *out, int po
     }
     matvec_t(m, ckv, waste_find(m, tname("%smodel.layers.%d.self_attn.kv_a_proj_with_mqa.weight", c->prefix, L)),
              in, c->kv_lora + c->qk_rope, hid);
-    float *kpass = ckv, *krot = ckv + c->kv_lora;
-    rmsnorm(kpass, kpass, T(m, "%smodel.layers.%d.self_attn.kv_a_layernorm.weight", c->prefix, L),
+    rmsnorm(ckv, ckv, T(m, "%smodel.layers.%d.self_attn.kv_a_layernorm.weight", c->prefix, L),
             c->kv_lora, c->eps);
-    matvec_t(m, kb, waste_find(m, tname("%smodel.layers.%d.self_attn.kv_b_proj.weight", c->prefix, L)),
-             kpass, nh * (c->qk_nope + vh), c->kv_lora);
-
-    float *kc = m->kcache[L] + (size_t)pos * nh * qd;
-    float *vc = m->vcache[L] + (size_t)pos * nh * vh;
-    for (int h = 0; h < nh; h++) {
-        const float *src = kb + h * (c->qk_nope + vh);
-        memcpy(kc + h * qd, src, (size_t)c->qk_nope * sizeof(float));
-        memcpy(kc + h * qd + c->qk_nope, krot, (size_t)c->qk_rope * sizeof(float));
-        memcpy(vc + h * vh, src + c->qk_nope, (size_t)vh * sizeof(float));
-    }
+    /* Cache the latent as-is — normalized kpass followed by the raw rope
+     * dims. kv_b_proj is not applied here at all; it is absorbed below. */
+    memcpy(m->latcache[L] + (size_t)pos * latd, ckv, (size_t)latd * sizeof(float));
     m->n_kv[L] = pos + 1;
 
-    const float scale = 1.0f / sqrtf((float)qd);
-    const int S = m->n_kv[L];
-    for (int h = 0; h < nh; h++) {
-        float *a = m->att;
-        for (int s = 0; s < S; s++) {
-            const float *kk = m->kcache[L] + ((size_t)s * nh + h) * qd;
-            float acc = 0;
-            for (int i = 0; i < qd; i++) acc += q[h * qd + i] * kk[i];
-            a[s] = acc * scale;
-        }
-        softmax(a, S);
-        float *oh = o + h * vh;
-        memset(oh, 0, (size_t)vh * sizeof(float));
-        for (int s = 0; s < S; s++) {
-            const float *vv = m->vcache[L] + ((size_t)s * nh + h) * vh;
-            const float w = a[s];
-            for (int i = 0; i < vh; i++) oh[i] += w * vv[i];
-        }
+    {
+        mla_par a;
+        a.m = m;
+        a.kvb = waste_find(m, tname("%smodel.layers.%d.self_attn.kv_b_proj.weight",
+                                    c->prefix, L));
+        a.q = q; a.lat = m->latcache[L]; a.o = o;
+        a.S = m->n_kv[L]; a.qd = qd;
+        a.qk_nope = c->qk_nope; a.qk_rope = c->qk_rope;
+        a.vh = vh; a.kv_lora = c->kv_lora; a.latd = latd;
+        a.scale = 1.0f / sqrtf((float)qd);
+        waste_parallel_for(nh, 1, mla_head_range, &a);
     }
     if (c->mla_output_gate) {
         /* sigmoid gate on the attention output, before o_proj */
@@ -1160,7 +1261,6 @@ int waste_model_state_save(const waste_model *m, const char *path, int pos)
     int rc = fwrite(&h, sizeof h, 1, f) == 1 ? 0 : -1;
 
     const int H = c->kda_heads, D = c->kda_dim, C = H * D;
-    const int qd = c->qk_nope + c->qk_rope;
     for (int L = 0; L < c->n_layers && !rc; L++) {
         if (c->kda_layer[L]) {
             if (fwrite(m->S[L], sizeof(float), (size_t)H * D * D, f) != (size_t)H * D * D) rc = -1;
@@ -1169,10 +1269,8 @@ int waste_model_state_save(const waste_model *m, const char *path, int pos)
         } else {
             const int32_t nkv = m->n_kv[L];
             if (fwrite(&nkv, sizeof nkv, 1, f) != 1) { rc = -1; break; }
-            const size_t kn = (size_t)nkv * c->n_heads * qd;
-            const size_t vn = (size_t)nkv * c->n_heads * c->v_head;
-            if (kn && fwrite(m->kcache[L], sizeof(float), kn, f) != kn) rc = -1;
-            if (!rc && vn && fwrite(m->vcache[L], sizeof(float), vn, f) != vn) rc = -1;
+            const size_t kn = (size_t)nkv * (c->kv_lora + c->qk_rope);
+            if (kn && fwrite(m->latcache[L], sizeof(float), kn, f) != kn) rc = -1;
         }
     }
     if (!rc && c->attn_res_block && m->n_blockres > 0) {
@@ -1205,7 +1303,6 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
     }
 
     const int H = c->kda_heads, D = c->kda_dim, C = H * D;
-    const int qd = c->qk_nope + c->qk_rope;
     int rc = 0;
     for (int L = 0; L < c->n_layers && !rc; L++) {
         if (c->kda_layer[L]) {
@@ -1216,10 +1313,8 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
             int32_t nkv = 0;
             if (fread(&nkv, sizeof nkv, 1, f) != 1) { rc = -1; break; }
             if (nkv < 0 || nkv > m->kv_cap) { rc = -1; break; }
-            const size_t kn = (size_t)nkv * c->n_heads * qd;
-            const size_t vn = (size_t)nkv * c->n_heads * c->v_head;
-            if (kn && fread(m->kcache[L], sizeof(float), kn, f) != kn) rc = -1;
-            if (!rc && vn && fread(m->vcache[L], sizeof(float), vn, f) != vn) rc = -1;
+            const size_t kn = (size_t)nkv * (c->kv_lora + c->qk_rope);
+            if (kn && fread(m->latcache[L], sizeof(float), kn, f) != kn) rc = -1;
             m->n_kv[L] = nkv;
         }
     }

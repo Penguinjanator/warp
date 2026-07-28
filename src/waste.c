@@ -122,11 +122,14 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
     const int n_kda = kl >= 0 ? d.tok[kl].size : 0;
     const int n_mla = layers - n_kda;
 
+    /* MLA caches the latent plus the rope dims, not the expanded per-head
+     * K and V — kv_b_proj is absorbed into the query and the output. That
+     * is 576 floats per token per layer here rather than 30720. */
     out->state_bytes = (uint64_t)n_kda * kh * kd * kd * 4                /* S */
                      + (uint64_t)n_kda * 3 * (ck - 1) * kh * kd * 4      /* conv */
-                     + (uint64_t)n_mla * ctx_tokens * nheads *
-                       ((uint64_t)(qk_nope + qk_rope) + v_head) * 4;     /* KV */
-    (void)kv_lora;
+                     + (uint64_t)n_mla * ctx_tokens *
+                       ((uint64_t)kv_lora + qk_rope) * 4;                /* KV */
+    (void)nheads; (void)qk_nope; (void)v_head;
     out->scratch_bytes = (uint64_t)64 * 1024 * 1024 + (uint64_t)hidden * 64 * 4;
 
     /* one layer's top-k experts, double buffered */

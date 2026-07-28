@@ -69,7 +69,9 @@ typedef struct {
     /* per-layer state */
     float *S[128];                   /* KDA recurrent state                 */
     float *conv[128];                /* KDA short-conv rings (3 x C x K-1)  */
-    float *kcache[128], *vcache[128];
+    /* MLA caches the latent, not the expanded per-head K and V: kv_b_proj
+     * is absorbed into the query and the output instead (see mla_layer). */
+    float *latcache[128];            /* [kv_cap][kv_lora + qk_rope]         */
     int n_kv[128], kv_cap;
 
     /* scratch */
@@ -84,6 +86,7 @@ typedef struct {
     float *blockres;                 /* AttnRes history: [nblocks][hidden]  */
     int    n_blockres;
     float *prefix_sum, *ares;
+    float *qabs, *cacc, *mrow;      /* MLA absorption scratch, per head    */
     float *e_gate, *e_up, *e_down, *ff, *lut, *xs;
     int8_t *xq;
     uint64_t expert_reads;
