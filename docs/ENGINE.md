@@ -78,6 +78,16 @@ its expert cache to fit inside what remains after the mandatory parts, and
 refuses to open with `WASTE_E_RAM_BUDGET` if the budget is under the
 floor, rather than thrashing the machine into swap.
 
+A budget of 0 asks the engine to choose, and the choice has to know the
+machine as well as the model. `recommended_bytes` is derived from the
+model alone — 80.63 GB on K3 — so taking it literally on a 64 GB laptop
+would have sized a 51.95 GB expert cache and swapped, which is precisely
+what the budget exists to prevent. The default is therefore the
+recommendation capped at 88% of physical RAM: 27.32 GB of cache on that
+machine. When even the floor is above the cap the engine runs at the
+floor and says so on stderr, because the alternative is refusing to open
+a model that does technically fit.
+
 ### What the floor is made of
 
 | part | scales with | can it shrink? |

@@ -477,6 +477,22 @@ def main():
             print(f"tokenizer: copied {name}")
             break
 
+    # ---- special tokens --------------------------------------------------
+    # tiktoken's rank file holds only ordinary merges; the markup tokens live
+    # in tokenizer_config.json. Without them the engine splits <|open|> into
+    # six ordinary tokens, which silently destroys any chat template and the
+    # media markers an image would be wrapped in.
+    p_cfg = os.path.join(args.src, "tokenizer_config.json")
+    if os.path.exists(p_cfg):
+        dec = json.load(open(p_cfg)).get("added_tokens_decoder", {})
+        specials = sorted(((int(i), v["content"]) for i, v in dec.items()),
+                          key=lambda x: x[0])
+        if specials:
+            with io.open(os.path.join(args.out, "specials.json"), "w",
+                         encoding="utf-8") as f:
+                json.dump([{"id": i, "text": t} for i, t in specials], f, indent=1)
+            print(f"special tokens: {len(specials)} written")
+
     # ---- chat template ---------------------------------------------------
     # HF keeps it either as a field in tokenizer_config.json or, more
     # recently, as its own .jinja file. Copy whichever exists so `waste chat`

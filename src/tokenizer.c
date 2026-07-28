@@ -11,6 +11,13 @@
 
 typedef struct { const uint8_t *p; int len; int rank; } tok_entry;
 
+/* Markup tokens — <|open|>, <|media_begin|>, [EOS] — are not merges and are
+ * absent from tiktoken's rank file; they come from specials.json next to
+ * it. They have to be matched before the BPE ever sees the text, or the
+ * engine splits <|open|> into six ordinary tokens and a chat template
+ * turns into gibberish the model was never trained on. */
+typedef struct { char *text; int len; int32_t id; } tok_special;
+
 struct waste_tok {
     uint8_t *blob;          /* decoded token bytes, back to back           */
     tok_entry *by_rank;     /* rank -> bytes                                */
@@ -18,6 +25,8 @@ struct waste_tok {
     int32_t *hash;          /* open addressing: -> index into by_rank       */
     int hash_mask;
     int bos, eos;
+    tok_special *special;   /* longest-first, so <|a|> cannot mask <|ab|>  */
+    int n_special;
 };
 
 /* ---- base64 ------------------------------------------------------------ */
@@ -79,6 +88,67 @@ static int tok_rank(const waste_tok *t, const uint8_t *p, int len)
     return -1;
 }
 
+/* ---- special tokens ------------------------------------------------------ */
+
+/* specials.json: [{"id": 163587, "text": "<|open|>"}, ...]. Hand-parsed —
+ * the file is written by our own converter and has no nesting — and sorted
+ * longest-first so a prefix can never shadow a longer token. */
+static int spec_cmp(const void *a, const void *b)
+{
+    return ((const tok_special *)b)->len - ((const tok_special *)a)->len;
+}
+
+static void load_specials(waste_tok *t, const char *dir)
+{
+    char path[512];
+    snprintf(path, sizeof path, "%s/specials.json", dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    const long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = (char *)malloc((size_t)n + 1);
+    if (!buf || fread(buf, 1, (size_t)n, f) != (size_t)n) { free(buf); fclose(f); return; }
+    buf[n] = 0;
+    fclose(f);
+
+    int cap = 16;
+    t->special = (tok_special *)malloc((size_t)cap * sizeof *t->special);
+    if (!t->special) { free(buf); return; }
+
+    const char *p = buf;
+    while ((p = strstr(p, "\"id\"")) != NULL) {
+        const int32_t id = (int32_t)strtol(strchr(p, ':') + 1, NULL, 10);
+        const char *tk = strstr(p, "\"text\"");
+        if (!tk) break;
+        const char *q = strchr(tk + 6, '"');
+        if (!q) break;
+        q++;
+        const char *e = q;
+        while (*e && *e != '"') e += (*e == '\\' && e[1]) ? 2 : 1;
+        const int len = (int)(e - q);
+        if (len > 0) {
+            if (t->n_special == cap) {
+                cap *= 2;
+                tok_special *g = (tok_special *)realloc(t->special, (size_t)cap * sizeof *g);
+                if (!g) break;
+                t->special = g;
+            }
+            char *txt = (char *)malloc((size_t)len + 1);
+            if (!txt) break;
+            memcpy(txt, q, (size_t)len);
+            txt[len] = 0;
+            t->special[t->n_special].text = txt;
+            t->special[t->n_special].len = len;
+            t->special[t->n_special].id = id;
+            t->n_special++;
+        }
+        p = e;
+    }
+    free(buf);
+    qsort(t->special, (size_t)t->n_special, sizeof *t->special, spec_cmp);
+}
+
 /* ---- loading ------------------------------------------------------------ */
 
 waste_tok *waste_tok_open(const char *dir)
@@ -136,12 +206,15 @@ waste_tok *waste_tok_open(const char *dir)
      * [BOS] = base, [EOS] = base+1, <|im_end|> = base+2. */
     t->bos = t->n_tokens;
     t->eos = t->n_tokens + 2;
+    load_specials(t, dir);
     return t;
 }
 
 void waste_tok_free(waste_tok *t)
 {
     if (!t) return;
+    for (int i = 0; i < t->n_special; i++) free(t->special[i].text);
+    free(t->special);
     free(t->blob); free(t->by_rank); free(t->hash); free(t);
 }
 
@@ -337,6 +410,23 @@ int waste_tok_encode(const waste_tok *t, const char *text, int32_t *out, int cap
     int n = 0, pos = 0;
     const int len = (int)strlen(text);
     while (pos < len) {
+        /* A special token is matched whole, before the pre-tokenizer ever
+         * sees it: the BPE has no entry for <|open|> and would emit six
+         * ordinary tokens the model has never been trained to read there. */
+        int sp = -1;
+        for (int i = 0; i < t->n_special; i++) {
+            if (t->special[i].len <= len - pos &&
+                memcmp(text + pos, t->special[i].text, (size_t)t->special[i].len) == 0) {
+                sp = i;
+                break;                       /* table is longest-first */
+            }
+        }
+        if (sp >= 0) {
+            if (n >= cap) return -1;
+            out[n++] = t->special[sp].id;
+            pos += t->special[sp].len;
+            continue;
+        }
         const int plen = next_piece(text + pos, len - pos);
         if (plen <= 0) break;
         const int got = encode_piece(t, (const uint8_t *)text + pos, plen,

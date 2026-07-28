@@ -101,8 +101,12 @@ typedef enum {
 } waste_cache_policy;
 
 typedef struct {
-    /* Hard ceiling on all engine allocations. 0 = query the machine and
-     * use a sane fraction. Loading fails if this is below floor_bytes. */
+    /* Hard ceiling on all engine allocations, used exactly as given.
+     * 0 = the engine picks: waste_memplan.recommended_bytes, capped at 88%
+     * of physical RAM so a model whose recommendation exceeds the machine
+     * does not swap it. Loading fails if the value (or, at 0, the capped
+     * default) is below floor_bytes. waste_memory_used reports what was
+     * actually resolved. */
     uint64_t ram_budget_bytes;
 
     uint32_t ctx_tokens;        /* 0 = container default                   */

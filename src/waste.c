@@ -125,12 +125,17 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
     /* trunk: sum the tensor payloads as they are stored, minus the ones the
      * engine deliberately leaves on disk (embed_tokens — one row per token) */
     const int trunk = js_get(&d, 0, "trunk");
+    char prefix[64];
+    js_str(&d, js_get(&d, 0, "tensor_prefix"), prefix, sizeof prefix);
     for (int i = 0; i < js_size(&d, trunk); i++) {
         const int e = js_at(&d, trunk, i);
         char nm[160];
         js_str(&d, js_get(&d, e, "name"), nm, sizeof nm);
         const int fmt = (int)js_int(&d, js_get(&d, e, "fmt"), 0);
         if (fmt != 0 && strstr(nm, "embed_tokens.weight")) continue;
+        /* the vision tower and projector are in the container but never
+         * loaded: the engine implements the text path only */
+        if (prefix[0] && strncmp(nm, prefix, strlen(prefix)) != 0) continue;
         out->trunk_bytes += (uint64_t)js_int(&d, js_get(&d, e, "bytes"), 0);
     }
 
@@ -237,24 +242,40 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
     waste_status st = waste_plan_memory(model_path, cfg.ctx_tokens, &c->plan);
     if (st != WASTE_OK) { free(c); return st; }
 
+    /* Resolve the budget. A budget the caller set is a contract and is used
+     * as given. A zero means "you decide", and that decision has to know the
+     * machine: recommended_bytes comes from the model alone — 80.85 GB on K3
+     * — so defaulting to it on a 64 GB laptop would ask for 51 GB of expert
+     * cache and swap, which is the one thing the budget exists to prevent.
+     * Cap the default at what the machine can hold, never below the floor. */
+    const uint64_t phys = waste_physical_ram();
+    const uint64_t cap = phys ? phys - phys / 8 : 0;   /* 12% left to the OS */
+    uint64_t budget = cfg.ram_budget_bytes;
+
+    if (!budget) {
+        budget = c->plan.recommended_bytes;
+        if (cap && budget > cap)
+            budget = cap > c->plan.floor_bytes ? cap : c->plan.floor_bytes;
+    }
+    if (budget < c->plan.floor_bytes) { free(c); return WASTE_E_RAM_BUDGET; }
+
     /* A budget close to physical RAM backfires: the OS starts paging out
      * the engine's own expert cache, and a "hit" then costs a page fault
      * instead of the disk read the engine was managing. Measured on K3:
      * 29.1 GB of cache on a 64 GB machine ran at 0.04 tok/s against 0.32
-     * with 28.0 GB — a better hit rate and eight times slower. */
-    {
-        const uint64_t phys = waste_physical_ram();
-        if (phys && cfg.ram_budget_bytes > phys - phys / 8)
-            fprintf(stderr,
-                    "waste: budget %.1f GB leaves under 12%% of this machine's "
-                    "%.1f GB free\n       the OS will page out the expert cache "
-                    "and throughput collapses\n",
-                    cfg.ram_budget_bytes / 1073741824.0, phys / 1073741824.0);
-    }
+     * with 28.0 GB — a better hit rate and eight times slower. This tests
+     * the resolved budget, not the caller's field: the default used to skip
+     * the check entirely by being zero here, which is exactly the case that
+     * needed it. What survives the clamp above is a floor that does not fit
+     * this machine — worth saying out loud before it crawls. */
+    if (cap && budget > cap)
+        fprintf(stderr,
+                "waste: budget %.1f GB leaves under 12%% of this machine's "
+                "%.1f GB free\n       the OS will page out the expert cache "
+                "and throughput collapses\n",
+                budget / 1073741824.0, phys / 1073741824.0);
 
-    uint64_t budget = cfg.ram_budget_bytes;
-    if (!budget) budget = c->plan.recommended_bytes;
-    if (budget < c->plan.floor_bytes) { free(c); return WASTE_E_RAM_BUDGET; }
+    c->cfg.ram_budget_bytes = budget;   /* what we actually run under */
 
     const uint64_t cache_bytes = budget - c->plan.floor_bytes +
                                  c->plan.min_expert_cache;

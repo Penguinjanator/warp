@@ -445,6 +445,19 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
              * more elements than the file has bytes is a lie. */
             if (t->n > (size_t)fsize) TRUNK_FAIL;
         }
+        /* K3 is multimodal and the container carries its vision tower and
+         * projector, 223 MB of them. The engine implements the text path
+         * only — every lookup goes through cfg.prefix — so loading them
+         * spends the one resource the whole design is fighting for. The
+         * bytes stay in trunk.bin for the day vision lands. */
+        if (m->cfg.prefix[0] &&
+            strncmp(t->name, m->cfg.prefix, strlen(m->cfg.prefix)) != 0) {
+            t->on_disk = 1;
+            t->file_off = off;
+            t->file_scale_off = soff;
+            continue;
+        }
+
         if (fmt == 0) {                                   /* F32 */
             t->data = (float *)waste_dio_alloc(t->n * sizeof(float));
             if (!t->data) TRUNK_FAIL;
