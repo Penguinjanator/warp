@@ -275,3 +275,38 @@ this machine.** 6 of 18 logical cores are performance cores, and a
 single-threaded process lands on an E-core; the same KDA kernel reads
 17.21s that way against 4.23s with the pool merely available. The
 parallel-vs-serial comparison has to be made with the pool alive.
+
+
+## 11. The RAM budget was not a ceiling (2026-07-28)
+
+`waste.h` calls `ram_budget_bytes` a hard ceiling on everything the engine
+allocates. Measuring it on K3 — rather than on the small model the test
+uses — showed peak RSS running 1.4 to 3.4 GB over a budget set near the
+floor. Two independent causes, neither visible on Kimi-Linear.
+
+**The trunk was loaded twice.** `load_trunk` slurped `trunk.bin` whole and
+then copied each tensor out of the buffer, so loading wanted twice the
+trunk resident: 57 GB on K3, before a single token. Every tensor knows
+its own offset, so there was never a reason to hold the file. Reading
+them one at a time with `pread` also cut load from 34s to 20s — most of
+that being the memory pressure the second copy caused, not the I/O.
+
+**Scratch was a guess.** The plan used a flat 64 MB + `hidden*64*4`. The
+decode buffers alone are 252 MB on K3 (`e_gate`/`e_up`/`e_down` are
+`moe_inter * hidden` floats each), and the chunked-prefill buffers — up
+to ~500 MB at `WASTE_CHUNK_MAX`, allocated on first use and never freed —
+were not counted at all. K3's floor is 30.38 GB, not the 29.69 the
+planner claimed.
+
+Two method notes worth keeping:
+
+- **A test on the small model does not test the big one.** The budget
+  check has been green since it was written; it runs on Kimi-Linear,
+  where the scratch it fails to count is measured in single megabytes.
+  Errors that scale with the model need a check that scales with it.
+- **Peak RSS is a noisy detector on macOS.** Under pressure the kernel
+  compresses anonymous pages, so the same pre-fix overrun measured
+  anywhere between 1.3 and 3.4 GB depending on the run and the prompt.
+  It is good enough as a guard and not good enough as a proof, which is
+  why the accounting is now derived from the config rather than inferred
+  from a measurement.
