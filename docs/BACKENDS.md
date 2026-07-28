@@ -373,3 +373,31 @@ instead of six, with the residual stream never returning to the host — a
 different engine, not a backend. The code stays, off by default, because
 it is correct and because that argument should be re-run if the CPU path
 ever stops being bandwidth-bound.
+
+## CI
+
+`.github/workflows/ci.yml` builds on linux-x86_64, linux-arm64 and
+macos-arm64, plus two jobs the matrix does not cover: a Metal build (off
+by default, so otherwise never compiled anywhere) and a guards job that
+checks the unimplemented accelerator flags still refuse with a message
+and that every source file carries its SPDX header.
+
+It exists because of what the first Linux run found. Both defects — the
+Makefile missing `aarch64`, and a peak-RSS check using a BSD-only flag of
+a tool debian does not ship — were invisible from macOS and would have
+been caught by a single push.
+
+**What it cannot do.** The end-to-end engine checks need a container, and
+the smallest is 19 GB, so CI runs only what is independent of one: the
+three builds, and the kernels against their PyTorch references — enough
+to catch a numerical regression in SiTU, the decay gates, AttnRes or KDA
+on a platform nobody develops on. Verified in a Linux arm64 container:
+with `uv` present those two checks run and pass; `tests/run.sh` skips the
+rest and exits 0.
+
+Closing the remaining gap means a **synthetic container generator** — a
+script that writes a valid few-megabyte container from random weights, so
+chunked prefill, the expert cache, session state and the RAM budget can
+all be exercised on every platform, and so a contributor can run the
+suite without downloading 19 GB. That is the single highest-value thing
+left in the test story.

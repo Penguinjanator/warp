@@ -163,9 +163,6 @@ PY
     else
         sk "oracle diff" "no fixture; regenerate with tools/kimi_ref.py --dump"
     fi
-else
-    sk "engine checks" "no container at $MODEL"
-fi
 
     if ./test_state "$MODEL" 2>/dev/null | grep -q "^STATE OK"; then
         ok "saved session resumes identically"
@@ -185,6 +182,9 @@ fi
     else
         no "hotlist did not reduce misses ($cold -> $warm)"
     fi
+else
+    sk "engine checks" "no container at $MODEL"
+fi
 
 # --------------------------------------------------------------- budget ----
 head_ "RAM budget"

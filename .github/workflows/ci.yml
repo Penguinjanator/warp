@@ -1,0 +1,118 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SQLite Cloud, Inc.
+#
+# What this catches, and what it does not.
+#
+# The engine had never been built on Linux until it was tried by hand, and
+# two defects fell out immediately: the Makefile picked up the NEON
+# translation unit only when `uname -m` contained "arm" — Linux on aarch64
+# says "aarch64" — so the link failed on an undefined symbol; and the RAM
+# check measured peak RSS with a BSD-only flag of a tool debian does not
+# install. Both were invisible from macOS. This matrix exists so the next
+# one is not.
+#
+# It cannot run the end-to-end engine checks: those need a real container,
+# and the smallest is 19 GB. What it does run is every check that is
+# independent of one — the build on three targets, and the kernels against
+# their PyTorch references, which is what would catch a numerical
+# regression in SiTU, the decay gates, AttnRes or KDA on a platform nobody
+# develops on. Closing the rest means a synthetic container generator; see
+# the note at the end of docs/BACKENDS.md.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+          - name: macos-arm64
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain and architecture
+        run: |
+          uname -m
+          cc --version | head -1
+          make --version | head -1
+
+      - name: Build
+        run: make
+
+      - name: Build the checkers
+        run: make test
+
+      - name: Report the backend this machine selected
+        run: ./waste version
+
+      # The official installer rather than a third-party action, so the
+      # workflow does not depend on an action tag moving under it.
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Model-independent: the kernels against their PyTorch references.
+      # tests/run.sh skips everything that needs a container and exits 0.
+      - name: Tests
+        run: tests/run.sh /nonexistent-container
+
+  metal:
+    name: macos-arm64 (Metal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The Metal backend is off by default and would otherwise never be
+      # compiled anywhere. It is Objective-C against two frameworks, so it
+      # breaks in ways the C build does not.
+      - name: Build with Metal
+        run: make WASTE_ENABLE_METAL=1
+      - name: The backend registers
+        run: ./waste version | grep -q Metal
+
+  guards:
+    name: build guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Accelerator flags with no implementation behind them must fail
+      # early with an explanation, not at link time on an undefined symbol.
+      - name: Unimplemented backends refuse to build
+        run: |
+          for flag in WASTE_ENABLE_CUDA WASTE_ENABLE_BLAS; do
+            if make "$flag=1" 2>&1 | grep -q "is not implemented"; then
+              echo "ok: $flag stops with a message"
+            else
+              echo "FAIL: $flag did not refuse cleanly"; exit 1
+            fi
+            make clean >/dev/null
+          done
+
+      # Every source file carries the licence header.
+      - name: SPDX headers
+        run: |
+          missing=$(git ls-files 'src/*.c' 'src/*.h' 'src/*.m' 'cli/*.c' \
+                                'tests/*.c' 'tools/*.py' 'tools/*.sh' \
+                    | xargs grep -L 'SPDX-License-Identifier' || true)
+          if [ -n "$missing" ]; then
+            echo "missing SPDX header:"; echo "$missing"; exit 1
+          fi
+          echo "ok: all source files carry the header"
