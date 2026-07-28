@@ -199,6 +199,31 @@ if [ -d "$MODEL" ]; then
     else
         no "under-floor budget not refused"
     fi
+    # A container from a future layout must be refused, not read against the
+    # old rules — the field was written from the first converter and read by
+    # nobody until it was wired up.
+    FV=$(mktemp -d)
+    python3 - "$MODEL/manifest.json" "$FV/manifest.json" <<'PYFV'
+import json, sys
+m = json.load(open(sys.argv[1])); m["format_version"] = 999
+json.dump(m, open(sys.argv[2], "w"))
+PYFV
+    out=$(./waste info "$FV" 2>&1); rc=$?
+    python3 - "$MODEL/manifest.json" "$FV/manifest.json" <<'PYFV'
+import json, sys
+m = json.load(open(sys.argv[1])); m.pop("format_version", None)
+json.dump(m, open(sys.argv[2], "w"))
+PYFV
+    out2=$(./waste info "$FV" 2>&1); rc2=$?
+    rm -rf "$FV"
+    if [ "$rc" -ne 0 ] && [ "$rc2" -ne 0 ] &&
+       printf '%s' "$out"  | grep -q "format version mismatch" &&
+       printf '%s' "$out2" | grep -q "format version missing"; then
+        ok "a container from another format version is refused"
+    else
+        no "format_version not enforced (rc=$rc rc2=$rc2)"
+    fi
+
     if tests/check_budget.sh "$MODEL" 2>/dev/null | grep -q "^BUDGET OK"; then
         ok "peak RSS stays inside the configured budget"
     else

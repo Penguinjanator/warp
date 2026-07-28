@@ -572,6 +572,28 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     js_doc d;
     if (js_parse(&d, src) < 0) { free(src); return -1; }
 
+    /* Refuse a container this build does not know how to read.
+     *
+     * The field has been written since the first converter and read by
+     * nobody, which is the dangerous shape: the day the layout changes, an
+     * old engine would parse a new container against the old rules and
+     * produce plausible wrong numbers instead of an error. Accept only the
+     * versions listed here, and reject a manifest with no version at all —
+     * that is either not a WASTE container or predates the guarantee. */
+    {
+        const int fv_tok = js_get(&d, 0, "format_version");
+        const long fv = fv_tok >= 0 ? js_int(&d, fv_tok, -1) : -1;
+        if (fv != WASTE_FORMAT_VERSION) {
+            fprintf(stderr,
+                    "waste: container format version %s, this build reads %d\n",
+                    fv_tok >= 0 ? "mismatch" : "missing", WASTE_FORMAT_VERSION);
+            if (fv_tok >= 0)
+                fprintf(stderr, "waste: manifest says %ld\n", fv);
+            js_free(&d); free(src);
+            return -2;                       /* -> WASTE_E_FORMAT */
+        }
+    }
+
     {
         int cfg = js_get(&d, 0, "config");
         /* The converter flattens K3's nested text_config into `config` and

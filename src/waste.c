@@ -223,10 +223,13 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
 
     const uint64_t cache_bytes = budget - c->plan.floor_bytes +
                                  c->plan.min_expert_cache;
-    if (waste_model_load(&c->m, model_path, (int)cfg.ctx_tokens,
-                         (size_t)cache_bytes)) {
-        free(c);
-        return WASTE_E_IO;
+    {
+        const int rc = waste_model_load(&c->m, model_path, (int)cfg.ctx_tokens,
+                                        (size_t)cache_bytes);
+        if (rc) {
+            free(c);
+            return rc == -2 ? WASTE_E_FORMAT : WASTE_E_IO;
+        }
     }
     c->tok = waste_tok_open(model_path);      /* optional */
     /* warm the cache from what previous runs learned, if anything */
