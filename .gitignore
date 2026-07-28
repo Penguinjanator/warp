@@ -13,5 +13,19 @@ libwaste.a
 # compiler-generated dependency files (-MMD)
 *.d
 
+# shared library and the debug bundles the linker leaves beside it
+*.dylib
+*.so
+*.dSYM/
+
+# hand-built sanitizer binaries: `make asan` cleans up after itself, a
+# manual instrumented build does not
+/waste_*
+/tf_asan
+
+# test_k3parts writes here when run without a path; tests/run.sh gives it
+# one under $TMP, a bare ./test_k3parts does not
+k3parts.bin
+
 # containers a fuzzer kept for reproduction
 fuzz-case-*/
