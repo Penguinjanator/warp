@@ -99,10 +99,15 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
 
     memset(out, 0, sizeof *out);
 
-    /* trunk: sum the tensor payloads as they are stored */
+    /* trunk: sum the tensor payloads as they are stored, minus the ones the
+     * engine deliberately leaves on disk (embed_tokens — one row per token) */
     const int trunk = js_get(&d, 0, "trunk");
     for (int i = 0; i < d.tok[trunk].size; i++) {
         const int e = js_at(&d, trunk, i);
+        char nm[160];
+        js_str(&d, js_get(&d, e, "name"), nm, sizeof nm);
+        const int fmt = (int)js_int(&d, js_get(&d, e, "fmt"), 0);
+        if (fmt != 0 && strstr(nm, "embed_tokens.weight")) continue;
         out->trunk_bytes += (uint64_t)js_int(&d, js_get(&d, e, "bytes"), 0);
     }
 

@@ -28,6 +28,11 @@ typedef struct {
     size_t rowbytes;      /* stride between rows of `q`                     */
     int shape[4], ndim;
     size_t n;
+    /* Set when the tensor is deliberately left on disk instead of being
+     * made resident (embed_tokens: 1.11 GB of which one row per token is
+     * ever read). q and qs are NULL in that case. */
+    long   file_off, file_scale_off;
+    int    on_disk;
 } waste_tensor;
 
 typedef struct {
@@ -86,6 +91,9 @@ typedef struct {
     float *blockres;                 /* AttnRes history: [nblocks][hidden]  */
     int    n_blockres;
     float *prefix_sum, *ares;
+    int      trunk_fd;              /* stays open for the on-disk tensors  */
+    int8_t  *embrow;                /* one embedding row, read per token   */
+    uint16_t *embsc;
     float *qabs, *cacc, *mrow;      /* MLA absorption scratch, per head    */
     float *e_gate, *e_up, *e_down, *ff, *lut, *xs;
     int8_t *xq;

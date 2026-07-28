@@ -55,6 +55,18 @@ static char *slurp(const char *path, size_t *len)
     return b;
 }
 
+/* pread until the whole range lands; short reads are legal. */
+static int pread_all(int fd, void *dst, size_t n, long off)
+{
+    uint8_t *p = (uint8_t *)dst;
+    while (n) {
+        const ssize_t r = pread(fd, p, n, (off_t)off);
+        if (r <= 0) return -1;
+        p += r; n -= (size_t)r; off += r;
+    }
+    return 0;
+}
+
 const waste_tensor *waste_find(const waste_model *m, const char *name)
 {
     for (int i = 0; i < m->n_tensors; i++)
@@ -344,6 +356,28 @@ static void deq_row(const waste_tensor *t, long r, int cols, float *dst)
     }
 }
 
+/* One row of a tensor that was left on disk, into the model's row scratch.
+ * Falls through to the resident pointers when the tensor is in RAM, so
+ * callers do not branch. */
+static void trunk_row(waste_model *m, const waste_tensor *t, long row,
+                      const int8_t **q, const uint16_t **qs)
+{
+    const int ng = (t->shape[t->ndim - 1] + t->group - 1) / t->group;
+    if (!t->on_disk) {
+        *q  = t->q  + (size_t)row * t->rowbytes;
+        *qs = t->qs + (size_t)row * ng;
+        return;
+    }
+    if (pread_all(m->trunk_fd, m->embrow, t->rowbytes,
+                  t->file_off + row * (long)t->rowbytes) ||
+        pread_all(m->trunk_fd, m->embsc, (size_t)ng * sizeof(uint16_t),
+                  t->file_scale_off + row * (long)ng * 2)) {
+        memset(m->embrow, 0, t->rowbytes);
+        memset(m->embsc, 0, (size_t)ng * sizeof(uint16_t));
+    }
+    *q = m->embrow; *qs = m->embsc;
+}
+
 static inline float silu(float v) { return v / (1.0f + expf(-v)); }
 
 /* SiTU (K3): beta*tanh(g/beta)*sigmoid(g) * [linear_beta*tanh(u/linear_beta)]
@@ -364,18 +398,6 @@ static void softmax(float *x, int n)
 }
 
 /* ---- loading ----------------------------------------------------------- */
-
-/* pread until the whole range lands; short reads are legal. */
-static int pread_all(int fd, void *dst, size_t n, long off)
-{
-    uint8_t *p = (uint8_t *)dst;
-    while (n) {
-        const ssize_t r = pread(fd, p, n, (off_t)off);
-        if (r <= 0) return -1;
-        p += r; n -= (size_t)r; off += r;
-    }
-    return 0;
-}
 
 /* Reads the trunk one tensor at a time.
  *
@@ -457,6 +479,16 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
                         ? (size_t)((ng * g * 3 + 7) / 8 + 1)
                         : (size_t)ng * g * t->bits / 8;
             const size_t payload = (size_t)rows * t->rowbytes;
+            /* The embedding table is the one big tensor of which a single
+             * row is read per token. Keeping 1.11 GB resident to touch 7 KB
+             * of it is a bad trade against the expert cache, so leave it on
+             * disk and pread the row. */
+            if (strstr(t->name, "embed_tokens.weight")) {
+                t->on_disk = 1;
+                t->file_off = off;
+                t->file_scale_off = soff;
+                continue;
+            }
             t->q = (int8_t *)malloc(payload);
             t->qs = (uint16_t *)malloc((size_t)rows * ng * sizeof(uint16_t));
             if (!t->q || !t->qs) TRUNK_FAIL;
@@ -465,7 +497,7 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
                 TRUNK_FAIL;
         }
     }
-    close(fd);
+    m->trunk_fd = fd;   /* on-disk tensors read through it */
 #undef TRUNK_FAIL
     return 0;
 }
@@ -629,6 +661,18 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                              + (size_t)2 * (c->q_lora ? c->q_lora : 1) + 256,
                              sizeof(float));
     m->att = (float *)calloc((size_t)kv_cap * c->n_heads + 1024, sizeof(float));
+    {   /* one row of whichever tensors were left on disk */
+        size_t rb = 0, sb = 0;
+        for (int i = 0; i < m->n_tensors; i++) {
+            const waste_tensor *t = &m->t[i];
+            if (!t->on_disk) continue;
+            const int ng = (t->shape[t->ndim - 1] + t->group - 1) / t->group;
+            if (t->rowbytes > rb) rb = t->rowbytes;
+            if ((size_t)ng > sb) sb = (size_t)ng;
+        }
+        m->embrow = rb ? (int8_t *)malloc(rb) : NULL;
+        m->embsc  = sb ? (uint16_t *)malloc(sb * sizeof(uint16_t)) : NULL;
+    }
     {   /* MLA absorption scratch: one q~, one accumulated latent and one
          * dequantized weight row per head, so the head loop needs no locks */
         const size_t n = (size_t)c->n_heads * (c->kv_lora ? c->kv_lora : 1);
@@ -676,6 +720,8 @@ void waste_model_free(waste_model *m)
         free(m->t[i].data); free(m->t[i].q); free(m->t[i].qs);
     }
     free(m->t);
+    if (m->trunk_fd > 0) close(m->trunk_fd);
+    free(m->embrow); free(m->embsc);
     free(m->codebooks);
     for (int L = 0; L < 128; L++) {
         free(m->S[L]); free(m->conv[L]); free(m->latcache[L]);
@@ -1698,8 +1744,8 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         if (emb->data) memcpy(dst, emb->data + (size_t)tokens[t] * hid, (size_t)hid * 4);
         else {
             const int g = emb->group, ng = (hid + g - 1) / g;
-            const int8_t *row = emb->q + (size_t)tokens[t] * emb->rowbytes;
-            const uint16_t *sc = emb->qs + (size_t)tokens[t] * ng;
+            const int8_t *row; const uint16_t *sc;
+            trunk_row(m, emb, tokens[t], &row, &sc);
             for (int k = 0; k < ng; k++) {
                 const float sv = f16_to_f32(sc[k]);
                 for (int i = 0; i < g && k * g + i < hid; i++) {
@@ -1831,8 +1877,8 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         memcpy(m->x, emb->data + (size_t)token * hid, (size_t)hid * sizeof(float));
     } else {
         const int g = emb->group, ng = (hid + g - 1) / g;
-        const int8_t *row = emb->q + (size_t)token * emb->rowbytes;
-        const uint16_t *sc = emb->qs + (size_t)token * ng;
+        const int8_t *row; const uint16_t *sc;
+        trunk_row(m, emb, token, &row, &sc);
         for (int k = 0; k < ng; k++) {
             const float s = f16_to_f32(sc[k]);
             for (int i = 0; i < g && k * g + i < hid; i++) {
