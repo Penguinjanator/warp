@@ -13,7 +13,7 @@
 #   SRC=... OUT=... JOBS=3 tools/pipeline.sh
 #
 # Stages
-#   1 download   loops tools/fetch_k3.sh until all shards verify
+#   1 download   loops tools/fetch_weights.sh until all shards verify
 #   2 convert    tools/convert.py --jobs N (skips layers already written)
 #   3 verify     container round-trip against the source weights
 #   4 run        the C engine generates from a prompt
@@ -54,13 +54,13 @@ tries=0
 while [ "$(have)" -lt "$NEED" ]; do
     tries=$((tries + 1))
     [ "$tries" -gt 200 ] && die "download (gave up after $tries passes)"
-    ./tools/fetch_k3.sh >/dev/null 2>&1
+    ./tools/fetch_weights.sh --dest "$SRC" >/dev/null 2>&1
     say "  pass $tries: $(have)/$NEED"
 done
 say "stage 1 done: all $NEED shards verified"
 
 # ---- 2. convert ----------------------------------------------------------
-FREE=$(df -g "$(dirname "$OUT")" | awk 'NR==2 {print $4}')
+FREE=$(( $(df -kP "$(dirname "$OUT")" | awk 'NR==2 {print $4}') / 1048576 ))
 say "stage 2: convert — ${FREE} GB free on the target volume"
 [ "$FREE" -lt 1100 ] && die "convert (need ~1.0 TB, ${FREE} GB free)"
 

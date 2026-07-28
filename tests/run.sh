@@ -76,6 +76,66 @@ else
     sk "kernel checks" "uv not installed"
 fi
 
+# -------------------------------------------------------------- download ----
+head_ "download script"
+
+# The shard downloader is the one tool whose failure modes only appear
+# hours into a 1.4 TB pull, so its worker is exercised here against a local
+# server instead: resume from a truncated file, skip an already-recorded
+# shard without a request, and fall back to a clean restart when the server
+# has no Range support.
+fetch_worker() {                       # $1 = generated worker path
+    { echo "DEST=$FT/dst; RAW=http://127.0.0.1:$1; STATE=\$DEST/.st; LOG=\$DEST/log"
+      echo 'MAX_RETRY=2; MIN_FREE_GB=0; STAT_MODE='"$2"
+      sed -n '/^cat > "\$DEST\/\.worker\.sh" <<WORKER$/,/^WORKER$/p' tools/fetch_weights.sh
+    } > "$FT/gen.sh"
+    bash "$FT/gen.sh"
+}
+
+FT="$TMP/fetch"
+mkdir -p "$FT/srv" "$FT/dst"
+if stat --version >/dev/null 2>&1; then SM=gnu; else SM=bsd; fi
+python3 -c "open('$FT/srv/s.bin','wb').write(bytes(range(256))*4096)"
+
+PORT=8731
+python3 tests/range_server.py "$FT/srv" $PORT >/dev/null 2>&1 &
+RSRV=$!
+sleep 1
+head -c 400000 "$FT/srv/s.bin" > "$FT/dst/s.bin"
+fetch_worker $PORT $SM
+: > "$FT/dst/.st"
+bash "$FT/dst/.worker.sh" s.bin >/dev/null 2>&1
+if cmp -s "$FT/srv/s.bin" "$FT/dst/s.bin" && grep -q "^s.bin$" "$FT/dst/.st"; then
+    ok "a truncated shard resumes and verifies against Content-Length"
+else
+    no "resume"
+fi
+# second pass: recorded in the state file, so not even a HEAD goes out
+before=$(wc -l < "$FT/dst/log")
+bash "$FT/dst/.worker.sh" s.bin >/dev/null 2>&1
+if [ "$(wc -l < "$FT/dst/log")" = "$before" ]; then
+    ok "a completed shard is skipped without a request"
+else
+    no "state-file skip"
+fi
+kill $RSRV 2>/dev/null; wait $RSRV 2>/dev/null
+
+PORT=8732
+python3 tests/range_server.py "$FT/srv" $PORT --no-range >/dev/null 2>&1 &
+RSRV=$!
+sleep 1
+rm -f "$FT/dst/s.bin" "$FT/dst/.st" "$FT/dst/log"
+head -c 400000 "$FT/srv/s.bin" > "$FT/dst/s.bin"
+fetch_worker $PORT $SM
+: > "$FT/dst/.st"
+bash "$FT/dst/.worker.sh" s.bin >/dev/null 2>&1
+if cmp -s "$FT/srv/s.bin" "$FT/dst/s.bin"; then
+    ok "a server without Range support restarts the shard instead of giving up"
+else
+    no "no-range fallback"
+fi
+kill $RSRV 2>/dev/null; wait $RSRV 2>/dev/null
+
 # ---------------------------------------------------------------- image ----
 head_ "image"
 

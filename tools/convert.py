@@ -14,7 +14,7 @@ channel. Codebooks are trained per (layer, matrix kind) on a sample and
 stored once. Gate 3 measured this recipe on real Kimi experts.
 
 Reads a Kimi checkpoint as published — the 1.42 TB of moonshotai/Kimi-K3
-that tools/fetch_k3.sh leaves on the staging disk, or any other
+that tools/fetch_weights.sh leaves on the staging disk, or any other
 member of the family (Kimi-Linear) by pointing --src elsewhere.
 
   uv run --with torch python tools/convert.py \

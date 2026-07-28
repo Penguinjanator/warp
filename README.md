@@ -182,7 +182,7 @@ the next steps are about memory rather than arithmetic.
 ```bash
 git clone <this repo> && cd waste
 make                          # libwaste.a, waste, libwastevq
-make check                    # 25 checks, about three minutes
+make check                    # 28 checks, about three minutes
 ```
 
 No configure step and no dependency resolution. `make check` needs no
@@ -197,12 +197,13 @@ exactly as published — 96 safetensors shards, 1.42 TB, nothing patched:
 
 ```bash
 # 1. download the weights: resumable, safe to kill and re-run
-DEST=/Volumes/WasteDisk/k3 tools/fetch_k3.sh
+tools/fetch_weights.sh --dest /Volumes/staging/k3 --dry-run   # preflight
+tools/fetch_weights.sh --dest /Volumes/staging/k3
 
 # 2. convert them into a container
 uv run --with torch --with safetensors python tools/convert.py \
-    --src /Volumes/WasteDisk/k3 \
-    --out /Users/you/models/k3.waste --jobs 3
+    --src /Volumes/staging/k3 \
+    --out ~/models/k3.waste --jobs 3
 ```
 
 That produces the 982 GB container every number above was measured on. It
@@ -325,7 +326,7 @@ src/        the engine — 6,700 lines of C, no dependencies
 cli/        the CLI, a client of the public API
 tools/      conversion and validation (Python, never at run time)
 docs/       format, engine, backends, and what was learned
-tests/      25 checks, and a diff against a PyTorch oracle given a model
+tests/      28 checks, and a diff against a PyTorch oracle given a model
 third_party/ stb_image.h, the single vendored header — see its README
 ```
 
