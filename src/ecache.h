@@ -8,7 +8,7 @@
  *
  * Policy is LFRU — frequency first, recency as tiebreak, victims chosen
  * from a small random sample rather than a full scan (the same
- * approximation the Gate 2 simulator used, and what earlier work's tier.h does).
+ * approximation the Gate 2 simulator used).
  * Gate 2 also showed why: at small cache fractions plain LRU collapses to
  * 5% where LFRU still gets 29%.
  *

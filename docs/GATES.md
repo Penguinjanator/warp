@@ -27,8 +27,8 @@ fixes. Trace fixture: `tests/trace_olmoe_299.jsonl`.
 - LFRU cache hit-rate at K3-analog cache fractions:
   ~6% of expert bytes cached → **~23%** hit; 12.5% → 35%; 25% → 53%;
   53% → 81%. LRU thrashes to 0% at small caches (each token touches 128
-  slots); LFRU degrades gracefully — the earlier work-style
-  frequency-first policy is the right one.
+  slots); LFRU degrades gracefully — the frequency-first
+  policy is the right one.
 
 *Implication for K3 on 64 GB (40 GB cache ≈ 6% of a ~700 GB expert set):*
 if K3 routes like OLMoE, expect ~20-25% hit → ~9.5 GB misses/token at
@@ -39,7 +39,7 @@ activations even in this flat-ish model.
 *Caveats (why this doesn't decide K3 yet):* different scale and expert
 granularity (K3: 896 fine-grained experts + quantile-balanced training —
 could route flatter or sharper); 299 tokens is short (LFRU barely warms
-up; earlier work's learned pin sets improve with hours of workload); single
+up; learned pin sets improve with hours of workload); single
 prompt/domain. Gate 2 reruns this exact pipeline on K3's real trace.
 
 ## Gate H — is the storage fast enough to stream experts? ✅ RUN 2026-07-27
@@ -180,7 +180,7 @@ dominates at 896 is exactly what Gate 2b on K3 itself must answer.
 *Test:* KBVQ-style VQ2R/VQ3R on 2-3 layers' experts from downloaded
 shards; measure per-layer output MSE vs MXFP4 reference on calibration
 activations; compare against the same measurement on GLM-5.2 layers
-(known-good baseline from earlier work).
+(our own known-good baseline).
 *Kill criterion:* reconstruction error ≫ GLM-5.2-at-int4 levels →
 raise bits (disk grows) or stop.
 

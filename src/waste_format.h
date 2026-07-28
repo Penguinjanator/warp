@@ -57,7 +57,7 @@ typedef enum {
  * File = contiguous 4 KiB-aligned ExpertRec, sorted by expert_id.
  * Offsets inside the record are relative to the record start, so a single
  * pread(fd, buf, rec_4k_blocks * 4096, file_off) yields a self-contained
- * expert; QT views point into the buffer (earlier work slab discipline).
+ * expert; QT views point into the buffer (slab discipline).
  *
  * W ≈ (U_shared · V_sharedᵀ) ⊙ chan_correction + dequant(vq_indices)
  */
@@ -122,7 +122,7 @@ static_assert(sizeof(waste_lowrank_hdr) == 20, "lowrank header layout");
 
 /* ---- usage.waste (append-only) ----------------------------------------- */
 /* Runtime routing stats for the LFRU pinner + pilot/COUPLE prefetch.
- * Entry stream after a 16-byte header; earlier work tier.h semantics.          */
+ * Entry stream after a 16-byte header; LFRU counters + decayed recency.   */
 
 typedef struct {
     uint32_t magic;          /* WASTE_MAGIC_USAGE                           */

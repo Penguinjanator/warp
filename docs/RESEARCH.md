@@ -57,8 +57,8 @@ Attention + Gated MLA, 1M context, open weights July 27, 2026.
    established. The LFRU cache may hit less than hoped.
 2. **"SSD expert offloading is viable for very large MoE on RAM-constrained
    machines"** — REFUTED (0-3) *as a literature claim*: no paper
-   demonstrates trillion-scale NVMe streaming. Counter-evidence: earlier work's
-   own measurements (GLM-5.2 744B streamed from NVMe, 0.3–3.3 tok/s, 71.6%
+   demonstrates trillion-scale NVMe streaming. Counter-evidence: our own
+   prior measurements (GLM-5.2 744B streamed from NVMe, 0.3–3.3 tok/s, 71.6%
    next-layer routing predictability) — empirical, ours, at 744B not 2.8T.
 
 ## Uncovered areas (no claims survived verification)
@@ -83,6 +83,6 @@ DeepSeek-R1/Kimi K2. These need first-party measurement, not literature.
 
 ~12.5 GB expert reads per cold token at 2 bit ⇒ on 10–14 GB/s NVMe:
 **~1 tok/s cold, 2–3 tok/s with warm learned cache** — extrapolation, not
-measurement. Same order as earlier work's GLM-5.2 numbers at equivalent
+measurement. Same order as our own GLM-5.2 numbers at equivalent
 bytes/token. Sub-1 tok/s on a single ~3 GB/s SSD. Plan B if unacceptable:
 workload-driven expert pruning (drop the cold tail of 896 experts).

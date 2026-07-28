@@ -6,20 +6,20 @@ drop (July 27, 2026) when real tensor shapes and routing statistics are known.
 ## Design goals
 
 1. **One coalesced read per expert.** An expert's gate/up/down matrices are
-   adjacent on disk and loaded with a single `pread` (earlier work measured this
-   as the difference between usable and unusable NVMe throughput).
-2. **Placement decides speed, never precision.** Same invariant as earlier work:
-   output is bit-identical whether an expert came from RAM cache or disk.
+   adjacent on disk and loaded with a single `pread` — measured as the
+   difference between usable and unusable NVMe throughput.
+2. **Placement decides speed, never precision.** The invariant: output is
+   bit-identical whether an expert came from RAM cache or disk.
    The *substitute* path (below) is the one deliberate, bounded exception,
    and it is off by default.
 3. **O_DIRECT-friendly.** Every independently-readable record is aligned to
    4 KiB and sized in 4 KiB multiples, so the page cache can be bypassed
-   (earlier work both measured wins from `F_NOCACHE`/O_DIRECT on some drives).
+   (measured wins from `F_NOCACHE`/O_DIRECT on some drives).
 4. **Sub-4-bit without collapse.** Per-expert weights are vector-quantized:
    multi-stage (residual) VQ over 8-dim vectors with per-channel scales.
    Gate 3 measured this on real Kimi experts — VQ decisively beats RTN
    below 4 bits, and **3 bits (19.4% error) is the operating point**; 2-bit
-   VQ (33%) is more than double earlier work's known-good production int4.
+   VQ (33%) is more than double the known-good production int4 baseline.
 
    The KBVQ-MoE shared-low-rank component (arXiv 2602.11184) is
    **specified but NOT implemented in v0** — see "Shared low-rank: on
@@ -27,8 +27,7 @@ drop (July 27, 2026) when real tensor shapes and routing statistics are known.
 5. **Non-uniform bits.** Global per-expert bit allocation à la GEMQ
    (arXiv 2605.23078): important experts get 3 bit, unimportant get 2 (or
    1-bit substitute only). Attention / router / norms / shared experts /
-   MTP head stay at 4–8 bit (earlier work's asymmetric recipe; earlier work issue #8:
-   MTP must be int8+).
+   MTP head stay at 4–8 bit (asymmetric recipe; the MTP head must be int8+).
 
 ## File layout
 
@@ -48,7 +47,7 @@ model.waste/
 
 ### manifest.json
 
-JSON (hardened parser, treat as untrusted — earlier work st.h lesson). Contains:
+JSON (hardened parser, treat as untrusted). Contains:
 
 - `config`: K3 hyperparameters (layers, n_experts=896, top_k=16, KDA/MLA
   layer pattern, dims — TBD from release config.json).
@@ -150,18 +149,17 @@ head. mmap-able as one region; target ≤ 25 GB at the fmt mix above so a
 ### usage.waste
 
 Append-only runtime log: per-(layer, expert) hit counts + decayed recency
-(earlier work `.coli_usage` / `tier.h` LFRU), plus cross-layer routing pairs for
-the pilot/COUPLE prefetcher. The converter can also bake an initial hotlist
-measured on a calibration corpus (earlier work `the precompiled hotlist` approach).
+for the LFRU policy, plus cross-layer routing pairs for the pilot/COUPLE
+prefetcher. The converter can also bake an initial hotlist measured on a
+calibration corpus.
 
 ## Converter pipeline (tools/, to build)
 
 1. Stream K3 release shards (MXFP4) one at a time — never needs the full
-   1.5 TB locally beyond the shard in flight + output (earlier work
-   `convert_fp8_to_int4.py` discipline).
+   1.5 TB locally beyond the shard in flight + output.
 2. Dequant MXFP4 → f32 blocks. (No shared-basis pass in v0 — see "Shared
    low-rank: on probation".)
-3. GEMQ-style bit allocation from an importance matrix (earlier work imatrix
+3. GEMQ-style bit allocation from an importance matrix (imatrix-style
    pipeline; fallback: weight-energy heuristic Σrow²).
 4. Emit VQ codebooks (k-means in 8-dim space), indices, corrections;
    verify with `--compare-tensor` byte/logit checks against the reference.

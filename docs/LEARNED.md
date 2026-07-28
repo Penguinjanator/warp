@@ -45,7 +45,7 @@ Measured on real Kimi experts (`tools/quant_lab.py`), matched bit budgets:
 | vq2 | 2.01 | 33.1% |
 | **vq3** | **3.01** | **19.4%** |
 | rtn3-g64 | 3.25 | 25.2% |
-| rtn4-row (earlier work's production default) | 4.01 | 15.2% |
+| rtn4-row (the known-good production default) | 4.01 | 15.2% |
 
 VQ beats round-to-nearest decisively below 4 bits. 3 bits is the
 operating point: 19.4% is within reach of the known-good int4 baseline,

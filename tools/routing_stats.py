@@ -2,7 +2,7 @@
 """
 routing_stats.py — answer WASTE open question #1 without downloading 1.5 TB.
 
-Three subcommands, stdlib only (no deps, earlier work discipline):
+Three subcommands, stdlib only (no deps):
 
   fetch     Download config.json + model.safetensors.index.json from the
             HF repo (a few KB/MB — NOT the weights). Works the moment the

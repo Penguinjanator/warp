@@ -125,7 +125,7 @@ reads used for MTP verification.
 ### Gating projections
 
 `f_a/f_b`, `b_proj`, `g_a/g_b` are ordinary dense matmuls living in
-`trunk.bin` at Q8G/Q4G — reuse earlier work's int8-activation IDOT kernels
+`trunk.bin` at Q8G/Q4G — reuse the int8-activation IDOT kernels
 (NEON SDOT / AVX-VNNI). No new matmul work.
 
 ## Validation (Gate 4)

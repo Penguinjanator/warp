@@ -6,8 +6,8 @@ on real Kimi MoE weights?
 Loads a batch of real experts straight from safetensors shards (no HF
 runtime needed) and compares quantization schemes at matched bit budgets:
 
-  rtn4-row     per-row INT4, amax scale        (earlier work fmt 2 baseline)
-  rtn4-g128    INT4, one scale per 128 inputs  (earlier work fmt 4)
+  rtn4-row     per-row INT4, amax scale        (known-good int4 baseline)
+  rtn4-g128    INT4, one scale per 128 inputs  (grouped int4 variant)
   rtn2-g64     INT2, one scale per 64 inputs   (the naive 2-bit strawman)
   vq2 / vq3    residual VQ, 8-dim vectors, N codebooks of 256 entries
   kbvq2/kbvq3  KBVQ-MoE: shared low-rank basis across experts (FP16,

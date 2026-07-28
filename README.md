@@ -2,8 +2,7 @@
 
 Run **Kimi K3** (2.8T params, 896 experts / 16 active) locally on a 64 GB machine.
 
-WASTE is a highly optimized model file format plus a pure-C inference engine,
-built on the lessons of two prior engines:
+WASTE is a highly optimized model file format plus a pure-C inference engine.
 
 **Scope:**
 
@@ -24,13 +23,6 @@ built on the lessons of two prior engines:
   sqlite-vector's discipline (one function-pointer table, baseline first,
   best backend partially overrides, force-CPU escape hatch) and, like it,
   **no dynamic loading**: [docs/BACKENDS.md](docs/BACKENDS.md).
-
-- earlier work — three-tier expert streaming
-  (VRAM → RAM → NVMe), LFRU learned expert cache, router-lookahead pilot,
-  MLA compressed KV, MTP speculative decoding, token-exact oracle validation.
-- earlier work — asymmetric 2-bit
-  per-expert quantization (imatrix-guided), precompiled expert hotlists,
-  overlapped SSD prefetch, proven 284B-MoE inference on 64 GB MacBooks.
 
 ## Why K3 is possible on 64 GB
 
@@ -64,7 +56,7 @@ Two K3 architecture choices work in our favor:
 1. **Kimi Delta Attention (KDA)** is linear attention: O(1) state w.r.t.
    context length. The KV cache that would kill 1M-context inference mostly
    disappears; residual Gated MLA layers use latent compression (~576
-   floats/token, earlier work-style).
+   floats/token).
 2. **MXFP4-native QAT** means the model was trained to survive 4-bit;
    requantizing to 2–3 bit starts from a far better point than BF16 models.
 
@@ -89,7 +81,7 @@ Two K3 architecture choices work in our favor:
    across decode tokens with 896 experts) and validate the 12.5 GB/token math.
 3. **Converter**: MXFP4 shards → WASTE container, shard-by-shard, disk-safe.
 4. **Engine bring-up**: dense trunk + KDA/Gated-MLA kernels, oracle-validated
-   token-exact against HF transformers (earlier work's standard bar).
+   token-exact against HF transformers.
 5. **Streaming tier**: LFRU + hotlist + pilot lookahead + Expert Deferral.
 6. **Fallback plan** if throughput disappoints: workload-driven expert
    pruning (with 896 experts the cold tail is likely huge) — halves disk
