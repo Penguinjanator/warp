@@ -3,7 +3,9 @@
 #
 # Every stage is resumable and refuses to start on a failed predecessor, so
 # this can be killed and restarted at any point. It writes a running report
-# to $OUT/pipeline.log and a final summary to $OUT/REPORT.md.
+# to $RUN/pipeline.log and a final summary to $RUN/REPORT.md, where
+# $RUN defaults to $OUT.runs — beside the container, not inside it, so
+# the container holds only what the engine loads.
 #
 #   tools/pipeline.sh
 #   SRC=... OUT=... JOBS=3 tools/pipeline.sh
@@ -27,14 +29,15 @@ OUT="${OUT:-/Users/marco/models/k3.waste}"
 JOBS="${JOBS:-3}"
 PROMPT="${PROMPT:-The capital of France is}"
 NTOK="${NTOK:-24}"
-LOG="$OUT/pipeline.log"
+RUN="${RUN_DIR:-$OUT.runs}"          # reports and logs, never inside $OUT
+LOG="$RUN/pipeline.log"
 UV="uv run --quiet --with torch --with fla-core --with einops --no-project python"
 
-mkdir -p "$OUT"
+mkdir -p "$OUT" "$RUN"
 say() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG"; }
-die() { say "FAILED at $*"; echo "$*" > "$OUT/.failed"; exit 1; }
+die() { say "FAILED at $*"; echo "$*" > "$RUN/.failed"; exit 1; }
 
-rm -f "$OUT/.failed"
+rm -f "$RUN/.failed"
 say "=== pipeline start ==="
 say "src $SRC -> out $OUT, $JOBS conversion processes"
 
@@ -67,17 +70,17 @@ say "stage 2 done in $(( ($(date +%s) - T0) / 60 )) min, $(du -sh "$OUT" | cut -
 # ---- 3. verify the container --------------------------------------------
 say "stage 3: container round-trip"
 $UV tools/verify_container.py --container "$OUT" --src "$SRC" --experts 1 \
-    > "$OUT/verify.txt" 2>&1
-grep -q "^PASS" "$OUT/verify.txt" || die "verify (see $OUT/verify.txt)"
-ERR=$(grep -oE "rel err +[0-9.]+%" "$OUT/verify.txt" | head -1)
+    > "$RUN/verify.txt" 2>&1
+grep -q "^PASS" "$RUN/verify.txt" || die "verify (see $RUN/verify.txt)"
+ERR=$(grep -oE "rel err +[0-9.]+%" "$RUN/verify.txt" | head -1)
 say "stage 3 done: round-trip PASS, $ERR"
 
 # ---- 4. the engine actually runs -----------------------------------------
 say "stage 4: engine"
 make -s >>"$LOG" 2>&1 || die "build"
-./waste run "$OUT" "$PROMPT" -n "$NTOK" --budget 46G > "$OUT/generated.txt" 2>&1 \
-    || die "engine run (see $OUT/generated.txt)"
-say "stage 4 done: $(head -c 200 "$OUT/generated.txt")"
+./waste run "$OUT" "$PROMPT" -n "$NTOK" --budget 46G > "$RUN/generated.txt" 2>&1 \
+    || die "engine run (see $RUN/generated.txt)"
+say "stage 4 done: $(head -c 200 "$RUN/generated.txt")"
 
 # ---- 5. against the oracle ----------------------------------------------
 say "stage 5: PyTorch oracle (slow — 93 layers in Python)"
@@ -85,11 +88,11 @@ IDS=$(./test_tokenizer "$OUT" "$PROMPT" | head -1 | cut -d' ' -f2- | tr ' ' ',')
 [ -n "$IDS" ] || die "tokenize"
 say "  prompt ids: $IDS"
 
-./test_forward "$OUT" "$IDS" "$OUT/logits_c.bin" 0 >>"$LOG" 2>&1 || die "engine logits"
+./test_forward "$OUT" "$IDS" "$RUN/logits_c.bin" 0 >>"$LOG" 2>&1 || die "engine logits"
 $UV tools/kimi_ref.py --container "$OUT" --tokens 0 --prompt-ids "$IDS" \
-    --dump "$OUT/logits_ref.bin" >>"$LOG" 2>&1 || die "oracle"
+    --dump "$RUN/logits_ref.bin" >>"$LOG" 2>&1 || die "oracle"
 
-python3 - "$OUT/logits_c.bin" "$OUT/logits_ref.bin" > "$OUT/diff.txt" <<'PY'
+python3 - "$RUN/logits_c.bin" "$RUN/logits_ref.bin" > "$RUN/diff.txt" <<'PY'
 import struct, sys
 def L(p):
     b = open(p, "rb").read()
@@ -105,8 +108,8 @@ print(f"argmax  engine {ta[0]}  oracle {tb[0]}  {'MATCH' if ta[0]==tb[0] else 'M
 print(f"top-10  {'identical' if ta==tb else 'differ'}")
 print("ORACLE OK" if md < 1e-2 and ta[0] == tb[0] else "ORACLE MISMATCH")
 PY
-cat "$OUT/diff.txt" | tee -a "$LOG"
-grep -q "^ORACLE OK" "$OUT/diff.txt" || die "oracle diff (see $OUT/diff.txt)"
+cat "$RUN/diff.txt" | tee -a "$LOG"
+grep -q "^ORACLE OK" "$RUN/diff.txt" || die "oracle diff (see $RUN/diff.txt)"
 
 # ---- report --------------------------------------------------------------
 {
@@ -123,14 +126,14 @@ grep -q "^ORACLE OK" "$OUT/diff.txt" || die "oracle diff (see $OUT/diff.txt)"
     echo '## Generated'
     echo
     echo '```'
-    cat "$OUT/generated.txt"
+    cat "$RUN/generated.txt"
     echo '```'
     echo
     echo '## Against the PyTorch oracle'
     echo
     echo '```'
-    cat "$OUT/diff.txt"
+    cat "$RUN/diff.txt"
     echo '```'
-} > "$OUT/REPORT.md"
+} > "$RUN/REPORT.md"
 
-say "=== pipeline complete — see $OUT/REPORT.md ==="
+say "=== pipeline complete — see $RUN/REPORT.md ==="
