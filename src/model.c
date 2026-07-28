@@ -1103,6 +1103,12 @@ static void mla_layer(waste_model *m, int L, const float *in, float *out, int po
     /* Cache the latent as-is — normalized kpass followed by the raw rope
      * dims. kv_b_proj is not applied here at all; it is absorbed below. */
     memcpy(m->latcache[L] + (size_t)pos * latd, ckv, (size_t)latd * sizeof(float));
+    /* WASTE_DUMP_LATENT=path appends the cached latent and the absorbed
+     * query, the two things a KV-cache quantizer has to keep faithful. */
+    if (getenv("WASTE_DUMP_LATENT")) {
+        FILE *df = fopen(getenv("WASTE_DUMP_LATENT"), "ab");
+        if (df) { fwrite(ckv, sizeof(float), (size_t)latd, df); fclose(df); }
+    }
     m->n_kv[L] = pos + 1;
 
     {
