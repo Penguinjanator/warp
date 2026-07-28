@@ -24,7 +24,8 @@ typedef struct {
     int8_t *q;            /* quantized payload, row-major                   */
     uint16_t *qs;         /* scales: one fp16 per group of `group`          */
     int group;
-    int bits;             /* 8 = one int8 per weight, 4 = two per byte      */
+    int bits;             /* 8, 4 (two per byte) or 3 (packed bitstream)    */
+    size_t rowbytes;      /* stride between rows of `q`                     */
     int shape[4], ndim;
     size_t n;
 } waste_tensor;

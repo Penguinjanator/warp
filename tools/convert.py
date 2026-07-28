@@ -64,6 +64,7 @@ MAGIC_EXPERT = 0x50584557        # 'WEXP'
 MAGIC_CODEBOOK = 0x4B424357      # 'WCBK'
 ALIGN = 4096
 FMT_F32, FMT_F16, FMT_Q8G, FMT_Q4G, FMT_VQ3R, FMT_VQ2R = 0, 1, 2, 3, 4, 5
+FMT_Q3G = 7
 VEC_DIM = 8
 CB_ENTRIES = 256
 TRAIN_VECTORS = 300000       # vectors k-means sees per (layer, matrix kind)
@@ -181,6 +182,45 @@ def quantize_vq(W, books, dev):
         idxs.append(i.to(torch.uint8).cpu())
         resid = resid - C[i]
     return torch.stack(idxs), scale.half().flatten().cpu()
+
+
+def quantize_q3g(W, group=128):
+    """3 bits per weight, packed per row, fp16 scale per group.
+
+    Values live in [-4, 3] biased by +4 into 0..7, written LSB-first at bit
+    offset 3*i within the row, and each row is padded to a fixed stride
+    that includes one guard byte so the decoder's two-byte read is always
+    in bounds. The engine uses the identical indexing.
+
+    Packing the whole tensor as one stream instead of per row is the
+    obvious shortcut and it is wrong: the decoder addresses rows by a fixed
+    stride, and with a guard byte in that stride every row after the first
+    lands one byte off. It is invisible at 4 bits, where a row is a whole
+    number of bytes with no guard needed.
+    """
+    orig = W.shape
+    X = W.reshape(-1, orig[-1])
+    rows, N = X.shape
+    pad = (-N) % group
+    if pad:
+        X = torch.nn.functional.pad(X, (0, pad))
+    ng = X.shape[1] // group
+    n = ng * group
+    Xg = X.view(rows, ng, group)
+    scale = Xg.abs().amax(-1, keepdim=True).clamp(min=1e-8) / 3.0
+    u = (torch.clamp(torch.round(Xg / scale), -4, 3).to(torch.int32) + 4).view(rows, n)
+
+    rowbytes = (n * 3 + 7) // 8 + 1                   # + guard
+    buf = torch.zeros(rows, rowbytes, dtype=torch.int32)
+    off = torch.arange(n) * 3
+    byte, shift = off // 8, off % 8
+    idx = byte.unsqueeze(0).expand(rows, n)
+    lo = ((u << shift) & 0xFF).to(torch.int32).contiguous()
+    buf.scatter_add_(1, idx.contiguous(), lo)
+    hi = torch.where(shift > 5, (u >> (8 - shift)) & 0xFF,
+                     torch.zeros_like(u)).to(torch.int32).contiguous()
+    buf.scatter_add_(1, (byte + 1).unsqueeze(0).expand(rows, n).contiguous(), hi)
+    return buf.to(torch.uint8).flatten(), scale.half().flatten(), list(orig)
 
 
 def quantize_q4g(W, group=128):
@@ -335,6 +375,9 @@ def main():
     ap.add_argument("--stages", type=int, default=3, help="3 = VQ3R, 2 = VQ2R")
     ap.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu")
     ap.add_argument("--experts", type=int, default=0, help="limit experts (debug)")
+    ap.add_argument("--trunk-bits", type=int, default=4, choices=(3, 4, 8),
+                    help="bit width for the bulk of the trunk; it is the RAM "
+                         "floor, so this is the main lever on cache size")
     ap.add_argument("--trunk8", action="store_true",
                     help="keep the whole trunk at 8 bits (needs the RAM)")
     ap.add_argument("--skip-trunk", action="store_true",
@@ -456,12 +499,17 @@ def main():
                 # network where error is least forgiving
                 big = not (name.endswith("embed_tokens.weight")
                            or name.endswith("lm_head.weight"))
-                use4 = big and not args.trunk8
-                q, sc, shape = (quantize_q4g(t) if use4 else quantize_q8g(t))
+                bits = 8 if (args.trunk8 or not big) else args.trunk_bits
+                if bits == 3:
+                    q, sc, shape = quantize_q3g(t); fmt = FMT_Q3G
+                elif bits == 4:
+                    q, sc, shape = quantize_q4g(t); fmt = FMT_Q4G
+                else:
+                    q, sc, shape = quantize_q8g(t); fmt = FMT_Q8G
                 tf.write(raw_bytes(q))
                 sc_off = tf.tell()
                 tf.write(raw_bytes(sc))
-                tindex.append({"name": name, "fmt": FMT_Q4G if use4 else FMT_Q8G,
+                tindex.append({"name": name, "fmt": fmt,
                                "off": off, "shape": shape, "group": 128,
                                "scale_off": sc_off, "bytes": tf.tell() - off})
     print(f"trunk: {os.path.getsize(trunk_path)/2**20:.0f} MB, "

@@ -136,6 +136,16 @@ static inline float dotf(const float *a, const float *b, int n)
 static int q8_off = 1;     /* 1 = keep the trunk stored as int8          */
 static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
 
+/* One weight from a 3-bit stream: values sit LSB-first at bit offset 3*i,
+ * biased by +4, with a guard byte so two loads are always safe. Identical
+ * indexing to tools/convert.py's quantize_q3g. */
+static inline int q3_at(const uint8_t *p, long i)
+{
+    const long off = i * 3;
+    const int v = (p[off >> 3] >> (off & 7)) | (p[(off >> 3) + 1] << (8 - (off & 7)));
+    return (v & 7) - 4;
+}
+
 /* ---- int8 x int8 matvec (SDOT / dotprod) --------------------------------
  * The trunk is already stored Q8G: int8 weights with one fp16 scale per
  * group of 128 inputs. Keeping it that way (instead of expanding to f32 at
@@ -146,6 +156,7 @@ static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
 typedef struct {
     float *y; const int8_t *W; const uint16_t *ws;
     const int8_t *xq; const float *xs; int in, ng, group, bits;
+    size_t rowbytes;
 } mvq_arg;
 
 static inline int32_t idot(const int8_t *a, const int8_t *b, int n)
@@ -174,17 +185,21 @@ static void mvq_rows_f32(int b, int e, void *p)
     const int ng = a->ng, g = a->group;
     const float *x = (const float *)a->xs;      /* raw activations */
     int8_t *unp = NULL;
-    if (a->bits == 4) {
+    if (a->bits != 8) {
         unp = (int8_t *)malloc((size_t)g);
         if (!unp) return;
     }
     for (int o = b; o < e; o++) {
-        const int8_t *row = a->W + (size_t)o * ng * g * a->bits / 8;
+        const int8_t *row = a->W + (size_t)o * a->rowbytes;
         const uint16_t *ws = a->ws + (size_t)o * ng;
         float acc = 0;
         for (int k = 0; k < ng; k++) {
             const int8_t *w;
-            if (a->bits == 4) {
+            if (a->bits == 3) {
+                const uint8_t *p3 = (const uint8_t *)row;
+                for (int i = 0; i < g; i++) unp[i] = (int8_t)q3_at(p3, (long)k * g + i);
+                w = unp;
+            } else if (a->bits == 4) {
                 /* two signed nibbles per byte, low first */
                 const uint8_t *p4 = (const uint8_t *)row + (size_t)k * g / 2;
                 for (int i = 0; i < g / 2; i++) {
@@ -284,10 +299,10 @@ static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
     const int g = t->group, ng = (in + g - 1) / g;
     if (sdot_on && t->bits == 8) {
         quant_act(x, in, g, m->xq, m->xs);
-        mvq_arg a = { y, t->q, t->qs, m->xq, m->xs, in, ng, g, 8 };
+        mvq_arg a = { y, t->q, t->qs, m->xq, m->xs, in, ng, g, 8, (size_t)ng * g };
         waste_parallel_for(out, 64, mvq_rows, &a);
     } else {
-        mvq_arg a = { y, t->q, t->qs, NULL, x, in, ng, g, t->bits };
+        mvq_arg a = { y, t->q, t->qs, NULL, x, in, ng, g, t->bits, t->rowbytes };
         waste_parallel_for(out, 64, mvq_rows_f32, &a);
     }
 }
@@ -373,8 +388,12 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
             const long rows = (long)(t->n / (size_t)N);
             const int ng = (N + g - 1) / g;
             t->group = g;
-            t->bits = (fmt == 3) ? 4 : 8;   /* FMT_Q4G = 3 */
-            const size_t payload = (size_t)rows * ng * g * t->bits / 8;
+            t->bits = (fmt == 3) ? 4 : (fmt == 7) ? 3 : 8;
+            /* 3-bit rows are a bitstream plus one guard byte */
+            t->rowbytes = (t->bits == 3)
+                        ? (size_t)((ng * g * 3 + 7) / 8 + 1)
+                        : (size_t)ng * g * t->bits / 8;
+            const size_t payload = (size_t)rows * t->rowbytes;
             t->q = (int8_t *)malloc(payload);
             t->qs = (uint16_t *)malloc((size_t)rows * ng * sizeof(uint16_t));
             if (!t->q || !t->qs) { free(blob); return -1; }
@@ -1224,6 +1243,7 @@ static void matmul_f32(float *Y, const float *W, const float *X,
 typedef struct {
     float *Y; const int8_t *W; const uint16_t *ws; const float *X;
     int in, out, T, ng, group, bits;
+    size_t rowbytes;
 } mmq_arg;
 
 static void mmq_rows(int b, int e, void *p)
@@ -1233,12 +1253,16 @@ static void mmq_rows(int b, int e, void *p)
     float *row = (float *)malloc((size_t)a->in * sizeof(float));
     if (!row) return;
     for (int o = b; o < e; o++) {
-        const int8_t *q = a->W + (size_t)o * ng * g * a->bits / 8;
+        const int8_t *q = a->W + (size_t)o * a->rowbytes;
         const uint16_t *sc = a->ws + (size_t)o * ng;
         for (int k = 0; k < ng; k++) {
             const float s = f16_to_f32(sc[k]);
             const int lim = (k * g + g <= a->in) ? g : a->in - k * g;
-            if (a->bits == 4) {
+            if (a->bits == 3) {
+                const uint8_t *p3 = (const uint8_t *)q;
+                for (int i = 0; i < lim; i++)
+                    row[k * g + i] = (float)q3_at(p3, (long)k * g + i) * s;
+            } else if (a->bits == 4) {
                 const uint8_t *p4 = (const uint8_t *)q + (size_t)k * g / 2;
                 for (int i = 0; i < lim; i++) {
                     const uint8_t byte = p4[i / 2];
@@ -1266,7 +1290,7 @@ static void matmul_t(waste_model *m, float *Y, const waste_tensor *t,
     }
     if (!t->q) { matmul_f32(Y, t->data, X, out, in, T); return; }
     const int g = t->group, ng = (in + g - 1) / g;
-    mmq_arg a = { Y, t->q, t->qs, X, in, out, T, ng, g, t->bits };
+    mmq_arg a = { Y, t->q, t->qs, X, in, out, T, ng, g, t->bits, t->rowbytes };
     waste_parallel_for(out, 32, mmq_rows, &a);
 }
 
@@ -1517,13 +1541,14 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
         if (emb->data) memcpy(dst, emb->data + (size_t)tokens[t] * hid, (size_t)hid * 4);
         else {
             const int g = emb->group, ng = (hid + g - 1) / g;
-            const int8_t *row = emb->q + (size_t)tokens[t] * ng * g * emb->bits / 8;
+            const int8_t *row = emb->q + (size_t)tokens[t] * emb->rowbytes;
             const uint16_t *sc = emb->qs + (size_t)tokens[t] * ng;
             for (int k = 0; k < ng; k++) {
                 const float sv = f16_to_f32(sc[k]);
                 for (int i = 0; i < g && k * g + i < hid; i++) {
                     int v;
-                    if (emb->bits == 4) {
+                    if (emb->bits == 3) v = q3_at((const uint8_t *)row, (long)k * g + i);
+                    else if (emb->bits == 4) {
                         const uint8_t byte = ((const uint8_t *)row)[(k * g + i) / 2];
                         v = (i & 1) ? (byte >> 4) - 8 : (byte & 0x0F) - 8;
                     } else v = row[k * g + i];
@@ -1640,13 +1665,14 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         memcpy(m->x, emb->data + (size_t)token * hid, (size_t)hid * sizeof(float));
     } else {
         const int g = emb->group, ng = (hid + g - 1) / g;
-        const int8_t *row = emb->q + (size_t)token * ng * g * emb->bits / 8;
+        const int8_t *row = emb->q + (size_t)token * emb->rowbytes;
         const uint16_t *sc = emb->qs + (size_t)token * ng;
         for (int k = 0; k < ng; k++) {
             const float s = f16_to_f32(sc[k]);
             for (int i = 0; i < g && k * g + i < hid; i++) {
                 int v;
-                if (emb->bits == 4) {
+                if (emb->bits == 3) v = q3_at((const uint8_t *)row, (long)k * g + i);
+                else if (emb->bits == 4) {
                     const uint8_t byte = ((const uint8_t *)row)[(k * g + i) / 2];
                     v = (i & 1) ? (byte >> 4) - 8 : (byte & 0x0F) - 8;
                 } else v = row[k * g + i];
