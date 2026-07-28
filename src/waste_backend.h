@@ -78,6 +78,11 @@ typedef struct {
     void (*mvq_rows_f32)(int b, int e, void *arg);
     void (*lutb_range)(int lo, int hi, void *arg);
 
+    /* Set by a backend that wants the whole row range in one call — a GPU
+     * dispatch must not be split across pool threads. Call sites use
+     * waste_run_rows() rather than waste_parallel_for() directly. */
+    int on_device;
+
     /* A backend implementing only some slots leaves the rest at CPU. */
 } waste_kernels;
 

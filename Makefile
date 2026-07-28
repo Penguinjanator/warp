@@ -4,6 +4,10 @@
 #   make test       the validation binaries
 #   make WASTE_ENABLE_METAL=1     (accelerators are build-time options)
 
+# Explicit, because per-object rules below would otherwise make the first
+# of them the default goal.
+.DEFAULT_GOAL := all
+
 CC      ?= cc
 # gnu11, not c11: with -std=c11 glibc sets __STRICT_ANSI__ and hides every
 # POSIX extension, so pread, fcntl, posix_memalign and pthread_* would all
@@ -63,7 +67,7 @@ backend is not implemented. Build without the flag: CPU+NEON is the only \
 backend this engine has)
 endif
 CFLAGS += -DWASTE_ENABLE_METAL=1
-SRC    += src/metal.m
+OBJCSRC := src/metal.m
 LDLIBS += -framework Metal -framework Foundation
 endif
 ifdef WASTE_ENABLE_CUDA
@@ -87,7 +91,10 @@ SRC    += src/blas.c
 LDLIBS += -lblas
 endif
 
-OBJ := $(SRC:.c=.o)
+OBJ := $(SRC:.c=.o) $(OBJCSRC:.m=.o)
+
+src/metal.o: src/metal.m
+	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
 
 src/simd_avx2.o:   CFLAGS += -mavx2 -mfma
 src/simd_avx512.o: CFLAGS += -mavx512f -mavx512bw

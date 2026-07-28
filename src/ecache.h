@@ -50,7 +50,10 @@ typedef struct {
  * logical block size, so record buffers come from here rather than malloc.
  * Expert records are whole 4 KiB pages by construction, which covers both
  * the 512- and 4096-byte cases; on macOS the alignment is merely harmless. */
-#define WASTE_DIO_ALIGN 4096
+/* 16 KiB, the Apple Silicon page: O_DIRECT wants 512 or 4096, and Metal's
+ * newBufferWithBytesNoCopy wants a whole page — one alignment serves both,
+ * which is what lets the GPU read trunk weights the CPU already has. */
+#define WASTE_DIO_ALIGN 16384
 void *waste_dio_alloc(size_t n);
 void  waste_dio_free(void *p);
 

@@ -266,6 +266,14 @@ static void matvec(float *y, const float *W, const float *x, int out, int in)
     waste_parallel_for(out, 64, mv_rows, &a);
 }
 
+/* A device backend takes the whole range at once; the pool would otherwise
+ * split one GPU dispatch into a dozen. */
+static inline void run_rows(int n, int min_chunk, waste_range_fn fn, void *arg)
+{
+    if (waste_k.on_device) fn(0, n, arg);
+    else waste_parallel_for(n, min_chunk, fn, arg);
+}
+
 /* Quantize x into per-group int8 (same grouping as the weights). */
 static void quant_act(const float *x, int n, int g, int8_t *q, float *sc)
 {
@@ -301,7 +309,7 @@ static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
         waste_parallel_for(out, 64, mvq_rows, &a);
     } else {
         mvq_arg a = { y, t->q, t->qs, NULL, x, in, ng, g, t->bits, t->rowbytes };
-        waste_parallel_for(out, 64, waste_k.mvq_rows_f32, &a);
+        run_rows(out, 64, waste_k.mvq_rows_f32, &a);
     }
 }
 
@@ -419,14 +427,14 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
             t->n *= (size_t)t->shape[k];
         }
         if (fmt == 0) {                                   /* F32 */
-            t->data = (float *)malloc(t->n * sizeof(float));
+            t->data = (float *)waste_dio_alloc(t->n * sizeof(float));
             if (!t->data) TRUNK_FAIL;
             if (pread_all(fd, t->data, t->n * sizeof(float), off)) TRUNK_FAIL;
         } else if (!q8_off) {                             /* Q8G -> f32 */
             const int N = t->shape[t->ndim - 1];
             const long rows = (long)(t->n / (size_t)N);
             const int ng = (N + g - 1) / g;
-            t->data = (float *)malloc(t->n * sizeof(float));
+            t->data = (float *)waste_dio_alloc(t->n * sizeof(float));
             int8_t *qbuf = (int8_t *)malloc((size_t)rows * ng * g);
             uint16_t *sbuf = (uint16_t *)malloc((size_t)rows * ng * sizeof(uint16_t));
             if (!t->data || !qbuf || !sbuf ||
@@ -475,8 +483,8 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
                 t->file_scale_off = soff;
                 continue;
             }
-            t->q = (int8_t *)malloc(payload);
-            t->qs = (uint16_t *)malloc((size_t)rows * ng * sizeof(uint16_t));
+            t->q = (int8_t *)waste_dio_alloc(payload);
+            t->qs = (uint16_t *)waste_dio_alloc((size_t)rows * ng * sizeof(uint16_t));
             if (!t->q || !t->qs) TRUNK_FAIL;
             if (pread_all(fd, t->q, payload, off) ||
                 pread_all(fd, t->qs, (size_t)rows * ng * sizeof(uint16_t), soff))
@@ -726,7 +734,8 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
 void waste_model_free(waste_model *m)
 {
     for (int i = 0; i < m->n_tensors; i++) {
-        free(m->t[i].data); free(m->t[i].q); free(m->t[i].qs);
+        waste_dio_free(m->t[i].data); waste_dio_free(m->t[i].q);
+        waste_dio_free(m->t[i].qs);
     }
     free(m->t);
     if (m->trunk_fd > 0) close(m->trunk_fd);

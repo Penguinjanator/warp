@@ -326,3 +326,50 @@ same "matches the CPU baseline" check to be the thing that decides it.
 
 No performance numbers from any of this: x86 here is emulated, so timings
 would measure Rosetta.
+
+## Metal: it works, and it loses (2026-07-28)
+
+`src/metal.m` implements `mvq_rows_f32` — the quantized matvec every trunk
+projection and the output head go through. Built with
+`make WASTE_ENABLE_METAL=1`; the shader is compiled from source at first
+use, because the offline Metal compiler ships with Xcode and not the
+Command Line Tools.
+
+The design point that makes it worth trying at all: **no copies**. The
+engine moves ~17 GB of weights per token, so a backend that staged host
+memory to the device would lose before it started. Apple Silicon has
+unified memory, so trunk tensors are allocated page-aligned — the
+`waste_dio_alloc` that O_DIRECT already needed, widened from 4 KiB to the
+16 KiB page — and wrapped with `newBufferWithBytesNoCopy`. The GPU reads
+the same physical pages the CPU does.
+
+It is correct: logits match the CPU baseline to 8.1e-06, argmax and top-5
+unchanged, on both Kimi-Linear and K3.
+
+It is also slower, on K3, 5 decode steps:
+
+| | total | kda | mla | lm_head |
+|---|---|---|---|---|
+| CPU/NEON | 15.93 s | 1.78 | 0.39 | 0.03 |
+| Metal | 19.43 s | 3.56 | 0.67 | 0.11 |
+
+**22% slower.** The first kernel put one thread on a whole row, which is
+the obvious mapping and the wrong one — adjacent threads read addresses
+`rowbytes` apart, so every load is its own cache line. Rewriting it as one
+threadgroup per row with strided, coalesced loads and a threadgroup
+reduction took the total from 21.28 s to 19.43 s. Still behind.
+
+`lm_head` is the clearest case, because it is one dispatch per token over
+1.17 GB of int8 weights: CPU 6 ms, GPU 22 ms. That is 195 GB/s against
+53 GB/s — the CPU path is already running at the machine's memory
+bandwidth, and this is a bandwidth-bound matvec. There is no headroom for
+the GPU to take, and it pays a synchronous round-trip per call on top.
+
+The conclusion is about shape, not about Metal. This engine issues several
+hundred small dependent matvecs per token and waits for each; that is the
+worst possible fit for an accelerator. Making the GPU pay would mean
+moving the whole forward pass on-device so there is one dispatch per layer
+instead of six, with the residual stream never returning to the host — a
+different engine, not a backend. The code stays, off by default, because
+it is correct and because that argument should be re-run if the CPU path
+ever stops being bandwidth-bound.
