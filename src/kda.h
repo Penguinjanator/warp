@@ -32,6 +32,7 @@ void waste_kda_step(int H, int K, int V,
                     const float *g_log, const float *beta,
                     float *S, float *o, float *scratch);
 
+
 /* Sequential prefill: T steps of the above. Inputs are [T][H][*]
  * (time-major, as the reference lays them out). Used for validation and
  * short prompts; the chunked path lands later. */

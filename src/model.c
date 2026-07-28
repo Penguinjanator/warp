@@ -808,6 +808,24 @@ void waste_kda_decay_gate(float *g, const float *A_log, const float *dt_bias,
     waste_kda_decay_gate_ex(g, A_log, dt_bias, H, D, lower_bound, 0);
 }
 
+typedef struct {
+    int K, V;
+    const float *q, *k, *v, *g, *beta;
+    float *S, *o, *u;
+} kda_par;
+
+static void kda_step_range(int lo, int hi, void *ap)
+{
+    const kda_par *a = (const kda_par *)ap;
+    waste_k.kda_step(hi - lo, a->K, a->V,
+                     a->q + (size_t)lo * a->K, a->k + (size_t)lo * a->K,
+                     a->v + (size_t)lo * a->V, a->g + (size_t)lo * a->K,
+                     a->beta + lo,
+                     a->S + (size_t)lo * a->K * a->V,
+                     a->o + (size_t)lo * a->V,
+                     a->u + (size_t)lo * a->V);
+}
+
 static void kda_layer(waste_model *m, int L, const float *in, float *out)
 {
     const waste_config *c = &m->cfg;
@@ -839,7 +857,16 @@ static void kda_layer(waste_model *m, int L, const float *in, float *out)
     matvec_t(m, beta, waste_find(m, tname("%smodel.layers.%d.self_attn.b_proj.weight", c->prefix, L)), in, H, hid);
     for (int h = 0; h < H; h++) beta[h] = 1.0f / (1.0f + expf(-beta[h]));
 
-    waste_k.kda_step(H, D, D, q, k, v, g, beta, m->S[L], o, m->att);
+    {
+        /* Heads own disjoint K x V slices of the recurrent state, so the
+         * decode step splits cleanly across the pool. Splitting here rather
+         * than inside kda.c keeps the backend dispatch (NEON) in play, and
+         * whole-head ranges keep the result bit-identical to the serial
+         * version. Worth doing: K3 spends 19% of a decode step in this call,
+         * 69 layers x 96 heads, and it was running on one core. */
+        kda_par a = { D, D, q, k, v, g, beta, m->S[L], o, m->att };
+        waste_parallel_for(H, 1, kda_step_range, &a);
+    }
 
     if (c->full_rank_gate) {
         matvec_t(m, gate, waste_find(m, tname("%smodel.layers.%d.self_attn.g_proj.weight",
