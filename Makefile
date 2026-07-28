@@ -7,6 +7,12 @@
 CC      ?= cc
 CFLAGS  ?= -O2 -std=c11 -Wall -Wextra
 LDLIBS  := -lm -lpthread
+# Shared-library suffix: convert.py already looks for both through ctypes.
+ifeq ($(shell uname -s),Darwin)
+SOEXT   := dylib
+else
+SOEXT   := so
+endif
 VQ_SUPER ?= 2
 CFLAGS  += -DVQ_SUPER=$(VQ_SUPER)
 # Track header dependencies. Without this a changed struct in a header
@@ -65,14 +71,14 @@ endif
 
 OBJ := $(SRC:.c=.o)
 
-all: waste libwaste.a libwastevq.dylib
+all: waste libwaste.a libwastevq.$(SOEXT)
 
 # `make` builds the shipped artifacts; `make test` also builds the checkers.
 # They are separate targets, so remember which one you need — testing a
 # stale test binary costs more time than rebuilding it.
 
 # shared object so tools/convert.py can call the encoder through ctypes
-libwastevq.dylib: src/vq.c
+libwastevq.$(SOEXT): src/vq.c
 	$(CC) $(CFLAGS) -shared -fPIC -o $@ $< -lm -lpthread
 
 libwaste.a: $(OBJ)
