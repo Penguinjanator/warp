@@ -3,12 +3,11 @@
 Scope requirement (Marco, 2026-07-27): the engine runs on **macOS, Windows
 and Linux**; acceleration backends (BLAS, CUDA, Metal, NEON, AVX-512, …)
 are selected without burdening a build that does not want them, over a
-**universal CPU version always available**. The dispatch discipline follows
-[sqlite-vector](file:///Users/marco/GitHub/sqlite-vector).
+**universal CPU version always available**. The dispatch discipline follows [sqlite-vector](https://github.com/sqliteai/sqlite-vector).
 
 **No dynamic loading.** An earlier draft resolved accelerators with
 `dlopen`/`LoadLibrary`; that was complexity without a matching problem, and
-sqlite-vector — the model here — uses none. Backends are chosen by
+sqlite-vector, the model here, uses none. Backends are chosen by
 **conditional compilation plus runtime feature detection**: one binary
 still adapts to the CPU it runs on, and a build without CUDA simply has no
 CUDA code in it.

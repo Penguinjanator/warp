@@ -6,7 +6,7 @@
  *
  *   cc -O2 -fopenmp -o test_forward tests/test_forward.c src/model.c src/kda.c \
  *      src/kda_neon.c src/backend.c -lm
- *   ./test_forward /Users/marco/models/kimi-linear.waste 1008,10484,318,15383,387 out.bin
+ *   ./test_forward model.waste 1008,10484,318,15383,387 out.bin
  */
 
 #include <stdio.h>

@@ -85,6 +85,13 @@ typedef struct {
     uint64_t min_expert_cache;   /* smallest cache that can run a layer    */
     uint64_t floor_bytes;        /* sum of the above: the hard minimum     */
     uint64_t recommended_bytes;  /* floor + a cache worth having           */
+    /* What the vision tower would add if cfg.vision were set; 0 for a
+     * container without one. Reported separately because the plan is
+     * computed before a caller has said whether it wants images, and
+     * because it is a real trade: on K3 it is 434 MB the expert cache
+     * does not get. waste_open folds it into the figures above when
+     * vision is on, so a budget resolved there already accounts for it. */
+    uint64_t vision_bytes;
 } waste_memplan;
 
 /* Compute the memory floor for a container without loading weights.
@@ -115,7 +122,7 @@ typedef struct {
 
     waste_cache_policy cache_policy;
     int      use_direct_io;     /* bypass page cache (F_NOCACHE/O_DIRECT)  */
-    int      vision;            /* load the vision tower (438 MB on K3)    */
+    int      vision;            /* load the vision tower (434 MB on K3)    */
     int      allow_substitutes; /* low-bit expert on cache miss (HOBBIT);
                                    breaks bit-exactness, off by default    */
     int      expert_deferral;   /* overlap expert fetch with next layer    */
@@ -166,6 +173,9 @@ waste_status waste_detokenize(waste_ctx *ctx, const int32_t *tokens, size_t n,
  * in queue order. Skipping expand is not a shortcut — the model would
  * see one image position and the rest of the embeddings would go
  * nowhere.
+ *
+ * `out` must not alias `tokens`: expand grows the array, so writing over
+ * its own input would overwrite tokens it has not read yet.
  *
  * Encoding happens in add, so its cost is paid before generation starts
  * and a bad file is reported as a load error rather than mid-prompt.

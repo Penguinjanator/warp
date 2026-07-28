@@ -7,7 +7,7 @@
 # allocates. That is a claim about peak RSS, so measure peak RSS.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-MODEL="${1:-/Users/marco/models/kimi-linear.waste}"
+MODEL="${1:-$HOME/models/kimi-linear.waste}"
 BUDGET_GB="${2:-6}"
 # A short prompt never allocates the chunked-prefill scratch, which is the
 # largest single thing the plan has to size. Pass "long" to force a chunk.

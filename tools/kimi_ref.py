@@ -15,7 +15,7 @@ Reads weights from a WASTE container: trunk dequantized once, experts
 dequantized on demand per token — the same access pattern the engine has.
 
   uv run --with torch --with fla-core python tools/kimi_ref.py \
-      --container /Users/marco/models/kimi-linear.waste --tokens 8
+      --container model.waste --tokens 8
 
   # dump a batch-1 routing trace for routing_stats.py simulate (Gate 2)
   ... --trace trace_kimi.jsonl --tokens 300
@@ -419,7 +419,7 @@ class KimiRef:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--container", default="/Users/marco/models/kimi-linear.waste")
+    ap.add_argument("--container", required=True)
     ap.add_argument("--tokens", type=int, default=8)
     ap.add_argument("--prompt-ids", default="1,100,200,300,400")
     ap.add_argument("--prompt", default="", help="text prompt (needs tiktoken)")

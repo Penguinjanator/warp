@@ -27,7 +27,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 SRC="${SRC:-/Volumes/WasteDisk/k3}"
-OUT="${OUT:-/Users/marco/models/k3.waste}"
+OUT="${OUT:-$HOME/models/k3.waste}"
 JOBS="${JOBS:-3}"
 PROMPT="${PROMPT:-The capital of France is}"
 NTOK="${NTOK:-24}"

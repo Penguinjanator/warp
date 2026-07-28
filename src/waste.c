@@ -171,10 +171,17 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
         js_str(&d, js_get(&d, e, "name"), nm, sizeof nm);
         const int fmt = (int)js_int(&d, js_get(&d, e, "fmt"), 0);
         if (fmt != 0 && strstr(nm, "embed_tokens.weight")) continue;
-        /* the vision tower and projector are in the container but never
-         * loaded: the engine implements the text path only */
-        if (prefix[0] && strncmp(nm, prefix, strlen(prefix)) != 0) continue;
-        out->trunk_bytes += (uint64_t)js_int(&d, js_get(&d, e, "bytes"), 0);
+        const uint64_t nb = (uint64_t)js_int(&d, js_get(&d, e, "bytes"), 0);
+        /* The vision tower and projector sit outside tensor_prefix. They
+         * are loaded only when a caller asks for images, so they are
+         * counted apart and folded in by waste_open — counting them here
+         * would overstate the floor for every text-only run, and leaving
+         * them out entirely understated it for every run with one. */
+        if (prefix[0] && strncmp(nm, prefix, strlen(prefix)) != 0) {
+            out->vision_bytes += nb;
+            continue;
+        }
+        out->trunk_bytes += nb;
     }
 
     const int cfg = js_get(&d, 0, "config");
@@ -279,6 +286,14 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
 
     waste_status st = waste_plan_memory(model_path, cfg.ctx_tokens, &c->plan);
     if (st != WASTE_OK) { free(c); return st; }
+
+    /* The tower is real memory the moment it is asked for, so it has to be
+     * in the floor before the budget is resolved against it. */
+    if (cfg.vision && c->plan.vision_bytes) {
+        c->plan.trunk_bytes += c->plan.vision_bytes;
+        c->plan.floor_bytes += c->plan.vision_bytes;
+        c->plan.recommended_bytes += c->plan.vision_bytes;
+    }
 
     /* Resolve the budget. A budget the caller set is a contract and is used
      * as given. A zero means "you decide", and that decision has to know the

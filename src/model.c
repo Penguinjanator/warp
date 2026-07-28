@@ -379,6 +379,43 @@ static void trunk_row(waste_model *m, const waste_tensor *t, long row,
     *q = m->embrow; *qs = m->embsc;
 }
 
+static int clamp_token(const waste_model *m, int token);
+
+/* One embedding row into dst. The table is often left quantized — at
+ * 163840 x 7168 it is 1.1 GB even at four bits — so this is a dequantize
+ * as often as it is a copy, and both prefill and single-token decode need
+ * exactly the same answer. Exported because a caller comparing image
+ * embeddings against text ones has no other way to ask what scale the
+ * model's own vocabulary sits at. */
+int waste_embed_row(waste_model *m, int token, float *dst)
+{
+    const int hid = m->cfg.hidden;
+    const waste_tensor *emb = waste_find(m, tname("%smodel.embed_tokens.weight",
+                                                  m->cfg.prefix));
+    if (!emb) return -1;
+    if (emb->data) {
+        memcpy(dst, emb->data + (size_t)clamp_token(m, token) * hid,
+               (size_t)hid * sizeof(float));
+        return 0;
+    }
+    const int g = emb->group, ng = (hid + g - 1) / g;
+    const int8_t *row; const uint16_t *sc;
+    trunk_row(m, emb, clamp_token(m, token), &row, &sc);
+    for (int k = 0; k < ng; k++) {
+        const float sv = f16_to_f32(sc[k]);
+        for (int i = 0; i < g && k * g + i < hid; i++) {
+            int v;
+            if (emb->bits == 3) v = q3_at((const uint8_t *)row, (long)k * g + i);
+            else if (emb->bits == 4) {
+                const uint8_t byte = ((const uint8_t *)row)[(k * g + i) / 2];
+                v = (i & 1) ? (byte >> 4) - 8 : (byte & 0x0F) - 8;
+            } else v = row[k * g + i];
+            dst[k * g + i] = (float)v * sv;
+        }
+    }
+    return 0;
+}
+
 static inline float silu(float v) { return v / (1.0f + expf(-v)); }
 
 /* SiTU (K3): beta*tanh(g/beta)*sigmoid(g) * [linear_beta*tanh(u/linear_beta)]
@@ -1876,35 +1913,6 @@ void waste_matmul_t(waste_model *m, float *Y, const waste_tensor *t,
     PROF_END(P_MM);
 }
 
-/* Expand one expert's VQ indices into f32 [M][N]. */
-static void vq_expand(waste_model *m, float *W, const uint8_t *idx,
-                      const uint16_t *scale, int M, int N, int cb_base)
-{
-    const int nv_row = N / m->vec_dim, st = m->stages, en = m->cb_entries,
-              vd = m->vec_dim;
-    for (int r0 = 0; r0 < M; r0 += VQ_TILE) {
-        const int nr = (r0 + VQ_TILE <= M) ? VQ_TILE : M - r0;
-        const uint8_t *base = idx + (size_t)(r0 / VQ_TILE) * nv_row * VQ_TILE * st;
-        for (int v = 0; v < nv_row; v++) {
-            const uint8_t *ix = base + (size_t)v * VQ_TILE * st;
-            for (int r = 0; r < nr; r++, ix += st) {
-                float *dst = W + (size_t)(r0 + r) * N + (size_t)v * vd;
-                for (int d = 0; d < vd; d++) dst[d] = 0.0f;
-                for (int s = 0; s < st; s++) {
-                    const float *C = m->codebooks +
-                        ((size_t)(cb_base + s) * en + ix[s]) * vd;
-                    for (int d = 0; d < vd; d++) dst[d] += C[d];
-                }
-            }
-        }
-    }
-    for (int r = 0; r < M; r++) {
-        const float sc = f16_to_f32(scale[r]);
-        float *row = W + (size_t)r * N;
-        for (int i = 0; i < N; i++) row[i] *= sc;
-    }
-}
-
 /* ---- forward ----------------------------------------------------------- */
 
 static int prefill_alloc(waste_model *m, int T)
@@ -1912,9 +1920,6 @@ static int prefill_alloc(waste_model *m, int T)
     if (m->chunk_cap >= T) return 0;
     const waste_config *c = &m->cfg;
     const int hid = c->hidden, lat = c->latent_dim ? c->latent_dim : hid;
-    const int wide = c->kda_heads * c->kda_dim;
-    const int big = hid > wide ? hid : wide;
-    const int inter = c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter;
     const int nb = c->attn_res_block ? c->n_layers / c->attn_res_block + 2 : 1;
 
     free(m->cx); free(m->cnorm); free(m->cresid); free(m->cq); free(m->ckv);
@@ -2133,7 +2138,6 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     if (n > WASTE_CHUNK_MAX) n = WASTE_CHUNK_MAX;
     if (prefill_alloc(m, n)) return NULL;
 
-    const waste_tensor *emb = waste_find(m, tname("%smodel.embed_tokens.weight", c->prefix));
     for (int t = 0; t < n; t++) {
         float *dst = m->cx + (size_t)t * hid;
         /* An image token has no embedding of its own: the vision tower
@@ -2148,24 +2152,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
             m->media_used++;
             continue;
         }
-        if (emb->data) memcpy(dst, emb->data + (size_t)tokens[t] * hid, (size_t)hid * 4);
-        else {
-            const int g = emb->group, ng = (hid + g - 1) / g;
-            const int8_t *row; const uint16_t *sc;
-            trunk_row(m, emb, clamp_token(m, tokens[t]), &row, &sc);
-            for (int k = 0; k < ng; k++) {
-                const float sv = f16_to_f32(sc[k]);
-                for (int i = 0; i < g && k * g + i < hid; i++) {
-                    int v;
-                    if (emb->bits == 3) v = q3_at((const uint8_t *)row, (long)k * g + i);
-                    else if (emb->bits == 4) {
-                        const uint8_t byte = ((const uint8_t *)row)[(k * g + i) / 2];
-                        v = (i & 1) ? (byte >> 4) - 8 : (byte & 0x0F) - 8;
-                    } else v = row[k * g + i];
-                    dst[k * g + i] = (float)v * sv;
-                }
-            }
-        }
+        waste_embed_row(m, tokens[t], dst);
     }
 
     const int ares_on = c->attn_res_block > 0;
@@ -2279,25 +2266,18 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
     /* one embedding row; the table may be kept quantized */
-    const waste_tensor *emb = waste_find(m, tname("%smodel.embed_tokens.weight", c->prefix));
-    if (emb->data) {
-        memcpy(m->x, emb->data + (size_t)token * hid, (size_t)hid * sizeof(float));
+    /* Same splice as the prefill: a chunked prompt whose last chunk is a
+     * single token comes through here, and if that token is a media
+     * placeholder its embedding is the tower's, not the table's. Without
+     * this the bug only appears when an image lands at the very end of a
+     * prompt or its token count divides badly — which is to say, rarely
+     * and confusingly. */
+    if (m->media && m->media_used < m->media_n && token == m->cfg_media_token) {
+        memcpy(m->x, m->media + (size_t)m->media_used * hid,
+               (size_t)hid * sizeof(float));
+        m->media_used++;
     } else {
-        const int g = emb->group, ng = (hid + g - 1) / g;
-        const int8_t *row; const uint16_t *sc;
-        trunk_row(m, emb, clamp_token(m, token), &row, &sc);
-        for (int k = 0; k < ng; k++) {
-            const float s = f16_to_f32(sc[k]);
-            for (int i = 0; i < g && k * g + i < hid; i++) {
-                int v;
-                if (emb->bits == 3) v = q3_at((const uint8_t *)row, (long)k * g + i);
-                else if (emb->bits == 4) {
-                    const uint8_t byte = ((const uint8_t *)row)[(k * g + i) / 2];
-                    v = (i & 1) ? (byte >> 4) - 8 : (byte & 0x0F) - 8;
-                } else v = row[k * g + i];
-                m->x[k * g + i] = (float)v * s;
-            }
-        }
+        waste_embed_row(m, token, m->x);
     }
 
     float *resid = (float *)malloc((size_t)hid * sizeof(float));

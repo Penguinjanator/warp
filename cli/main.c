@@ -207,7 +207,7 @@ static waste_status open_model(const char *path, const opts *o, waste_ctx **ctx)
     cfg.ram_budget_bytes = o->budget;
     cfg.ctx_tokens = o->ctx;
     cfg.n_threads = o->threads;
-    /* The tower is 438 MB that a text prompt would never touch, so it is
+    /* The tower is 434 MB that a text prompt would never touch, so it is
      * loaded only when there is an image to put through it. */
     cfg.vision = o->n_image > 0;
     return waste_open(path, &cfg, ctx);
@@ -407,6 +407,8 @@ static int cmd_plan(int argc, char **argv)
                (unsigned long long)p.min_expert_cache,
                (unsigned long long)p.floor_bytes,
                (unsigned long long)p.recommended_bytes);
+        if (p.vision_bytes)
+            printf(",\"vision_bytes\":%llu", (unsigned long long)p.vision_bytes);
         if (o.budget)
             printf(",\"budget_bytes\":%llu,\"expert_cache_bytes\":%lld",
                    (unsigned long long)o.budget,
@@ -431,6 +433,12 @@ static int cmd_plan(int argc, char **argv)
     printf("  recommended           %12s   (floor + 3x a token's working set;\n"
            "                                      below that the cache keeps\n"
            "                                      nothing alive between tokens)\n", b[0]);
+    if (p.vision_bytes) {
+        char vb[32];
+        human(p.vision_bytes, vb, 32);
+        printf("\n  with --image           %12s more, taken from the expert\n"
+               "                                      cache, not added to the budget\n", vb);
+    }
     if (o.budget) {
         char bb[32];
         human(o.budget, bb, 32);
@@ -495,12 +503,24 @@ static int cmd_info(int argc, char **argv)
  * follows and the only ordering a single --image flag can express; a caller
  * that needs a picture in the middle of a sentence should write the
  * placeholder itself and use the library. */
+/* One media block is under 64 bytes, so this is the parser's limit spelled
+ * in bytes: sizing it to a round 512 instead would have accepted 32 images
+ * on the command line and refused the tenth here. */
+#define MEDIA_HEAD_CAP (WASTE_MAX_IMAGES_CLI * 64 + 1)
+
 static int prefix_images(waste_ctx *c, const opts *o, char *buf, size_t cap)
 {
     size_t k = 0;
     for (int i = 0; i < o->n_image; i++) {
         size_t rows = 0;
         const waste_status st = waste_image_add(c, o->image[i], &rows);
+        if (st == WASTE_E_UNSUPPORTED) {
+            /* "unsupported" next to a filename reads as a rejected image
+             * format, which is the wrong thing to go and check. */
+            fprintf(stderr, "%s: this container has no vision tower\n",
+                    o->image[i]);
+            return 1;
+        }
         if (st != WASTE_OK) return fail(o->image[i], st);
         if (!o->quiet)
             fprintf(stderr, "[%s: %zu image tokens]\n", o->image[i], rows);
@@ -517,28 +537,39 @@ static int prefix_images(waste_ctx *c, const opts *o, char *buf, size_t cap)
     return 0;
 }
 
+/* Text to token ids, with any queued images already expanded into their
+ * runs of positions. Every command that prompts the model goes through
+ * here, so `--image` works the same on all of them. */
+static int build_prompt(waste_ctx *c, const opts *o, const char *prompt,
+                        int32_t *ids, size_t cap, size_t *n)
+{
+    if (!o->n_image)
+        return waste_tokenize(c, prompt, 0, ids, cap, n) == WASTE_OK
+                   ? 0 : fail("tokenize", WASTE_E_ARG);
+
+    char head[MEDIA_HEAD_CAP], *full;
+    if (prefix_images(c, o, head, sizeof head)) return 1;
+    const size_t need = strlen(head) + strlen(prompt) + 1;
+    if (!(full = (char *)malloc(need))) return fail("prompt", WASTE_E_OOM);
+    snprintf(full, need, "%s%s", head, prompt);
+
+    int32_t *raw = (int32_t *)malloc(cap * sizeof *raw);
+    if (!raw) { free(full); return fail("prompt", WASTE_E_OOM); }
+    size_t rn = 0;
+    waste_status st = waste_tokenize(c, full, 0, raw, cap, &rn);
+    free(full);
+    if (st == WASTE_OK) st = waste_image_expand(c, raw, rn, ids, cap, n);
+    free(raw);
+    if (st != WASTE_OK) return fail("prompt", st);
+    return 0;
+}
+
 static int run_prompt(waste_ctx *c, const opts *o, const char *prompt, int show_stats)
 {
-    int32_t ids[MAXTOK], raw[MAXTOK];
+    int32_t ids[MAXTOK];
     size_t n = 0;
     waste_status st;
-
-    if (o->n_image) {
-        char head[512], *full;
-        if (prefix_images(c, o, head, sizeof head)) return 1;
-        const size_t need = strlen(head) + strlen(prompt) + 1;
-        if (!(full = (char *)malloc(need))) return fail("prompt", WASTE_E_OOM);
-        snprintf(full, need, "%s%s", head, prompt);
-        size_t rn = 0;
-        st = waste_tokenize(c, full, 0, raw, MAXTOK, &rn);
-        free(full);
-        if (st != WASTE_OK) return fail("tokenize", st);
-        st = waste_image_expand(c, raw, rn, ids, MAXTOK, &n);
-        if (st != WASTE_OK) return fail("image expand", st);
-    } else {
-        st = waste_tokenize(c, prompt, 0, ids, MAXTOK, &n);
-        if (st != WASTE_OK) return fail("tokenize", st);
-    }
+    if (build_prompt(c, o, prompt, ids, MAXTOK, &n)) return 1;
 
     waste_gen_params p;
     waste_gen_params_init(&p);
@@ -645,7 +676,8 @@ static int cmd_chat(int argc, char **argv)
                "instruct model is being asked to continue text rather than "
                "to answer\n");
     printf("/reset clears state, /save FILE and /load FILE persist it, "
-           "/stats prints counters, Ctrl-D exits\n");
+           "/image FILE attaches a picture, /stats prints counters, "
+           "Ctrl-D exits\n");
 
     /* The system turn goes in once, before anything else. */
     if (templated && o.system && *o.system) {
@@ -655,9 +687,14 @@ static int cmd_chat(int argc, char **argv)
         opts q = o;
         q.quiet = 1;
         q.max_tokens = 1;
+        q.n_image = 0;              /* a picture belongs to a user turn */
         run_prompt(c, &q, sysbuf, 0);
         waste_state_reset(c);       /* keep the text, drop the sampled token */
     }
+    /* Attached paths live here rather than in strdup'd memory: image[]
+     * otherwise mixes argv pointers with owned ones and /reset in a long
+     * session would leak one path per attachment. */
+    char attach[WASTE_MAX_IMAGES_CLI][512];
     char line[8192];
     while (1) {
         fputs("\n> ", stdout);
@@ -666,7 +703,26 @@ static int cmd_chat(int argc, char **argv)
         size_t l = strlen(line);
         while (l && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = 0;
         if (!l) continue;
-        if (!strcmp(line, "/reset")) { waste_state_reset(c); printf("(state cleared)\n"); continue; }
+        if (!strcmp(line, "/reset")) {
+            waste_state_reset(c);
+            waste_image_clear(c);
+            o.n_image = 0;
+            printf("(state cleared)\n");
+            continue;
+        }
+        if (!strncmp(line, "/image ", 7)) {
+            if (o.n_image >= WASTE_MAX_IMAGES_CLI) printf("(too many images)\n");
+            else {
+                /* Attached, not encoded: the tower runs as part of the next
+                 * turn, so a typo in the path is reported next to the
+                 * prompt it belongs to rather than at a bare > . */
+                snprintf(attach[o.n_image], sizeof attach[0], "%s", line + 7);
+                o.image[o.n_image] = attach[o.n_image];
+                o.n_image++;
+                printf("(%s attached to the next message)\n", line + 7);
+            }
+            continue;
+        }
         if (!strncmp(line, "/save ", 6)) {
             const waste_status s = waste_state_save(c, line + 6);
             printf(s == WASTE_OK ? "(saved to %s)\n" : "(save failed: %s)\n",
@@ -705,6 +761,11 @@ static int cmd_chat(int argc, char **argv)
         } else {
             run_prompt(c, &o, line, 0);
         }
+        /* One turn, one splice. The picture's positions are in the
+         * attention state now, and re-encoding it for every later message
+         * would both cost the tower again and show the model the same
+         * image several times over. */
+        o.n_image = 0;
     }
     waste_close(c);
     return 0;
@@ -828,9 +889,11 @@ static int cmd_eval(int argc, char **argv)
 
     int32_t ids[MAXTOK];
     size_t n = 0;
-    waste_status t = waste_tokenize(c, prompt, 0, ids, MAXTOK, &n);
-    if (t != WASTE_OK) { waste_close(c); free(prompt); return fail("tokenize", t); }
+    if (build_prompt(c, &o, prompt, ids, MAXTOK, &n)) {
+        waste_close(c); free(prompt); return 1;
+    }
 
+    waste_status t;
     const float *lg = NULL;
     size_t vocab = 0;
     t = waste_eval(c, ids, n, &lg, &vocab);

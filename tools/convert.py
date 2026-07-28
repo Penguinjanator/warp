@@ -13,9 +13,13 @@ Experts use VQ3R by default: 3-stage residual VQ over 8-dim vectors,
 channel. Codebooks are trained per (layer, matrix kind) on a sample and
 stored once. Gate 3 measured this recipe on real Kimi experts.
 
+Reads a Kimi checkpoint as published — the 1.42 TB of moonshotai/Kimi-K3
+that tools/fetch_k3.sh leaves on the staging disk, or any other
+member of the family (Kimi-Linear) by pointing --src elsewhere.
+
   uv run --with torch python tools/convert.py \
-      --src /Volumes/WasteDisk/kimi-linear \
-      --out /Volumes/WasteDisk/kimi-linear.waste \
+      --src /path/to/hf-checkpoint \
+      --out model.waste \
       --layers 1,2                       # subset for a fast first pass
 
 Resumable: a layer whose bank file already exists is skipped. Never holds
@@ -372,7 +376,8 @@ def convert_layer(job):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--src", default="/Volumes/WasteDisk/kimi-linear")
+    ap.add_argument("--src", required=True,
+                    help="HF checkpoint directory, as published")
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", default="", help="comma list; default = all MoE layers")
     ap.add_argument("--stages", type=int, default=3, help="3 = VQ3R, 2 = VQ2R")

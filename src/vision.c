@@ -18,7 +18,7 @@
  * against the code.
  *
  * The tower is loaded only when a caller asks for it (waste_cfg.vision):
- * it is 438 MB, and on a machine where the expert cache decides throughput
+ * it is 434 MB, and on a machine where the expert cache decides throughput
  * that is not a rounding error.
  */
 

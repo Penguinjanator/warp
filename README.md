@@ -145,11 +145,19 @@ measured on the commit it is published with.
 | model load | 20 s |
 | prefill | 0.47 tok/s chunked, 0.29 sequential |
 | decode | 0.31–0.33 tok/s, best around a 52 GB budget |
+| vision tower | 15.7 s for a 1024-patch image, 27 layers |
+| image in a prompt | 256 positions for 896x896, 2.8 s each — as text |
 
 The floor is almost entirely the resident trunk. Useful throughput starts
 above ~46 GB, where the expert cache finally clears one token's working
 set, and ends around 52 GB, where the machine starts paging. Below the
 first line extra RAM buys nothing; above the second it costs.
+
+The tower is not what an image costs. Encoding 1024 patches takes 15.7 s;
+the 256 positions it produces then go through 93 MoE layers like any other
+token, which is the other 731 s. An image is priced as text of the same
+length, so the patch budget in `vision.json` is a real dial: halving the
+grid halves the prompt.
 
 ### Kimi-Linear — 48B parameters, 19 GB container
 
@@ -181,21 +189,50 @@ No configure step and no dependency resolution. `make check` needs no
 model: it builds a small synthetic container and runs the engine against
 it.
 
-Converting a model needs Python once:
+### Converting Kimi K3
+
+Conversion is the one step that needs Python, and it happens once. The
+source is [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3)
+exactly as published — 96 safetensors shards, 1.42 TB, nothing patched:
 
 ```bash
+# 1. download the weights: resumable, safe to kill and re-run
+DEST=/Volumes/WasteDisk/k3 tools/fetch_k3.sh
+
+# 2. convert them into a container
 uv run --with torch --with safetensors python tools/convert.py \
-    --src /path/to/hf-model --out model.waste --jobs 3
+    --src /Volumes/WasteDisk/k3 \
+    --out /Users/you/models/k3.waste --jobs 3
 ```
 
-Then:
+That produces the 982 GB container every number above was measured on. It
+takes about **4.7 hours** with three processes on the M5 Pro (23.7 with
+the pure-torch encoder — see [docs/K3.md](docs/K3.md)), and wants ~1.0 TB
+free on the target volume. Both steps are resumable: a shard already
+downloaded is not refetched, a layer whose bank is already written is
+skipped, so an interrupted run costs only the layer it was in the middle
+of.
+
+`tools/pipeline.sh` chains the whole thing unattended — download, convert,
+round-trip the container against the source weights, generate, then diff
+the logits against the PyTorch oracle — and leaves a report next to the
+container. The same converter handles the other member of the family,
+`Kimi-Linear-48B-A3B-Instruct`, into the 19 GB container of the second
+benchmark; `--src` is the only thing that changes.
+
+**Pre-converted containers are on their way to
+[huggingface.co/sqliteai](https://huggingface.co/sqliteai/)**, at which
+point this whole section becomes a download and the Python is only needed
+for models we have not published.
+
+### Running it
 
 ```bash
-waste run   model.waste "The capital of France is" -n 32 --budget 46G
-waste chat  model.waste --budget 46G           # multi-turn, state kept
-waste eval  model.waste "2 + 2 =" --top-k 5    # next-token distribution
-waste plan  model.waste --budget 46G           # what fits, and what does not
-echo "prompt" | waste run model.waste          # stdin works too
+waste run   k3.waste "The capital of France is" -n 32 --budget 46G
+waste chat  k3.waste --budget 46G           # multi-turn, state kept
+waste eval  k3.waste "2 + 2 =" --top-k 5    # next-token distribution
+waste plan  k3.waste --budget 46G           # what fits, and what does not
+echo "prompt" | waste run k3.waste          # stdin works too
 ```
 
 `--budget` is optional. Left out, the engine takes the container's own
@@ -216,12 +253,16 @@ K3 is multimodal, and so is the engine. `--image` puts a picture in front
 of the prompt; repeat it for several:
 
 ```bash
-waste run model.waste "What is in this picture?" --image photo.png
+waste run k3.waste "What is in this picture?" --image photo.png
 ```
 
 PNG, JPEG, GIF, BMP and TGA, decoded by the one vendored header in
-`third_party/`. The 27-layer ViT is loaded only when an image is present,
-because its 438 MB otherwise come straight out of the expert cache.
+`third_party/`. It works on `run`, `chat` and `eval`; inside a chat,
+`/image FILE` attaches a picture to the next message, and it is spliced
+once — the positions are in the attention state afterwards, so later turns
+discuss the same photograph without re-encoding it. The 27-layer ViT is
+loaded only when an image is present, because its 434 MB otherwise come
+straight out of the expert cache.
 
 An image is not one token. The tower turns a 14-pixel patch grid into one
 embedding per merged 2×2 patch, and each occupies a position in the
@@ -274,15 +315,18 @@ bandwidth.
 ## Repository
 
 ```
-src/        the engine — 6,600 lines of C, no dependencies
+src/        the engine — 6,700 lines of C, no dependencies
   model.c     forward pass, MoE routing, KDA and MLA layers
   ecache.c    bounded LFRU expert cache over the banks
+  vision.c    the 27-layer ViT and the projector into text space
+  image.c     a file on disk to the patch tensor the tower wants
   waste.c     the public API
   simd_*.c    per-ISA kernels, selected at run time
 cli/        the CLI, a client of the public API
 tools/      conversion and validation (Python, never at run time)
 docs/       format, engine, backends, and what was learned
-tests/      21 checks, and a diff against a PyTorch oracle given a model
+tests/      25 checks, and a diff against a PyTorch oracle given a model
+third_party/ stb_image.h, the single vendored header — see its README
 ```
 
 [docs/LEARNED.md](docs/LEARNED.md) is the one to read before contributing.
@@ -293,9 +337,12 @@ numbers that killed them.
 ## Status
 
 Version 0.1.0. Output is correct, validated layer by layer against a
-PyTorch reference on both models. The API is not frozen.
+PyTorch reference on both models, and the vision tower against its own
+oracle to 2.3e-06. The API is not frozen.
 
-Known gaps, plainly: AVX-512 compiles but has never executed on hardware
+Known gaps, plainly: the image normalization constants are a convention
+rather than something read out of the K3 release, which ships no
+preprocessor config; AVX-512 compiles but has never executed on hardware
 that has it; Windows has never been built; there is no container checksum;
 and chat templates are applied from a declarative `chat.json` rather than
 by interpreting Jinja, so a model whose format is published only as a

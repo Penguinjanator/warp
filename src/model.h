@@ -83,7 +83,7 @@ typedef struct {
 typedef struct {
     waste_config cfg;
     waste_vision_cfg vcfg;
-    int  want_vision;                /* load the tower's 438 MB or not     */
+    int  want_vision;                /* load the tower's 434 MB or not     */
     /* Image embeddings for the prefill about to run: one row per merged
      * patch, consumed in order at each media placeholder. */
     const float *media;
@@ -136,7 +136,7 @@ typedef struct {
 } waste_model;
 
 /* cache_bytes: hard ceiling for the expert cache; 0 = no cache. */
-/* want_vision loads the 438 MB vision tower; it has to be a parameter
+/* want_vision loads the 434 MB vision tower; it has to be a parameter
  * because the first thing load does is zero the struct. */
 int  waste_model_load(waste_model *m, const char *dir, int kv_cap,
                       size_t cache_bytes, int want_vision);
@@ -176,6 +176,10 @@ void waste_rmsnorm(float *o, const float *x, const float *w, int n, float eps);
 void waste_matmul_t(waste_model *m, float *Y, const waste_tensor *t,
                     const float *X, int out, int in, int T);
 void waste_deq_row(const waste_tensor *t, long r, int cols, float *dst);
+
+/* One token's embedding row into dst (hidden floats), dequantizing if the
+ * table was left quantized. */
+int waste_embed_row(waste_model *m, int token, float *dst);
 
 /* Vision: encodes one image's patches into text-embedding space.
  * `pixels` is [h*w][3*14*14] already patchified and normalized, the result

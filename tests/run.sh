@@ -20,7 +20,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-MODEL="${1:-${WASTE_REF_MODEL:-/Users/marco/models/kimi-linear.waste}}"
+MODEL="${1:-${WASTE_REF_MODEL:-$HOME/models/kimi-linear.waste}}"
 SRC="${WASTE_REF_SRC:-/Volumes/WasteDisk/kimi-linear}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -376,7 +376,7 @@ fi
 # The small model cannot catch budget accounting that is wrong in
 # proportion to the model: K3 overran by 2-3 GB on scratch that Kimi-Linear
 # sizes in single megabytes. Run the same check against K3 when it is here.
-BIG="${BIG_MODEL:-/Users/marco/models/k3.waste}"
+BIG="${BIG_MODEL:-$HOME/models/k3.waste}"
 if [ -f "$BIG/manifest.json" ]; then
     if [ -n "${WASTE_SANITIZED:-}" ]; then
         sk "K3 budget check" "sanitizer shadow memory makes RSS meaningless"
