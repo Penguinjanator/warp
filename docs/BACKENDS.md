@@ -44,6 +44,12 @@ heterogeneous ops.
 
 ## How a backend gets in
 
+*Design, not inventory.* What exists today is the portable C baseline plus
+`kda_neon.c`, and inline NEON in `model.c` and `vq.c` for the quantized
+matvec and the VQ tables. There is no x86 SIMD, no SVE, no RVV and no
+accelerator: on anything but ARM the engine runs the baseline. The rest of
+this section describes where new backends plug in.
+
 **SIMD** (NEON, dotprod/i8mm, AVX2, AVX-512, SVE, RVV): one translation
 unit per ISA (`kda.c`, `kda_neon.c`, `kda_avx2.c`, …), each guarded by
 `#if defined(__ARM_NEON)`-style fences so a build for another architecture
@@ -52,7 +58,11 @@ for the target architecture are compiled in, and `waste_cpu_features()`
 picks at runtime — that is what lets a single x86 binary use AVX-512 on a
 machine that has it and AVX2 on one that does not.
 
-**Accelerators** (CUDA, Metal, BLAS, ROCm): build-time options.
+**Accelerators** (CUDA, Metal, BLAS, ROCm): build-time options. None is
+implemented yet — the dispatch table has hooks for them and the Makefile
+has the flags, but there is no `src/metal.m`, `src/cuda.cu` or
+`src/blas.c`. Setting a flag now stops the build with a message saying so
+rather than failing at link time on an undefined `waste_register_*`.
 
 ```
 make                     # CPU + SIMD only, zero extra dependencies
@@ -102,14 +112,19 @@ Implemented and verified today:
   [src/kda.c](../src/kda.c) is the universal baseline,
   [src/kda_neon.c](../src/kda_neon.c) the NEON specialization.
 
-Verified on this machine (MacBook Pro M5 Pro): detection reports
-**`NEON+i8mm`**, and `tools/kda_ref.py` passes against the official
-reference on *both* paths —
+Verified on this machine (MacBook Pro M5 Pro): `tools/kda_ref.py` passes
+against the official reference on *both* paths —
 
 | path | output max\|diff\| | state max\|diff\| |
 |---|---|---|
 | `WASTE_BACKEND=cpu` (baseline) | 4.10e-08 | 1.79e-07 |
-| auto (NEON+i8mm) | 4.47e-08 | 1.19e-07 |
+| auto (NEON) | 4.47e-08 | 1.19e-07 |
+
+`waste_cpu_features()` also detects dotprod and i8mm on this CPU, and the
+build used to name itself `NEON+i8mm` on the strength of that. Nothing in
+the engine emits SDOT or SMMLA, so the name has been cut back to `NEON`:
+the backend string reports what the binary *uses*, not what the silicon
+offers. Put the suffix back in the commit that adds the kernel.
 
 That equivalence is the contract every future backend must meet: **same
 results, only faster.** The Windows branches are written but not yet

@@ -98,9 +98,11 @@ const char *waste_kda_register_neon(waste_kernels *t)
     t->kda_step = kda_step_neon;
     /* short_conv_step and rmsnorm_gated stay on the CPU baseline until
      * they show up in a profile — partial override is the whole point. */
-    const uint32_t f = waste_cpu_features();
-    if (f & WASTE_CPU_I8MM)    return "NEON+i8mm";
-    if (f & WASTE_CPU_DOTPROD) return "NEON+dotprod";
+    /* The name reports what this build *uses*, not what the CPU offers.
+     * waste_cpu_features() detects dotprod and i8mm, and neither drives a
+     * kernel yet — no SDOT or SMMLA is emitted anywhere in the engine — so
+     * naming them here only made `waste version` overstate the binary.
+     * Add the suffix back in the same commit that adds the kernel. */
     return "NEON";
 }
 

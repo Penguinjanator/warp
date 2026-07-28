@@ -19,16 +19,43 @@ SRC := src/model.c src/kda.c src/backend.c src/ecache.c src/version.c \
 ifneq (,$(findstring arm,$(shell uname -m)))
 SRC += src/kda_neon.c
 endif
-OBJ := $(SRC:.c=.o)
-
+# Accelerator backends are build-time options, and each needs a source file
+# that registers it. None exists yet: the flags below were reachable but
+# only produced "Undefined symbols: _waste_register_metal" at link time.
+# Fail early and say why instead. Deleting a check is the last step of
+# adding the backend it guards.
 ifdef WASTE_ENABLE_METAL
+ifeq (,$(wildcard src/metal.m))
+$(error WASTE_ENABLE_METAL=1, but src/metal.m does not exist — the Metal \
+backend is not implemented. Build without the flag: CPU+NEON is the only \
+backend this engine has)
+endif
 CFLAGS += -DWASTE_ENABLE_METAL=1
+SRC    += src/metal.m
 LDLIBS += -framework Metal -framework Foundation
 endif
 ifdef WASTE_ENABLE_CUDA
+ifeq (,$(wildcard src/cuda.cu))
+$(error WASTE_ENABLE_CUDA=1, but src/cuda.cu does not exist — the CUDA \
+backend is not implemented. Build without the flag: CPU+NEON is the only \
+backend this engine has)
+endif
 CFLAGS += -DWASTE_ENABLE_CUDA=1
+SRC    += src/cuda.cu
 LDLIBS += -lcudart
 endif
+ifdef WASTE_ENABLE_BLAS
+ifeq (,$(wildcard src/blas.c))
+$(error WASTE_ENABLE_BLAS=1, but src/blas.c does not exist — the BLAS \
+backend is not implemented. Build without the flag: CPU+NEON is the only \
+backend this engine has)
+endif
+CFLAGS += -DWASTE_ENABLE_BLAS=1
+SRC    += src/blas.c
+LDLIBS += -lblas
+endif
+
+OBJ := $(SRC:.c=.o)
 
 all: waste libwaste.a libwastevq.dylib
 
