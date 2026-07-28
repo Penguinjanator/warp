@@ -340,3 +340,51 @@ once it passes one token's working set — the Gate 5 floor, still the
 single most predictive number in this project. Nothing about the
 architecture work changed that; it changed how much RAM was left over
 to spend on it.
+
+
+## 13. Reducing the trunk: one clean gigabyte, and a dead end (2026-07-28)
+
+The trunk is 28.61 GB resident and every gigabyte of it is a gigabyte
+the expert cache does not get. Where it goes:
+
+| component | GB | note |
+|---|---|---|
+| shared experts | 5.84 | every layer, every token |
+| g_proj | 3.93 | full-rank gates, 93 layers |
+| o_proj | 3.93 | |
+| q/k/v_proj (KDA) | 8.76 | 2.92 each |
+| latent MoE down/up | 2.26 | |
+| lm_head | 1.11 | whole tensor, once per token |
+| embed_tokens | 1.11 | **one row per token** |
+| everything else | 1.67 | |
+
+Only the last line of that table is compressible without a cost.
+**embed_tokens is 1.11 GB of which 7 KB is read per token**, so it now
+stays on disk and the row is pread on use — bit-identical logits, floor
+30.38 -> 29.27 GB. Everything above it is touched in full every token:
+streaming it would cost more I/O than the freed cache could ever save.
+lm_head is the near miss — 1.11 GB read per token to free 1.11 GB of
+cache, which at the current knee buys about 2 points of hit rate, or
+0.34 GB/token. A net loss of roughly 0.8 GB/token.
+
+**The 3-bit trunk is refuted, this time on both axes.** It was parked
+earlier as "cache prediction held, throughput did not", and the obvious
+follow-up was that a vectorized 3-bit unpack would rescue it. Re-measured
+now that MLA absorption has put the cache at the knee where extra room
+actually pays:
+
+| | resident | cache @46G | hit | tok/s | output |
+|---|---|---|---|---|---|
+| Q4G trunk | 27.50 GB | 17.10 GB | 12% | 0.23 | coherent |
+| Q3G trunk | 21.13 GB | 23.48 GB | 29% | 0.16 | `+` and spaces |
+
+It gets the better hit rate — 29% against 12%, exactly as predicted —
+and is still 1.4x slower, because the scalar 3-bit unpack costs more in
+the trunk matvecs than the cache saves in I/O (kda bucket 3.70s -> 10.39s
+over 5 steps). And the vectorized unpack would not save it: the logits
+land 36% off the 4-bit ones and generation collapses. The technical
+report says why — QAT covered the expert weights at MXFP4 and left every
+non-expert component in higher precision, so the trunk has no trained
+tolerance for being squeezed. **Correct the earlier lead: vectorizing the
+3-bit unpack would not make Q3G viable for the trunk.** The quality wall
+sits in front of the speed wall.
