@@ -1761,6 +1761,13 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         } else {
             for (int i = 0; i < hid; i++) m->x[i] += resid[i];
         }
+        /* WASTE_DUMP_HIDDEN=path appends the residual stream after every
+         * layer, so a divergence against the PyTorch oracle can be bisected
+         * to the layer that introduces it. */
+        if (getenv("WASTE_DUMP_HIDDEN")) {
+            FILE *df = fopen(getenv("WASTE_DUMP_HIDDEN"), L ? "ab" : "wb");
+            if (df) { fwrite(m->x, sizeof(float), (size_t)hid, df); fclose(df); }
+        }
     }
     /* One last AttnRes: the output layer attends over every block
      * representation before the final norm (tech report §2.2, "the final

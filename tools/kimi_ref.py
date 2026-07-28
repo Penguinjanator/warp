@@ -120,14 +120,25 @@ class Container:
                     n *= s
                 x = torch.frombuffer(bytearray(blob[off:off + n * 4]),
                                      dtype=torch.float32).view(*shape)
-            else:                                              # Q8G
+            else:                                              # Q8G / Q4G
                 rows = 1
                 for s in shape[:-1]:
                     rows *= s
                 N, g = shape[-1], e["group"]
                 ng = (N + g - 1) // g
-                q = torch.frombuffer(bytearray(blob[off:off + rows * ng * g]),
-                                     dtype=torch.int8).view(rows, ng, g).float()
+                if e["fmt"] == 3:
+                    # Q4G: two signed nibbles per byte, low first, stored as
+                    # v+8 and packed per row. Most of K3's trunk is this, and
+                    # decoding it as int8 silently blows the hidden state up
+                    # by seven orders of magnitude.
+                    b = torch.frombuffer(
+                        bytearray(blob[off:off + rows * ng * g // 2]),
+                        dtype=torch.uint8).view(rows, ng * g // 2).int()
+                    q = torch.stack([b & 0x0F, b >> 4], -1)
+                    q = (q.view(rows, ng, g) - 8).float()
+                else:
+                    q = torch.frombuffer(bytearray(blob[off:off + rows * ng * g]),
+                                         dtype=torch.int8).view(rows, ng, g).float()
                 sc = torch.frombuffer(
                     bytearray(blob[e["scale_off"]:e["scale_off"] + rows * ng * 2]),
                     dtype=torch.float16).view(rows, ng, 1).float()
@@ -288,7 +299,14 @@ class KimiRef:
         nh = cfg["num_attention_heads"]
         qk_n, qk_r, vh = cfg["qk_nope_head_dim"], cfg["qk_rope_head_dim"], cfg["v_head_dim"]
         qd = qk_n + qk_r
-        q = (x @ self.t[p + "q_proj.weight"].T).view(T, nh, qd)
+        # K3 factorizes the query projection (q_lora_rank 1536); Kimi-Linear
+        # does not, and keeps a single q_proj.
+        if cfg.get("q_lora_rank"):
+            qa = x @ self.t[p + "q_a_proj.weight"].T
+            qa = rms_norm(qa, self.t[p + "q_a_layernorm.weight"], self.eps)
+            q = (qa @ self.t[p + "q_b_proj.weight"].T).view(T, nh, qd)
+        else:
+            q = (x @ self.t[p + "q_proj.weight"].T).view(T, nh, qd)
         ckv = x @ self.t[p + "kv_a_proj_with_mqa.weight"].T
         kpass, krot = ckv.split([cfg["kv_lora_rank"], qk_r], dim=-1)
         kpass = rms_norm(kpass, self.t[p + "kv_a_layernorm.weight"], self.eps)
@@ -305,6 +323,8 @@ class KimiRef:
         mask = torch.full((T, S), float("-inf")).triu(S - T + 1)
         att = (att + mask).softmax(-1)
         o = torch.einsum("hts,shd->thd", att, val).reshape(T, nh * vh)
+        if cfg.get("mla_use_output_gate"):
+            o = o * torch.sigmoid(x @ self.t[p + "g_proj.weight"].T)
         return o @ self.t[p + "o_proj.weight"].T
 
     def moe(self, L, x, trace=None):
@@ -382,6 +402,10 @@ class KimiRef:
                 x = ps
             else:
                 x = x + ffn
+            if os.environ.get("WASTE_DUMP_HIDDEN"):
+                with open(os.environ["WASTE_DUMP_HIDDEN"], "ab" if L else "wb") as f:
+                    v = x[-1].float().tolist()
+                    f.write(struct.pack(f"<{len(v)}f", *v))
         if self.ares and blocks is not None and blocks.shape[-2] > 0:
             x = apply_attn_res(x, blocks,
                                self.t[self.p + "model.output_attn_res_norm.weight"],
