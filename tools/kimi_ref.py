@@ -255,10 +255,9 @@ class KimiRef:
 
         g = (x @ self.t[p + "f_a_proj.weight"].T) @ self.t[p + "f_b_proj.weight"].T
         g = g.view(T, H, D)
-        # K3 ships A_log with head_dim entries (per channel, broadcast over
-        # heads); Kimi-Linear ships one per head. Let the shape decide.
-        A_raw = self.t[p + "A_log"].flatten()
-        A_log = A_raw.view(1, D) if A_raw.numel() == D and D != H else A_raw.view(H, 1)
+        # One log-scale per head (tech report eq. 5). K3 pads the tensor to
+        # head_dim, so take the first H rather than trusting its length.
+        A_log = self.t[p + "A_log"].flatten()[:H].view(H, 1)
         z = g + self.t[p + "dt_bias"].view(H, D)
         if self.gate_lb is not None:
             g = self.gate_lb * torch.sigmoid(A_log.exp() * z)
@@ -383,6 +382,11 @@ class KimiRef:
                 x = ps
             else:
                 x = x + ffn
+        if self.ares and blocks is not None and blocks.shape[-2] > 0:
+            x = apply_attn_res(x, blocks,
+                               self.t[self.p + "model.output_attn_res_norm.weight"],
+                               self.t[self.p + "model.output_attn_res_proj.weight"],
+                               self.eps)
         x = rms_norm(x, self.t[self.p + "model.norm.weight"], self.eps)
         return x @ self.t[self.p + "lm_head.weight"].T
 

@@ -777,9 +777,12 @@ static void vq_matvec(waste_model *m, float *y, const uint8_t *idx,
  * The second is not a clamp of the first — it is a different function, and
  * it confines the decay exp(g) to (exp(lower_bound), 1).
  */
-/* `per_channel`: K3 ships A_log with head_dim entries (one per channel,
- * broadcast over heads); Kimi-Linear ships one per head. The tensor's own
- * length says which, so the caller passes that rather than guessing. */
+/* A_log is one learnable log-scale PER HEAD (tech report eq. 5). K3 ships
+ * the tensor padded to head_dim — 96 real values in a 128-slot tensor,
+ * indices 96..127 exactly zero — so its length must not be used to infer
+ * the layout: reading it per channel silently applies exp(0)=1 to a
+ * quarter of the channels. `per_channel` is kept for a model that really
+ * does store one per channel, but nothing ships that today. */
 void waste_kda_decay_gate_ex(float *g, const float *A_log, const float *dt_bias,
                              int H, int D, float lower_bound, int per_channel)
 {
@@ -829,8 +832,10 @@ static void kda_layer(waste_model *m, int L, const float *in, float *out)
     const waste_tensor *At = waste_find(m, tname("%smodel.layers.%d.self_attn.A_log",
                                                  c->prefix, L));
     const float *dt = T(m, "%smodel.layers.%d.self_attn.dt_bias", c->prefix, L);
-    waste_kda_decay_gate_ex(g, At->data, dt, H, D, c->gate_lower_bound,
-                            (int)At->n == D && D != H);
+    /* A_log is per head, not per channel: the tech report's eq. 5 indexes it
+     * by h, and K3 ships it padded to head_dim (indices 96..127 are exactly
+     * zero on every layer we checked). */
+    waste_kda_decay_gate_ex(g, At->data, dt, H, D, c->gate_lower_bound, 0);
     matvec_t(m, beta, waste_find(m, tname("%smodel.layers.%d.self_attn.b_proj.weight", c->prefix, L)), in, H, hid);
     for (int h = 0; h < H; h++) beta[h] = 1.0f / (1.0f + expf(-beta[h]));
 
@@ -1064,9 +1069,13 @@ void waste_apply_attn_res(waste_model *m, const float *blockres, int nb,
         sc[i] = acc;
     }
     softmax(sc, nb + 1);
-    memset(out, 0, (size_t)hid * sizeof(float));
-    for (int i = 0; i <= nb; i++) {
-        const float *v = (i < nb) ? blockres + (size_t)i * hid : prefix_sum;
+    /* The output aggregation passes the same buffer as prefix_sum and out,
+     * so the prefix_sum term has to be written first, element by element —
+     * a memset here would zero the input before reading it. */
+    const float pl = sc[nb];
+    for (int j = 0; j < hid; j++) out[j] = pl * prefix_sum[j];
+    for (int i = 0; i < nb; i++) {
+        const float *v = blockres + (size_t)i * hid;
         const float p = sc[i];
         for (int j = 0; j < hid; j++) out[j] += p * v[j];
     }
@@ -1646,6 +1655,15 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
                (size_t)nb * hid * sizeof(float));
     }
     m->n_blockres = nb;
+    if (ares_on && nb > 0) {
+        const float *onw = waste_find(m, tname("%smodel.output_attn_res_norm.weight", c->prefix))->data;
+        const float *opw = waste_find(m, tname("%smodel.output_attn_res_proj.weight", c->prefix))->data;
+        const int stride = (c->n_layers / c->attn_res_block + 2) * hid;
+        for (int t = 0; t < n; t++)
+            waste_apply_attn_res(m, m->cblockres + (size_t)t * stride, nb,
+                                 m->cx + (size_t)t * hid, onw, opw,
+                                 m->cx + (size_t)t * hid);
+    }
     const float *fnw = waste_find(m, tname("%smodel.norm.weight", c->prefix))->data;
     float *last = m->cnorm;
     rmsnorm(last, m->cx + (size_t)(n - 1) * hid, fnw, hid, c->eps);
@@ -1744,6 +1762,14 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
             for (int i = 0; i < hid; i++) m->x[i] += resid[i];
         }
     }
+    /* One last AttnRes: the output layer attends over every block
+     * representation before the final norm (tech report §2.2, "the final
+     * output layer then aggregates all N block representations"). */
+    if (ares_on && m->n_blockres > 0)
+        waste_apply_attn_res(m, m->blockres, m->n_blockres, m->x,
+            waste_find(m, tname("%smodel.output_attn_res_norm.weight", c->prefix))->data,
+            waste_find(m, tname("%smodel.output_attn_res_proj.weight", c->prefix))->data,
+            m->x);
     rmsnorm(norm, m->x, waste_find(m, tname("%smodel.norm.weight", c->prefix))->data, hid, c->eps);
     PROF_START(P_HEAD);
     matvec_t(m, m->logits, waste_find(m, tname("%slm_head.weight", c->prefix)), norm, c->vocab, hid);
