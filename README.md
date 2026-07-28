@@ -107,8 +107,10 @@ worse — reproduced twice. The engine is inside its budget; the *machine*
 is not, so the OS pages out the expert cache, and a "hit" becomes a page
 fault instead of the disk read the engine was managing. One extra
 gigabyte of cache turned 0.32 tok/s into 0.04. The engine now warns when
-a budget leaves the machine less than 12% of its RAM, but the real lesson
-is that a cache you do not control is not a cache.
+a budget leaves the machine less than 12% of its RAM, and holds itself to
+the same 12% when it has to pick a budget for itself — K3 asks for
+80.63 GB on its own numbers and gets 56.00 GB on this machine — but the
+real lesson is that a cache you do not control is not a cache.
 
 ### Linear attention, and an absorbed KV cache
 
@@ -172,7 +174,7 @@ the next steps are about memory rather than arithmetic.
 ```bash
 git clone <this repo> && cd waste
 make                          # libwaste.a, waste, libwastevq
-make check                    # 18 checks, about three minutes
+make check                    # 21 checks, about three minutes
 ```
 
 No configure step and no dependency resolution. `make check` needs no
@@ -196,6 +198,15 @@ waste plan  model.waste --budget 46G           # what fits, and what does not
 echo "prompt" | waste run model.waste          # stdin works too
 ```
 
+`--budget` is optional. Left out, the engine takes the container's own
+recommendation and caps it at 88% of physical RAM — never below the floor,
+or it refuses to open — then says on stderr which ceiling it landed on, so
+the same command on two machines is not silently two different runs:
+
+```
+waste: no --budget, using 55.99 GB of 64.00 GB (expert cache 27.32 GB)
+```
+
 `waste --help` lists all nine commands. `--json` makes `eval`, `tokenize`,
 `plan`, `info` and `bench` machine-readable.
 
@@ -203,10 +214,15 @@ echo "prompt" | waste run model.waste          # stdin works too
 
 | | build | tests | backend |
 |---|---|---|---|
-| macOS arm64 | yes | 18/18 | NEON |
-| Linux arm64 | yes | 12/12 | NEON |
-| Linux x86_64 | yes | 12/12 | AVX2 |
+| macOS arm64 | yes | 14/14 | NEON |
+| Linux arm64 | yes | 14/14 | NEON |
+| Linux x86_64 | yes | 14/14 | AVX2 |
 | Windows | branches written, never compiled | — | — |
+
+The three run the same model-free suite — CI has no container, so
+`tests/run.sh` builds a synthetic one and the seven checks that need real
+weights say SKIP rather than passing quietly. Which is why the numbers
+match: the platform is the variable, the suite is not.
 
 SIMD is selected at run time from CPUID, so a single x86 binary uses
 AVX-512 where it exists and AVX2 where it does not. Accelerator backends
@@ -227,7 +243,7 @@ src/        the engine — 6,600 lines of C, no dependencies
 cli/        the CLI, a client of the public API
 tools/      conversion and validation (Python, never at run time)
 docs/       format, engine, backends, and what was learned
-tests/      18 checks, including a diff against a PyTorch oracle
+tests/      21 checks, and a diff against a PyTorch oracle given a model
 ```
 
 [docs/LEARNED.md](docs/LEARNED.md) is the one to read before contributing.
