@@ -17,7 +17,7 @@ with its own tokenizer, its own chat format and its own vision tower,
 running on hardware you can buy in a shop.
 
 WASTE was written for that one model and that one constraint: **K3 does
-not fit in RAM, and no consumer machine will ever hold it.** It is 1.42 TB
+not fit in the RAM of current mainstream consumer systems.** It is 1.42 TB
 as published and 982 GB after conversion. But a mixture of experts
 activates about 4% of itself per token, so almost all of that weight is
 idle at any instant — and idle weight does not need to be in memory, it
@@ -33,16 +33,18 @@ its own oracle to 2.3e-06. It is also slow — a third of a token per
 second, fifty seconds for the sentence above.
 
 Both of those matter, and the second one should not be read as a
-disclaimer. As far as we could find, nothing else runs a model of this
-size from disk on a consumer machine; the literature we surveyed has no
-demonstration of trillion-scale NVMe streaming at all, and the
-best-documented 671B-class recipes assume a server with a terabyte of
-DDR5. The interesting result is not the speed, it is that the whole thing
-is in the reachable range on hardware that costs less than a month of API
-bills — and that from here the question is engineering rather than
-feasibility. Half of a decode step is already disk I/O running near the
-drive's measured ceiling, so the levers are known: read fewer bytes per
-token, and keep more of them in RAM.
+disclaimer. We are not aware of another published demonstration of a
+model this size streaming from disk on a consumer machine: we found none
+for trillion-scale NVMe streaming, and the best-documented 671B-class
+recipes assume a server with a terabyte of DDR5. That is a report of what
+our search turned up rather than a survey — this repository carries no
+bibliography and no comparison table, so read it as an invitation to send
+a counter-example, not as a result. The interesting part is not the
+speed, it is that the whole thing is in the reachable range on a single
+consumer machine — and that from here the question is engineering rather
+than feasibility. Half of a decode step is already disk I/O running near
+the drive's measured ceiling, so the levers are known: read fewer bytes
+per token, and keep more of them in RAM.
 
 What that opens up, concretely: a frontier-scale model that answers with
 no network, no per-token invoice, and nothing leaving the machine — which
