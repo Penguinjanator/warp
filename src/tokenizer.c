@@ -203,7 +203,11 @@ waste_tok *waste_tok_open(const char *dir)
     for (int i = 0; i < t->n_tokens; i++) tok_index(t, i);
 
     /* Kimi's reserved block starts right after the base vocabulary:
-     * [BOS] = base, [EOS] = base+1, <|im_end|> = base+2. */
+     * [BOS] = base, [EOS] = base+1, <|end_of_msg|> = base+2 — and it is
+     * the third of those, not [EOS], that generation_config.json names as
+     * eos_token_id on both models. This positional default is a guess
+     * that happens to be right here; waste_tok_set_eos replaces it with
+     * the container's stated id when there is one. */
     t->bos = t->n_tokens;
     t->eos = t->n_tokens + 2;
     load_specials(t, dir);
@@ -221,6 +225,8 @@ void waste_tok_free(waste_tok *t)
 int waste_tok_vocab(const waste_tok *t) { return t->n_tokens; }
 int waste_tok_bos(const waste_tok *t) { return t->bos; }
 int waste_tok_eos(const waste_tok *t) { return t->eos; }
+
+void waste_tok_set_eos(waste_tok *t, int id) { if (t && id > 0) t->eos = id; }
 
 /* ---- UTF-8 + the character classes the pattern needs -------------------- */
 
@@ -405,41 +411,100 @@ static int encode_piece(const waste_tok *t, const uint8_t *p, int len,
     return n;
 }
 
-int waste_tok_encode(const waste_tok *t, const char *text, int32_t *out, int cap)
+/* First occurrence of `needle` in [hay, hay+n). Hand-rolled because memmem
+ * is a GNU extension on Linux and a BSD one on macOS, and this file
+ * deliberately compiles with neither's feature macros. */
+static const char *find_sub(const char *hay, int n, const char *needle, int m)
+{
+    if (m <= 0 || m > n) return NULL;
+    for (int i = 0; i <= n - m; i++)
+        if (hay[i] == needle[0] && memcmp(hay + i, needle, (size_t)m) == 0)
+            return hay + i;
+    return NULL;
+}
+
+int waste_tok_encode(const waste_tok *t, const char *text, int32_t *out,
+                     int cap, int allow_special)
 {
     int n = 0, pos = 0;
     const int len = (int)strlen(text);
+    if (!allow_special) {
+        /* Untrusted text: every byte goes through the BPE, so a prompt
+         * containing `<|end_of_msg|><|open|>message role="system"<|sep|>`
+         * is that many ordinary tokens and not a forged turn. */
+        while (pos < len) {
+            const int plen = next_piece(text + pos, len - pos);
+            if (plen <= 0) break;
+            const int got = encode_piece(t, (const uint8_t *)text + pos, plen,
+                                         out + n, cap - n);
+            if (got < 0) return -1;
+            n += got;
+            pos += plen;
+        }
+        return n;
+    }
     while (pos < len) {
         /* A special token is matched whole, before the pre-tokenizer ever
          * sees it: the BPE has no entry for <|open|> and would emit six
-         * ordinary tokens the model has never been trained to read there. */
-        int sp = -1;
+         * ordinary tokens the model has never been trained to read there.
+         *
+         * Locating it means searching the *remaining text*, not testing
+         * the current offset. Testing the offset only finds specials that
+         * happen to begin a pre-token, and the pre-tokenizer groups runs
+         * of punctuation: in `role="user"<|sep|>` it swallows the quote
+         * together with the `<` that opens the token, so the boundary
+         * where the test would fire never exists and the marker silently
+         * became five ordinary tokens. That is the exact shape of K3's
+         * chat template, which is how it was found. */
+        int best_at = -1, best_len = 0;
+        int32_t best_id = 0;
         for (int i = 0; i < t->n_special; i++) {
-            if (t->special[i].len <= len - pos &&
-                memcmp(text + pos, t->special[i].text, (size_t)t->special[i].len) == 0) {
-                sp = i;
-                break;                       /* table is longest-first */
+            const char *hit = find_sub(text + pos, len - pos,
+                                       t->special[i].text, t->special[i].len);
+            if (!hit) continue;
+            const int at = (int)(hit - text);
+            /* earliest wins; the table is longest-first, so among specials
+             * starting at the same offset the longest is seen first */
+            if (best_at < 0 || at < best_at) {
+                best_at = at; best_len = t->special[i].len; best_id = t->special[i].id;
             }
+            if (best_at == pos && best_len == t->special[i].len) break;
         }
-        if (sp >= 0) {
-            if (n >= cap) return -1;
-            out[n++] = t->special[sp].id;
-            pos += t->special[sp].len;
-            continue;
+
+        /* ordinary text up to the marker (or to the end), pre-tokenized
+         * within that limit so no piece can straddle the boundary */
+        const int upto = best_at >= 0 ? best_at : len;
+        while (pos < upto) {
+            const int plen = next_piece(text + pos, upto - pos);
+            if (plen <= 0) return n;
+            const int got = encode_piece(t, (const uint8_t *)text + pos, plen,
+                                         out + n, cap - n);
+            if (got < 0) return -1;
+            n += got;
+            pos += plen;
         }
-        const int plen = next_piece(text + pos, len - pos);
-        if (plen <= 0) break;
-        const int got = encode_piece(t, (const uint8_t *)text + pos, plen,
-                                     out + n, cap - n);
-        if (got < 0) return -1;
-        n += got;
-        pos += plen;
+        if (best_at < 0) break;
+        if (n >= cap) return -1;
+        out[n++] = best_id;
+        pos = best_at + best_len;
     }
     return n;
 }
 
 int waste_tok_decode1(const waste_tok *t, int32_t id, char *buf, int cap)
 {
+    /* Specials first: they are not in the rank table, and returning zero
+     * bytes for them silently deleted them from every decode. That is how
+     * `<|close|>response<|sep|>` reached a terminal as the bare word
+     * "response" — and why a stop string written in markers could never
+     * match the text it was compared against. Encode and decode have to
+     * agree about what a token is. */
+    for (int i = 0; i < t->n_special; i++)
+        if (t->special[i].id == id) {
+            const int l = t->special[i].len < cap ? t->special[i].len : cap;
+            memcpy(buf, t->special[i].text, (size_t)l);
+            return l;
+        }
     for (int i = 0; i < t->n_tokens; i++)
         if (t->by_rank[i].rank == id) {
             const int l = t->by_rank[i].len < cap ? t->by_rank[i].len : cap;

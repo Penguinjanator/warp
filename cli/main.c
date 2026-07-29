@@ -67,6 +67,8 @@ typedef struct {
     uint32_t ctx, max_tokens;
     float temperature, top_p;
     int top_k, threads, quiet, learn, json, no_echo;
+    int media_inlined;              /* the media block is already in the
+                                       prompt string, inside the user turn */
     uint64_t seed;
     const char *file, *stop, *system;
     const char *image[WASTE_MAX_IMAGES_CLI];
@@ -326,6 +328,20 @@ typedef struct {
     int  have;
 } chatfmt;
 
+/* Closing quote of the JSON string whose opening quote is `p`, honouring
+ * backslash escapes. Scanning with strchr instead treats the `\"` inside
+ * `role=\"user\"` as a delimiter, which silently truncates every field of
+ * an XTML chat template — the values that need embedded quotes are
+ * exactly the ones this format is made of. */
+static const char *jstr_end(const char *p)
+{
+    for (p++; *p; p++) {
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '"') return p;
+    }
+    return NULL;
+}
+
 static void jstr_field(const char *js, const char *key, int idx,
                        char *out, size_t cap)
 {
@@ -337,7 +353,7 @@ static void jstr_field(const char *js, const char *key, int idx,
     for (int i = 0; i <= idx; i++) {
         p = strchr(p, '"');
         if (!p) return;
-        if (i < idx) { p = strchr(p + 1, '"'); if (!p) return; p++; }
+        if (i < idx) { p = jstr_end(p); if (!p) return; p++; }
     }
     p++;
     size_t n = 0;
@@ -506,7 +522,9 @@ static int cmd_info(int argc, char **argv)
 /* One media block is under 64 bytes, so this is the parser's limit spelled
  * in bytes: sizing it to a round 512 instead would have accepted 32 images
  * on the command line and refused the tenth here. */
-#define MEDIA_HEAD_CAP (WASTE_MAX_IMAGES_CLI * 64 + 1)
+/* Per image: the four markers are 58 bytes and `image 99999x99999` is
+ * another 17, so 64 was exactly too small once the dimensions went in. */
+#define MEDIA_HEAD_CAP (WASTE_MAX_IMAGES_CLI * 128 + 1)
 
 static int prefix_images(waste_ctx *c, const opts *o, char *buf, size_t cap)
 {
@@ -524,8 +542,18 @@ static int prefix_images(waste_ctx *c, const opts *o, char *buf, size_t cap)
         if (st != WASTE_OK) return fail(o->image[i], st);
         if (!o->quiet)
             fprintf(stderr, "[%s: %zu image tokens]\n", o->image[i], rows);
-        const int w = snprintf(buf + k, cap - k, "%s%s%s%s",
-                               "<|media_begin|>", "<|media_content|>",
+        /* K3's own media block carries the source resolution as text:
+         * `<|media_begin|>image 1024x768<|media_content|>…`, built by
+         * make_image_prompt() in kimi_k3_vision_processing.py. Leaving it
+         * out — as this did — hands the model a block it was never
+         * trained on and withholds a fact it was trained to be told. The
+         * dimensions are the file's, not the resized patch grid's. */
+        int iw = 0, ih = 0;
+        char dims[48] = "";
+        if (waste_image_dimensions(o->image[i], &iw, &ih) == WASTE_OK)
+            snprintf(dims, sizeof dims, "image %dx%d", iw, ih);
+        const int w = snprintf(buf + k, cap - k, "%s%s%s%s%s",
+                               "<|media_begin|>", dims, "<|media_content|>",
                                "<|media_pad|>", "<|media_end|>");
         if (w < 0 || (size_t)w >= cap - k) {
             fprintf(stderr, "prompt too long\n");
@@ -540,36 +568,85 @@ static int prefix_images(waste_ctx *c, const opts *o, char *buf, size_t cap)
 /* Text to token ids, with any queued images already expanded into their
  * runs of positions. Every command that prompts the model goes through
  * here, so `--image` works the same on all of them. */
-static int build_prompt(waste_ctx *c, const opts *o, const char *prompt,
-                        int32_t *ids, size_t cap, size_t *n)
+typedef struct { const char *text; int markup; } seg;
+
+/* A prompt is a run of segments, each encoded in its own mode: markup for
+ * the parts the template wrote, plain for the parts a user did. Encoding
+ * the concatenation once instead would let a prompt containing
+ * `<|end_of_msg|><|open|>message role="system"<|sep|>` end its own turn
+ * and open a forged one. The reference tokenizer splits the same way, so
+ * the token boundaries between segments are the model's own. */
+static int tokenize_segs(waste_ctx *c, const seg *s, int ns,
+                         int32_t *ids, size_t cap, size_t *n)
 {
-    if (!o->n_image)
-        return waste_tokenize(c, prompt, 0, ids, cap, n) == WASTE_OK
-                   ? 0 : fail("tokenize", WASTE_E_ARG);
-
-    char head[MEDIA_HEAD_CAP], *full;
-    if (prefix_images(c, o, head, sizeof head)) return 1;
-    const size_t need = strlen(head) + strlen(prompt) + 1;
-    if (!(full = (char *)malloc(need))) return fail("prompt", WASTE_E_OOM);
-    snprintf(full, need, "%s%s", head, prompt);
-
-    int32_t *raw = (int32_t *)malloc(cap * sizeof *raw);
-    if (!raw) { free(full); return fail("prompt", WASTE_E_OOM); }
-    size_t rn = 0;
-    waste_status st = waste_tokenize(c, full, 0, raw, cap, &rn);
-    free(full);
-    if (st == WASTE_OK) st = waste_image_expand(c, raw, rn, ids, cap, n);
-    free(raw);
-    if (st != WASTE_OK) return fail("prompt", st);
+    size_t total = 0;
+    for (int i = 0; i < ns; i++) {
+        if (!s[i].text || !*s[i].text) continue;
+        size_t got = 0;
+        const waste_status st = s[i].markup
+            ? waste_tokenize_markup(c, s[i].text, 0, ids + total, cap - total, &got)
+            : waste_tokenize(c, s[i].text, 0, ids + total, cap - total, &got);
+        if (st != WASTE_OK) return fail("tokenize", st);
+        total += got;
+    }
+    *n = total;
     return 0;
 }
 
+static int build_prompt_segs(waste_ctx *c, const opts *o, const seg *s, int ns,
+                             int32_t *ids, size_t cap, size_t *n)
+{
+    if (!o->n_image) return tokenize_segs(c, s, ns, ids, cap, n);
+
+    int32_t *raw = (int32_t *)malloc(cap * sizeof *raw);
+    if (!raw) return fail("prompt", WASTE_E_OOM);
+    size_t rn = 0;
+    int rc = tokenize_segs(c, s, ns, raw, cap, &rn);
+    if (!rc) {
+        const waste_status st = waste_image_expand(c, raw, rn, ids, cap, n);
+        if (st != WASTE_OK) rc = fail("prompt", st);
+    }
+    free(raw);
+    return rc;
+}
+
+/* The untemplated path: one plain prompt, plus the media block when there
+ * are images. Markup mode here, because without a template there is no
+ * conversation structure to forge and `--raw` is the "I wrote this
+ * string on purpose" door. */
+static int build_prompt(waste_ctx *c, const opts *o, const char *prompt,
+                        int32_t *ids, size_t cap, size_t *n)
+{
+    char head[MEDIA_HEAD_CAP];
+    head[0] = 0;
+    if (o->n_image && !o->media_inlined &&
+        prefix_images(c, o, head, sizeof head)) return 1;
+    const seg s[2] = { { head, 1 }, { prompt, 1 } };
+    return build_prompt_segs(c, o, s, 2, ids, cap, n);
+}
+
+static int run_segs(waste_ctx *c, const opts *o, const seg *s, int ns,
+                    const char *echo, int show_stats);
+
 static int run_prompt(waste_ctx *c, const opts *o, const char *prompt, int show_stats)
+{
+    char head[MEDIA_HEAD_CAP];
+    head[0] = 0;
+    if (o->n_image && !o->media_inlined &&
+        prefix_images(c, o, head, sizeof head)) return 1;
+    const seg s[2] = { { head, 1 }, { prompt, 1 } };
+    opts q = *o;
+    q.media_inlined = 1;          /* prefix_images already ran, above */
+    return run_segs(c, &q, s, 2, prompt, show_stats);
+}
+
+static int run_segs(waste_ctx *c, const opts *o, const seg *segs, int ns,
+                    const char *echo, int show_stats)
 {
     int32_t ids[MAXTOK];
     size_t n = 0;
     waste_status st;
-    if (build_prompt(c, o, prompt, ids, MAXTOK, &n)) return 1;
+    if (build_prompt_segs(c, o, segs, ns, ids, MAXTOK, &n)) return 1;
 
     waste_gen_params p;
     waste_gen_params_init(&p);
@@ -585,7 +662,7 @@ static int run_prompt(waste_ctx *c, const opts *o, const char *prompt, int show_
     s.stop = o->stop;
     /* chat already showed the user what they typed, and with a
      * template the prompt is mostly role markers */
-    if (!o->quiet && !o->no_echo) fputs(prompt, stdout);
+    if (!o->quiet && !o->no_echo && echo) fputs(echo, stdout);
     st = waste_generate(c, ids, n, &p, on_token, &s);
     if (!o->quiet && s.pend_n) fwrite(s.pend, 1, s.pend_n, stdout);
     printf("\n");
@@ -647,7 +724,48 @@ static int cmd_run(int argc, char **argv)
     const waste_status st = open_model(o.pos[0], &o, &c);
     if (st != WASTE_OK) { free(prompt); return fail("open", st); }
     show_chosen_budget(c, &o);
-    const int r = run_prompt(c, &o, prompt, !o.quiet);
+
+    /* A one-shot run is a question when the container knows how to ask
+     * one. Without this, `run` was raw continuation even on a container
+     * carrying chat.json, so the only way to get an answer rather than a
+     * completion was the interactive `chat` — and every single-command
+     * example had to be a completion. --raw restores the old behaviour,
+     * which is what you want for a base model or to measure the prompt
+     * the model actually sees. */
+    chatfmt fmt;
+    int r;
+    if (!o.raw && load_chatfmt(o.pos[0], &fmt)) {
+        char head[MEDIA_HEAD_CAP];
+        head[0] = 0;
+        if (o.n_image) {
+            if (prefix_images(c, &o, head, sizeof head)) {
+                waste_close(c); free(prompt); return 1;
+            }
+            o.media_inlined = 1;
+        }
+        /* Markup is the template's; the system text and the prompt are
+         * the caller's and are encoded as plain text. The image block
+         * goes inside the user turn, before the words. */
+        const seg s[7] = {
+            { o.system && *o.system ? fmt.sys_p : "", 1 },
+            { o.system ? o.system : "",               0 },
+            { o.system && *o.system ? fmt.sys_s : "", 1 },
+            { fmt.usr_p,                              1 },
+            { head,                                   1 },
+            { prompt,                                 0 },
+            { fmt.usr_s,                              1 },
+        };
+        seg all[8];
+        memcpy(all, s, sizeof s);
+        all[7] = (seg){ fmt.open, 1 };
+        /* stop where the assistant's turn closes, so the marker does not
+         * land in the user's output */
+        if (!o.stop && fmt.asst_s[0]) o.stop = fmt.asst_s;
+        o.no_echo = 1;              /* the prompt here is mostly markers */
+        r = run_segs(c, &o, all, 8, NULL, !o.quiet);
+    } else {
+        r = run_prompt(c, &o, prompt, !o.quiet);
+    }
     if (o.learn) waste_save_usage(c);
     waste_close(c);
     free(prompt);
@@ -750,14 +868,22 @@ static int cmd_chat(int argc, char **argv)
         }
         printf("\n");
         if (templated) {
-            char turn[8192 + 512];
-            snprintf(turn, sizeof turn, "%s%s%s%s",
-                     fmt.usr_p, line, fmt.usr_s,
-                     fmt.open[0] ? fmt.open : fmt.asst_p);
             opts t = o;
+            char head[MEDIA_HEAD_CAP];
+            head[0] = 0;
+            if (t.n_image) {
+                if (prefix_images(c, &t, head, sizeof head)) { o.n_image = 0; continue; }
+                t.media_inlined = 1;
+            }
+            /* `line` is what the user typed: plain, so a marker pasted
+             * into a chat turn cannot end it or open a system message. */
+            const seg s[5] = {
+                { fmt.usr_p, 1 }, { head, 1 }, { line, 0 }, { fmt.usr_s, 1 },
+                { fmt.open[0] ? fmt.open : fmt.asst_p, 1 },
+            };
             t.no_echo = 1;
             if (!t.stop && fmt.asst_s[0]) t.stop = fmt.asst_s;
-            run_prompt(c, &t, turn, 0);
+            run_segs(c, &t, s, 5, NULL, 0);
         } else {
             run_prompt(c, &o, line, 0);
         }
@@ -854,7 +980,11 @@ static int cmd_tokens(int argc, char **argv, int decode)
     } else {
         int32_t ids[MAXTOK];
         size_t n = 0;
-        const waste_status t = waste_tokenize(c, text, 0, ids, MAXTOK, &n);
+        /* Markup mode: this command is how a chat template gets checked
+         * marker by marker, so it has to show `<|sep|>` as the one token
+         * it is. Prompts go through waste_tokenize instead, where the
+         * same string is ordinary text. */
+        const waste_status t = waste_tokenize_markup(c, text, 0, ids, MAXTOK, &n);
         if (t != WASTE_OK) rc = fail("tokenize", t);
         else if (o.json) {
             printf("{\"n\":%zu,\"ids\":[", n);

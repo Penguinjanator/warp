@@ -55,6 +55,13 @@ static float sample(const unsigned char *src, int sw, int sh, int ch,
     return (1 - wy) * ((1 - wx) * a + wx * b) + wy * ((1 - wx) * d + wx * e);
 }
 
+int waste_image_size(const char *path, int *w, int *h)
+{
+    int c = 0;
+    if (!path || !w || !h) return -1;
+    return stbi_info(path, w, h, &c) ? 0 : -1;
+}
+
 float *waste_image_load(const char *path, int max_patches,
                         const float *mean, const float *std,
                         int *out_h, int *out_w)

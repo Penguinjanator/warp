@@ -2,10 +2,12 @@
  * Copyright 2026 SQLite Cloud, Inc.
  */
 /*
- * waste_format.h — WASTE container on-disk layout (format v0, draft)
+ * waste_format.h — WASTE container on-disk layout (format v0)
  *
- * See docs/FORMAT.md for the rationale. Field sizes marked TBD freeze
- * after the Kimi K3 weights drop (2026-07-27).
+ * See docs/FORMAT.md for the rationale. Sizes were frozen against the
+ * released Kimi K3 weights (2026-07-27) and the containers built from
+ * them; a reader must take the variable ones from the manifest rather
+ * than from the comments here.
  *
  * Invariants:
  *   - every independently-readable record is 4 KiB aligned and sized in
@@ -45,10 +47,21 @@ typedef enum {
     WQ_F16  = 1, /* low-rank factors, codebooks (bf16 flagged via WF_BF16) */
     WQ_Q8G  = 2, /* int8, f16 scale per group of 128                       */
     WQ_Q4G  = 3, /* int4 packed, f16 scale per group of 128                */
-    WQ_VQ3R = 4, /* ~3.06 b/w: VQ residual, 8-dim vectors, 2^12 codebook   */
-    WQ_VQ2R = 5, /* ~2.12 b/w: VQ residual, 8-dim vectors, 2^8 codebook    */
+    WQ_VQ3R = 4, /* 3.00 b/w: 3 residual stages, 8-dim vectors, 256/stage  */
+    WQ_VQ2R = 5, /* 2.00 b/w: 2 residual stages, 8-dim vectors, 256/stage  */
     WQ_SUB1 = 6, /* ~1.0  b/w: direct VQ substitute (cache-miss fallback)  */
+    WQ_Q3G  = 7, /* 3-bit packed, f16 scale per group of 128. Implemented
+                  * end to end and not the default for anything: measured
+                  * on K3's trunk it buys cache and loses more to the
+                  * unpack, and the output collapses — docs/LEARNED.md §13 */
 } waste_fmt;
+
+/* Bits per weight for VQxR is exactly `stages` — one byte of index per
+ * 8-dim vector per stage — plus one f16 scale per output row, i.e.
+ * 16/n_in amortized. The manifest's expert_quant block carries the real
+ * values (`stages`, `vec_dim`, `entries`, `bits_per_weight`); nothing
+ * should hardcode them. WQ_SUB1 is specified and not written by the
+ * converter in v0. */
 
 /* record flags */
 #define WF_BF16      (1u << 0) /* f16 payloads are bf16                    */
@@ -82,7 +95,12 @@ typedef struct {
     uint32_t up_off;
     uint32_t down_off;
     uint32_t chan_corr_off;  /* per-channel f16 scale+bias, all 3 matrices  */
-    uint32_t crc32;          /* payload checksum (manifest holds blake3)    */
+    uint32_t crc32;          /* payload checksum, written by the converter
+                              * and checked by tools/verify_container.py.
+                              * The engine does NOT verify it on the read
+                              * path: that would cost a pass over every
+                              * expert on every miss. There is no
+                              * whole-container checksum.                   */
     uint32_t reserved1[2];
     /* payload follows, padded to 4 KiB multiple                            */
 } waste_expert_hdr;
@@ -98,8 +116,9 @@ typedef struct {
     uint32_t magic;          /* WASTE_MAGIC_CODEBOOK                        */
     uint16_t codebook_id;
     uint8_t  fmt;            /* which WQ_* this codebook serves             */
-    uint8_t  vec_dim;        /* 8 (TBD via ablation)                        */
-    uint32_t n_entries;      /* 2^12 VQ3R, 2^8 VQ2R (TBD)                   */
+    uint8_t  vec_dim;        /* 8                                           */
+    uint32_t n_entries;      /* 256 per stage; the stage count is what
+                              * VQ3R and VQ2R differ in, not this           */
     uint32_t reserved;
     /* n_entries * vec_dim f16 vectors follow                               */
 } waste_codebook_hdr;

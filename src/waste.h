@@ -16,8 +16,8 @@
  *     ceiling on everything the engine allocates (weights, caches, KV,
  *     scratch). The engine sizes its expert cache to fit and never
  *     exceeds the budget; if the budget is below the floor
- *     (waste_ram_floor), loading fails with WASTE_E_RAM_BUDGET instead of
- *     swapping the machine to death.
+ *     (waste_plan_memory's floor_bytes), loading fails with
+ *     WASTE_E_RAM_BUDGET instead of swapping the machine to death.
  *   - No hidden I/O: expert streaming happens on the caller's thread or
  *     on the engine's own pool, never via page-fault surprises.
  *   - Errors are returned, never printed. Nothing calls exit().
@@ -47,15 +47,15 @@ extern "C" {
  * for an embeddable engine that may be updated independently.
  */
 #define WASTE_VERSION_MAJOR  0
-#define WASTE_VERSION_MINOR  1
+#define WASTE_VERSION_MINOR  5
 #define WASTE_VERSION_PATCH  0
-#define WASTE_VERSION_STRING "0.1.0"
+#define WASTE_VERSION_STRING "0.5.0"
 #define WASTE_VERSION_NUMBER (WASTE_VERSION_MAJOR * 10000 + \
                               WASTE_VERSION_MINOR * 100 + \
                               WASTE_VERSION_PATCH)
 
-const char *waste_version(void);         /* e.g. "0.1.0"                    */
-int         waste_version_number(void);  /* e.g. 100                        */
+const char *waste_version(void);         /* e.g. "0.5.0"                    */
+int         waste_version_number(void);  /* e.g. 500                        */
 /* Build details: backend, SIMD, container format version. Never NULL. */
 const char *waste_build_info(void);
 
@@ -109,11 +109,18 @@ typedef enum {
 
 typedef struct {
     /* Hard ceiling on all engine allocations, used exactly as given.
-     * 0 = the engine picks: waste_memplan.recommended_bytes, capped at 88%
-     * of physical RAM so a model whose recommendation exceeds the machine
-     * does not swap it. Loading fails if the value (or, at 0, the capped
-     * default) is below floor_bytes. waste_memory_used reports what was
-     * actually resolved. */
+     *
+     * 0 = the engine picks, and it picks conservatively: expert cache is
+     * only useful in whole multiples of one token's working set, so it
+     * starts from waste_memplan.recommended_bytes (floor + 3x that set)
+     * and steps down a whole multiple at a time until the total fits
+     * under 7/8 of physical RAM. It does not spend the remainder up to
+     * that ceiling: the last fraction buys a little hit rate and risks
+     * the OS paging the cache out, which costs far more than it gains.
+     * When not even floor + 1x fits, it runs at floor_bytes.
+     *
+     * Loading fails with WASTE_E_RAM_BUDGET if the value given is below
+     * floor_bytes. waste_memory_used reports what was actually resolved. */
     uint64_t ram_budget_bytes;
 
     uint32_t ctx_tokens;        /* 0 = container default                   */
@@ -148,8 +155,22 @@ waste_status waste_memory_used(const waste_ctx *ctx, waste_memplan *out);
 
 /* ---- tokenizer --------------------------------------------------------- */
 
+/* Ordinary text. A `<|...|>` marker inside it is encoded as the ordinary
+ * tokens it looks like — never as a control token — so text from a user,
+ * a document or a tool result cannot close the current turn or forge a
+ * system message. Use this for anything you did not write yourself. */
 waste_status waste_tokenize(waste_ctx *ctx, const char *text, int add_bos,
                             int32_t *out_tokens, size_t cap, size_t *n_out);
+
+/* The same, with the container's special tokens recognised: this is what
+ * a chat template is made of, and what `waste tokenize` reports so a
+ * template can be checked marker by marker. Build a prompt by calling
+ * this for the markup and waste_tokenize for the content, the way
+ * K3's own tokenizer splits allowed_special from disallowed_special —
+ * concatenating them into one string and encoding it once hands whoever
+ * wrote the content the ability to write the structure too. */
+waste_status waste_tokenize_markup(waste_ctx *ctx, const char *text, int add_bos,
+                                   int32_t *out_tokens, size_t cap, size_t *n_out);
 waste_status waste_detokenize(waste_ctx *ctx, const int32_t *tokens, size_t n,
                               char *out, size_t cap, size_t *n_out);
 
@@ -184,6 +205,14 @@ waste_status waste_detokenize(waste_ctx *ctx, const int32_t *tokens, size_t n,
  * positions are already in the attention state. */
 waste_status waste_image_add(waste_ctx *ctx, const char *path,
                              size_t *n_tokens_out);
+
+/* Source pixel dimensions, read from the file header without decoding it
+ * and without needing a context. K3 wraps an image as
+ *   <|media_begin|>image WxH<|media_content|><|media_pad|><|media_end|>
+ * and those are the *original* dimensions, not the resized patch grid —
+ * the model was trained to be told the resolution it is looking at. A
+ * host building the media block itself needs them before add(). */
+waste_status waste_image_dimensions(const char *path, int *w, int *h);
 waste_status waste_image_expand(waste_ctx *ctx, const int32_t *tokens, size_t n,
                                 int32_t *out, size_t cap, size_t *n_out);
 void waste_image_clear(waste_ctx *ctx);

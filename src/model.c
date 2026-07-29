@@ -620,6 +620,7 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     c->n_shared = (int)js_int(d, js_get(d, cfg, "num_shared_experts"), 0);
     c->first_dense = (int)js_int(d, js_get(d, cfg, "first_k_dense_replace"), 0);
     c->vocab = (int)js_int(d, js_get(d, cfg, "vocab_size"), 0);
+    c->eos_token_id = (int)js_int(d, js_get(d, cfg, "eos_token_id"), 0);
     c->n_heads = (int)js_int(d, js_get(d, cfg, "num_attention_heads"), 0);
     c->kv_lora = (int)js_int(d, js_get(d, cfg, "kv_lora_rank"), 0);
     c->q_lora = (int)js_int(d, js_get(d, cfg, "q_lora_rank"), 0);
@@ -773,10 +774,16 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                                      "media_placeholder_token_id"), -1);
                 v->max_patches = (int)js_int(&vd, js_get(&vd, 0,
                                      "max_patches"), 1024);
-                {   /* no preprocessor config ships with K3; these are the
-                     * CLIP constants, overridable in vision.json */
-                    static const float dm[3] = {0.48145466f, 0.4578275f, 0.40821073f};
-                    static const float ds[3] = {0.26862954f, 0.26130258f, 0.27577711f};
+                {   /* K3 normalizes to [-1, 1]: preprocessor_config.json
+                     * carries mean = std = 0.5 under `media_proc_cfg`, and
+                     * kimi_k3_vision_processing.py applies exactly those.
+                     * These used to be the CLIP constants, on the belief
+                     * that the release shipped no preprocessor config. It
+                     * does. The converter writes the real values into
+                     * vision.json, which overrides this; the fallback is
+                     * for a container converted without the file present. */
+                    static const float dm[3] = {0.5f, 0.5f, 0.5f};
+                    static const float ds[3] = {0.5f, 0.5f, 0.5f};
                     const int mi = js_get(&vd, 0, "image_mean");
                     const int si = js_get(&vd, 0, "image_std");
                     for (int k = 0; k < 3; k++) {

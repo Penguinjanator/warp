@@ -58,6 +58,11 @@ typedef struct {
     int   act_situ;                  /* 1 = SiTU instead of SiLU            */
     float situ_beta, situ_linear_beta;
     char  prefix[64];                /* "" or "language_model." (K3)        */
+    /* generation_config.json's eos_token_id, mirrored into the container
+     * config. The tokenizer used to derive this positionally as
+     * base_vocab + 2, which is right on both Kimi models by luck of the
+     * reserved-block layout and is a guess everywhere else. Read it. */
+    int   eos_token_id;              /* 0 = not stated, keep the default    */
     /* The HF architecture the container was built from. Both models call
      * themselves model_type "kimi_linear", so this is the only field that
      * tells them apart by name rather than by feature. */
@@ -192,6 +197,10 @@ int waste_vision_available(const waste_model *m);
 /* Decodes an image and lays it out as [gh*gw][3*14*14], normalized. The
  * grid is chosen to keep the aspect ratio under `max_patches` and to be
  * even on both axes, because the tower merges 2x2. Caller frees. */
+/* Source dimensions without decoding the pixels. K3 writes them into the
+ * media block as text, so the wrapper needs them before the encode. */
+int waste_image_size(const char *path, int *w, int *h);
+
 float *waste_image_load(const char *path, int max_patches,
                         const float *mean, const float *std,
                         int *out_h, int *out_w);

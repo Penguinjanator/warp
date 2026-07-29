@@ -297,18 +297,37 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
 
     /* Resolve the budget. A budget the caller set is a contract and is used
      * as given. A zero means "you decide", and that decision has to know the
-     * machine: recommended_bytes comes from the model alone — 80.85 GB on K3
+     * machine: recommended_bytes comes from the model alone — 80.63 GB on K3
      * — so defaulting to it on a 64 GB laptop would ask for 51 GB of expert
      * cache and swap, which is the one thing the budget exists to prevent.
-     * Cap the default at what the machine can hold, never below the floor. */
+     *
+     * What it must NOT do is then take every byte up to the cap. Expert
+     * cache is only worth anything in whole multiples of one token's
+     * working set: below one multiple it keeps nothing alive between
+     * tokens (Gate 5), and the fractional remainder above a multiple buys
+     * a few points of hit rate while pushing the machine towards paging —
+     * where a "hit" costs a page fault and throughput collapses by 8x
+     * (docs/LEARNED.md §16). Filling the cap is how the default landed a
+     * 27.32 GB cache on this laptop, between two budgets measured at
+     * 0.11 and 0.04 tok/s, when 17.32 GB runs at 0.32.
+     *
+     * So step down a whole working set at a time and take the largest
+     * that fits. On 64 GB K3 gets floor + 1x = 46 GB, the measured
+     * optimum; on 128 GB it still gets the full floor + 3x; a model whose
+     * recommendation already fits, like Kimi-Linear, is unaffected. When
+     * not even one multiple fits, run at the floor and say so below. */
     const uint64_t phys = waste_physical_ram();
     const uint64_t cap = phys ? phys - phys / 8 : 0;   /* 12% left to the OS */
     uint64_t budget = cfg.ram_budget_bytes;
 
     if (!budget) {
-        budget = c->plan.recommended_bytes;
-        if (cap && budget > cap)
-            budget = cap > c->plan.floor_bytes ? cap : c->plan.floor_bytes;
+        /* exact: recommended_bytes is floor + 3 * working_set by construction */
+        const uint64_t ws = (c->plan.recommended_bytes - c->plan.floor_bytes) / 3;
+        budget = c->plan.floor_bytes;
+        for (int k = 3; k >= 1; k--) {
+            const uint64_t b = c->plan.floor_bytes + ws * (uint64_t)k;
+            if (!cap || b <= cap) { budget = b; break; }
+        }
     }
     if (budget < c->plan.floor_bytes) { free(c); return WASTE_E_RAM_BUDGET; }
 
@@ -342,6 +361,7 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
     }
     quant_summary(c);
     c->tok = waste_tok_open(model_path);      /* optional */
+    if (c->tok) waste_tok_set_eos(c->tok, c->m.cfg.eos_token_id);
     /* warm the cache from what previous runs learned, if anything */
     c->warmed = waste_model_warm_cache(&c->m, model_path);
     *out = c;
@@ -367,17 +387,31 @@ waste_status waste_memory_used(const waste_ctx *c, waste_memplan *out)
 
 /* ---- tokenizer ---------------------------------------------------------- */
 
-waste_status waste_tokenize(waste_ctx *c, const char *text, int add_bos,
-                            int32_t *out, size_t cap, size_t *n_out)
+static waste_status tokenize_1(waste_ctx *c, const char *text, int add_bos,
+                               int32_t *out, size_t cap, size_t *n_out,
+                               int allow_special)
 {
     if (!c || !text || !out || !n_out) return WASTE_E_ARG;
     if (!c->tok) return WASTE_E_UNSUPPORTED;
     size_t n = 0;
     if (add_bos && cap > 0) out[n++] = (int32_t)waste_tok_bos(c->tok);
-    const int got = waste_tok_encode(c->tok, text, out + n, (int)(cap - n));
+    const int got = waste_tok_encode(c->tok, text, out + n, (int)(cap - n),
+                                     allow_special);
     if (got < 0) return WASTE_E_ARG;
     *n_out = n + (size_t)got;
     return WASTE_OK;
+}
+
+waste_status waste_tokenize(waste_ctx *c, const char *text, int add_bos,
+                            int32_t *out, size_t cap, size_t *n_out)
+{
+    return tokenize_1(c, text, add_bos, out, cap, n_out, 0);
+}
+
+waste_status waste_tokenize_markup(waste_ctx *c, const char *text, int add_bos,
+                                   int32_t *out, size_t cap, size_t *n_out)
+{
+    return tokenize_1(c, text, add_bos, out, cap, n_out, 1);
 }
 
 waste_status waste_detokenize(waste_ctx *c, const int32_t *ids, size_t n,
@@ -408,6 +442,12 @@ static waste_status check_ids(const waste_ctx *c, const int32_t *ids, size_t n)
 
 
 /* ---- images ------------------------------------------------------------- */
+
+waste_status waste_image_dimensions(const char *path, int *w, int *h)
+{
+    if (!path || !w || !h) return WASTE_E_ARG;
+    return waste_image_size(path, w, h) == 0 ? WASTE_OK : WASTE_E_IO;
+}
 
 void waste_image_clear(waste_ctx *c)
 {
