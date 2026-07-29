@@ -59,6 +59,15 @@ jobs:
       # the opmask and ZMM bits clear in XCR0. A hosted runner is the
       # cheapest hardware that might have it, so ask, and let the backend
       # line below say what the engine then chose.
+      #
+      # The answer so far is no. The x86 runner is an AMD EPYC 7763, which
+      # answers avx512f/bw/dq/vl: no, and `waste version` on it says
+      # backend AVX2 — so the AVX-512 kernels are still compiled, linked
+      # and never entered. This step exists so that the day a runner does
+      # have them, the *SIMD backend matches the CPU baseline* check
+      # becomes the confirmation without anyone arranging it. Do not read
+      # that check passing as evidence about AVX-512: it passes on
+      # whichever backend dispatch actually chose.
       - name: Toolchain and architecture
         run: |
           uname -m

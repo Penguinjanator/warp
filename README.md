@@ -301,15 +301,16 @@ memory rather than arithmetic.
 ```bash
 git clone https://github.com/sqliteai/waste && cd waste
 make                          # libwaste.a, waste, libwastevq
-make check                    # 19 pass, 10 skip on a fresh clone
+make check                    # 23 pass, 11 skip on a fresh clone
 ```
 
 No configure step and no dependency resolution. `make check` needs no
 model: it builds a small synthetic container and runs the engine against
-it. The ten skips are the checks that need real weights — the PyTorch
-oracle, the round-trip against the source shards, and anything driving
-the CLI with text, since the synthetic container carries no tokenizer.
-With both containers present the suite is 31 checks.
+it. The eleven skips are the checks that need something a clone does not
+carry — the PyTorch oracle, the round-trip against the source shards,
+anything driving the CLI with text, since the synthetic container carries
+no tokenizer, and the K3 checks, which want the container and the release
+on disk. With both containers present the suite is 36 checks.
 
 ### Converting Kimi K3
 
@@ -394,6 +395,22 @@ not silently two different runs:
 ```
 waste: no --budget, using 46.24 GB of 64.00 GB (expert cache 17.56 GB)
 ```
+
+`--verify` checks each expert record's `crc32` as it comes off the disk.
+It is off by default, and that is a throughput decision rather than a
+claim that containers do not rot: it is a pass over every record on every
+cache miss, about 5% on Kimi-Linear and about 1% on K3, where the read
+dominates. Turn it on once for a container you copied, downloaded, or left
+on a disk you do not trust, and for anything whose wrong answers would be
+believed; leave it off for one you converted yourself and have been
+reading since. `WASTE_VERIFY=1` in the environment does the same thing,
+and it is the only way in for the server, which has no flag of its own.
+Either turns it on; neither turns it off.
+
+What is checked either way: a short read, and a record header that does
+not describe the expert the bank index asked for. Those are O(1), they
+cost nothing measurable, and they are what keeps a damaged offset out of
+the arithmetic — `--verify` only adds the pass over the payload.
 
 `waste --help` lists all nine commands. `--json` makes `eval`, `tokenize`,
 `plan`, `info` and `bench` machine-readable.
@@ -499,17 +516,16 @@ honest caveat is not a substitute for reading the file.
 
 | | build | model-free suite | backend |
 |---|---|---|---|
-| macOS arm64 | yes | 19 pass / 0 fail / 10 skip | NEON |
-| Linux arm64 | yes | 17 pass / 0 fail / 11 skip | NEON |
-| Linux x86_64 | yes | 17 pass / 0 fail / 11 skip | AVX2 |
+| macOS arm64 | yes | 23 pass / 0 fail / 11 skip | NEON |
+| Linux arm64 | yes | 23 pass / 0 fail / 11 skip | NEON |
+| Linux x86_64 | yes | 23 pass / 0 fail / 11 skip | AVX2 |
 | Windows x86_64 | yes | container, CLI and forward pass — see below | AVX2 |
 
-The first three run the same suite. CI has no container, so
+The first three run the same suite and now agree check for check: same
+23 passes, same 11 skips, same list. CI has no container, so
 `tests/run.sh` builds a synthetic one and the checks that need real
-weights say SKIP rather than passing quietly. The Linux rows skip one
-more than macOS only because that image has no `uv`, which collapses the
-two kernel checks into a single skip; both also pass the sanitizer suite
-and 400 fuzz cases.
+weights say SKIP rather than passing quietly. All three also pass the
+sanitizer suite and 400 fuzz cases.
 
 Windows is cross-compiled with MinGW-w64 on a Linux runner and then run
 on a Windows one: the binary reads a synthetic container, opens it from
@@ -550,8 +566,8 @@ serve/      the OpenAI-compatible server, the other client
   server.py   /v1/chat/completions and friends
 tools/      conversion and validation (Python, never at run time)
 docs/       format, engine, backends, and what was learned
-tests/      31 checks, and a diff against a PyTorch oracle given a model
-  serve/      147 more for the server, incl. a differential vs upstream
+tests/      34 checks, and a diff against a PyTorch oracle given a model
+  serve/      149 more for the server, incl. a differential vs upstream
 examples/   chat.json for K3 and ChatML, the format a container carries
 third_party/ stb_image.h, the single vendored header — see its README
 ```
@@ -563,18 +579,9 @@ bit allocation — with the numbers that killed them.
 
 ## What is not there yet
 
-Version 0.5.0, and the API is not frozen. Stated plainly, because finding
+Version 0.6.0, and the API is not frozen. Stated plainly, because finding
 these out for yourself is worse than reading them here:
 
-- **tool calls, JSON schemas and the think channel are server-only.** K3
-  builds its prompt with a Python program rather than a Jinja template,
-  and `examples/chat-k3.json` transcribes only the part that fits four
-  prefix/suffix strings — enough for a conversation, not for a typed
-  argument list. `serve/` carries the whole format and parses the reply
-  back into reasoning, answer and tool calls, under 149 tests. So the
-  capability exists; it is reachable through `python3 -m serve` and not
-  through `waste chat`, and that split is deliberate rather than
-  temporary: a C engine should not grow a JSON Schema renderer;
 - a container carries its chat format in `chat.json`, and the converter
   can only fill it in for a model whose format has been transcribed from
   its reference encoder — K3 today. Neither Kimi release distributes a
@@ -584,10 +591,11 @@ these out for yourself is worse than reading them here:
 - AVX-512 compiles and is dispatched from CPUID, and has still never
   executed an instruction. This laptop is ARM and its x86 emulation is
   Rosetta, which reports AVX2 and leaves the ZMM state disabled in XCR0;
-  the first CI run to get that far answered **AVX2** as well. The workflow
-  prints the runner's flags before every build, so the day a runner has
-  them the *SIMD backend matches the CPU baseline* check becomes the
-  confirmation without anyone arranging it;
+  the hosted x86 runner is an AMD EPYC 7763, which answers
+  `avx512f/bw/dq/vl: no`, so CI says **AVX2** as well — on Linux and on
+  Windows both. The workflow prints the runner's flags before every
+  build, so the day a runner has them the *SIMD backend matches the CPU
+  baseline* check becomes the confirmation without anyone arranging it;
 - **Windows builds and runs, on one toolchain and one CPU.** MinGW-w64
   x86_64, cross-compiled, with `src/platform.h` holding the six calls
   that are not POSIX: the positional read, the aligned allocation, the
@@ -602,9 +610,13 @@ these out for yourself is worse than reading them here:
   throughput on every token, against a container that is usually fine —
   and it means the default build of a rotted container still answers with
   whatever the damaged bytes decode to. Run `--verify` once after copying
-  a container, or `tools/verify_container.py` to audit it offline. The
-  second is not a decision: the trunk and the codebooks have nothing to
-  check against in the format, and nothing has been built in its place;
+  a container, to establish that it arrived intact.
+  `tools/verify_container.py` does not stand in for that: it re-derives
+  records against the **source** weights, so it wants torch and the
+  original checkpoint on disk, and it answers whether the conversion was
+  right rather than whether the copy still is. The second is not a
+  decision: the trunk and the codebooks have nothing to check against in
+  the format, and nothing has been built in its place;
 - every expert in a container is at the same bit width. The non-uniform
   per-expert allocation the format was designed around is **not coming**:
   it was measured on both models rather than built, and the importance it

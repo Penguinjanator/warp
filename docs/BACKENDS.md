@@ -51,7 +51,7 @@ of this section can stay about the mechanism:
 | portable C baseline | `kda.c`, `model.c`, `vq.c` | always compiled in |
 | NEON | `kda_neon.c` + inline in `model.c`/`vq.c` | default on ARM |
 | AVX2 | `simd_avx2.c` | verified on Linux/x86_64 |
-| AVX-512 | `simd_avx512.c` | compiled and dispatched, never executed |
+| AVX-512 | `simd_avx512.c` | compiled and dispatched, never executed — CI runner is Zen 3, confirmed 2026-07-29 |
 | Metal | `metal.m` | correct, off by default, 22% slower |
 | CUDA, BLAS, ROCm | — | not implemented; the flag refuses to build |
 | SVE, RVV | — | not implemented |
@@ -384,7 +384,35 @@ flags before it builds — if a hosted runner has them, `waste version`
 on the next push says `AVX-512` instead of `AVX2` and the *SIMD backend
 matches the CPU baseline* check becomes the confirmation, at no cost.
 If it does not, this stays open until someone runs the suite on an Ice
-Lake, a Sapphire Rapids or a Zen 4.
+Lake, a Sapphire Rapids or a Zen 4. It did not; see below.
+
+### The runner answered, and the answer is no (2026-07-29)
+
+The workflow asked, and the hosted x86 runner closed the cheap option:
+
+```
+model name	: AMD EPYC 7763 64-Core Processor
+  avx2: yes
+  avx512f: no   avx512bw: no   avx512dq: no   avx512vl: no
+WASTE 0.6.0 (container v0, backend AVX2, crc32 slice8, x86_64)
+```
+
+An EPYC 7763 is Milan, which is Zen 3 — AMD added AVX-512 in Zen 4, so
+this is the generation before. The Windows x86_64 job reports `backend
+AVX2` as well. The AVX-512 kernels are therefore still compiled, linked,
+dispatched past and never entered, on every target this project builds
+for.
+
+One consequence is worth stating, because the check invites exactly the
+wrong reading: *SIMD backend matches the CPU baseline* **passes** on
+linux-x86_64 and says nothing whatsoever about AVX-512. It compares the
+dispatched path against `WASTE_BACKEND=cpu`, and the dispatched path
+there is AVX2. A green CI is not evidence about the AVX-512 kernels;
+only the flags line above says which backend was under test.
+
+So this stays open, and the hardware it wants is now specific: Zen 4 or
+later on AMD, Ice Lake or Sapphire Rapids or later on Intel. A larger
+hosted runner class would also reach it, at cost.
 
 ## Metal: it works, and it loses (2026-07-28)
 
