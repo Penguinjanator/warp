@@ -96,8 +96,16 @@ OBJ := $(SRC:.c=.o) $(OBJCSRC:.m=.o)
 src/metal.o: src/metal.m
 	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
 
-src/simd_avx2.o:   CFLAGS += -mavx2 -mfma
-src/simd_avx512.o: CFLAGS += -mavx512f -mavx512bw
+# `override`, and it is load-bearing. A plain target-specific `CFLAGS +=`
+# is discarded whenever CFLAGS arrives from the command line — which is
+# exactly what `make asan` and `make fuzz-asan` do when they re-enter make
+# with the sanitizer flags. Without it those builds compile simd_avx2.c
+# with no -mavx2, and gcc then refuses to inline the always_inline AVX
+# intrinsics ("target specific option mismatch") instead of doing anything
+# so helpful as warning that the flag went missing. Invisible on ARM,
+# where these translation units are not in SRC at all.
+src/simd_avx2.o:   override CFLAGS += -mavx2 -mfma
+src/simd_avx512.o: override CFLAGS += -mavx512f -mavx512bw
 
 all: waste libwaste.a libwastevq.$(SOEXT)
 
@@ -115,12 +123,22 @@ libwaste.a: $(OBJ)
 waste: cli/main.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-test: test_kda test_container test_forward test_tokenizer test_k3parts test_state test_vision test_image
+# One list, used by both `test` and `clean`. A stale test binary is one of
+# the two failures tests/run.sh was written to catch, so a binary that
+# `test` builds and `clean` forgets defeats the check meant to notice it.
+TESTBINS := test_kda test_container test_forward test_tokenizer test_k3parts \
+            test_state test_vision test_image
+
+test: $(TESTBINS)
 
 test_kda: tests/test_kda.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+# Every link rule passes LDLIBS, including the one target that does not
+# currently need it. `test_image` omitted it and linked fine on macOS for
+# a week: clang folded the one sqrt() in image.c, glibc did not, and the
+# Linux build failed on an undefined reference the day CI first saw it.
 test_container: tests/test_container.o
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 test_forward: tests/test_forward.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 test_tokenizer: tests/test_tokenizer.o libwaste.a
@@ -128,7 +146,7 @@ test_tokenizer: tests/test_tokenizer.o libwaste.a
 test_k3parts: tests/test_k3parts.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 test_image: tests/test_image.o libwaste.a
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 test_vision: tests/test_vision.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
@@ -142,9 +160,8 @@ test_state: tests/test_state.o libwaste.a
 
 clean:
 	rm -f $(OBJ) cli/*.o tests/*.o $(OBJ:.o=.d) cli/*.d tests/*.d libwaste.a waste \
-	      test_kda test_container test_forward test_tokenizer test_k3parts test_state \
-	      test_image \
-	      libwastevq.dylib libwastevq.so
+	      $(TESTBINS) libwastevq.dylib libwastevq.so
+	rm -rf libwastevq.dylib.dSYM
 
 check: test
 	@tests/run.sh
@@ -184,5 +201,3 @@ fuzz-asan:
 	 $(MAKE) --no-print-directory clean; exit $$rc
 
 .PHONY: all test check clean asan fuzz fuzz-asan
-
-.PHONY: all test check clean

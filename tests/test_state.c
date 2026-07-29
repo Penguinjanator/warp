@@ -28,7 +28,17 @@ int main(int argc, char **argv)
     if (argc < 2) { fprintf(stderr, "usage: %s MODEL\n", argv[0]); return 2; }
     waste_cfg cfg;
     waste_cfg_init(&cfg);
-    cfg.ram_budget_bytes = 6ULL << 30;
+    /* 0 = let the engine size itself: the container's recommendation,
+     * capped at what this machine can hold. This used to be a hardcoded
+     * 6 GB, which is a hard ceiling the engine then *fills* with expert
+     * cache — 6 GB of it, to test session round-trip on a 1 MB synthetic
+     * container. Invisible on a 64 GB laptop and an OOM kill in a CI
+     * container, which is a stupid way to lose a check that has nothing
+     * to do with memory. The budget still has to clear the floor of
+     * whatever container is passed, and letting the engine choose is the
+     * only value that does that for both the synthetic one and a real
+     * model. */
+    cfg.ram_budget_bytes = 0;
     waste_ctx *c;
     if (waste_open(argv[1], &cfg, &c) != WASTE_OK) { fprintf(stderr, "open\n"); return 1; }
 

@@ -5,6 +5,8 @@ __pycache__/
 model.waste/
 *.waste
 *.o
+# clang writes these beside the object when a build is interrupted
+*.o.tmp
 /test_*
 waste
 libwaste.a
