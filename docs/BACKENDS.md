@@ -346,6 +346,37 @@ same "matches the CPU baseline" check to be the thing that decides it.
 No performance numbers from any of this: x86 here is emulated, so timings
 would measure Rosetta.
 
+### Emulation cannot close this gap (2026-07-29)
+
+Asked directly whether Docker could execute the AVX-512 path, and the
+answer is no, for a reason worth writing down rather than re-deriving.
+A CPUID probe inside `--platform linux/amd64` reports:
+
+```
+cpu        : VirtualApple @ 2.50GHz
+AVX2       : 1
+AVX512F    : 0
+XCR0       : 0x7  (SSE 1 YMM 1 opmask 0 ZMM_hi 0 hi16 0)
+```
+
+That brand string is **Rosetta 2**, not QEMU — Docker Desktop on Apple
+silicon translates x86 with Rosetta by default, which is also why
+`QEMU_CPU=max`, `Skylake-Server-v4` and `Sapphire-Rapids` all change
+nothing: the variable means nothing to a translator that is not QEMU.
+Rosetta implements AVX2 and not AVX-512, and `XCR0 = 0x7` says the
+opmask and ZMM state is not enabled, so an AVX-512 instruction could not
+retire even if it decoded. Switching Docker to QEMU would not obviously
+help either: TCG has implemented AVX/AVX2 for some releases and AVX-512
+is not among them.
+
+So the gap needs hardware. The cheapest that might already exist is the
+CI runner, and the workflow now prints the CPU model and its avx512
+flags before it builds — if a hosted runner has them, `waste version`
+on the next push says `AVX-512` instead of `AVX2` and the *SIMD backend
+matches the CPU baseline* check becomes the confirmation, at no cost.
+If it does not, this stays open until someone runs the suite on an Ice
+Lake, a Sapphire Rapids or a Zen 4.
+
 ## Metal: it works, and it loses (2026-07-28)
 
 `src/metal.m` implements `mvq_rows_f32` — the quantized matvec every trunk

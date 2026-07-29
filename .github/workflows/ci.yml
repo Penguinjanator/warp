@@ -47,11 +47,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The SIMD line is not decoration. AVX-512 compiles and dispatches
+      # here and has never executed: no machine we own has it, and it
+      # cannot be emulated on the development laptop — Docker on Apple
+      # silicon runs x86 through Rosetta, which reports AVX2 and leaves
+      # the opmask and ZMM bits clear in XCR0. A hosted runner is the
+      # cheapest hardware that might have it, so ask, and let the backend
+      # line below say what the engine then chose.
       - name: Toolchain and architecture
         run: |
           uname -m
           cc --version | head -1
           make --version | head -1
+          if [ -r /proc/cpuinfo ]; then
+            model=$(grep -m1 'model name' /proc/cpuinfo || true)
+            echo "${model:-cpu model unknown}"
+            for f in avx2 avx512f avx512bw avx512dq avx512vl; do
+              grep -qw "$f" /proc/cpuinfo && echo "  $f: yes" || echo "  $f: no"
+            done
+          fi
 
       - name: Build
         run: make
