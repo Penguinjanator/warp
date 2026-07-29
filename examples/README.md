@@ -73,7 +73,7 @@ fit four prefix/suffix strings at all.
 
 ### What this template leaves out
 
-`encoding_k3.py` is 800 lines and this file covers the text conversation.
+`encoding_k3.py` is 647 lines and this file covers the text conversation.
 Not covered: **tool definitions and tool results**, which are their own
 XTML elements with typed `argument` children; `response_format` and JSON
 schemas, which the program injects as synthetic system messages; and the
@@ -84,6 +84,17 @@ hours before an answer starts, so this template asks for the `response`
 channel directly. Set the `open` field to `…<|open|>think<|sep|>` if you
 want the reasoning, and expect to wait for it.
 
-Parsing the reply back into reasoning / answer / tool-call regions is the
-other half of that program, and it belongs to whatever host wants those
-regions. The engine's job ends at tokens.
+**All of it lives in [`serve/`](../serve/)**, which is where a format this
+big belongs: four prefix/suffix strings cannot express a typed argument
+list, and a C engine should not be growing a JSON Schema renderer.
+`serve/xtml.py` is a port of `encoding_k3.py`, checked against it segment
+for segment, and `serve/regions.py` is the other half of that program —
+reading the reply back into reasoning, answer and tool calls. Both are
+reachable over HTTP:
+
+```bash
+python3 -m serve ~/models/k3.waste
+```
+
+See [docs/SERVE.md](../docs/SERVE.md). This file remains the answer for
+`waste chat` and `waste run`, which carry no Python.
