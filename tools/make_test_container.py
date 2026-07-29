@@ -176,16 +176,78 @@ def write_expert(f, layer, eid, cb_base, shapes, rng):
     return blocks * ALIGN
 
 
+# ---- optional tokenizer ---------------------------------------------------
+#
+# Off by default: tests/run.sh states, in several places, that the synthetic
+# container carries no tokenizer, and quietly changing that would turn its
+# SKIPs into checks nobody asked for. `--tokenizer` is for the callers that
+# need one — serve/ has to encode a chat template against real specials, and
+# a 983 GB download is not a test dependency.
+#
+# The vocabulary is the 256 single bytes plus a few merges, which is enough
+# to make BPE actually merge rather than emit one token per character, and
+# the ranks are the ids, as in a tiktoken mergeable_ranks file.
+
+MERGES = [
+    b"he", b"in", b"re", b"on", b"at", b"en", b"nd", b"ti", b"es", b"or",
+    b" t", b" a", b" s", b" w", b" o", b" i", b" c", b" b", b" f", b" m",
+    b"the", b"ing", b"and", b" th", b" the", b" an", b" to", b" of",
+    b"hello", b"world", b"weather", b"Paris", b"city", b"json", b"true",
+    b"false", b"null", b"message", b"role", b"user", b"assistant", b"system",
+    b"tool", b"call", b"argument", b"response", b"think", b"index", b"type",
+]
+
+# K3's four XTML markers, the media block, and the reserved block the
+# tokenizer positions BOS/EOS in. Order matters: waste_tok_open puts
+# [BOS] at n_tokens, [EOS] at n_tokens+1 and treats n_tokens+2 as the id
+# generation_config.json names — <|end_of_msg|> on both Kimi releases.
+SPECIALS = [
+    "[BOS]", "[EOS]", "<|end_of_msg|>",
+    "<|open|>", "<|close|>", "<|sep|>",
+    "<|media_begin|>", "<|media_content|>", "<|media_pad|>", "<|media_end|>",
+    "<|kimi_image_placeholder|>",
+]
+
+
+def write_tokenizer(outdir):
+    """tokenizer.model + specials.json. Returns the total vocabulary size."""
+    import base64
+
+    tokens = [bytes([b]) for b in range(256)] + MERGES
+    with open(os.path.join(outdir, "tokenizer.model"), "wb") as f:
+        for rank, tok in enumerate(tokens):
+            f.write(base64.b64encode(tok) + b" " + str(rank).encode() + b"\n")
+
+    base = len(tokens)
+    specials = [{"id": base + i, "text": s} for i, s in enumerate(SPECIALS)]
+    with open(os.path.join(outdir, "specials.json"), "w") as f:
+        json.dump(specials, f, indent=1)
+
+    return base + len(SPECIALS)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
     ap.add_argument("--seed", type=int, default=0,
                     help="same seed, byte-identical container")
+    ap.add_argument("--tokenizer", action="store_true",
+                    help="also write a small tiktoken-style vocabulary with "
+                         "K3's XTML specials, so the container can be driven "
+                         "with text instead of raw ids")
     args = ap.parse_args()
     rng = random.Random(args.seed)
     os.makedirs(args.out, exist_ok=True)
 
-    cfg = CFG
+    cfg = dict(CFG)
+    if args.tokenizer:
+        # Every special has to be a real row of the embedding table and the
+        # head: a container whose vocab_size stops short of its own specials
+        # is one where tokenizing a chat template indexes out of the model.
+        vocab = write_tokenizer(args.out)
+        cfg["vocab_size"] = vocab
+        cfg["bos_token_id"] = vocab - len(SPECIALS)
+        cfg["eos_token_id"] = vocab - len(SPECIALS) + 2   # <|end_of_msg|>
     hid = cfg["hidden_size"]
     nh, vh = cfg["num_attention_heads"], cfg["v_head_dim"]
     qd = cfg["qk_nope_head_dim"] + cfg["qk_rope_head_dim"]

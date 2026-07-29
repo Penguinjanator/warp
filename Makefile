@@ -107,7 +107,7 @@ src/metal.o: src/metal.m
 src/simd_avx2.o:   override CFLAGS += -mavx2 -mfma
 src/simd_avx512.o: override CFLAGS += -mavx512f -mavx512bw
 
-all: waste libwaste.a libwastevq.$(SOEXT)
+all: waste libwaste.a libwaste.$(SOEXT) libwastevq.$(SOEXT)
 
 # `make` builds the shipped artifacts; `make test` also builds the checkers.
 # They are separate targets, so remember which one you need — testing a
@@ -119,6 +119,26 @@ libwastevq.$(SOEXT): src/vq.c
 
 libwaste.a: $(OBJ)
 	ar rcs $@ $^
+
+# The whole engine as a shared object. waste.h says the engine is a
+# library first and the CLI is just one of its clients; serve/ is the
+# other one, and it reaches the same functions through ctypes rather
+# than through a second copy of the engine in Python. Built from its own
+# objects because -fPIC is not in CFLAGS for the static path: mixing a
+# non-PIC libwaste.a into a shared object fails to link on Linux.
+SHOBJ := $(SRC:.c=.pic.o) $(OBJCSRC:.m=.pic.o)
+
+%.pic.o: %.c
+	$(CC) $(CFLAGS) -fPIC -c -o $@ $<
+
+src/metal.pic.o: src/metal.m
+	$(CC) $(CFLAGS) -fPIC -fobjc-arc -c -o $@ $<
+
+src/simd_avx2.pic.o:   override CFLAGS += -mavx2 -mfma
+src/simd_avx512.pic.o: override CFLAGS += -mavx512f -mavx512bw
+
+libwaste.$(SOEXT): $(SHOBJ)
+	$(CC) $(CFLAGS) -shared -o $@ $^ $(LDLIBS)
 
 waste: cli/main.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
@@ -156,15 +176,24 @@ test_state: tests/test_state.o libwaste.a
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
--include $(OBJ:.o=.d) cli/main.d $(patsubst %.c,%.d,$(wildcard tests/*.c))
+-include $(OBJ:.o=.d) $(SHOBJ:.o=.d) cli/main.d \
+        $(patsubst %.c,%.d,$(wildcard tests/*.c))
 
 clean:
-	rm -f $(OBJ) cli/*.o tests/*.o $(OBJ:.o=.d) cli/*.d tests/*.d libwaste.a waste \
-	      $(TESTBINS) libwastevq.dylib libwastevq.so
-	rm -rf libwastevq.dylib.dSYM
+	rm -f $(OBJ) $(SHOBJ) cli/*.o tests/*.o $(OBJ:.o=.d) $(SHOBJ:.o=.d) \
+	      cli/*.d tests/*.d libwaste.a waste \
+	      $(TESTBINS) libwaste.dylib libwaste.so libwastevq.dylib libwastevq.so
+	rm -rf libwastevq.dylib.dSYM libwaste.dylib.dSYM
+	rm -rf serve/__pycache__ tests/serve/__pycache__
 
 check: test
 	@tests/run.sh
+
+# The Python server's own suite. Separate from `check` because it needs
+# libwaste as a shared object rather than the archive the CLI links, and
+# because it is the one part of this repo that is not C.
+serve-check: libwaste.$(SOEXT)
+	@python3 -m unittest discover -s tests/serve -t . -p "test_*.py"
 
 # Sanitizers. Separate targets rather than a flag on `make`, because they
 # need a full rebuild: mixing instrumented and uninstrumented objects
@@ -200,4 +229,4 @@ fuzz-asan:
 	    python3 tools/fuzz_container.py --runs $(FUZZ_RUNS) || rc=$$?; \
 	 $(MAKE) --no-print-directory clean; exit $$rc
 
-.PHONY: all test check clean asan fuzz fuzz-asan
+.PHONY: all test check serve-check clean asan fuzz fuzz-asan

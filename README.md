@@ -387,6 +387,36 @@ waste: no --budget, using 46.24 GB of 64.00 GB (expert cache 17.56 GB)
 `waste --help` lists all nine commands. `--json` makes `eval`, `tokenize`,
 `plan`, `info` and `bench` machine-readable.
 
+### Serving it
+
+`serve/` is an OpenAI-compatible HTTP server — the second client of the
+public API, alongside the CLI, reaching the same engine through ctypes
+rather than keeping a copy of the model code in Python:
+
+```bash
+make libwaste.dylib                     # or libwaste.so on Linux
+python3 -m serve ~/models/k3.waste --port 8000
+```
+
+```bash
+curl localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"k3","messages":[{"role":"user","content":"Why is the sky blue?"}]}'
+```
+
+`/v1/chat/completions` (streaming and not), `/v1/completions`,
+`/v1/models`, `/health`. It carries the whole of K3's prompt format, not
+the four-string subset a container's `chat.json` can hold: **tool
+definitions and tool results, typed call arguments, JSON response schemas,
+`tool_choice`, the think channel and `thinking_effort`, and images** — plus
+the parser that reads the reply back into reasoning, answer and
+`tool_calls`. Stdlib only.
+
+The prompt renderer is a port of `encoding_k3.py` from the release, and the
+test suite checks it against that file **segment for segment** on a corpus
+of 38 conversations whenever the weights directory is on disk.
+[docs/SERVE.md](docs/SERVE.md) is the reference.
+
 ### Images
 
 K3 is multimodal — a 401M ViT, 27 layers, patch 14 — and so is the engine.
@@ -461,7 +491,7 @@ honest caveat is not a substitute for reading the file.
 | macOS arm64 | yes | 19 pass / 0 fail / 10 skip | NEON |
 | Linux arm64 | yes | 17 pass / 0 fail / 11 skip | NEON |
 | Linux x86_64 | yes | 17 pass / 0 fail / 11 skip | AVX2 |
-| Windows | branches written, never compiled | — | — |
+| Windows | three POSIX calls short — see below | — | — |
 
 The three run the same suite. CI has no container, so `tests/run.sh`
 builds a synthetic one and the checks that need real weights say SKIP
@@ -493,9 +523,15 @@ src/        the engine — 6,700 lines of C, no dependencies
   waste.c     the public API
   simd_*.c    per-ISA kernels, selected at run time
 cli/        the CLI, a client of the public API
+serve/      the OpenAI-compatible server, the other client
+  xtml.py     K3's prompt format, ported from the release's encoding_k3.py
+  regions.py  its replies, back into reasoning / answer / tool calls
+  engine.py   libwaste through ctypes, and the request queue
+  server.py   /v1/chat/completions and friends
 tools/      conversion and validation (Python, never at run time)
 docs/       format, engine, backends, and what was learned
 tests/      31 checks, and a diff against a PyTorch oracle given a model
+  serve/      147 more for the server, incl. a differential vs upstream
 examples/   chat.json for K3 and ChatML, the format a container carries
 third_party/ stb_image.h, the single vendored header — see its README
 ```
@@ -510,17 +546,23 @@ numbers that killed them.
 Version 0.5.0, and the API is not frozen. Stated plainly, because finding
 these out for yourself is worse than reading them here:
 
-- the chat template covers the text conversation and not tool calls,
-  JSON response schemas, or the think channel. K3 builds its prompt with
-  a Python program rather than a Jinja template; `examples/chat-k3.json`
-  transcribes the part that fits four prefix/suffix strings, and
-  [examples/](examples/) says what it leaves out;
+- the **CLI's** chat template covers the text conversation and not tool
+  calls, JSON response schemas, or the think channel. K3 builds its prompt
+  with a Python program rather than a Jinja template, and
+  `examples/chat-k3.json` transcribes only the part that fits four
+  prefix/suffix strings. The server has all of it — so tool calling and
+  structured output are reachable through `python3 -m serve`, and not
+  through `waste chat`;
 - a container carries its chat format in `chat.json`, which the converter
   cannot write because neither Kimi release distributes one — copy it in
   from `examples/` or the CLI falls back to raw continuation;
 - AVX-512 compiles and dispatches but has never executed on hardware that
   has it;
-- Windows has never been built;
+- Windows has never been built. Cross-compiled with MinGW, every
+  translation unit builds except for `sysconf`, `posix_memalign` and
+  `pread`, which have no Windows path; CI pins that list so it cannot
+  quietly grow. Three shims and a cache-bypass flag is the whole port,
+  but nobody has written or run them;
 - the engine verifies no checksum on the read path. Records carry a
   `crc32` that the converter writes and `tools/verify_container.py`
   checks, but a container corrupted after conversion gives wrong numbers

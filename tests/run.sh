@@ -652,5 +652,50 @@ else
     sk "tokenizer diff" "needs uv, a container and source weights"
 fi
 
+# ---------------------------------------------------------------- serve ----
+head_ "serve (OpenAI-compatible server)"
+
+# The Python suite needs libwaste as a shared object; the CLI links the
+# archive, so a plain `make` before this change did not produce one.
+SOEXT=so
+[ "$(uname -s)" = "Darwin" ] && SOEXT=dylib
+
+if [ "${WASTE_SANITIZED:-0}" = 1 ]; then
+    # ASan needs to be the first library loaded; a dlopen from a plain
+    # python3 is not, and the run dies in the allocator rather than
+    # reporting anything about the server.
+    sk "serve suite" "not run under the sanitizers"
+elif ! command -v python3 >/dev/null 2>&1; then
+    sk "serve suite" "python3 not installed"
+elif ! make -s "libwaste.$SOEXT" >/dev/null 2>&1; then
+    no "libwaste.$SOEXT failed to build"
+else
+    # Counted rather than pass/fail as a lump: 140-odd checks reported as
+    # one line hides which half ran.
+    out=$(python3 -m unittest discover -s tests/serve -t . -p "test_*.py" 2>&1)
+    n=$(printf '%s' "$out" | grep -oE "^Ran [0-9]+ test" | grep -oE "[0-9]+")
+    if printf '%s' "$out" | tail -3 | grep -q "^OK"; then
+        ok "serve suite (${n:-?} checks: XTML vs upstream, regions, ctypes, HTTP)"
+    else
+        no "serve suite"
+        printf '%s\n' "$out" | grep -E "^(FAIL|ERROR):" | head -8
+    fi
+fi
+
+# The prompt corpus is checked against the release's own encoder when the
+# weights directory is present. That is the check that says our port of
+# encoding_k3.py is K3's format and not merely self-consistent.
+K3_SRC="${K3_DIR:-/Volumes/WasteDisk/k3}"
+if [ -f "$K3_SRC/encoding_k3.py" ]; then
+    if K3_DIR="$K3_SRC" python3 -m unittest \
+           tests.serve.test_xtml.TestAgainstUpstream 2>&1 | tail -3 | grep -q "^OK"; then
+        ok "XTML prompts match the release's encoding_k3.py, segment for segment"
+    else
+        no "XTML prompts differ from encoding_k3.py"
+    fi
+else
+    sk "XTML vs encoding_k3.py" "no release at $K3_SRC (set K3_DIR)"
+fi
+
 printf "\n\033[1m%d passed, %d failed, %d skipped\033[0m\n" "$pass" "$fail" "$skip"
 [ "$fail" -eq 0 ]
