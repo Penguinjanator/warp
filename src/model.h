@@ -118,6 +118,14 @@ typedef struct {
 
     /* scratch */
     float *x, *h, *tmp, *att, *logits;
+    /* 1 when at least one layer is MLA, i.e. when the sequence is bounded
+     * by kv_cap. KDA state is O(1) in context and imposes no such limit,
+     * so a container that is all KDA is not capped by ctx_tokens. */
+    int   has_mla;
+    /* Set when a step was asked for a position outside kv_cap. Sticky
+     * like read_error and cleared by the same call, because the caller
+     * has to hear it once rather than once per layer. */
+    int   ctx_full;
     /* chunked prefill scratch (allocated on first use) */
     float *cx, *cnorm, *cresid, *cq, *ckv, *clat, *cff, *cexp;
     float *cblockres, *cprefix;
@@ -166,7 +174,17 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed);
  * is static; `layer` and `expert` name the record. Sticky, so a caller
  * checks it once per call rather than per expert. */
 const char *waste_model_read_error(const waste_model *m, int *layer, int *expert);
+/* Clears both sticky per-call flags: the record error and the context
+ * one. Called to arm a fresh eval or generate. */
 void        waste_model_clear_read_error(waste_model *m);
+
+/* Highest position + 1 this model can hold, or 0 when it is unbounded
+ * (no MLA layer, so nothing is stored per position). A step or prefill
+ * outside it returns NULL and sets the flag below rather than writing
+ * past the latent KV cache — which is what it used to do, quietly, on
+ * any chat long enough or any prompt longer than ctx_tokens. */
+int waste_model_ctx_max(const waste_model *m);
+int waste_model_ctx_full(const waste_model *m);
 
 /* Prefill a chunk of `n` tokens starting at `pos0`, returning the logits of
  * the last one. Equivalent to n successive waste_model_step calls, but the
@@ -180,6 +198,19 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
  * the engine actually allocates. */
 #define WASTE_CHUNK_MAX 64
 int waste_model_chunk_max(const waste_model *m);
+
+/* Where the MoE router parks its scores inside m->att.
+ *
+ * That buffer has four users — MLA's per-head score rows, KDA's per-head
+ * delta scratch, the router's two score arrays at this offset, and
+ * AttnRes's handful — and they take turns rather than overlapping in
+ * time. The offset is past anything the others use on a real container,
+ * but "on a real container" is not a bound: `--ctx 64` makes the
+ * attention part 1088 floats and the router then wrote at 4096. Declared
+ * here so the allocation is sized from the same number the code indexes
+ * with, and so waste_plan_memory counts the buffer that is really
+ * allocated. */
+#define WASTE_ATT_ROUTER_OFF 4096
 
 /* Session state: KDA recurrent state + short-conv rings + MLA KV + the
  * AttnRes history. Saving it turns a cold re-prefill into a file read,

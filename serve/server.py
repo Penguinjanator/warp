@@ -115,6 +115,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        # Set when we are about to hang up on an unread body; saying so
+        # is what lets the client reconnect rather than see a reset.
+        if self.close_connection:
+            self.send_header("Connection", "close")
         for k, v in (headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -124,16 +128,25 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(err.status, err.to_json())
 
     def _read_body(self) -> dict:
+        # Refusing a request without consuming its body desynchronises a
+        # keep-alive connection: the bytes we did not read become the next
+        # request line, and the client's following request is parsed out of
+        # its own predecessor's payload. Every path that rejects before
+        # reading closes the connection instead.
+        def refuse(message: str, status: int) -> api.APIError:
+            self.close_connection = True
+            return api.APIError(message, status=status)
+
         length = self.headers.get("Content-Length")
         if length is None:
-            raise api.APIError("Content-Length is required", status=411)
+            raise refuse("Content-Length is required", 411)
         try:
             n = int(length)
         except ValueError:
-            raise api.APIError("Content-Length is not a number", status=400)
+            raise refuse("Content-Length is not a number", 400)
         if n < 0 or n > MAX_BODY_BYTES:
-            raise api.APIError(f"request body may not exceed "
-                               f"{MAX_BODY_BYTES} bytes", status=413)
+            raise refuse(f"request body may not exceed "
+                         f"{MAX_BODY_BYTES} bytes", 413)
         raw = self.rfile.read(n) if n else b""
         if not raw:
             raise api.APIError("request body is empty")

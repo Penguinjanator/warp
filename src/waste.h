@@ -177,6 +177,13 @@ waste_status waste_memory_used(const waste_ctx *ctx, waste_memplan *out);
  * error". NULL when there is nothing to add. Owned by the context and
  * valid until the next eval or generate on it.
  *
+ * Also set after a *successful* waste_generate that stopped because the
+ * context filled rather than because the model finished or max_tokens
+ * ran out. That is not an error — the tokens produced are good — but it
+ * is the one ending a host cannot tell from the others by the status
+ * alone, and a UI that says "the answer is complete" when it is not is
+ * worse than one that says nothing.
+ *
  * Every expert record carries a crc32, and the engine checks it as the
  * record comes off the disk — so a container that rots after conversion
  * ends the generation with WASTE_E_IO instead of quietly answering with
@@ -281,6 +288,15 @@ typedef struct {
 typedef int (*waste_token_cb)(const waste_token_info *info, const char *piece,
                               void *user);
 
+/* Both of these are bounded by cfg.ctx_tokens: MLA keeps one latent per
+ * position and the cache is exactly that long, so the sequence a context
+ * can hold is fixed at open. A prompt that does not fit in what is left
+ * is WASTE_E_ARG, refused before anything is evaluated, so the
+ * conversation is left as it was rather than half-prefilled;
+ * waste_error_detail gives the position and the ceiling. Generation that
+ * *reaches* the ceiling mid-answer stops there and returns WASTE_OK — see
+ * waste_error_detail above. Call waste_state_reset to start over, or open
+ * with a larger ctx_tokens. */
 waste_status waste_generate(waste_ctx *ctx, const int32_t *prompt, size_t n,
                             const waste_gen_params *params,
                             waste_token_cb cb, void *user);

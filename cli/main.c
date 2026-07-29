@@ -26,6 +26,12 @@
 
 #define MAXTOK 8192
 
+/* Rolling window the --stop matcher works in: how much recent output is
+ * kept to match a marker that straddles two pieces, and how much is held
+ * back so the marker can still be cut off when it does match. Declared
+ * here because parse_opts refuses a --stop that would not fit in it. */
+#define TAILCAP 256
+
 static uint64_t parse_size(const char *s)
 {
     char *end;
@@ -162,6 +168,12 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
     if (o->ctx == 0) { fprintf(stderr, "--ctx must be > 0\n"); return -1; }
     if (o->max_tokens == 0) { fprintf(stderr, "-n must be > 0\n"); return -1; }
     if (o->threads < 0) { fprintf(stderr, "--threads must be >= 0\n"); return -1; }
+    /* The matcher holds back one marker's worth of output, in a buffer of
+     * TAILCAP. A longer marker could never be held, let alone matched. */
+    if (o->stop && strlen(o->stop) >= TAILCAP - 1) {
+        fprintf(stderr, "--stop must be under %d characters\n", TAILCAP - 1);
+        return -1;
+    }
     return 0;
 }
 
@@ -248,8 +260,6 @@ static int fail_ctx(const char *what, waste_status s, const waste_ctx *c)
 
 /* ---- token callback ----------------------------------------------------- */
 
-#define TAILCAP 256
-
 typedef struct {
     int quiet;
     uint32_t n;
@@ -278,12 +288,17 @@ static int on_token(const waste_token_info *i, const char *piece, void *user)
             /* the whole marker, not one short: at match time it has
              * to be entirely still in the buffer to be cut off */
             const size_t hold = strlen(s->stop);
-            const size_t have = s->pend_n + strlen(piece);
-            if (s->pend_n + strlen(piece) + 1 < sizeof s->pend) {
-                memcpy(s->pend + s->pend_n, piece, strlen(piece) + 1);
-                s->pend_n += strlen(piece);
+            const size_t pl = strlen(piece);
+            if (s->pend_n + pl + 1 < sizeof s->pend) {
+                memcpy(s->pend + s->pend_n, piece, pl + 1);
+                s->pend_n += pl;
             }
-            if (have > hold) {
+            /* Emit everything except the last `hold` bytes still buffered.
+             * This used to test a count that included a piece the buffer
+             * had refused, so with a stop string longer than what was
+             * held back the subtraction wrapped and fwrite was handed
+             * SIZE_MAX. parse_opts now caps --stop as well. */
+            if (s->pend_n > hold) {
                 const size_t emit = s->pend_n - hold;
                 fwrite(s->pend, 1, emit, stdout);
                 fflush(stdout);
@@ -690,6 +705,14 @@ static int run_segs(waste_ctx *c, const opts *o, const seg *segs, int ns,
     if (!o->quiet && s.pend_n) fwrite(s.pend, 1, s.pend_n, stdout);
     printf("\n");
     if (st != WASTE_OK && st != WASTE_E_CANCELLED) return fail_ctx("generate", st, c);
+    /* A generation that ran out of context returns OK — the tokens it
+     * produced are good — and stops mid-answer. Silence there reads as a
+     * model that had nothing more to say, which is the wrong thing to
+     * conclude. To stderr, so a piped run is still just the generation. */
+    if (st == WASTE_OK) {
+        const char *why = waste_error_detail(c);
+        if (why) fprintf(stderr, "\nwaste: %s\n", why);
+    }
 
     if (show_stats && s.n) {
         const double sec = s.ms / 1000.0;

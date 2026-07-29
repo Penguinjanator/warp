@@ -178,7 +178,11 @@ static inline int js_size(const js_doc *d, int tok)
 /* Element `i` of array `arr`, or -1. */
 static inline int js_at(const js_doc *d, int arr, int i)
 {
-    if (arr < 0 || arr >= d->n || d->tok[arr].type != JS_ARR || i >= d->tok[arr].size) return -1;
+    /* i < 0 used to fall through the loop and return the first element,
+     * so a caller computing an index and getting it wrong read a value
+     * instead of the -1 that says "not there". */
+    if (arr < 0 || arr >= d->n || d->tok[arr].type != JS_ARR ||
+        i < 0 || i >= d->tok[arr].size) return -1;
     int p = arr + 1;
     for (int j = 0; j < i; j++) p = js_skip(d, p);
     return p;

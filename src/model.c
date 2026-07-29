@@ -53,6 +53,9 @@ static char *slurp(const char *path, size_t *len)
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
+    /* ftell says -1 on a directory or a pipe, and (size_t)(-1) + 1 is a
+     * zero-byte malloc that the fread below then writes past. */
+    if (n < 0) { fclose(f); return NULL; }
     char *b = (char *)malloc((size_t)n + 1);
     if (!b || fread(b, 1, (size_t)n, f) != (size_t)n) { free(b); fclose(f); return NULL; }
     b[n] = 0;
@@ -466,6 +469,10 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
 
     m->n_tensors = js_size(d, trunk);
     m->t = (waste_tensor *)calloc((size_t)m->n_tensors, sizeof *m->t);
+    /* n_tensors is set before the allocation is known to have worked, and
+     * waste_model_free walks it — so a failure here has to leave the two
+     * agreeing rather than a count pointing at NULL. */
+    if (!m->t) { m->n_tensors = 0; TRUNK_FAIL; }
 
     for (int i = 0; i < m->n_tensors; i++) {
         int e = js_at(d, trunk, i);
@@ -752,6 +759,21 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     m->stages = (int)js_int(&d, js_get(&d, eq, "stages"), 3);
     m->vec_dim = (int)js_int(&d, js_get(&d, eq, "vec_dim"), 8);
     m->cb_entries = (int)js_int(&d, js_get(&d, eq, "entries"), 256);
+    /* cfg_sane covers `config`; this block is the other half of the
+     * manifest and nothing checked it. All three size the LUT and two of
+     * them divide: `"vec_dim": 0` was a division by zero in three places,
+     * silent on ARM (which yields 0) and a SIGFPE on x86, which is to say
+     * on Linux and Windows. The codebook index is a byte, so entries
+     * above 256 could never be addressed anyway. */
+    if (m->stages < 1 || m->stages > 8 ||
+        m->vec_dim < 1 || m->vec_dim > 64 ||
+        m->cb_entries < 1 || m->cb_entries > 256) {
+        fprintf(stderr, "waste: manifest expert_quant is out of range "
+                        "(%d stages, vec_dim %d, %d entries)\n",
+                m->stages, m->vec_dim, m->cb_entries);
+        js_free(&d); free(src);
+        return -2;                        /* -> WASTE_E_FORMAT */
+    }
 
     if (load_trunk(m, dir, &d, js_get(&d, 0, "trunk")) < 0) { js_free(&d); free(src); return -1; }
 
@@ -811,6 +833,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     const size_t rec = 16 + (size_t)m->cb_entries * m->vec_dim * 2;
     m->n_books = (int)(cblen / rec);
     m->codebooks = (float *)malloc((size_t)m->n_books * m->cb_entries * m->vec_dim * sizeof(float));
+    if (!m->codebooks) { free(cb); js_free(&d); free(src); return -1; }
     for (int b = 0; b < m->n_books; b++) {
         const uint16_t *h = (const uint16_t *)(cb + b * rec + 16);
         for (int i = 0; i < m->cb_entries * m->vec_dim; i++) {
@@ -899,6 +922,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
             m->S[L] = (float *)calloc((size_t)H * D * D, sizeof(float));
             m->conv[L] = (float *)calloc((size_t)3 * C * (c->conv_k - 1), sizeof(float));
         } else {
+            m->has_mla = 1;      /* this is what makes kv_cap a real bound */
             m->latcache[L] = (float *)calloc(
                 (size_t)kv_cap * (c->kv_lora + c->qk_rope), sizeof(float));
         }
@@ -910,7 +934,16 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                              + (size_t)4 * c->n_heads * (c->v_head + c->qk_nope + c->qk_rope)
                              + (size_t)2 * (c->q_lora ? c->q_lora : 1) + 256,
                              sizeof(float));
-    m->att = (float *)calloc((size_t)kv_cap * c->n_heads + 1024, sizeof(float));
+    /* Sized for every user of the buffer, not just the one it is named
+     * after — see WASTE_ATT_ROUTER_OFF in model.h. */
+    {
+        size_t need = (size_t)kv_cap * (size_t)c->n_heads;   /* MLA scores  */
+        const size_t kda = (size_t)c->kda_heads * (size_t)c->kda_dim;
+        const size_t route = WASTE_ATT_ROUTER_OFF + 2u * (size_t)c->n_experts;
+        if (kda > need) need = kda;
+        if (route > need) need = route;
+        m->att = (float *)calloc(need + 1024, sizeof(float));
+    }
     {   /* int8 activations for the SMMLA batched matmul: a full chunk of
          * the widest input the trunk has (the dense FFN's 33792) */
         const int widest = c->dense_inter > c->hidden ? c->dense_inter : c->hidden;
@@ -956,10 +989,15 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         m->xs = (float *)calloc((size_t)nmax / 32 + 64, sizeof(float));
     }
 
-    {   /* LUT: [max_nv][stages][entries] */
-        const int nmax = (c->hidden > c->moe_inter ? c->hidden : c->moe_inter);
-        m->lut = (float *)malloc((size_t)3 * (nmax / 8 + 1) * m->stages
-                                 * m->cb_entries * sizeof(float));
+    {   /* LUT: [max_nv][stages][entries], three of them (gate, up, down).
+         * Sized from the container's own vec_dim/stages/entries — it used
+         * to divide by a literal 8 and so was only correct for the one
+         * vec_dim the converter happens to write. */
+        const int lt = c->latent_dim ? c->latent_dim : c->hidden;
+        int nmax = c->hidden > c->moe_inter ? c->hidden : c->moe_inter;
+        if (lt > nmax) nmax = lt;
+        m->lut = (float *)malloc((size_t)3 * (nmax / m->vec_dim + 1) *
+                                 m->stages * m->cb_entries * sizeof(float));
     }
     {   /* expert cache, sized by the caller's budget */
         int64_t rec = 0;
@@ -969,11 +1007,29 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         m->miss_buf = (uint8_t *)waste_dio_alloc((size_t)rec);
         if (!m->miss_buf) return -1;
     }
-    return (m->x && m->logits && m->e_gate && m->e_up && m->e_down) ? 0 : -1;
+    /* Every buffer the forward pass dereferences without asking, not the
+     * five that used to be listed here — a NULL m->tmp or m->att is a
+     * crash on the first token rather than a load failure. The per-layer
+     * state arrays are checked in the same breath. */
+    if (!m->x || !m->h || !m->tmp || !m->att || !m->logits || !m->ff ||
+        !m->e_gate || !m->e_up || !m->e_down || !m->lut ||
+        !m->xq || !m->xs || !m->qabs || !m->cacc || !m->mrow ||
+        !m->prefix_sum || !m->ares || !m->mmxq || !m->mmxs)
+        return -1;
+    for (int L = 0; L < c->n_layers; L++) {
+        if (c->kda_layer[L]) { if (!m->S[L] || !m->conv[L]) return -1; }
+        else if (!m->latcache[L]) return -1;
+    }
+    if (c->attn_res_block && !m->blockres) return -1;
+    return 0;
 }
 
 void waste_model_free(waste_model *m)
 {
+    /* Reachable on a partially-built model now that waste_open frees what
+     * a failed load left behind, so nothing here may assume the load got
+     * as far as its own allocation. */
+    if (!m->t) m->n_tensors = 0;
     for (int i = 0; i < m->n_tensors; i++) {
         waste_dio_free(m->t[i].data); waste_dio_free(m->t[i].q);
         waste_dio_free(m->t[i].qs);
@@ -1138,7 +1194,24 @@ static rec_status record_check(const waste_model *m, int layer, int expert,
 static int bank_fetch(void *user, int layer, int expert, uint8_t *dst)
 {
     waste_model *m = (waste_model *)user;
-    waste_bank *b = &m->bank[layer];
+    /* The ids are not always the engine's own. waste_ecache_warm takes
+     * them from usage.waste, which travels next to a container and is
+     * read at open without anyone asking for it — and its layer field is
+     * 16 bits against a bank array of WASTE_MAX_LAYERS. Indexing it
+     * unchecked gave a garbage fd and a garbage record size to a pread
+     * aimed at a fixed-size cache slot. */
+    const int bad_layer = layer < 0 || layer >= m->cfg.n_layers ||
+                          layer >= WASTE_MAX_LAYERS;
+    waste_bank *b = bad_layer ? NULL : &m->bank[layer];
+    if (bad_layer || expert < 0 || expert >= b->n_experts ||
+        b->fd < 0 || b->rec_bytes <= 0) {
+        if (!m->read_error) {
+            m->read_error = (int)REC_E_HEADER;
+            m->bad_layer = layer;
+            m->bad_expert = expert;
+        }
+        return -1;
+    }
     const int64_t got = waste_pread(b->fd, dst, (size_t)b->rec_bytes,
                                     (int64_t)expert * (int64_t)b->rec_bytes);
     rec_status st = got == (int64_t)b->rec_bytes ? REC_OK : REC_E_READ;
@@ -1178,7 +1251,21 @@ const char *waste_model_read_error(const waste_model *m, int *layer, int *expert
     }
 }
 
-void waste_model_clear_read_error(waste_model *m) { m->read_error = 0; }
+void waste_model_clear_read_error(waste_model *m)
+{
+    m->read_error = 0;
+    m->ctx_full = 0;
+}
+
+/* MLA stores one latent per position, so kv_cap is the whole sequence
+ * this model can hold. A container with no MLA layer stores nothing per
+ * position and is not bounded here. */
+int waste_model_ctx_max(const waste_model *m)
+{
+    return m->has_mla ? m->kv_cap : 0;
+}
+
+int waste_model_ctx_full(const waste_model *m) { return m->ctx_full; }
 
 /* ---- fused VQ matvec ---------------------------------------------------
  * Never materializes the weights. For a matrix stored as `stages` codebook
@@ -1621,7 +1708,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     /* K3's Stable LatentMoE: experts run on a narrower projection of the
      * hidden state. `in` still drives the router and the shared experts. */
     const int lat = c->latent_dim ? c->latent_dim : hid;
-    float *sc = m->att + 4096;
+    float *sc = m->att + WASTE_ATT_ROUTER_OFF;
     matvec_t(m, sc, waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L)), in, E, hid);
     const float *bias = T(m, "%smodel.layers.%d.block_sparse_moe.gate.e_score_correction_bias", c->prefix, L);
     float *score = sc + E;
@@ -1761,7 +1848,12 @@ int waste_model_warm_cache(waste_model *m, const char *dir)
     if (m->cache.n_slots <= 0) return 0;
     char p[512];
     snprintf(p, sizeof p, "%s/usage.waste", dir);
-    return waste_ecache_warm(&m->cache, p, bank_fetch, m);
+    const int n = waste_ecache_warm(&m->cache, p, bank_fetch, m);
+    /* Warming is best-effort: a usage file naming experts this container
+     * does not have is stale, not broken, and must not be reported as a
+     * read failure by the first generation that follows. */
+    waste_model_clear_read_error(m);
+    return n;
 }
 
 int waste_model_save_usage(const waste_model *m, const char *dir)
@@ -1865,6 +1957,13 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
             m->n_kv[L] = nkv;
         }
     }
+    /* n_blockres is payload, not shape, so the checks above do not cover
+     * it — and it decides how much is read into a buffer allocated for
+     * n_layers/attn_res_block + 2 rows. A state file claiming more than
+     * that read past the end of it. */
+    const int nb_max = c->attn_res_block
+                     ? c->n_layers / c->attn_res_block + 2 : 0;
+    if (h.n_blockres < 0 || h.n_blockres > nb_max) { fclose(f); return -2; }
     m->n_blockres = h.n_blockres;
     if (!rc && c->attn_res_block && h.n_blockres > 0) {
         const size_t n = (size_t)h.n_blockres * c->hidden;
@@ -2092,8 +2191,12 @@ static int prefill_alloc(waste_model *m, int T)
     m->cx     = (float *)calloc((size_t)T * hid, sizeof(float));
     m->cnorm  = (float *)calloc((size_t)T * hid, sizeof(float));
     m->cresid = (float *)calloc((size_t)T * hid, sizeof(float));
-    {   /* cq holds 2 LUTs per token plus one for `down` */
-        const size_t lut_sz = (size_t)((hid > lat ? hid : lat) / 8) * 3 * 256;
+    {   /* cq holds 2 LUTs per token plus one for `down`. Same story as
+         * m->lut: the geometry is the container's, not 8/3/256. */
+        int nmax = hid > lat ? hid : lat;
+        if (c->moe_inter > nmax) nmax = c->moe_inter;
+        const size_t lut_sz = (size_t)(nmax / m->vec_dim + 1) *
+                              (size_t)m->stages * (size_t)m->cb_entries;
         m->cq = (float *)calloc((size_t)(2 * T + 1) * lut_sz + 64, sizeof(float));
     }
     {   /* ckv holds the shared-expert staging: gate, up, out */
@@ -2144,7 +2247,7 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
     int *route = m->croute;
     float *rw = m->crw;
 
-    float *sc = m->att + 4096, *score = sc + E;
+    float *sc = m->att + WASTE_ATT_ROUTER_OFF, *score = sc + E;
     const float *bias = T(m, "%smodel.layers.%d.block_sparse_moe.gate.e_score_correction_bias",
                           c->prefix, L);
     for (int t = 0; t < nT; t++) {
@@ -2299,6 +2402,13 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     if (n <= 0) return m->logits;
     if (n == 1) return waste_model_step(m, tokens[0], pos0, NULL);
     if (n > WASTE_CHUNK_MAX) n = WASTE_CHUNK_MAX;
+    /* mla_layer writes one latent per position with no bound of its own,
+     * so the bound is here. The public API refuses an over-long prompt
+     * before it reaches this; a direct model.h caller gets a NULL. */
+    {
+        const int cm = waste_model_ctx_max(m);
+        if (cm && (pos0 < 0 || pos0 > cm - n)) { m->ctx_full = 1; return NULL; }
+    }
     if (prefill_alloc(m, n)) return NULL;
 
     for (int t = 0; t < n; t++) {
@@ -2432,6 +2542,10 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
 {
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
+    {   /* see waste_model_prefill */
+        const int cm = waste_model_ctx_max(m);
+        if (cm && (pos < 0 || pos >= cm)) { m->ctx_full = 1; return NULL; }
+    }
     /* one embedding row; the table may be kept quantized */
     /* Same splice as the prefill: a chunked prompt whose last chunk is a
      * single token comes through here, and if that token is a media
@@ -2449,6 +2563,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
 
     float *resid = (float *)malloc((size_t)hid * sizeof(float));
     float *norm = (float *)malloc((size_t)hid * sizeof(float));
+    if (!resid || !norm) { free(resid); free(norm); return NULL; }
     const int ares_on = c->attn_res_block > 0;
     float *ps = m->prefix_sum;
     int ps_live = 0;

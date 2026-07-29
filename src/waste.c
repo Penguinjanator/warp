@@ -126,6 +126,8 @@ static char *slurp_all(const char *path)
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
+    /* -1 on a directory or a pipe; see slurp() in model.c */
+    if (n < 0) { fclose(f); return NULL; }
     char *b = (char *)malloc((size_t)n + 1);
     if (!b || fread(b, 1, (size_t)n, f) != (size_t)n) { free(b); fclose(f); return NULL; }
     b[n] = 0;
@@ -231,7 +233,18 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
     uint64_t sc = 0;
     sc += (uint64_t)3 * moe_inter * hidden * 4;             /* expert staging  */
     sc += (uint64_t)2 * (dense_inter > moe_inter ? dense_inter : moe_inter) * 4;
-    sc += ((uint64_t)ctx_tokens * nheads + 1024) * 4;       /* attention rows  */
+    {   /* m->att, and it holds more than attention rows — the same max the
+         * allocation in waste_model_load takes, so the plan reports the
+         * buffer that is really allocated rather than the smallest of its
+         * four users. */
+        const int n_exp = (int)js_int(&d, js_get(&d, cfg, "num_experts"), 0);
+        uint64_t att = (uint64_t)ctx_tokens * (uint64_t)nheads;
+        const uint64_t kda = (uint64_t)kh * (uint64_t)kd;
+        const uint64_t route = WASTE_ATT_ROUTER_OFF + 2ull * (uint64_t)n_exp;
+        if (kda > att) att = kda;
+        if (route > att) att = route;
+        sc += (att + 1024) * 4;
+    }
     sc += (uint64_t)vocab * 4;                              /* logits          */
     sc += ((uint64_t)8 * big + 8 * moe_inter + 8 * dense_inter + 512) * 4;
     sc += (uint64_t)3 * nheads * (kv_lora ? kv_lora : 1) * 4;   /* MLA absorb  */
@@ -359,6 +372,10 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
         const int rc = waste_model_load(&c->m, model_path, (int)cfg.ctx_tokens,
                                         (size_t)cache_bytes, cfg.vision);
         if (rc) {
+            /* The load allocates tensors, banks and the cache before it can
+             * fail, and freeing only the context left all of it behind —
+             * on K3 that is tens of gigabytes lost to one bad manifest. */
+            waste_model_free(&c->m);
             free(c);
             return rc == -2 ? WASTE_E_FORMAT : WASTE_E_IO;
         }
@@ -425,6 +442,9 @@ waste_status waste_detokenize(waste_ctx *c, const int32_t *ids, size_t n,
                               char *out, size_t cap, size_t *n_out)
 {
     if (!c || !ids || !out || !n_out) return WASTE_E_ARG;
+    /* cap 0 made the capacity below -1 and then wrote the terminator at
+     * out[0] — a one-byte overflow of a zero-byte buffer. */
+    if (!cap) return WASTE_E_ARG;
     if (!c->tok) return WASTE_E_UNSUPPORTED;
     const int got = waste_tok_decode(c->tok, ids, (int)n, out, (int)cap - 1);
     out[got < 0 ? 0 : got] = 0;
@@ -545,13 +565,41 @@ static void read_error_arm(waste_ctx *c)
     c->detail[0] = 0;
 }
 
+/* The sequence has reached the context this container was opened for.
+ * Not an I/O failure and not a malformed anything: MLA stores one latent
+ * per position and the cache is exactly ctx_tokens long, so position
+ * ctx_tokens has nowhere to go. Said with the number, because "invalid
+ * argument" on the fortieth turn of a chat is not actionable. */
+static waste_status ctx_full_report(waste_ctx *c)
+{
+    snprintf(c->detail, sizeof c->detail,
+             "context of %u tokens is full at position %d — "
+             "reset the conversation or open with a larger ctx_tokens",
+             c->cfg.ctx_tokens, c->pos);
+    return WASTE_E_ARG;
+}
+
+/* Positions left before that happens. -1 means the model is unbounded —
+ * it stores nothing per position — and never compares equal to 0. */
+static long ctx_room(const waste_ctx *c)
+{
+    const int cm = waste_model_ctx_max(&c->m);
+    if (!cm) return -1;
+    return (long)cm - (long)c->pos;
+}
+
 static waste_status read_error_report(waste_ctx *c)
 {
+    /* Checked first: it is the one failure that is the caller's doing
+     * rather than the container's, and reporting it as an I/O error
+     * would send someone to re-download 900 GB over a full context. */
+    if (waste_model_ctx_full(&c->m)) return ctx_full_report(c);
     int layer = 0, expert = 0;
     const char *why = waste_model_read_error(&c->m, &layer, &expert);
-    /* The forward pass returns no logits for exactly two reasons: a
-     * record it could not read or trust, or the chunk scratch it could
-     * not allocate. Nothing named a record, so it was the second. */
+    /* Past the context check, the forward pass returns no logits for
+     * exactly two reasons: a record it could not read or trust, or the
+     * chunk scratch it could not allocate. Nothing named a record, so it
+     * was the second. */
     if (!why) return WASTE_E_OOM;
     snprintf(c->detail, sizeof c->detail,
              "expert %d of layer %d: %s", expert, layer, why);
@@ -568,6 +616,10 @@ waste_status waste_eval(waste_ctx *c, const int32_t *tokens, size_t n,
 {
     if (!c || !tokens || !n) return WASTE_E_ARG;
     { const waste_status st = check_ids(c, tokens, n); if (st) return st; }
+    /* Refused before anything is written, so a prompt that does not fit
+     * leaves the conversation as it was rather than half-prefilled. */
+    { const long room = ctx_room(c);
+      if (room >= 0 && (size_t)room < n) { read_error_arm(c); return ctx_full_report(c); } }
     const float *lg = NULL;
     const int cmax = waste_model_chunk_max(&c->m);
     media_arm(c);
@@ -639,6 +691,12 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
 {
     if (!c || !prompt || !n) return WASTE_E_ARG;
     { const waste_status st = check_ids(c, prompt, n); if (st) return st; }
+    /* The prompt has to fit before a single expert is read for it. One
+     * position is kept back so there is somewhere to put the first
+     * sampled token; a prompt that fills the context exactly can be
+     * evaluated but not continued. */
+    { const long room = ctx_room(c);
+      if (room >= 0 && (size_t)room <= n) { read_error_arm(c); return ctx_full_report(c); } }
     waste_gen_params p;
     if (params) p = *params; else waste_gen_params_init(&p);
     uint64_t rng = p.seed ? p.seed : 0x853c49e6748fea9bULL;
@@ -672,6 +730,11 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
     waste_status st = WASTE_OK;
     int cur = sample(lg, c->m.cfg.vocab, &p, &rng);
     for (uint32_t t = 0; t < p.max_tokens; t++) {
+        /* Out of context is a reason to stop, not a reason to fail: the
+         * tokens already produced are good, and this is the same kind of
+         * end as max_tokens. The detail string says which one it was for
+         * a host that wants to tell them apart. */
+        if (ctx_room(c) == 0) { ctx_full_report(c); break; }
         const uint64_t hb = c->m.cache.hits, mb = c->m.cache.misses;
         const uint64_t bb = c->m.cache.bytes_read;
         t0 = nowf();
