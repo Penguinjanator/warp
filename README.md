@@ -408,8 +408,8 @@ dominates. Turn it on once for a container you copied, downloaded, or left
 on a disk you do not trust, and for anything whose wrong answers would be
 believed; leave it off for one you converted yourself and have been
 reading since. `WASTE_VERIFY=1` in the environment does the same thing,
-and it is the only way in for the server, which has no flag of its own.
-Either turns it on; neither turns it off.
+and the server takes `--verify` as well. Any of them turns it on; none of
+them turns it off.
 
 What is checked either way: a short read, and a record header that does
 not describe the expert the bank index asked for. Those are O(1), they
@@ -555,7 +555,7 @@ bandwidth.
 ## Repository
 
 ```
-src/        the engine — 6,700 lines of C, no dependencies
+src/        the engine — 6,000 lines of C, no dependencies
   model.c     forward pass, MoE routing, KDA and MLA layers
   ecache.c    bounded LFRU expert cache over the banks
   vision.c    the 27-layer ViT and the projector into text space
@@ -581,10 +581,66 @@ It records what was measured, including the optimizations that were
 refuted — index-layout blocking, a 3-bit trunk, GPU offload, per-expert
 bit allocation — with the numbers that killed them.
 
+## What changed in 0.6.0
+
+The API is not frozen, and this release moved it. Containers are
+unaffected — `format_version` is still 0 and one built with 0.5.0 is read
+unchanged — but a host that compiles against `waste.h` has four things to
+look at.
+
+**`waste_cfg` lost four fields, and four others started working.** Eight
+of them were set by the CLI and the server and read by nothing: `--threads
+N` sized no pool, only `WASTE_THREADS` did, and `--cache lru` selected
+LFRU because the cache was handed a literal 0 for a policy it implements
+two of.
+
+| field | 0.6.0 |
+|---|---|
+| `n_threads` | wired. An explicit value wins; `WASTE_THREADS` now only fills in a 0 |
+| `cache_policy` | wired. `WASTE_CACHE_PINNED` is **gone** — never implemented, and it selected LFRU like everything that was not LRU |
+| `use_direct_io` | wired, and on by default. The server's binding had it defaulting to *off* — harmless while nothing read the field, and a silently disabled bypass the moment something did, so that default was flipped to match |
+| `usage_path` | wired, so a learned hotlist can belong to a workload rather than to a container |
+| `io_threads` | **gone** — there is no expert-fetch pool; reads happen on the calling thread |
+| `expert_deferral` | **gone** — no overlap of a fetch with the next layer |
+| `allow_substitutes` | **gone** — the converter writes no substitute bank in v0, so there is nothing to substitute |
+| `state_path` | **gone** — state is persisted by calling `waste_state_save`, not by configuring a directory |
+
+The four that described machinery this engine does not have were removed
+rather than documented as inert. A switch that reads as a capability is
+worse than an absent one.
+
+**`ctx_tokens` is a bound now, and it is enforced.** MLA stores one latent
+per position and the cache is allocated to exactly that length; nothing
+checked the position against it, so a long enough `chat` session, or a
+prompt longer than `--ctx`, wrote past the end of it. Two behaviours
+follow, and the second is the one to read twice:
+
+- a prompt that does not fit in what is left is `WASTE_E_ARG`, refused
+  before anything is evaluated, so the conversation is left as it was
+  rather than half-prefilled;
+- a generation that *reaches* the ceiling stops there and returns
+  `WASTE_OK` — the same kind of end as `max_tokens`. `waste_error_detail`
+  is what distinguishes them, and it is now set after a successful call
+  for exactly this case. A host that reports "complete" on every
+  `WASTE_OK` will sometimes be wrong about a truncated answer.
+
+**A pre-token past 256 bytes is no longer truncated.** The tokenizer used
+to encode the first 256 bytes of one and advance past the rest, dropping
+it from the prompt without a word — on Chinese that cliff was 85
+characters of an unpunctuated run. Text that hit it now produces different
+token ids, because it now produces the right ones, so a host caching ids
+across versions should re-encode.
+
+**The server's flags moved with the config.** `--io-threads`,
+`--allow-substitutes` and `--expert-deferral` are gone; `--cache` no
+longer takes `pinned`; `--direct-io` became `--no-direct-io`, because the
+bypass is on by default and a flag to *ask* for it would have meant
+leaving it off by omission; `--verify` is new.
+
 ## What is not there yet
 
-Version 0.6.0, and the API is not frozen. Stated plainly, because finding
-these out for yourself is worse than reading them here:
+The API is not frozen, as above. The rest is stated plainly too, because
+finding these out for yourself is worse than reading them here:
 
 - a container carries its chat format in `chat.json`, and the converter
   can only fill it in for a model whose format has been transcribed from
