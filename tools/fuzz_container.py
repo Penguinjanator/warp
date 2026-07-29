@@ -13,8 +13,14 @@ instrumented build — `make fuzz-asan`.
 Structure-aware rather than random: it starts from a valid container
 (tools/make_test_container.py) and breaks one thing at a time — a JSON
 field retyped or moved out of range, an offset pointed past the end, a
-file truncated mid-record, bytes flipped in a header. Purely random bytes
-would be rejected by the JSON parser before reaching anything interesting.
+file truncated mid-record, bytes flipped in a header, every record of one
+bank damaged at once. Purely random bytes would be rejected by the JSON
+parser before reaching anything interesting.
+
+Each case is run twice: `waste info`, which parses the manifest and opens
+every bank, and then a forward pass, which is the only thing that reads an
+expert record and therefore the only thing that reaches the record header
+checks and the checksum.
 
 A clean rejection is a pass. A nonzero exit is a pass. Being killed by a
 signal is a failure, and so is hanging.
@@ -28,6 +34,7 @@ import json
 import os
 import random
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -119,6 +126,32 @@ def m_flip(d, rng):
     return f"{f} bit flipped at {where}"
 
 
+def m_records(d, rng):
+    """Damage every record of one expert bank.
+
+    m_flip already puts a bit somewhere in a random .bin, but a forward
+    pass only routes to a few experts per layer, so a single damaged
+    record is usually never read and the case proves nothing. Hitting all
+    of them makes the read path reach one for certain — which is what
+    exercises the header checks and the checksum."""
+    banks = [f for f in os.listdir(d) if f.startswith("experts-L")]
+    if not banks:
+        return None
+    f = rng.choice(banks)
+    p = os.path.join(d, f)
+    data = bytearray(open(p, "rb").read())
+    rec = struct.unpack_from("<I", data, 16)[0] * 4096      # rec_4k_blocks
+    if rec <= 0 or len(data) < rec:
+        return None
+    # Header bytes half the time, payload the other half: the two are
+    # caught by different checks, and only one of them by the crc32.
+    where = rng.randrange(0, 48) if rng.random() < 0.5 else rng.randrange(48, rec)
+    for e in range(len(data) // rec):
+        data[e * rec + where] ^= 1 << rng.randrange(8)
+    open(p, "wb").write(data)
+    return f"{f}: every record damaged at byte {where}"
+
+
 def m_json_garbage(d, rng):
     p = os.path.join(d, "manifest.json")
     s = open(p).read()
@@ -135,15 +168,30 @@ def m_remove(d, rng):
 
 
 MUTATIONS = [m_json_retype, m_json_shape, m_json_layers, m_truncate,
-             m_flip, m_json_garbage, m_remove]
+             m_flip, m_json_garbage, m_remove, m_records]
+
+
+# Valid for the synthetic container's 256-entry vocabulary.
+IDS = "3,7,11,5,9,13,2,17"
 
 
 def run_engine(container):
-    """`waste info` parses the manifest and opens every bank — the whole
-    untrusted surface, without needing a forward pass."""
-    return subprocess.run([os.path.join(HERE, "waste"), "info", container],
-                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                          timeout=TIMEOUT)
+    """Two passes over the untrusted surface.
+
+    `waste info` parses the manifest and opens every bank. That was the
+    whole check while nothing read a record; now the engine verifies each
+    one as it comes off the disk, so the record headers — magic, identity,
+    the offsets that bound the checksummed payload — are followed only by
+    a forward pass. test_forward is the shortest way to make it happen.
+
+    A clean rejection from either is a pass; only a signal is a failure."""
+    for cmd in (["waste", "info", container], ["test_forward", container, IDS]):
+        cmd[0] = os.path.join(HERE, cmd[0])
+        r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, timeout=TIMEOUT)
+        if r.returncode != 0:
+            break
+    return r, cmd
 
 
 def main():
@@ -157,7 +205,7 @@ def main():
     seed_dir = os.path.join(tmp, "seed")
     try:
         build_seed(seed_dir)
-        if run_engine(seed_dir).returncode != 0:
+        if run_engine(seed_dir)[0].returncode != 0:
             print("FAIL: the unmutated seed container does not load")
             return 1
 
@@ -170,7 +218,7 @@ def main():
             if what is None:
                 continue
             try:
-                r = run_engine(work)
+                r, cmd = run_engine(work)
             except subprocess.TimeoutExpired:
                 hangs.append(what)
                 continue
@@ -183,7 +231,8 @@ def main():
                                     "fuzz-case-%d" % len(crashes))
                 shutil.rmtree(keep, ignore_errors=True)
                 shutil.copytree(work, keep)
-                crashes.append((what, -r.returncode, err[:1200], keep))
+                cmd = [keep if a == work else a for a in cmd]
+                crashes.append((what, -r.returncode, err[:1200], cmd))
             elif r.returncode:
                 rejected += 1
             else:
@@ -191,9 +240,9 @@ def main():
 
         print(f"{args.runs} cases: {rejected} rejected, {accepted} still "
               f"loaded, {len(crashes)} crashed, {len(hangs)} hung")
-        for what, sig, err, keep in crashes[:10]:
+        for what, sig, err, cmd in crashes[:10]:
             print(f"\n  CRASH (signal {sig}) after: {what}")
-            print(f"    reproduce: ./waste info {keep}")
+            print("    reproduce: " + " ".join(cmd))
             for line in err.strip().split("\n")[:8]:
                 print(f"    {line}")
         for what in hangs[:5]:

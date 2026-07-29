@@ -23,6 +23,7 @@
 
 #include "json.h"
 #include "model.h"
+#include "platform.h"
 #include "tokenizer.h"
 #include "waste_backend.h"
 
@@ -39,6 +40,7 @@ struct waste_ctx {
     int pos;                 /* next position in the sequence */
     int warmed;              /* experts preloaded from the hotlist */
     char quant[64];          /* composed at open, reported by get_info */
+    char detail[128];        /* which record failed, for waste_error_detail */
     waste_stats stats;
 
     /* Queued image embeddings, concatenated: img_each[] is how many rows
@@ -139,6 +141,8 @@ uint64_t waste_physical_ram(void)
     size_t n = sizeof v;
     if (sysctlbyname("hw.memsize", &v, &n, NULL, 0) == 0) return v;
     return 0;
+#elif defined(_WIN32)
+    return waste_physical_ram_bytes();
 #elif defined(__linux__)
     const long p = sysconf(_SC_PHYS_PAGES), z = sysconf(_SC_PAGESIZE);
     return (p > 0 && z > 0) ? (uint64_t)p * (uint64_t)z : 0;
@@ -527,6 +531,35 @@ static void media_release(waste_ctx *c)
     c->m.media_n = c->m.media_used = 0;
 }
 
+/* An expert record that fails its checksum stops the pass and comes back
+ * as WASTE_E_IO. The status alone is not actionable on a container with
+ * 89,000 records in it, so the record that failed is composed into a
+ * detail string the host can print — the engine still prints nothing
+ * itself. Armed per call so a stale failure cannot be reported twice. */
+static void read_error_arm(waste_ctx *c)
+{
+    waste_model_clear_read_error(&c->m);
+    c->detail[0] = 0;
+}
+
+static waste_status read_error_report(waste_ctx *c)
+{
+    int layer = 0, expert = 0;
+    const char *why = waste_model_read_error(&c->m, &layer, &expert);
+    /* The forward pass returns no logits for exactly two reasons: a
+     * record it could not read or trust, or the chunk scratch it could
+     * not allocate. Nothing named a record, so it was the second. */
+    if (!why) return WASTE_E_OOM;
+    snprintf(c->detail, sizeof c->detail,
+             "expert %d of layer %d: %s", expert, layer, why);
+    return WASTE_E_IO;
+}
+
+const char *waste_error_detail(const waste_ctx *c)
+{
+    return (c && c->detail[0]) ? c->detail : NULL;
+}
+
 waste_status waste_eval(waste_ctx *c, const int32_t *tokens, size_t n,
                         const float **logits_out, size_t *vocab_out)
 {
@@ -535,6 +568,7 @@ waste_status waste_eval(waste_ctx *c, const int32_t *tokens, size_t n,
     const float *lg = NULL;
     const int cmax = waste_model_chunk_max(&c->m);
     media_arm(c);
+    read_error_arm(c);
     for (size_t i = 0; i < n; ) {
         int k = (int)(n - i);
         if (k > cmax) k = cmax;
@@ -542,8 +576,10 @@ waste_status waste_eval(waste_ctx *c, const int32_t *tokens, size_t n,
                      : waste_model_step(&c->m, tokens[i], c->pos, NULL);
         c->pos += k;
         i += (size_t)k;
+        if (!lg) break;
     }
     media_release(c);
+    if (!lg) return read_error_report(c);
     if (logits_out) *logits_out = lg;
     if (vocab_out) *vocab_out = (size_t)c->m.cfg.vocab;
     return WASTE_OK;
@@ -614,6 +650,7 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
         const int cmax = waste_model_chunk_max(&c->m);
         size_t i = 0;
         media_arm(c);
+        read_error_arm(c);
         while (i < n) {
             int k = (int)(n - i);
             if (k > cmax) k = cmax;
@@ -621,12 +658,15 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
                          : waste_model_step(&c->m, prompt[i], c->pos, NULL);
             c->pos += k;
             i += (size_t)k;
+            if (!lg) break;
         }
         media_release(c);
     }
     c->stats.sec_total += nowf() - t0;
+    if (!lg) return read_error_report(c);
 
     char piece[64];
+    waste_status st = WASTE_OK;
     int cur = sample(lg, c->m.cfg.vocab, &p, &rng);
     for (uint32_t t = 0; t < p.max_tokens; t++) {
         const uint64_t hb = c->m.cache.hits, mb = c->m.cache.misses;
@@ -655,13 +695,19 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
             piece[pn] = 0;
             if (cb(&info, piece, user) != 0) return WASTE_E_CANCELLED;
         }
+        /* `cur` was sampled from the previous step and has already gone to
+         * the callback; it is the token after it that has no logits. The
+         * failure is reported even when this token was a stop token,
+         * because a container that failed a check is worth hearing about
+         * whether or not the answer happened to be finished. */
+        if (!lg) { st = read_error_report(c); break; }
         if (stop) break;
         cur = sample(lg, c->m.cfg.vocab, &p, &rng);
     }
     c->stats.experts_hit += c->m.cache.hits - h0;
     c->stats.experts_missed += c->m.cache.misses - m0;
     c->stats.bytes_read = c->m.cache.bytes_read;
-    return WASTE_OK;
+    return st;
 }
 
 /* ---- state & introspection ---------------------------------------------- */

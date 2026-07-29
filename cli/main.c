@@ -223,6 +223,23 @@ static int fail(const char *what, waste_status s)
     return 1;
 }
 
+/* The same, for a failure the engine can say more about than its status:
+ * an expert record that did not survive the read is reported as an I/O
+ * error, and which record it was is the part worth printing. */
+static int fail_ctx(const char *what, waste_status s, const waste_ctx *c)
+{
+    const char *detail = c ? waste_error_detail(c) : NULL;
+    fail(what, s);
+    if (detail) {
+        fprintf(stderr, "  %s\n", detail);
+        if (s == WASTE_E_IO)
+            fprintf(stderr, "  (the container is damaged: re-download or "
+                            "re-convert it, then `tools/verify_container.py` "
+                            "to find anything else)\n");
+    }
+    return 1;
+}
+
 /* ---- token callback ----------------------------------------------------- */
 
 #define TAILCAP 256
@@ -666,7 +683,7 @@ static int run_segs(waste_ctx *c, const opts *o, const seg *segs, int ns,
     st = waste_generate(c, ids, n, &p, on_token, &s);
     if (!o->quiet && s.pend_n) fwrite(s.pend, 1, s.pend_n, stdout);
     printf("\n");
-    if (st != WASTE_OK && st != WASTE_E_CANCELLED) return fail("generate", st);
+    if (st != WASTE_OK && st != WASTE_E_CANCELLED) return fail_ctx("generate", st, c);
 
     if (show_stats && s.n) {
         const double sec = s.ms / 1000.0;
@@ -792,7 +809,8 @@ static int cmd_chat(int argc, char **argv)
     else
         printf("no chat.json in the container: raw continuation, so an "
                "instruct model is being asked to continue text rather than "
-               "to answer\n");
+               "to answer.\n  Copy one in — examples/ has K3's — or pass "
+               "--raw to say you meant it\n");
     printf("/reset clears state, /save FILE and /load FILE persist it, "
            "/image FILE attaches a picture, /stats prints counters, "
            "Ctrl-D exits\n");
@@ -1027,7 +1045,8 @@ static int cmd_eval(int argc, char **argv)
     const float *lg = NULL;
     size_t vocab = 0;
     t = waste_eval(c, ids, n, &lg, &vocab);
-    if (t != WASTE_OK) { waste_close(c); free(prompt); return fail("eval", t); }
+    if (t != WASTE_OK) { const int rc = fail_ctx("eval", t, c);
+                         waste_close(c); free(prompt); return rc; }
 
     /* softmax over the whole vocabulary, then report the top few */
     int k = o.top_k > 0 ? o.top_k : 10;

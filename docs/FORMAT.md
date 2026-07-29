@@ -4,7 +4,8 @@ Status: **v0, frozen against the released weights.** This started as a
 pre-release design; the TBDs were settled on 2026-07-27 when K3 dropped
 and are recorded as answers below. Two things in it are *specified and
 not implemented* — the shared low-rank block and the SUB1 substitute
-bank — and both say so where they appear.
+bank — and both say so where they appear. A third, the per-expert bit
+allocator, was measured instead of built and then dropped: design goal 5.
 
 `format_version` is enforced: a container from another version, or one
 without the field, is refused rather than read against the wrong rules.
@@ -30,10 +31,22 @@ without the field, is refused rather than read against the wrong rules.
    The KBVQ-MoE shared-low-rank component (arXiv 2602.11184) is
    **specified but NOT implemented in v0** — see "Shared low-rank: on
    probation" below.
-5. **Non-uniform bits.** Global per-expert bit allocation à la GEMQ
-   (arXiv 2605.23078): important experts get 3 bit, unimportant get 2 (or
-   1-bit substitute only). Attention / router / norms / shared experts /
-   MTP head stay at 4–8 bit (asymmetric recipe; the MTP head must be int8+).
+5. ~~**Non-uniform bits.**~~ **Measured and dropped.** The design goal was
+   global per-expert bit allocation à la GEMQ (arXiv 2605.23078) —
+   important experts at 3 bits, unimportant at 2. It assumes experts
+   differ in how much the third bit buys them, and on this family they do
+   not: the spread in that quantity is 1.06–1.15x between experts in a
+   layer, **1.01x between layers**, and 1.09–1.30x between gate, up and
+   down, on both K3 and Kimi-Linear. An optimal allocator and a coin flip
+   therefore write the same container, and the only importance signal
+   that is not flat — routing frequency — buys disk footprint and no I/O.
+   Every expert in a container stays at one width. The measurement, and
+   the criterion that would revive this, are in
+   [LEARNED.md](LEARNED.md) §20; the instrument is
+   `tools/bitalloc_lab.py`.
+
+   Attention / router / norms / shared experts / MTP head stay at 4–8 bit
+   (asymmetric recipe; the MTP head must be int8+). That part stands.
 
 ## File layout
 
@@ -77,14 +90,52 @@ fuzzer in `tools/fuzz_container.py` exists for this file). Keys:
 | `trunk` | per tensor: `name`, `fmt`, `off`, `shape`, `group`, `scale_off`, `bytes` |
 
 Two fields from the original design are **not** here. There is no
-`bits[]`: the GEMQ-style per-expert bit allocator was specified and never
-built, so every expert in a container is at the same width. And there is
+`bits[]`: the GEMQ-style per-expert bit allocator was specified, measured
+(design goal 5 above, [LEARNED.md](LEARNED.md) §20) and dropped, so every
+expert in a container is at the same width — deliberately, now, rather
+than for want of the code. And there is
 no `blake3` — the only checksum in the format is the per-expert `crc32`
-in the record header, written by the converter and checked by
-`tools/verify_container.py`. **The engine verifies nothing on the read
-path**, which is a deliberate omission (it would cost a pass over every
-expert on every miss) and a real gap: a container corrupted on disk
-produces wrong numbers rather than an error.
+in the record header.
+
+### What the engine checks on the read path
+
+Every expert record is verified as it comes off the disk, and one that
+fails ends the generation with `WASTE_E_IO` naming the record — "expert
+412 of layer 37: checksum mismatch" — instead of answering with whatever
+the damaged bytes decode to. A cache hit is not re-checked: the unit
+being verified is bytes entering RAM, and re-checking resident records
+would cost a pass over every expert on every token.
+
+The `crc32` covers the payload from the end of the header to the end of
+the per-channel scales, excluding the 4 KiB padding — bit for bit what
+`zlib.crc32` returns, since `tools/convert.py` is what writes it, and
+`tests/test_container.c` pins the two together against known values.
+
+The header is *outside* the checksum, so it is checked structurally
+instead, which is needed regardless: the offsets that say where the
+payload ends live in the header, and following an unvalidated offset to
+decide how much to checksum would be a read past the buffer rather than
+a check. A record must carry the right magic, be the expert the bank
+index asked for at that offset, be the bank's stride long, be a VQ
+format with `lowrank_id == 0`, name a codebook that exists, and have
+ordered offsets that fit. All of that is derivable from the manifest, so
+it is derived rather than believed.
+
+The cost is one pass over the record beside the read of the same bytes:
+about **5% of throughput on Kimi-Linear** (4.7% and 5.5% in two sittings,
+paired runs each way — [LEARNED.md](LEARNED.md) §21) and about **1% on
+K3**, where 11.83 MB records make the read dominate — 7,287 misses at
+0.376 ms of CRC each is 2.7 s of a 268 s run. `WASTE_VERIFY=0` skips the
+checksum, which is for measuring that number rather than for running on;
+the O(1) header checks stay on, since they are what keeps an offset from
+a damaged header out of the arithmetic. The CRC itself is
+[`src/crc32.c`](../src/crc32.c): 33 GB/s where the ARMv8 CRC extension is
+available, 2.7 GB/s from the slice-by-8 table everywhere else.
+
+Not checked: the trunk, which has no checksum in the format at all, and
+the codebooks. Both are read once at load rather than per token, so the
+argument for a per-record check does not carry over — it is simply not
+built.
 
 ### Quantization formats (`fmt`)
 
@@ -247,10 +298,11 @@ bake an initial hotlist from a calibration corpus.
    and the manifest. Verify with `tools/verify_container.py`, which
    dequantizes records back and diffs them against the source weights.
 
-**Step 3 of the original design is missing:** there is no GEMQ-style
-per-expert bit allocation from an importance matrix. Every expert in a
-container is at `--stages` bits. Non-uniform allocation remains the
-single largest unexplored lever on the disk footprint.
+**Step 3 of the original design is not missing, it is refused:** there is
+no GEMQ-style per-expert bit allocation, because the importance it would
+allocate against does not vary — 1.01x between layers, 1.15x between
+experts. Every expert in a container is at `--stages` bits.
+[LEARNED.md](LEARNED.md) §20 has the numbers and the revive criterion.
 
 ## Questions the weights drop answered
 
@@ -271,4 +323,7 @@ single largest unexplored lever on the disk footprint.
   the substitute bank is written at all.
 - Whether the shared low-rank basis survives an activation-weighted
   metric (the revive-or-delete criterion above).
+- Whether per-expert importance spreads under that same metric. Both
+  questions want the same rented GPU session and the same importance
+  matrix, so they are one experiment, not two.
 - A read-path integrity check that does not cost a pass per miss.

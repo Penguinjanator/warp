@@ -14,12 +14,55 @@ CC      ?= cc
 # be implicitly declared on Linux. Only model.c defines _GNU_SOURCE itself.
 CFLAGS  ?= -O2 -std=gnu11 -Wall -Wextra
 LDLIBS  := -lm -lpthread
-# Shared-library suffix: convert.py already looks for both through ctypes.
-ifeq ($(shell uname -s),Darwin)
+
+# The target triple rather than `uname -m`, because those differ the moment
+# anyone cross-compiles: building for Windows from this ARM laptop, uname
+# says arm64 and would put the NEON translation unit into an x86 binary
+# while leaving out the two SIMD ones the target actually dispatches to.
+TRIPLE  := $(shell $(CC) -dumpmachine 2>/dev/null)
+ARCH    := $(if $(TRIPLE),$(TRIPLE),$(shell uname -m))
+
+# Shared-library suffix: convert.py and serve/engine.py look for all three
+# through ctypes.
+ifneq (,$(findstring mingw,$(ARCH)))
+WINDOWS := 1
+endif
+ifdef WINDOWS
+SOEXT   := dll
+EXE     := .exe
+# The archiver has to match the target as well as the compiler. macOS `ar`
+# writes an archive of PE objects without complaining; what comes out is
+# 96 bytes and a page of undefined references at link time, with nothing
+# anywhere saying the archiver was the wrong one.
+#
+# The -posix/-win32 strip is for Debian and Ubuntu, which ship the two
+# threading models as separate compilers. Only -posix has pthread.h, so
+# that is the one to build with — and its name does not end in `gcc`.
+CCBASE  := $(patsubst %-posix,%,$(patsubst %-win32,%,$(CC)))
+AR      := $(if $(filter %gcc,$(CCBASE)),$(patsubst %gcc,%ar,$(CCBASE)),ar)
+# msvcrt's printf has no %zu and no C99 anything. mingw ships a conforming
+# one; this is what selects it, and without it every size_t we print is
+# garbage rather than a compile error.
+CFLAGS  += -D__USE_MINGW_ANSI_STDIO=1
+# One self-contained .exe/.dll: winpthreads and libgcc go inside rather
+# than turning `waste.exe` into a DLL hunt on a machine with no toolchain.
+# libwastevq needs it for the same reason from the other direction — it is
+# loaded by convert.py through ctypes, where a missing dependency surfaces
+# as "could not be found" naming the library that was found.
+STATIC  := -static
+LDLIBS  += $(STATIC)
+# ld exports everything from a DLL only until one symbol is marked
+# dllexport. Nothing here is, but saying it keeps serve/'s ctypes binding
+# working the day one is.
+SHLDFLAGS := -Wl,--export-all-symbols
+else ifeq ($(shell uname -s),Darwin)
 SOEXT   := dylib
 else
 SOEXT   := so
 endif
+# Windows code is position-independent by definition and gcc warns, once
+# per file, when told again.
+PICFLAG := $(if $(WINDOWS),,-fPIC)
 VQ_SUPER ?= 2
 CFLAGS  += -DVQ_SUPER=$(VQ_SUPER)
 # Track header dependencies. Without this a changed struct in a header
@@ -28,13 +71,13 @@ CFLAGS  += -DVQ_SUPER=$(VQ_SUPER)
 CFLAGS  += -MMD -MP
 
 SRC := src/model.c src/kda.c src/backend.c src/ecache.c src/version.c \
-       src/tokenizer.c src/waste.c src/vq.c src/vision.c src/image.c
+       src/tokenizer.c src/waste.c src/vq.c src/vision.c src/image.c \
+       src/crc32.c
 # Match what backend.c tests for. Linux/aarch64 reports "aarch64", which
 # does not contain "arm" — the old findstring left kda_neon.c out of the
 # build while backend.c still emitted the call to it, so the link failed
 # with an undefined waste_kda_register_neon.
-UNAME_M := $(shell uname -m)
-ifneq (,$(filter arm% aarch64%,$(UNAME_M)))
+ifneq (,$(filter arm% aarch64%,$(ARCH)))
 SRC += src/kda_neon.c
 endif
 
@@ -43,7 +86,7 @@ endif
 # picks between them from CPUID, so a single binary adapts at run time —
 # which is the whole reason these are separate files rather than #ifdefs
 # inside model.c.
-ifneq (,$(filter x86_64% amd64%,$(UNAME_M)))
+ifneq (,$(filter x86_64% amd64%,$(ARCH)))
 X86SRC  := src/simd_avx2.c src/simd_avx512.c
 SRC     += $(X86SRC)
 endif
@@ -107,7 +150,7 @@ src/metal.o: src/metal.m
 src/simd_avx2.o:   override CFLAGS += -mavx2 -mfma
 src/simd_avx512.o: override CFLAGS += -mavx512f -mavx512bw
 
-all: waste libwaste.a libwaste.$(SOEXT) libwastevq.$(SOEXT)
+all: waste$(EXE) libwaste.a libwaste.$(SOEXT) libwastevq.$(SOEXT)
 
 # `make` builds the shipped artifacts; `make test` also builds the checkers.
 # They are separate targets, so remember which one you need — testing a
@@ -115,10 +158,10 @@ all: waste libwaste.a libwaste.$(SOEXT) libwastevq.$(SOEXT)
 
 # shared object so tools/convert.py can call the encoder through ctypes
 libwastevq.$(SOEXT): src/vq.c
-	$(CC) $(CFLAGS) -shared -fPIC -o $@ $< -lm -lpthread
+	$(CC) $(CFLAGS) -shared $(PICFLAG) -o $@ $< -lm -lpthread $(STATIC)
 
 libwaste.a: $(OBJ)
-	ar rcs $@ $^
+	$(AR) rcs $@ $^
 
 # The whole engine as a shared object. waste.h says the engine is a
 # library first and the CLI is just one of its clients; serve/ is the
@@ -129,48 +172,53 @@ libwaste.a: $(OBJ)
 SHOBJ := $(SRC:.c=.pic.o) $(OBJCSRC:.m=.pic.o)
 
 %.pic.o: %.c
-	$(CC) $(CFLAGS) -fPIC -c -o $@ $<
+	$(CC) $(CFLAGS) $(PICFLAG) -c -o $@ $<
 
 src/metal.pic.o: src/metal.m
-	$(CC) $(CFLAGS) -fPIC -fobjc-arc -c -o $@ $<
+	$(CC) $(CFLAGS) $(PICFLAG) -fobjc-arc -c -o $@ $<
 
 src/simd_avx2.pic.o:   override CFLAGS += -mavx2 -mfma
 src/simd_avx512.pic.o: override CFLAGS += -mavx512f -mavx512bw
 
 libwaste.$(SOEXT): $(SHOBJ)
-	$(CC) $(CFLAGS) -shared -o $@ $^ $(LDLIBS)
+	$(CC) $(CFLAGS) -shared -o $@ $^ $(SHLDFLAGS) $(LDLIBS)
 
-waste: cli/main.o libwaste.a
+waste$(EXE): cli/main.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 # One list, used by both `test` and `clean`. A stale test binary is one of
 # the two failures tests/run.sh was written to catch, so a binary that
 # `test` builds and `clean` forgets defeats the check meant to notice it.
-TESTBINS := test_kda test_container test_forward test_tokenizer test_k3parts \
-            test_state test_vision test_image
+TESTNAMES := test_kda test_container test_forward test_tokenizer test_k3parts \
+             test_state test_vision test_image
+TESTBINS  := $(addsuffix $(EXE),$(TESTNAMES))
 
 test: $(TESTBINS)
 
-test_kda: tests/test_kda.o libwaste.a
+test_kda$(EXE): tests/test_kda.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 # Every link rule passes LDLIBS, including the one target that does not
 # currently need it. `test_image` omitted it and linked fine on macOS for
 # a week: clang folded the one sqrt() in image.c, glibc did not, and the
 # Linux build failed on an undefined reference the day CI first saw it.
-test_container: tests/test_container.o
+# The one test that links no engine: it reads the container with nothing
+# but the format header. crc32.c comes along because the checksum in that
+# header is part of the format, and checking it against zlib's values is
+# what says the two agree.
+test_container$(EXE): tests/test_container.o src/crc32.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
-test_forward: tests/test_forward.o libwaste.a
+test_forward$(EXE): tests/test_forward.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
-test_tokenizer: tests/test_tokenizer.o libwaste.a
+test_tokenizer$(EXE): tests/test_tokenizer.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
-test_k3parts: tests/test_k3parts.o libwaste.a
+test_k3parts$(EXE): tests/test_k3parts.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
-test_image: tests/test_image.o libwaste.a
+test_image$(EXE): tests/test_image.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-test_vision: tests/test_vision.o libwaste.a
+test_vision$(EXE): tests/test_vision.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
-test_state: tests/test_state.o libwaste.a
+test_state$(EXE): tests/test_state.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 %.o: %.c
@@ -181,8 +229,10 @@ test_state: tests/test_state.o libwaste.a
 
 clean:
 	rm -f $(OBJ) $(SHOBJ) cli/*.o tests/*.o $(OBJ:.o=.d) $(SHOBJ:.o=.d) \
-	      cli/*.d tests/*.d libwaste.a waste \
-	      $(TESTBINS) libwaste.dylib libwaste.so libwastevq.dylib libwastevq.so
+	      cli/*.d tests/*.d libwaste.a waste waste.exe \
+	      $(TESTBINS) $(TESTNAMES) $(addsuffix .exe,$(TESTNAMES)) \
+	      libwaste.dylib libwaste.so libwaste.dll \
+	      libwastevq.dylib libwastevq.so libwastevq.dll
 	rm -rf libwastevq.dylib.dSYM libwaste.dylib.dSYM
 	rm -rf serve/__pycache__ tests/serve/__pycache__
 

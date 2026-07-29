@@ -47,9 +47,9 @@ extern "C" {
  * for an embeddable engine that may be updated independently.
  */
 #define WASTE_VERSION_MAJOR  0
-#define WASTE_VERSION_MINOR  5
+#define WASTE_VERSION_MINOR  6
 #define WASTE_VERSION_PATCH  0
-#define WASTE_VERSION_STRING "0.5.0"
+#define WASTE_VERSION_STRING "0.6.0"
 #define WASTE_VERSION_NUMBER (WASTE_VERSION_MAJOR * 10000 + \
                               WASTE_VERSION_MINOR * 100 + \
                               WASTE_VERSION_PATCH)
@@ -72,7 +72,9 @@ typedef enum {
     WASTE_E_CANCELLED = -7,    /* callback asked to stop                   */
 } waste_status;
 
-/* Human-readable, static storage; never NULL. */
+/* Human-readable, static storage; never NULL. A coarse answer by design:
+ * an expert record that fails its checksum is a WASTE_E_IO like any
+ * other, and waste_error_detail below is what says which record it was. */
 const char *waste_strerror(waste_status s);
 
 /* ---- memory planning (usable before loading anything) ------------------ */
@@ -152,6 +154,19 @@ void waste_close(waste_ctx *ctx);
 
 /* What the engine actually allocated, after open. */
 waste_status waste_memory_used(const waste_ctx *ctx, waste_memplan *out);
+
+/* What went wrong, specifically, when the status alone is too coarse to
+ * act on: "expert 412 of layer 37: checksum mismatch" rather than "I/O
+ * error". NULL when there is nothing to add. Owned by the context and
+ * valid until the next eval or generate on it.
+ *
+ * Every expert record carries a crc32, and the engine checks it as the
+ * record comes off the disk — so a container that rots after conversion
+ * ends the generation with WASTE_E_IO instead of quietly answering with
+ * whatever the damaged bytes happen to decode to. The conversation state
+ * is undefined afterwards, because the pass stopped in the middle of a
+ * layer: call waste_state_reset before reusing the context. */
+const char *waste_error_detail(const waste_ctx *ctx);
 
 /* ---- tokenizer --------------------------------------------------------- */
 

@@ -9,19 +9,22 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "platform.h"
 #include "waste_format.h"
 
 #define EC_SAMPLE 16      /* victims sampled per eviction (Redis-style)     */
 
+/* Rounding the length up as well as the address is not decoration: both
+ * O_DIRECT and FILE_FLAG_NO_BUFFERING refuse a transfer whose length is
+ * not a whole number of sectors, and the tail of a record buffer is the
+ * one the caller does not think about. */
 void *waste_dio_alloc(size_t n)
 {
-    void *p = NULL;
     const size_t pad = (n + WASTE_DIO_ALIGN - 1) / WASTE_DIO_ALIGN * WASTE_DIO_ALIGN;
-    if (posix_memalign(&p, WASTE_DIO_ALIGN, pad) != 0) return NULL;
-    return p;
+    return waste_aligned_alloc(WASTE_DIO_ALIGN, pad);
 }
 
-void waste_dio_free(void *p) { free(p); }
+void waste_dio_free(void *p) { waste_aligned_free(p); }
 
 static int32_t ec_key(int layer, int expert) { return (layer << 16) | expert; }
 

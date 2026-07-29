@@ -20,6 +20,7 @@ those are the ones to quote.
 | 2 | real batch-1 routing on a Kimi MoE | ✅ run 2026-07-27 on Kimi-Linear |
 | 3 | quantization quality at 2–3 bit | ✅ run 2026-07-27, repeated on real K3 experts |
 | 4 | engine correctness | ✅ all three steps passed 2026-07-27 |
+| 6 | is per-expert bit allocation a real lever? | ❌ run 2026-07-29 — refuted, nothing to allocate |
 
 ## Gate 0 — does the trace→simulate methodology work, and what does real
 ## batch-1 routing look like? ✅ PASSED (with a sobering data point)
@@ -268,3 +269,37 @@ no OpenMP on this build, weights are dequantized to f32 rather than kept
 quantized, and nothing is threaded — this measures correctness, not speed.
 Optimizing it is the next body of work, and now it has a reference to stay
 correct against.
+
+## Gate 6 — is per-expert bit allocation a real lever? ❌ RUN 2026-07-29.
+## Refuted: there is nothing to allocate
+
+*Protects:* a reconversion of all 982 GB, plus the engine work that
+variable-width records would need — a per-expert index, a cache that can
+hold two record sizes, and a stage count threaded through the hot loop.
+This is the gate the working rule exists for: the build is days, the
+measurement was an afternoon.
+
+*Test:* `tools/bitalloc_lab.py`. Encode real experts at 1, 2 and 3
+residual stages against codebooks fitted per (layer, matrix) exactly as
+`convert.py` fits them, and look at delta = err2 − err3 per expert. For a
+fixed number of demoted experts the optimal set is provably the smallest
+deltas, so the only question is whether delta varies at all.
+
+*Kill criterion:* if the greedy allocation does not beat a random one at
+matched average bits, the allocator is a coin flip and the mechanism is
+not worth building.
+
+*Verdict: killed.* Delta spreads 1.06–1.15x between experts in a layer,
+**1.01x between layers** (1, 5, 23, 46, 69, 92) and 1.09–1.30x between
+gate, up and down. Greedy beats random by 0.2–1.4% relative — noise.
+Confirmed against a 128-expert layer, in case importance hid in a tail
+rather than in the variance, and against Kimi-Linear, in case K3's QAT
+was what homogenized the experts. Neither. Each residual stage removes
+42% of the remaining error in every expert of both models, because
+per-channel amax scaling normalizes them all to the same distribution.
+
+Routing frequency is the one importance signal that is not flat, and it
+does not rescue the idea: demoting the cold tail buys disk, which is not
+scarce, and 0–2% of the reads, which are. The table is in
+[LEARNED.md](LEARNED.md) §20, with the activation-weighted measurement
+that would revive it.

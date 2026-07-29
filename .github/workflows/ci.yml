@@ -11,13 +11,18 @@
 # install. Both were invisible from macOS. This matrix exists so the next
 # one is not.
 #
-# It cannot run the end-to-end engine checks: those need a real container,
-# and the smallest is 19 GB. What it does run is every check that is
-# independent of one — the build on three targets, and the kernels against
-# their PyTorch references, which is what would catch a numerical
-# regression in SiTU, the decay gates, AttnRes or KDA on a platform nobody
-# develops on. Closing the rest means a synthetic container generator; see
-# the note at the end of docs/BACKENDS.md.
+# It cannot run the end-to-end engine checks against real weights: those
+# need a real container, and the smallest is 19 GB. What it does run is
+# every check that is independent of one — the build on four targets, and
+# the kernels against their PyTorch references, which is what would catch
+# a numerical regression in SiTU, the decay gates, AttnRes or KDA on a
+# platform nobody develops on.
+#
+# Windows is the fourth, and it is two jobs rather than one because the
+# toolchain and the OS are in different places: MinGW-w64 is an apt
+# package on the Linux runner, and the only machine that can say whether
+# FILE_FLAG_NO_BUFFERING and the ReadFile offsets behave is a Windows
+# one. Cross-build there, run here.
 
 name: CI
 
@@ -115,59 +120,141 @@ jobs:
       - name: Fuzz the container parser under ASan/UBSan
         run: make fuzz-asan FUZZ_RUNS=400
 
-  windows-portability:
-    name: windows portability tripwire
+  # Windows is built where the toolchain is an apt package and run where
+  # the OS is real. Cross-compiling on Linux keeps the build reproducible
+  # and fast; it also proves nothing by itself, which is what the second
+  # job is for — FILE_FLAG_NO_BUFFERING, the ReadFile offsets and
+  # _aligned_malloc either work on Windows or they do not, and a link is
+  # not evidence either way.
+  #
+  # This replaced a tripwire that counted unresolved POSIX calls without
+  # linking. The build is now the tripwire: a fourth POSIX dependency
+  # fails it, and so does everything the old job could not see.
+  windows-build:
+    name: windows-x86_64 (cross-build)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # The engine has never been built for Windows, and the honest
-      # measure of that gap is small: cross-compiled with MinGW, every
-      # translation unit builds except for three POSIX calls with no
-      # Windows equivalent. This job pins that number. It is not a build
-      # — it does not link, and passing it does not mean Windows works —
-      # it fails when the list grows, so a fourth dependency is noticed
-      # when it is added rather than on the day someone attempts the port.
+      # The -posix variant by name, not the bare triplet. Debian ships the
+      # two threading models as separate compilers and the bare name is an
+      # alternatives symlink to whichever was installed last; only -posix
+      # has pthread.h, and threads.h needs it. Naming it means this job
+      # cannot start depending on which package won that race.
       - name: MinGW cross-compiler
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends gcc-mingw-w64-x86-64
-          x86_64-w64-mingw32-gcc --version | head -1
+          sudo apt-get install -y -qq --no-install-recommends \
+              gcc-mingw-w64-x86-64-posix
+          x86_64-w64-mingw32-gcc-posix --version | head -1
+          x86_64-w64-mingw32-gcc-posix -dumpmachine
 
-      - name: Which POSIX calls still have no Windows path
+      # CC alone is enough: the Makefile takes the architecture from the
+      # compiler's target triple, so this picks the two x86 SIMD units and
+      # the matching archiver rather than the host's.
+      - name: Build
+        run: make CC=x86_64-w64-mingw32-gcc-posix
+
+      - name: Build the checkers
+        run: make test CC=x86_64-w64-mingw32-gcc-posix
+
+      - name: It is actually a Windows binary
         run: |
-          set -u
-          CC=x86_64-w64-mingw32-gcc
-          known="posix_memalign pread sysconf"
-          found=""
-          for f in src/*.c cli/main.c; do
-            case "$f" in
-              *simd_avx2*)   X="-mavx2 -mfma" ;;
-              *simd_avx512*) X="-mavx512f -mavx512bw" ;;
-              *)             X="" ;;
-            esac
-            $CC -std=gnu11 -O1 -DVQ_SUPER=2 $X -c -o /tmp/o.o "$f" 2>/tmp/err || true
-            # implicit declarations become undefined symbols at link time;
-            # an undeclared identifier is a hard error already
-            n=$(sed -n "s/.*implicit declaration of function '\([a-z_0-9]*\)'.*/\1/p;
-                        s/.*error: '\([A-Z_0-9]*\)' undeclared.*/\1/p" /tmp/err)
-            found="$found $n"
+          file waste.exe libwaste.dll
+          file waste.exe | grep -q "PE32+ executable"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: |
+            waste.exe
+            test_*.exe
+            libwaste.dll
+            libwastevq.dll
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-run:
+    name: windows-x86_64 (run)
+    runs-on: windows-latest
+    needs: windows-build
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x86_64
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Which SIMD backend CPUID picked here. The Linux job asks the same
+      # question of /proc/cpuinfo; this is the only place the answer comes
+      # from a Windows CPUID path.
+      - name: The backend this machine selected
+        run: ./waste.exe version
+
+      # The synthetic container is a few megabytes of deterministic noise
+      # in the real format, and it is the whole reason this job can test
+      # anything: the smallest real container is 19 GB. It exercises every
+      # call this port had to write — the bypassed open, positional reads
+      # at 4 KiB offsets, and the aligned buffers both of those require.
+      - name: A container to read
+        run: python tools/make_test_container.py tiny.waste
+
+      # One bank per call: the record count is the second argument, so a
+      # glob passed whole puts a filename where a number goes and the
+      # checker reads nothing while reporting no problems.
+      - name: Expert records read through the C structs
+        run: |
+          for bank in tiny.waste/experts-L*.bin; do
+            out=$(./test_container.exe "$bank" 2)
+            echo "$out" | tail -1
+            echo "$out" | grep -qE "^[1-9][0-9]* records read, 0 problems$"
           done
-          found=$(printf '%s\n' $found | sort -u | tr '\n' ' ')
-          echo "unresolved on Windows: ${found:-none}"
-          extra=""
-          for s in $found; do
-            case " $known _SC_NPROCESSORS_ONLN " in
-              *" $s "*) ;;
-              *) extra="$extra $s" ;;
-            esac
-          done
-          if [ -n "$extra" ]; then
-            echo "::error::new POSIX dependencies with no Windows path:$extra"
-            echo "Add a _WIN32 branch, or widen the known list in this job"
-            exit 1
+
+      - name: The CLI opens it
+        run: |
+          ./waste.exe info tiny.waste
+          ./waste.exe plan tiny.waste
+
+      # The forward pass, twice: one token at a time and in chunks. They
+      # read the same expert records through the same cache, so agreement
+      # is the evidence that the streaming read path works here and not
+      # merely that it linked.
+      - name: Forward pass, sequential vs chunked
+        run: |
+          IDS=3,7,11,5,9,13,2,17,4,8,19,23,6,29,12,31
+          ./test_forward.exe tiny.waste "$IDS" seq.bin 0
+          WASTE_CHUNK=1 ./test_forward.exe tiny.waste "$IDS" chunk.bin 0
+          python - seq.bin chunk.bin <<'PY'
+          import struct, sys
+          def L(p):
+              b = open(p, "rb").read()
+              return struct.unpack(f"<{len(b)//4}f", b)
+          a, b = L(sys.argv[1]), L(sys.argv[2])
+          d = max(abs(x - y) for x, y in zip(a, b))
+          print(f"max |seq - chunked| = {d:.3e}")
+          sys.exit(0 if d < 1e-3 and a.index(max(a)) == b.index(max(b)) else 1)
+          PY
+
+      # The bypass is the reason the hit rates in docs/GATES.md mean
+      # anything, and FILE_FLAG_NO_BUFFERING is the piece of this port with
+      # no fallback that preserves them. The engine reports per run whether
+      # it got it, so ask rather than assume. A warning and not a failure:
+      # a filesystem is allowed to refuse, and the runner's is not the one
+      # anybody will run K3 on.
+      - name: The page-cache bypass engaged
+        run: |
+          out=$(./waste.exe bench tiny.waste -n 1 --json | tail -1)
+          echo "$out"
+          if echo "$out" | grep -q '"direct_io":true'; then
+            echo "FILE_FLAG_NO_BUFFERING accepted"
+          else
+            echo "::warning::this filesystem refused FILE_FLAG_NO_BUFFERING"
           fi
-          echo "ok: still the three known gaps, and no more"
 
   guards:
     name: build guards

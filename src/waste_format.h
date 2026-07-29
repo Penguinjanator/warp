@@ -95,11 +95,16 @@ typedef struct {
     uint32_t up_off;
     uint32_t down_off;
     uint32_t chan_corr_off;  /* per-channel f16 scale+bias, all 3 matrices  */
-    uint32_t crc32;          /* payload checksum, written by the converter
-                              * and checked by tools/verify_container.py.
-                              * The engine does NOT verify it on the read
-                              * path: that would cost a pass over every
-                              * expert on every miss. There is no
+    uint32_t crc32;          /* payload checksum: zlib's crc32 over the
+                              * record from the end of this header to the
+                              * end of the per-channel scales, excluding
+                              * the 4 KiB padding. Written by the converter
+                              * and checked by tools/verify_container.py
+                              * and by the engine, on every record that
+                              * comes off the disk — a cache hit is not
+                              * re-checked. It covers the payload only:
+                              * the header is outside it, and is checked
+                              * structurally instead. There is no
                               * whole-container checksum.                   */
     uint32_t reserved1[2];
     /* payload follows, padded to 4 KiB multiple                            */

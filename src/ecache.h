@@ -15,8 +15,8 @@
  * Gate 2 also showed why: at small cache fractions plain LRU collapses to
  * 5% where LFRU still gets 29%.
  *
- * Reads bypass the page cache (F_NOCACHE on macOS, O_DIRECT on Linux).
- * That is deliberate:
+ * Reads bypass the page cache (F_NOCACHE on macOS, O_DIRECT on Linux,
+ * FILE_FLAG_NO_BUFFERING on Windows). That is deliberate:
  * with a 17 GB container on a 64 GB machine the kernel would cache
  * everything and the hit rate we measure would be a fiction. K3's ~900 GB
  * gets no such help, so the engine must not depend on it.

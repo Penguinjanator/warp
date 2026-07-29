@@ -67,6 +67,19 @@ int main(int argc, char **argv)
     }
     const double tp = now() - t0;
 
+    /* NULL means an expert record did not survive the read: a short read,
+     * a header that is not the one the bank index describes, or a payload
+     * that is not what the converter checksummed. Say which record, and
+     * stop — there are no logits to look at. */
+    if (!lg) {
+        int layer = 0, expert = 0;
+        const char *why = waste_model_read_error(&m, &layer, &expert);
+        fprintf(stderr, "expert %d of layer %d: %s\n", expert, layer,
+                why ? why : "read failed");
+        waste_model_free(&m);
+        return 1;
+    }
+
     int best = 0;
     for (int v = 1; v < m.cfg.vocab; v++) if (lg[v] > lg[best]) best = v;
     printf("prefill %d tok in %.2fs (%.2f tok/s); argmax %d, max %.4f\n",
@@ -83,6 +96,14 @@ int main(int argc, char **argv)
     for (int i = 0; i < n_gen; i++) {
         t0 = now();
         lg = waste_model_step(&m, cur, n + i, NULL);
+        if (!lg) {
+            int layer = 0, expert = 0;
+            const char *why = waste_model_read_error(&m, &layer, &expert);
+            fprintf(stderr, "expert %d of layer %d: %s\n", expert, layer,
+                    why ? why : "read failed");
+            waste_model_free(&m);
+            return 1;
+        }
         best = 0;
         for (int v = 1; v < m.cfg.vocab; v++) if (lg[v] > lg[best]) best = v;
         printf("  [%3d] %6d  (%.2fs, %llu expert reads)\n", i, best, now() - t0,

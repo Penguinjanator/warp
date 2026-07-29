@@ -131,10 +131,19 @@ resident trunk, and one expert bank per layer. Each expert record is
 an expert costs exactly **one `pread`** — not three, not a seek per
 matrix. The arithmetic was never the bottleneck.
 
-Reads bypass the page cache (`F_NOCACHE` on macOS, `O_DIRECT` on Linux).
-That is deliberate: with a container smaller than RAM the kernel would
-cache everything, and the hit rates measured that way are a fiction that
-does not survive contact with a 982 GB model.
+Reads bypass the page cache (`F_NOCACHE` on macOS, `O_DIRECT` on Linux,
+`FILE_FLAG_NO_BUFFERING` on Windows). That is deliberate: with a container
+smaller than RAM the kernel would cache everything, and the hit rates
+measured that way are a fiction that does not survive contact with a
+982 GB model.
+
+Every record is checked on the way in — its `crc32` against the payload,
+its header against what the manifest says should be at that offset — so a
+container that rots on disk stops the generation and names the record
+rather than answering with whatever the damaged bytes decode to. It costs
+about 5% on Kimi-Linear and about 1% on K3, where the read dominates.
+Records already in the cache are not re-checked: the thing being verified
+is bytes arriving from disk. See [docs/FORMAT.md](docs/FORMAT.md).
 
 ### Three bits per expert weight
 
@@ -491,13 +500,22 @@ honest caveat is not a substitute for reading the file.
 | macOS arm64 | yes | 19 pass / 0 fail / 10 skip | NEON |
 | Linux arm64 | yes | 17 pass / 0 fail / 11 skip | NEON |
 | Linux x86_64 | yes | 17 pass / 0 fail / 11 skip | AVX2 |
-| Windows | three POSIX calls short — see below | — | — |
+| Windows x86_64 | yes | container, CLI and forward pass — see below | AVX2 |
 
-The three run the same suite. CI has no container, so `tests/run.sh`
-builds a synthetic one and the checks that need real weights say SKIP
-rather than passing quietly. The Linux rows skip one more than macOS only
-because that image has no `uv`, which collapses the two kernel checks
-into a single skip; both also pass the sanitizer suite and 400 fuzz cases.
+The first three run the same suite. CI has no container, so
+`tests/run.sh` builds a synthetic one and the checks that need real
+weights say SKIP rather than passing quietly. The Linux rows skip one
+more than macOS only because that image has no `uv`, which collapses the
+two kernel checks into a single skip; both also pass the sanitizer suite
+and 400 fuzz cases.
+
+Windows is cross-compiled with MinGW-w64 on a Linux runner and then run
+on a Windows one: the binary reads a synthetic container, opens it from
+the CLI, and produces the same logits token-by-token as it does in
+chunks. It is not the same suite — `tests/run.sh` is a bash script that
+rebuilds first, and the Windows job runs binaries it did not build — so
+what is claimed is what that job checks and no more. Nobody has run it on
+a real container there.
 
 The platform is the variable, the suite is not, and that is the point:
 both Linux targets produce the same continuation as macOS and pass
@@ -538,39 +556,62 @@ third_party/ stb_image.h, the single vendored header — see its README
 
 [docs/LEARNED.md](docs/LEARNED.md) is the one to read before contributing.
 It records what was measured, including the optimizations that were
-refuted — index-layout blocking, a 3-bit trunk, GPU offload — with the
-numbers that killed them.
+refuted — index-layout blocking, a 3-bit trunk, GPU offload, per-expert
+bit allocation — with the numbers that killed them.
 
 ## What is not there yet
 
 Version 0.5.0, and the API is not frozen. Stated plainly, because finding
 these out for yourself is worse than reading them here:
 
-- the **CLI's** chat template covers the text conversation and not tool
-  calls, JSON response schemas, or the think channel. K3 builds its prompt
-  with a Python program rather than a Jinja template, and
-  `examples/chat-k3.json` transcribes only the part that fits four
-  prefix/suffix strings. The server has all of it — so tool calling and
-  structured output are reachable through `python3 -m serve`, and not
-  through `waste chat`;
-- a container carries its chat format in `chat.json`, which the converter
-  cannot write because neither Kimi release distributes one — copy it in
-  from `examples/` or the CLI falls back to raw continuation;
-- AVX-512 compiles and dispatches but has never executed on hardware that
-  has it;
-- Windows has never been built. Cross-compiled with MinGW, every
-  translation unit builds except for `sysconf`, `posix_memalign` and
-  `pread`, which have no Windows path; CI pins that list so it cannot
-  quietly grow. Three shims and a cache-bypass flag is the whole port,
-  but nobody has written or run them;
-- the engine verifies no checksum on the read path. Records carry a
-  `crc32` that the converter writes and `tools/verify_container.py`
-  checks, but a container corrupted after conversion gives wrong numbers
-  rather than an error;
-- every expert in a container is at the same bit width — the non-uniform
-  per-expert allocation the format was designed around is specified and
-  not built, and it is the largest unexplored lever on both the disk
-  footprint and the bytes read per token.
+- **tool calls, JSON schemas and the think channel are server-only.** K3
+  builds its prompt with a Python program rather than a Jinja template,
+  and `examples/chat-k3.json` transcribes only the part that fits four
+  prefix/suffix strings — enough for a conversation, not for a typed
+  argument list. `serve/` carries the whole format and parses the reply
+  back into reasoning, answer and tool calls, under 149 tests. So the
+  capability exists; it is reachable through `python3 -m serve` and not
+  through `waste chat`, and that split is deliberate rather than
+  temporary: a C engine should not grow a JSON Schema renderer;
+- a container carries its chat format in `chat.json`, and the converter
+  can only fill it in for a model whose format has been transcribed from
+  its reference encoder — K3 today. Neither Kimi release distributes a
+  template, so for anything else the CLI says so and continues raw rather
+  than guessing a format, which would produce plausible wrong answers
+  instead of visibly wrong ones. Kimi-Linear is in that position now;
+- AVX-512 compiles and is dispatched from CPUID, and has still never
+  executed an instruction. This laptop is ARM and its x86 emulation is
+  Rosetta, which reports AVX2 and leaves the ZMM state disabled in XCR0;
+  the first CI run to get that far answered **AVX2** as well. The workflow
+  prints the runner's flags before every build, so the day a runner has
+  them the *SIMD backend matches the CPU baseline* check becomes the
+  confirmation without anyone arranging it;
+- **Windows builds and runs, on one toolchain and one CPU.** MinGW-w64
+  x86_64, cross-compiled, with `src/platform.h` holding the six calls
+  that are not POSIX: the positional read, the aligned allocation, the
+  CPU count, the file size and `FILE_FLAG_NO_BUFFERING` for the
+  cache-bypass open. MSVC is a different port and has not been attempted
+  — the sources use GNU C. ARM64 Windows is not built. Neither is the
+  page-cache bypass proven under load there: CI confirms Windows grants
+  it on the runner's filesystem, which is not the same as measuring a hit
+  rate against a container that does not fit in RAM;
+- expert records are checksummed on the read path and the **trunk is
+  not**. It has no checksum in the format at all, and neither do the
+  codebooks: both are read once at load rather than per token, so the
+  per-record argument does not carry over, and nothing has been built in
+  its place. A trunk that rots still gives wrong numbers rather than an
+  error;
+- every expert in a container is at the same bit width. The non-uniform
+  per-expert allocation the format was designed around is **not coming**:
+  it was measured on both models rather than built, and the importance it
+  would allocate against does not vary — the value of the third bit
+  spreads at most 1.15x between experts in a layer and 1.01x between
+  layers, so
+  the optimal allocator and a coin flip write the same container. The one
+  signal that is not flat, routing frequency, buys disk footprint and
+  almost no I/O, which is the resource that is actually scarce.
+  [docs/LEARNED.md](docs/LEARNED.md) §20 has the table and the one
+  measurement that would revive it.
 
 ## License
 

@@ -35,12 +35,17 @@ it will be split into ordinary text and the model will not recognize it —
 ## chat-k3.json — Kimi K3
 
 [chat-k3.json](chat-k3.json) is K3's own format, transcribed from
-`encoding_k3.py` in the release. Copy it in and `waste run` answers
-questions instead of continuing text:
+`encoding_k3.py` in the release. **`tools/convert.py` installs it for you**
+when it recognises K3, so a fresh container already answers questions
+instead of continuing text. It is here for containers converted before
+that, and for editing:
 
 ```bash
 cp examples/chat-k3.json ~/models/k3.waste/chat.json
 ```
+
+The converter never overwrites a `chat.json` that is already there, so an
+edited one survives a re-conversion.
 
 **Neither Kimi release ships a Jinja template**, which is why the
 converter has nothing to copy: K3 does not have one. It builds the prompt

@@ -18,10 +18,12 @@
 #include <string.h>
 
 #include <fcntl.h>
-#include <unistd.h>
+#include <unistd.h>          /* MinGW ships one too: open/close/lseek */
 
+#include "crc32.h"
 #include "ecache.h"
 #include "json.h"
+#include "platform.h"
 #include "threads.h"
 #include "kda.h"
 #include "simd.h"
@@ -61,12 +63,16 @@ static char *slurp(const char *path, size_t *len)
 
 static int bank_open(const char *path, size_t rec_bytes, int *direct);
 
-/* pread until the whole range lands; short reads are legal. */
-static int pread_all(int fd, void *dst, size_t n, long off)
+/* pread until the whole range lands; short reads are legal.
+ *
+ * The offset is int64_t and not `long` because `long` is 32 bits on
+ * Windows: a trunk is 57 GB on K3, so a truncating offset would read the
+ * wrong tensor rather than fail. */
+static int pread_all(int fd, void *dst, size_t n, int64_t off)
 {
     uint8_t *p = (uint8_t *)dst;
     while (n) {
-        const ssize_t r = pread(fd, p, n, (off_t)off);
+        const int64_t r = waste_pread(fd, p, n, off);
         if (r <= 0) return -1;
         p += r; n -= (size_t)r; off += r;
     }
@@ -448,14 +454,14 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
 {
     char path[MAXP];
     snprintf(path, sizeof path, "%s/trunk.bin", dir);
-    const int fd = open(path, O_RDONLY);
+    const int fd = open(path, O_RDONLY | WASTE_O_BINARY);
     if (fd < 0) return -1;
 #define TRUNK_FAIL do { close(fd); return -1; } while (0)
     /* Every offset and length below comes from the manifest, so bound them
      * by the one thing that is not a claim: how big the file actually is.
      * Without it a declared shape of [2^20, 2^20] asks for a 4 TB
      * allocation before anything notices. */
-    const off_t fsize = lseek(fd, 0, SEEK_END);
+    const int64_t fsize = waste_file_size(fd);
     if (fsize < 0) TRUNK_FAIL;
 
     m->n_tensors = js_size(d, trunk);
@@ -466,9 +472,9 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
         waste_tensor *t = &m->t[i];
         js_str(d, js_get(d, e, "name"), t->name, sizeof t->name);
         const int fmt = (int)js_int(d, js_get(d, e, "fmt"), 0);
-        const long off = js_int(d, js_get(d, e, "off"), 0);
+        const int64_t off = js_int(d, js_get(d, e, "off"), 0);
         const int g = (int)js_int(d, js_get(d, e, "group"), 128);
-        const long soff = js_int(d, js_get(d, e, "scale_off"), 0);
+        const int64_t soff = js_int(d, js_get(d, e, "scale_off"), 0);
         int sh = js_get(d, e, "shape");
         t->ndim = js_size(d, sh);
         /* Shapes and the group size divide and index below, so a manifest
@@ -514,7 +520,7 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
             if (pread_all(fd, t->data, t->n * sizeof(float), off)) TRUNK_FAIL;
         } else if (!q8_off) {                             /* Q8G -> f32 */
             const int N = t->shape[t->ndim - 1];
-            const long rows = (long)(t->n / (size_t)N);
+            const int64_t rows = (int64_t)(t->n / (size_t)N);
             const int ng = (N + g - 1) / g;
             t->data = (float *)waste_dio_alloc(t->n * sizeof(float));
             int8_t *qbuf = (int8_t *)malloc((size_t)rows * ng * g);
@@ -526,7 +532,7 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
             }
             const int8_t *q = qbuf;
             const uint16_t *sc = sbuf;
-            for (long r = 0; r < rows; r++) {
+            for (int64_t r = 0; r < rows; r++) {
                 for (int b = 0; b < ng; b++) {
                     /* fp16 -> float without <arm_fp16.h> assumptions */
                     const uint16_t h = sc[r * ng + b];
@@ -546,7 +552,7 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
             free(qbuf); free(sbuf);
         } else {                             /* Q8G or Q4G, kept quantized */
             const int N = t->shape[t->ndim - 1];
-            const long rows = (long)(t->n / (size_t)N);
+            const int64_t rows = (int64_t)(t->n / (size_t)N);
             const int ng = (N + g - 1) / g;
             t->group = g;
             t->bits = (fmt == 3) ? 4 : (fmt == 7) ? 3 : 8;
@@ -833,9 +839,20 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         }
     }
 
-    /* expert banks */
-    m->expert_m[0] = m->expert_m[1] = c->moe_inter; m->expert_n[0] = m->expert_n[1] = c->hidden;
-    m->expert_m[2] = c->hidden; m->expert_n[2] = c->moe_inter;
+    /* expert banks. The expert's input width is the latent one on a model
+     * that has it (K3), and the hidden everywhere else — the same choice
+     * moe_layer makes, and the one that decides how many per-channel
+     * scales a record ends with. */
+    {
+        const int lat = c->latent_dim ? c->latent_dim : c->hidden;
+        m->expert_m[0] = m->expert_m[1] = c->moe_inter;
+        m->expert_n[0] = m->expert_n[1] = lat;
+        m->expert_m[2] = lat; m->expert_n[2] = c->moe_inter;
+    }
+    /* Verification is on: a record that fails is an error, not a wrong
+     * answer. The knob is for measuring what it costs, the way
+     * WASTE_DIRECT=0 is for measuring the page-cache bypass. */
+    { const char *e = getenv("WASTE_VERIFY"); m->no_verify = e && *e == '0'; }
     int layers = js_get(&d, 0, "layers");
     for (int L = 0; L < c->n_layers; L++) {
         char key[16];
@@ -847,12 +864,31 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         snprintf(path, sizeof path, "%s/%s", dir, fn);
         m->bank[L].n_experts = (int)js_int(&d, js_get(&d, e, "experts"), 0);
         m->bank[L].cb_base = (int)js_int(&d, js_get(&d, e, "codebook_base"), 0);
-        const long bytes = js_int(&d, js_get(&d, e, "bytes"), 0);
+        /* A layer's bank passes 2 GB well before K3's largest does, so the
+         * division that produces rec_bytes has to happen in 64 bits. */
+        const int64_t bytes = js_int(&d, js_get(&d, e, "bytes"), 0);
         m->bank[L].rec_bytes = m->bank[L].n_experts ? bytes / m->bank[L].n_experts : 0;
         m->bank[L].fd = bank_open(path, m->bank[L].rec_bytes, &m->direct_io);
     }
     js_free(&d);
     free(src);
+
+    /* The three the forward pass reads for every token of every model,
+     * whatever its architecture: the embedding row, the final norm and
+     * the head. A trunk index that has lost them — an empty list, a
+     * truncated one — otherwise loads, and the first token dereferences
+     * the NULL that waste_find returns. Checking every tensor the pass
+     * might want would mean a second copy of its naming rules, and a
+     * wrong entry there would refuse a container that works; these three
+     * are unconditional, so the check cannot be wrong about them. */
+    {
+        static const char *req[] = { "%smodel.embed_tokens.weight",
+                                     "%smodel.norm.weight",
+                                     "%slm_head.weight" };
+        for (size_t i = 0; i < sizeof req / sizeof *req; i++)
+            if (!waste_find(m, tname(req[i], c->prefix)))
+                return -2;               /* -> WASTE_E_FORMAT */
+    }
 
     /* state + scratch */
     const int H = c->kda_heads, D = c->kda_dim, C = H * D;
@@ -924,7 +960,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                                  * m->cb_entries * sizeof(float));
     }
     {   /* expert cache, sized by the caller's budget */
-        long rec = 0;
+        int64_t rec = 0;
         for (int L = 0; L < c->n_layers; L++)
             if (m->bank[L].rec_bytes > rec) rec = m->bank[L].rec_bytes;
         if (waste_ecache_init(&m->cache, cache_bytes, (size_t)rec, 0)) return -1;
@@ -969,14 +1005,16 @@ void waste_model_free(waste_model *m)
  * measure would be about the kernel's cache, not ours. K3's ~900 GB gets no
  * such help, so the engine must not depend on it.
  *
- * macOS says so with fcntl. Linux needs O_DIRECT, which additionally
- * demands that the offset, the length and the destination buffer all be
- * multiples of the device's logical block size. Offsets and lengths are
- * whole 4 KiB pages by construction — but only if this container was
- * written that way, so check rather than assume, because a misaligned
- * record makes every read fail EINVAL rather than merely run slow. The
- * buffers come from waste_dio_alloc. Filesystems may still refuse O_DIRECT
- * (tmpfs does), so fall back and at least turn readahead off.
+ * macOS says so with fcntl. Linux needs O_DIRECT and Windows
+ * FILE_FLAG_NO_BUFFERING, which are the same mechanism under two names and
+ * carry the same contract: the offset, the length and the destination
+ * buffer must all be multiples of the device's logical block size. Offsets
+ * and lengths are whole 4 KiB pages by construction — but only if this
+ * container was written that way, so check rather than assume, because a
+ * misaligned record makes every read fail outright rather than merely run
+ * slow. The buffers come from waste_dio_alloc. A filesystem may still
+ * refuse the bypass (tmpfs does), so fall back and at least turn readahead
+ * off.
  *
  * `*direct` is set to 0 if any bank ends up without the bypass, so `waste
  * info` can say the hit rates are being measured against a warm page
@@ -984,9 +1022,23 @@ void waste_model_free(waste_model *m)
 static int bank_open(const char *path, size_t rec_bytes, int *direct)
 {
     (void)rec_bytes; (void)direct;
+    /* The escape hatch, for measuring what the page cache is worth. */
+    const char *e = getenv("WASTE_DIRECT");
+    const int want = !(e && e[0] == '0') && rec_bytes &&
+                     rec_bytes % WASTE_DIO_ALIGN == 0;
+    (void)want;
+#if defined(_WIN32)
+    if (want) {
+        const int fd = waste_open_stream(path, 1);
+        if (fd >= 0) return fd;
+    }
+    *direct = 0;
+    /* Second call rather than a retry flag: the first CreateFileA failed,
+     * and the fallback differs only in the flag it asks for. */
+    return waste_open_stream(path, 0);
+#else
 #if defined(__linux__) && defined(O_DIRECT)
-    if (rec_bytes && rec_bytes % WASTE_DIO_ALIGN == 0 &&
-        !(getenv("WASTE_DIRECT") && getenv("WASTE_DIRECT")[0] == '0')) {
+    if (want) {
         const int fd = open(path, O_RDONLY | O_DIRECT);
         if (fd >= 0) return fd;
     }
@@ -1004,16 +1056,101 @@ static int bank_open(const char *path, size_t rec_bytes, int *direct)
     *direct = 0;
 #endif
     return fd;
+#endif /* _WIN32 */
 }
 
-/* One pread of a 4 KiB-aligned record — what the layout exists for. */
+/* ---- record verification ------------------------------------------------
+ *
+ * This runs once per record that comes off the disk and never on a cache
+ * hit: the unit being checked is "bytes that just entered RAM", and
+ * re-checking a record already in the cache would cost a pass over every
+ * expert on every token to learn nothing new.
+ *
+ * The crc32 covers the body only — the converter computes it from byte 48
+ * to the end of the per-channel scales — so the header is outside it and
+ * has to be checked structurally instead. That is needed anyway: the
+ * offsets saying where the body ends are in the header, and following an
+ * unvalidated offset to decide how much to checksum is a read past the
+ * buffer rather than a check.
+ *
+ * Everything here is derivable from the manifest, so it is derived rather
+ * than believed: the record has to be the bank's stride, has to be the
+ * expert that was asked for, and its scales are one f16 per output row of
+ * each of the three matrices.
+ */
+
+typedef enum {
+    REC_OK = 0,
+    REC_E_READ,      /* short read                                        */
+    REC_E_HEADER,    /* magic, identity, offsets                          */
+    REC_E_CRC,       /* the payload is not what the converter wrote       */
+} rec_status;
+
+static rec_status record_check(const waste_model *m, int layer, int expert,
+                               const uint8_t *rec)
+{
+    const size_t rec_bytes = (size_t)m->bank[layer].rec_bytes;
+    const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
+
+    if (rec_bytes < sizeof *h) return REC_E_HEADER;
+    if (h->magic != WASTE_MAGIC_EXPERT) return REC_E_HEADER;
+    /* A bank is a flat array indexed by expert id, so a record naming a
+     * different one means the file has been spliced, or truncated by
+     * something other than a whole number of records — a pread that lands
+     * on the wrong one still succeeds. */
+    if (h->layer != (uint16_t)layer || h->expert_id != (uint16_t)expert)
+        return REC_E_HEADER;
+    if ((size_t)h->rec_4k_blocks * WASTE_ALIGN != rec_bytes) return REC_E_HEADER;
+    if (h->fmt != WQ_VQ3R && h->fmt != WQ_VQ2R) return REC_E_HEADER;
+    if (h->lowrank_id != 0) return REC_E_HEADER;             /* v0 */
+    /* codebook_id indexes the table three stage-groups deep and nothing
+     * downstream bounds it. */
+    if ((long)h->codebook_id + 3L * m->stages > m->n_books) return REC_E_HEADER;
+
+    if (!(h->gate_off == sizeof *h && h->gate_off < h->up_off &&
+          h->up_off < h->down_off && h->down_off < h->chan_corr_off &&
+          h->chan_corr_off <= rec_bytes))
+        return REC_E_HEADER;
+
+    /* one f16 scale per output row of gate, up and down */
+    const size_t scales = 2u * (size_t)(m->expert_m[0] + m->expert_m[1] +
+                                        m->expert_m[2]);
+    if (scales > rec_bytes - h->chan_corr_off) return REC_E_HEADER;
+
+    /* Only the checksum is optional. The checks above are O(1) and are
+     * the ones keeping an offset from a damaged header out of the
+     * arithmetic downstream, so WASTE_VERIFY=0 skips the pass over the
+     * payload and nothing else — it is a knob for measuring the cost of
+     * that pass, not for turning the bounds off. */
+    if (m->no_verify) return REC_OK;
+
+    const size_t payload = (size_t)h->chan_corr_off + scales - sizeof *h;
+    if (waste_crc32(rec + sizeof *h, payload) != h->crc32) return REC_E_CRC;
+    return REC_OK;
+}
+
+/* One pread of a 4 KiB-aligned record — what the layout exists for —
+ * and then the check that it is the record it says it is.
+ * The offset is computed in 64 bits before the multiply: a bank of 384
+ * experts crosses 2 GB well before the biggest layer does. */
 static int bank_fetch(void *user, int layer, int expert, uint8_t *dst)
 {
     waste_model *m = (waste_model *)user;
     waste_bank *b = &m->bank[layer];
-    const ssize_t got = pread(b->fd, dst, (size_t)b->rec_bytes,
-                              (off_t)expert * b->rec_bytes);
-    if (got != (ssize_t)b->rec_bytes) return -1;
+    const int64_t got = waste_pread(b->fd, dst, (size_t)b->rec_bytes,
+                                    (int64_t)expert * (int64_t)b->rec_bytes);
+    rec_status st = got == (int64_t)b->rec_bytes ? REC_OK : REC_E_READ;
+    if (st == REC_OK) st = record_check(m, layer, expert, dst);
+    if (st != REC_OK) {
+        /* First failure wins: it is the one with a cause worth reporting,
+         * and the layer and expert of the twentieth tell nobody anything. */
+        if (!m->read_error) {
+            m->read_error = (int)st;
+            m->bad_layer = layer;
+            m->bad_expert = expert;
+        }
+        return -1;
+    }
     m->expert_reads++;
     return 0;
 }
@@ -1026,6 +1163,20 @@ static const uint8_t *read_expert(waste_model *m, int L, int eid)
     m->cache.bytes_read += (size_t)m->bank[L].rec_bytes;
     return bank_fetch(m, L, eid, m->miss_buf) == 0 ? m->miss_buf : NULL;
 }
+
+const char *waste_model_read_error(const waste_model *m, int *layer, int *expert)
+{
+    if (!m->read_error) return NULL;
+    if (layer) *layer = m->bad_layer;
+    if (expert) *expert = m->bad_expert;
+    switch (m->read_error) {
+        case REC_E_READ:   return "short read";
+        case REC_E_HEADER: return "record header is not what the bank index describes";
+        default:           return "checksum mismatch";
+    }
+}
+
+void waste_model_clear_read_error(waste_model *m) { m->read_error = 0; }
 
 /* ---- fused VQ matvec ---------------------------------------------------
  * Never materializes the weights. For a matrix stored as `stages` codebook
@@ -1516,7 +1667,10 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
         PROF_START(P_EDEQ);
         const uint8_t *rec = read_expert(m, L, idx[j]);
         PROF_END(P_EDEQ);
-        if (!rec) continue;
+        /* This token is already wrong — the expert it needed is not
+         * readable. Stop rather than sum the ones that were, and let the
+         * step report it; m->read_error is what carries the reason out. */
+        if (!rec) break;
         const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
         const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
 
@@ -2042,7 +2196,7 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
         PROF_START(P_EDEQ);
         const uint8_t *rec = read_expert(m, L, e);
         PROF_END(P_EDEQ);
-        if (!rec) continue;
+        if (!rec) break;                 /* see moe_layer: the chunk is lost */
         const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
         const uint16_t *s16 = (const uint16_t *)(rec + h->chan_corr_off);
 
@@ -2167,6 +2321,10 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     int ps_live = 0;
 
     for (int L = 0; L < c->n_layers; L++) {
+        /* A record already failed: stop instead of streaming the rest of
+         * the layers from a container that has been shown to be wrong.
+         * On K3 that is gigabytes of pointless reads per token. */
+        if (m->read_error) break;
         if (ares_on) {
             memcpy(m->cprefix, m->cx, (size_t)n * hid * sizeof(float));
             ps_live = 1;
@@ -2265,7 +2423,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     matvec_t(m, m->logits, waste_find(m, tname("%slm_head.weight", c->prefix)), last,
              c->vocab, hid);
     memcpy(m->x, m->cx + (size_t)(n - 1) * hid, (size_t)hid * sizeof(float));
-    return m->logits;
+    return m->read_error ? NULL : m->logits;
 }
 
 const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
@@ -2295,6 +2453,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     m->n_blockres = 0;
 
     for (int L = 0; L < c->n_layers; L++) {
+        if (m->read_error) break;        /* see waste_model_prefill */
         char b[128];
         if (ares_on) {
             memcpy(ps, m->x, (size_t)hid * sizeof(float));
@@ -2371,5 +2530,5 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     PROF_END(P_HEAD);
     free(resid);
     free(norm);
-    return m->logits;
+    return m->read_error ? NULL : m->logits;
 }

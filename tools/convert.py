@@ -53,7 +53,7 @@ def _load_vq():
         return _VQ or None
     import ctypes
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    for name in ("libwastevq.dylib", "libwastevq.so"):
+    for name in ("libwastevq.dylib", "libwastevq.so", "libwastevq.dll"):
         path = os.path.join(here, name)
         if os.path.exists(path):
             lib = ctypes.CDLL(path)
@@ -520,6 +520,40 @@ def main():
                      encoding="utf-8") as f:
             f.write(tpl)
         print(f"chat template: copied ({len(tpl)} bytes)")
+
+    # ---- chat.json -------------------------------------------------------
+    # The declarative format the CLI reads. Neither Kimi release ships a
+    # template, so there is nothing to convert from — but for the models we
+    # have transcribed from the reference encoder, examples/ holds one, and
+    # a container that has to be finished by hand is a container that will
+    # be used unfinished. Copied from examples/ rather than embedded here,
+    # so there is one copy of each template and not two that drift.
+    #
+    # Only for an architecture we actually have: for anything else the CLI
+    # keeps saying so and falling back, which is better than a guessed
+    # format that produces plausible wrong answers. And never over an
+    # existing file — a hand-edited chat.json outranks the shipped one.
+    _tmpl_for = {"kimi-k3": "chat-k3.json"}
+    _hf0 = ((cfg.get("_outer", {}).get("architectures")
+             or cfg.get("architectures") or [""]))[0]
+    _arch0 = ("kimi-k3" if "KimiK3" in _hf0 else
+              "kimi-linear" if "KimiLinear" in _hf0 else "")
+    _dst = os.path.join(args.out, "chat.json")
+    _name = _tmpl_for.get(_arch0)
+    if _name and not os.path.exists(_dst):
+        _src_tmpl = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "examples", _name)
+        if os.path.exists(_src_tmpl):
+            shutil.copyfile(_src_tmpl, _dst)
+            print(f"chat.json: {_name} — `waste chat` will use it")
+        else:
+            print(f"chat.json: examples/{_name} not found; the CLI will "
+                  f"fall back to raw continuation")
+    elif os.path.exists(_dst):
+        print("chat.json: already present, left alone")
+    elif _arch0:
+        print(f"chat.json: none known for {_arch0}; the CLI will fall back "
+              f"to raw continuation (see examples/README.md)")
 
     # ---- vision config ---------------------------------------------------
     # The tower's shape lives in the release's nested vision_config, and the

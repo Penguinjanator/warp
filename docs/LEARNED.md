@@ -771,3 +771,179 @@ invisible while there was no chat template — with nothing to forge, a
 marker in a prompt was just a strange token. Shipping the template is
 what turned a latent flaw into a live one, which is the usual way a
 feature and a vulnerability arrive together.
+
+## 20. Per-expert bit allocation: the lever that is not there (2026-07-29)
+
+Design goal 5 of [FORMAT.md](FORMAT.md) said important experts get 3 bits
+and unimportant ones get 2, after GEMQ
+([arXiv:2605.23078](https://arxiv.org/pdf/2605.23078)). A `bits[]`
+manifest field was reserved for it, the converter never wrote one, and
+the README called it *the largest unexplored lever on both the disk
+footprint and the bytes read per token*. It is now explored, with
+`tools/bitalloc_lab.py`, and it is not a lever.
+
+The arithmetic first, because it makes the question small. Total squared
+error when a set S of experts drops from 3 stages to 2 is
+
+    E(S) = sum_e err3_e + sum_{e in S} (err2_e - err3_e)
+                           \______  delta_e  ______/
+
+so the best possible S of a given size is exactly the smallest deltas.
+That is arithmetic, not a result. Everything therefore rests on one
+question: **how much does delta vary between experts?** If it is
+constant, the optimal allocator and a coin flip write the same container.
+
+It is constant. Three places it could have varied, all measured on K3
+with the codebooks fitted per (layer, matrix) exactly as `convert.py`
+fits them:
+
+| where the spread could live | max/min delta | greedy vs random |
+|---|---|---|
+| between experts in a layer | 1.06–1.15x | 0.2–1.4% |
+| between layers — 1, 5, 23, 46, 69, 92 | **1.01x** | — |
+| between gate, up and down | 1.09–1.30x | 0.3–0.6% |
+
+The middle row is the surprising one: the first and last MoE layers
+quantize like the middle, to within one part in a hundred, so even
+*per-layer* allocation — which the engine could do almost for free, since
+record size is already keyed by layer — has nothing to allocate.
+
+Two checks that this is real and not an artefact of the sample. **128
+experts of one layer**, in case importance hides in a heavy tail rather
+than in the variance: spread 1.15x, no tail. **Kimi-Linear**, in case
+K3's QAT is what homogenized the experts: 1.09–1.17x within a layer,
+1.02x across layers. Not a QAT effect.
+
+The mechanism is visible in the uniform numbers. Error by stage count is
+57.5% / 33.2% / 19.5%, i.e. each residual stage removes 42% of what is
+left — and it removes the same 42% in every expert, every layer, both
+models. Per-output-channel amax scaling is what does it: after dividing
+each row by its own maximum, one expert's 8-dim vectors are distributed
+like another's, so a codebook fitted on twelve of them fits all 896
+equally well. Experts differ in what they compute, not in how hard they
+are to quantize.
+
+**What survives is routing frequency**, which is not flat. With delta
+constant, the routing-weighted damage of demoting a set is just its share
+of activations — `err^2 = err3^2 + mass(S) * delta` — so the whole policy
+space collapses to picking an end of the routing distribution. Against
+`tests/trace_kimi_300.jsonl` (300 tokens, 62 400 activations) and
+Kimi-Linear's own errors, since no K3 routing trace exists yet:
+
+| demoted | avg bits | disk | coldest first: I/O, error | hottest first: I/O, error |
+|---|---|---|---|---|
+| 25% | 2.75 | −8.3% | −0.0%, 19.60% | −25.6%, 30.66% |
+| 50% | 2.50 | −16.7% | −1.9%, 20.58% | −31.5%, 32.70% |
+| 75% | 2.25 | −25.0% | −7.8%, 23.51% | −33.3%, 33.30% |
+
+Uniform VQ3R is 19.57%. Read the two halves against each other: the
+policy that protects quality saves disk and **no I/O**, because cold
+experts are cold and are not what gets read; the policy that saves I/O
+costs 11 points of error for 26% of the reads. There is no third policy,
+because delta is flat — the exchange rate is fixed and both ends of it
+are bad. Disk is not the scarce resource here anyway (982 GB on a 3.7 TB
+drive); bytes per token is, and this cannot buy them.
+
+The left column is if anything generous: 300 tokens over 6656 slots
+leaves most of the cold half simply unvisited, so a longer trace would
+move mass out of the tail and make the coldest-first rows cost more error
+for the same disk. The conclusion does not depend on which way that
+error goes, because the column it would have to rescue is the I/O one.
+
+So the mechanism was not built: variable-size records, a per-expert index,
+a width-classed cache and an allocator, to land on the straight line
+between VQ3R and VQ2R that a coin flip already reaches. §3 killed the
+shared low-rank basis for the same kind of reason — the structure the
+paper assumes is not in these weights.
+
+**Revive criterion**, the same one §3 has. This is the unweighted metric:
+for x ~ N(0, I), E||(W−R)x||² = ||W−R||²_F exactly, so the isotropic
+proxy *is* Frobenius and the ranking is calibration-free — but real
+activations are not isotropic, and an importance matrix could make delta
+spread where the weights do not. Rerun `bitalloc_lab.py` with an
+activation-weighted error in the same rented session as the Gate 4
+oracle. Revive if delta spreads past ~2x between experts; otherwise
+delete design goal 5 and the `bits[]` field with it. Nothing has been
+written in that field, so either way it is a cheap change.
+
+## 21. What a checksum on the read path costs (2026-07-29)
+
+Every expert record has carried a `crc32` since the first converter wrote
+one, and until now nothing on the read path looked at it. The reasoning
+was in the format header, and it was not wrong: verifying costs a pass
+over every expert on every miss. What it left out is what the alternative
+costs. A single flipped bit in an expert payload does not produce a
+visible failure — on the synthetic container it produces the *same
+argmax* and slightly different logits. There is no symptom to notice, so
+a container that rots after conversion is discovered by not being
+discovered.
+
+So it was measured rather than argued about.
+
+**CRC throughput, one M-series core, over a whole record:**
+
+| | GB/s | per 2.54 MB record | per 11.83 MB record |
+|---|---|---|---|
+| byte table | 0.60 | 4.41 ms | 20.5 ms |
+| slice-by-8 | 2.70 | 0.99 ms | 4.59 ms |
+| armv8 `crc32d`, one chain | 12.05 | 0.22 ms | 1.03 ms |
+| armv8, three chains | **33.03** | **0.10 ms** | **0.38 ms** |
+
+The gap between the last two rows is the whole reason the implementation
+is not four lines. `crc32d` retires one per cycle and takes about three
+to produce its result, so a single dependent chain runs at a third of
+what the unit can do. Three chains over three slices, stitched back
+together with zlib's GF(2) combine, cost two matrix walks per record —
+microseconds against a 0.38 ms pass.
+
+**End to end, `WASTE_VERIFY=0` against the default:**
+
+| Kimi-Linear, 16 tokens, 5 GB budget | verify off | verify on | cost |
+|---|---|---|---|
+| three pairs, quiet machine | 9.08 tok/s | 8.65 tok/s | 4.7% |
+| median of eight pairs, machine busy | 6.40 tok/s | 6.04 tok/s | 5.5% |
+
+Call it **5%**. The absolute throughput moved by a third between those
+two sittings — the second was taken while the machine was building
+something else — and the ratio moved by 0.8 points, which is about the
+resolution this measurement has. A single run either way says nothing:
+the spread within one sitting reached 17%.
+
+**K3 pays about 1%**, and that figure is derived rather than measured:
+7,287 misses at 0.376 ms is 2.7 s of a 268 s run, and a 1% difference is
+far under the noise of a four-minute streaming decode. The direction is
+the point — the more a model is dominated by reading, the less a pass
+over the bytes it just read costs. K3 is the model this engine exists
+for, and it is the one that pays least.
+
+x86-64 gets the table path and its 2.70 GB/s: SSE4.2 does have a `crc32`
+instruction, and it is Castagnoli — a different polynomial, no help for
+this one. PCLMULQDQ folding would close the gap and has not been written.
+An aarch64 build gets the fast path when the compiler was told the CPU
+has the CRC extension, which on Apple clang is the default and on a
+portable Linux build is `make WASTE_NATIVE=1`. `waste info` prints which
+one a binary got, because nothing else would say.
+
+**The header is not in the checksum**, and that had to be handled rather
+than noted. The converter computes the crc32 over the body alone, so a
+flipped bit in `chan_corr_off` is invisible to it — and that field is
+what says how much to checksum. Deciding the extent of a check from a
+value the check does not cover is a read past the buffer, not a check. So
+the header is verified structurally first, against what the manifest
+already implies: the record must be the bank's stride long, must be the
+expert asked for at that offset, must name a codebook that exists. All of
+it derivable, so none of it believed.
+
+**What the fuzzer found once it read records.** `fuzz_container.py` only
+ever ran `waste info`, which parses the manifest and opens every bank but
+never reads a record — so the new checks were outside everything it
+covered. Extending it to drive a forward pass, plus a mutation that
+damages *every* record of a bank (a prompt routes to few experts, so one
+damaged record is usually never read and proves nothing), turned up a
+defect that had nothing to do with checksums: a manifest whose `trunk`
+list is empty loads successfully, and the first token dereferences the
+NULL that `waste_find` returns. The three tensors every forward pass
+reads unconditionally — embeddings, final norm, head — are now required
+at load. Checking *every* tensor the pass might want would mean a second
+copy of its naming rules, and a wrong entry there would refuse a
+container that works; these three cannot be wrong.

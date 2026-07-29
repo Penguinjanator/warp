@@ -15,6 +15,7 @@
 #ifndef WASTE_JSON_H
 #define WASTE_JSON_H
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -194,10 +195,13 @@ static inline double js_num(const js_doc *d, int t, double dflt)
     return atof(buf);
 }
 
-static inline long js_int(const js_doc *d, int t, long dflt)
+/* int64_t rather than long: the manifest's `off` and `scale_off` are byte
+ * offsets into a trunk that is 57 GB on K3, and `long` is 32 bits on
+ * Windows. Every other caller wants a small number and casts to int. */
+static inline int64_t js_int(const js_doc *d, int t, int64_t dflt)
 {
     double v = js_num(d, t, (double)dflt);
-    return (long)v;
+    return (int64_t)v;
 }
 
 /* Copies at most cap-1 bytes; always NUL-terminates. */

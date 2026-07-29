@@ -10,8 +10,9 @@
  * all have finished. Splitting is by row, so results are bit-identical to
  * the serial version regardless of thread count.
  *
- * Windows: swap the pthreads calls for SRWLOCK + CONDITION_VARIABLE; the
- * interface stays the same.
+ * Windows needs nothing here: MinGW implements pthreads over winpthreads,
+ * so the pool below compiles and runs unchanged. Only the CPU count was
+ * POSIX-only, and that now comes from platform.h.
  */
 
 #ifndef WASTE_THREADS_H
@@ -20,7 +21,8 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+
+#include "platform.h"
 
 typedef void (*waste_range_fn)(int begin, int end, void *arg);
 
@@ -63,11 +65,7 @@ static void *waste__worker(void *p)
     }
 }
 
-static inline int waste_hw_threads(void)
-{
-    long n = sysconf(_SC_NPROCESSORS_ONLN);
-    return n > 1 ? (int)n : 1;
-}
+static inline int waste_hw_threads(void) { return waste_cpu_count(); }
 
 static inline void waste_pool_init(int nthreads)
 {

@@ -93,16 +93,23 @@ uncertainty beyond device selection.
 
 ## Platform abstraction
 
-Beyond kernels, three areas differ per OS and are isolated behind thin
-wrappers rather than sprinkled through the engine:
+Beyond kernels, a handful of calls differ per OS. They live in
+[src/platform.h](../src/platform.h) rather than sprinkled through the
+engine — one Windows implementation and one POSIX line each, so no call
+site carries a branch:
 
 | concern | macOS | Linux | Windows |
 |---|---|---|---|
 | cache-bypass read | `fcntl(F_NOCACHE)` | `O_DIRECT` | `FILE_FLAG_NO_BUFFERING` |
 | positional read | `pread` | `pread` | `ReadFile` + `OVERLAPPED` |
-| mapping | `mmap` | `mmap` | `CreateFileMapping`/`MapViewOfFile` |
+| aligned allocation | `posix_memalign` | `posix_memalign` | `_aligned_malloc` |
+| CPU count | `sysconf` | `sysconf` | `GetActiveProcessorCount` |
+| physical RAM | `sysctlbyname("hw.memsize")` | `sysconf(_SC_PHYS_PAGES)` | `GlobalMemoryStatusEx` |
 | CPU features | `sysctlbyname("hw.optional.arm.*")` | `getauxval(AT_HWCAP/2)` | `IsProcessorFeaturePresent` / CPUID |
-| threads | pthreads | pthreads | Win32 or C11 `threads.h` |
+| threads | pthreads | pthreads | pthreads (winpthreads) |
+
+Nothing is mapped: the engine reads by offset and never calls `mmap`,
+which is what makes the streaming path one shim rather than two.
 
 The expert-streaming path is the one that really cares: Gate H showed
 throughput is set by random 12 MB reads with the page cache bypassed, and
@@ -137,8 +144,8 @@ the backend string reports what the binary *uses*, not what the silicon
 offers. Put the suffix back in the commit that adds the kernel.
 
 That equivalence is the contract every future backend must meet: **same
-results, only faster.** Windows is not built and not claimed; what that
-costs is measured below.
+results, only faster.** Windows is built and run in CI as of 2026-07-29;
+what it cost, and what is still not claimed, is at the end.
 
 ## Machine-specific optimization: measured, not guessed (2026-07-27)
 
@@ -224,9 +231,10 @@ the platform I/O wrapper and the CI matrix all landed the following day
 and have their own sections below; what remains of it is CUDA, BLAS and
 Windows.)*
 
-The CUDA and BLAS backends, and Windows — where "the branches are
-written" turned out to mean one branch, in dot-product detection. The
-measurement is at the end of this document.
+The CUDA and BLAS backends. Windows was on this list until 2026-07-29;
+"the branches are written" had turned out to mean one branch, in
+dot-product detection. The measurement, and the port that followed it,
+are at the end of this document.
 
 ## i8mm/SMMLA for the batched matmul: 2x on its own work, 1.2% overall
 
@@ -492,11 +500,49 @@ winpthreads, so the thread pool needs nothing.
 
 That is a small port — three shims plus `FILE_FLAG_NO_BUFFERING` for the
 page-cache bypass, which is where the real work is, since the whole
-expert-streaming argument rests on it. It is not done, and this document
-does not claim it.
+expert-streaming argument rests on it.
 
-**CI pins the list.** A `windows-portability` job cross-compiles every
-translation unit and fails if a fourth POSIX dependency appears. It is
-not a build and passing it does not mean Windows works; it means the
-distance to Windows has not quietly grown. That is worth more than a job
-that is red every day for a reason nobody reads.
+## The port (2026-07-29)
+
+The estimate above was right about the three calls and wrong about the
+size, because it counted what fails to compile. Two things that compile
+cleanly were the actual work:
+
+**`long` is 32 bits on Windows.** LLP64 keeps `int` and `long` at 32 and
+widens only pointers, so every file offset in the engine — `pread_all`'s
+argument, `waste_tensor.file_off`, the manifest's `off` and `scale_off`
+through `js_int`, a bank's `bytes` before it is divided into records —
+was a silent 2 GB truncation on a format whose small container is 17 GB.
+None of it is a compile error and none of it is visible on a machine
+where `long` is 64 bits. They are `int64_t` now.
+
+**The archiver is part of the target.** `ar rcs` on macOS accepts PE
+objects and writes a 96-byte archive without a word of complaint; the
+link then fails with a page of undefined references naming every public
+symbol, which reads like a source problem and is not one. `AR` follows
+`CC`.
+
+What the port is: [src/platform.h](../src/platform.h), which holds the
+six calls that are not POSIX — positional read, aligned allocation, CPU
+count, file size, cache-bypass open — with a Windows implementation and a
+one-line POSIX one, so no call site branches. `pread` becomes `ReadFile`
+with an `OVERLAPPED` offset, which does not move the shared file pointer
+and so keeps the property the expert cache needs. `posix_memalign`
+becomes `_aligned_malloc`, whose pointer must not be passed to `free()` —
+that is heap corruption rather than a leak, which is why the allocation
+and its release are a pair and neither is called directly. MinGW supplies
+pthreads through winpthreads, so the thread pool needed nothing.
+
+**CI builds it and then runs it**, in two jobs: cross-compile with
+MinGW-w64 on a Linux runner, then execute the artifacts on
+`windows-latest` against a synthetic container — the expert records
+through the C structs, `waste info` and `waste plan`, and the forward
+pass sequential against chunked. The old `windows-portability` tripwire
+counted unresolved POSIX calls without linking; the build now subsumes
+it, since a fourth dependency fails it outright.
+
+What is still not claimed: MSVC (the sources are GNU C), ARM64 Windows,
+and the bypass under load. CI reports whether Windows granted
+`FILE_FLAG_NO_BUFFERING` on the runner's filesystem, which is a different
+claim from a hit rate measured against a container that does not fit in
+RAM.

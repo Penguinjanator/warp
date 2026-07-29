@@ -23,6 +23,10 @@ Attention + Gated MLA, 1M context, open weights July 27, 2026.
   calibration. MxMoE (ICML 2025) beats GPTQ by 2.4 PPL at 2.25 bits avg.
   [arXiv:2505.05799](https://arxiv.org/abs/2505.05799),
   [arXiv:2505.03804](https://arxiv.org/abs/2505.03804)
+  **The premise does not hold on this family.** Activation frequencies are
+  indeed heterogeneous; *sensitivity* is not. Measured per expert, per
+  layer and per matrix on K3 and Kimi-Linear, the value of the third bit
+  varies by 1.01–1.15x — see [LEARNED.md](LEARNED.md) §20.
 - **KBVQ-MoE (ICLR 2026)** — strongest sub-4-bit result: shared low-rank
   components across experts kept FP16 (~0.1 bit/param overhead), per-expert
   residuals vector-quantized. Near-lossless at 3 bit; usable at 2 bit where
@@ -41,6 +45,13 @@ Attention + Gated MLA, 1M context, open weights July 27, 2026.
   bits/expert**, with attention/dense at 4+ bits (consistent with Unsloth's
   1.58-bit DeepSeek-R1 recipe).
   [arXiv:2605.23078](https://arxiv.org/pdf/2605.23078)
+  **The floor held; the allocation did not.** 3 bits is where this engine
+  runs and 2 is unusable, which is the cliff. But the LP has nothing to
+  optimize over here — the importance is flat to within 1.15x, so the
+  allocator was measured and dropped rather than built
+  ([LEARNED.md](LEARNED.md) §20). The paper's Mixtral is not QAT'd from
+  MXFP4 and its experts are 8, not 896; neither difference explains it,
+  since Kimi-Linear is not QAT'd either and measures the same.
 - **DynaExq** — expert utilization is heavy-tailed and the hot set shifts
   per workload; runtime hot/cold precision promotion beats static
   quantization at equal memory (Qwen3-80B: 73.09→77.57 avg).
@@ -109,5 +120,8 @@ workload-driven expert pruning (drop the cold tail of 896 experts).
 > I/O is under half a decode step, so even free reads would not give
 > 2–3 tok/s. The one part that held is the shape: this is an I/O-bound
 > engine whose only real lever is bytes read per token. Plan B — expert
-> pruning — is still unexplored, and so is the non-uniform bit allocation
-> that would make it cheap.
+> pruning — is still unexplored. The non-uniform bit allocation that was
+> to make it cheap has since been measured and dropped (§20), and the
+> same measurement is why pruning would have to be justified on its own
+> terms: dropping the cold tail costs disk, which is not scarce, and
+> saves almost none of the reads, which are.

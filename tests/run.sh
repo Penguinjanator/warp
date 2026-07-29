@@ -151,8 +151,26 @@ fi
 head_ "container"
 
 if [ -d "$MODEL" ]; then
-    if ./test_container "$MODEL"/experts-L*.bin 2 2>/dev/null | grep -q "0 problems"; then
-        ok "expert records read through the C structs (magic, offsets, 4 KiB)"
+    # One bank per call, and the count of records read is checked as well
+    # as the count of problems. The glob used to be passed whole, so
+    # `experts-L2.bin` landed where the record count goes, atoi made it 0,
+    # and the check reported "0 records read, 0 problems" — a pass, from a
+    # run that opened one file and read nothing out of it.
+    banks=0; recs=0; bad=0
+    for bank in "$MODEL"/experts-L*.bin; do
+        [ -f "$bank" ] || continue
+        banks=$((banks + 1))
+        out=$(./test_container "$bank" 2 2>/dev/null) || { bad=1; continue; }
+        n=$(printf '%s' "$out" | sed -n 's/^\([0-9]*\) records read, \([0-9]*\) problems$/\1 \2/p')
+        set -- $n
+        [ "${1:-0}" -gt 0 ] || bad=1
+        [ "${2:-1}" -eq 0 ] || bad=1
+        recs=$((recs + ${1:-0}))
+    done
+    if [ "$banks" -gt 0 ] && [ "$bad" = 0 ]; then
+        ok "expert records read through the C structs ($recs records over $banks banks)"
+    elif [ "$banks" = 0 ]; then
+        no "expert record layout — no expert bank in $MODEL"
     else
         no "expert record layout"
     fi
@@ -172,6 +190,71 @@ if [ -d "$MODEL" ]; then
     fi
 else
     sk "container checks" "no container at $MODEL"
+fi
+
+# The checksum is only worth writing if something reads it. Every expert
+# record carries a crc32, and until it was checked on the read path a
+# container that rotted after conversion answered with whatever the
+# damaged bytes decoded to — which on a single flipped bit is the same
+# argmax and slightly different numbers, i.e. invisible.
+#
+# Its own container, built here and thrown away: the check has to damage
+# one, and neither the reference container nor CI's should be the victim.
+CRC="$TMP/crc.waste"
+if python3 tools/make_test_container.py "$CRC" >/dev/null 2>&1; then
+    IDS_CRC=3,7,11,5,9,13,2,17
+    damage() {                        # $1 = bank file, $2 = byte to flip
+        python3 - "$1" "$2" <<'PY'
+import struct, sys
+p = sys.argv[1]
+d = bytearray(open(p, "rb").read())
+rec = struct.unpack_from("<I", d, 16)[0] * 4096     # rec_4k_blocks
+# Every record, because a prompt only routes to some of the experts and a
+# check that depends on which ones is a check that passes by luck.
+for e in range(len(d) // rec):
+    d[e * rec + int(sys.argv[2])] ^= 0x01
+open(p, "wb").write(d)
+PY
+    }
+
+    if ./test_forward "$CRC" "$IDS_CRC" /dev/null 0 >/dev/null 2>&1; then
+        damage "$CRC"/experts-L1.bin 148          # inside the gate payload
+        out=$(./test_forward "$CRC" "$IDS_CRC" /dev/null 0 2>&1); rc=$?
+        if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "checksum mismatch" &&
+           printf '%s' "$out" | grep -qE "expert [0-9]+ of layer 1"; then
+            ok "a flipped bit in an expert payload is an error, and names the record"
+        else
+            no "corrupted expert record not caught (rc=$rc)"
+        fi
+        # The contrast is the point: with the check off, that same
+        # container runs to completion and answers. That is the behaviour
+        # this replaced, and the reason the check is worth its 5%.
+        if WASTE_VERIFY=0 ./test_forward "$CRC" "$IDS_CRC" /dev/null 0 \
+               >/dev/null 2>&1; then
+            ok "WASTE_VERIFY=0 runs the damaged container, as the old engine did"
+        else
+            no "WASTE_VERIFY=0 did not skip verification"
+        fi
+    else
+        no "the undamaged synthetic container does not run"
+    fi
+
+    # A bank cut short of a whole record: the pread succeeds against the
+    # record before it, so only the header identity catches this one.
+    if python3 tools/make_test_container.py "$TMP/trunc.waste" >/dev/null 2>&1; then
+        python3 - "$TMP/trunc.waste/experts-L1.bin" <<'PY'
+import os, sys
+os.truncate(sys.argv[1], os.path.getsize(sys.argv[1]) - 4096)
+PY
+        out=$(./test_forward "$TMP/trunc.waste" "$IDS_CRC" /dev/null 0 2>&1); rc=$?
+        if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qE "short read|record header"; then
+            ok "a bank truncated mid-record is refused"
+        else
+            no "truncated bank not caught (rc=$rc)"
+        fi
+    fi
+else
+    sk "expert record verification" "cannot build a synthetic container"
 fi
 
 # ----------------------------------------------------------------- e2e ----

@@ -34,7 +34,7 @@ typedef struct {
     /* Set when the tensor is deliberately left on disk instead of being
      * made resident (embed_tokens: 1.11 GB of which one row per token is
      * ever read). q and qs are NULL in that case. */
-    long   file_off, file_scale_off;
+    int64_t file_off, file_scale_off;   /* not long: 32 bits on Windows */
     int    on_disk;
 } waste_tensor;
 
@@ -70,8 +70,8 @@ typedef struct {
 } waste_config;
 
 typedef struct {
-    int fd;                          /* pread + F_NOCACHE: no page cache    */
-    long rec_bytes;
+    int fd;                          /* positional reads, no page cache     */
+    int64_t rec_bytes;
     int n_experts, cb_base;
 } waste_bank;
 
@@ -103,7 +103,10 @@ typedef struct {
      * branch that fills in t->bits. */
     uint32_t trunk_fmts;
     waste_bank bank[WASTE_MAX_LAYERS];
-    int expert_m[3], expert_n[3];    /* gate, up, down shapes               */
+    /* gate, up, down shapes. In a latent MoE the experts are as wide as
+     * the latent, not the hidden — these are what a record's per-channel
+     * scales are counted from, so they have to be the real ones. */
+    int expert_m[3], expert_n[3];
 
     /* per-layer state */
     float *S[WASTE_MAX_LAYERS];                   /* KDA recurrent state                 */
@@ -138,6 +141,13 @@ typedef struct {
     waste_ecache cache;
     uint8_t *miss_buf;               /* used when the cache is disabled     */
     int      direct_io;              /* 0 = a bank fell back to page cache  */
+    /* A record that failed on the way in. Sticky until cleared, because
+     * the forward pass that hit it is already wrong and the caller has to
+     * hear about it once rather than once per expert. WASTE_VERIFY=0 sets
+     * no_verify, which skips the checksum — the pass over the payload
+     * whose cost is the only reason to want the knob — and leaves the
+     * O(1) header checks on. */
+    int      read_error, bad_layer, bad_expert, no_verify;
 } waste_model;
 
 /* cache_bytes: hard ceiling for the expert cache; 0 = no cache. */
@@ -146,9 +156,17 @@ typedef struct {
 int  waste_model_load(waste_model *m, const char *dir, int kv_cap,
                       size_t cache_bytes, int want_vision);
 void waste_model_free(waste_model *m);
-/* Runs one token; returns logits (vocab floats, owned by the model).
+/* Runs one token; returns logits (vocab floats, owned by the model), or
+ * NULL when an expert record failed to read or failed verification —
+ * waste_model_read_error then says which one and why.
  * `pos` is the position in the sequence (0-based). */
 const float *waste_model_step(waste_model *m, int token, int pos, int *routed);
+
+/* Why the last read failed, and where. NULL when nothing has. The string
+ * is static; `layer` and `expert` name the record. Sticky, so a caller
+ * checks it once per call rather than per expert. */
+const char *waste_model_read_error(const waste_model *m, int *layer, int *expert);
+void        waste_model_clear_read_error(waste_model *m);
 
 /* Prefill a chunk of `n` tokens starting at `pos0`, returning the logits of
  * the last one. Equivalent to n successive waste_model_step calls, but the

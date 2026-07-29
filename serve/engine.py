@@ -141,6 +141,11 @@ _LIB = None
 _LIB_LOCK = threading.Lock()
 
 
+def _soext() -> str:
+    """What `make` called the shared object on this platform."""
+    return {"Darwin": "dylib", "Windows": "dll"}.get(platform.system(), "so")
+
+
 def library_candidates() -> list[Path]:
     """Where libwaste might be, most specific first.
 
@@ -148,7 +153,7 @@ def library_candidates() -> list[Path]:
     is where `make` puts it and where a developer running from a checkout
     expects it to be found without installing anything.
     """
-    soext = "dylib" if platform.system() == "Darwin" else "so"
+    soext = _soext()
     out: list[Path] = []
     env = os.environ.get("WASTE_LIB")
     if env:
@@ -179,9 +184,8 @@ def _lib():
             return _LIB
         raise EngineError(
             "libwaste not found", WASTE_E_IO,
-            "build it with `make libwaste." +
-            ("dylib" if platform.system() == "Darwin" else "so") +
-            "`, or point WASTE_LIB at it.\n  " + "\n  ".join(tried))
+            f"build it with `make libwaste.{_soext()}`, or point WASTE_LIB "
+            "at it.\n  " + "\n  ".join(tried))
 
 
 def _bind(lib) -> None:
@@ -246,6 +250,11 @@ def _bind(lib) -> None:
     lib.waste_eval.argtypes = [C.c_void_p, C.POINTER(C.c_int32), C.c_size_t,
                                C.POINTER(C.POINTER(C.c_float)),
                                C.POINTER(C.c_size_t)]
+    # Which expert record failed, when one does. A status of "I/O error" is
+    # not something an operator can act on for a container holding 89,000
+    # of them; this names the record.
+    lib.waste_error_detail.restype = C.c_char_p
+    lib.waste_error_detail.argtypes = [C.c_void_p]
 
     lib.waste_state_save.restype = C.c_int
     lib.waste_state_save.argtypes = [C.c_void_p, C.c_char_p]
@@ -402,6 +411,14 @@ class Engine:
     def _check(self):
         if self._closed:
             raise EngineError("engine is closed", WASTE_E_ARG)
+
+    def _detail(self) -> str:
+        """The engine's own account of the last failure, if it has one —
+        which record failed its checksum, rather than just "I/O error"."""
+        if self._closed or not self._ctx:
+            return ""
+        d = self.lib.waste_error_detail(self._ctx)
+        return d.decode() if d else ""
 
     @property
     def lock(self) -> threading.RLock:
@@ -676,5 +693,5 @@ class Engine:
         if st == WASTE_E_CANCELLED or stopped[0]:
             return False
         if st != WASTE_OK:
-            raise EngineError("generate", st)
+            raise EngineError("generate", st, self._detail())
         return True
