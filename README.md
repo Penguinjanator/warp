@@ -1,6 +1,6 @@
 # WASTE — Weight-Aware Streaming Tensor Engine
 
-**Kimi K3 — 2.78 trillion parameters — on a laptop.**
+**Kimi K3 — 2.78 trillion parameters — running on a consumer laptop.**
 
 ```
 $ waste run ~/models/k3.waste 'What is the capital of Italy?'
@@ -9,12 +9,14 @@ The capital of Italy is **Rome**.
 [16 tokens, 49.31 s, 0.32 tok/s | experts 3357 hit / 20195 miss = 14%]
 ```
 
-That is the full open-weights K3 — 93 layers, 896 experts in each of the
-92 that are MoE, multimodal — answering on a MacBook Pro, from a 982 GB
-container on the internal SSD, inside 46 GB of RAM. Not a distillation,
-not a pruned variant, not a smaller sibling. The model Moonshot published,
-with its own tokenizer, its own chat format and its own vision tower,
-running on hardware you can buy in a shop.
+WASTE is an embeddable inference engine written in C, with no third-party runtime dependencies. It keeps the model trunk in memory, streams selected experts directly from disk, and uses the remaining RAM as a bounded expert cache.
+
+Its current proof point is the complete open-weights Kimi K3 model: 2.78 trillion parameters, converted into a 982 GiB container and running on a 64 GB MacBook Pro at 0.32–0.34 tokens per second. **This is not a distilled, pruned, or reduced variant**.
+
+| Model               | Container | Minimum RAM | Tested speed    |
+| ------------------- | --------- | ----------- | --------------- |
+| **Kimi K3 2.78T**   | 982 GiB   | 29.05 GiB   | 0.32–0.34 tok/s |
+| **Kimi-Linear 48B** | 19 GiB    | 1.86 GiB    | 8.92 tok/s      |
 
 WASTE was written for that one model and that one constraint: **K3 does
 not fit in the RAM of current mainstream consumer systems.** It is 1.42 TB
