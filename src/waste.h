@@ -136,6 +136,23 @@ typedef struct {
                                    breaks bit-exactness, off by default    */
     int      expert_deferral;   /* overlap expert fetch with next layer    */
 
+    /* Check each expert record's crc32 as it comes off the disk. **Off by
+     * default**, and that is a throughput decision rather than a claim
+     * that containers do not rot: it is a pass over every record on every
+     * cache miss, measured at ~5% on Kimi-Linear and ~1% on K3, where the
+     * read dominates. Turn it on for a container that has been copied,
+     * downloaded or left on a disk you do not trust, and for anything
+     * whose wrong answers would be believed.
+     *
+     * What is checked regardless: a short read, and a record header that
+     * does not describe the expert the bank index asked for. Those are
+     * O(1) and they are what keeps a damaged offset out of the
+     * arithmetic — this flag only adds the pass over the payload.
+     *
+     * WASTE_VERIFY=1 in the environment turns it on too. Either is
+     * enough; neither turns it off. */
+    int      verify_records;
+
     const char *usage_path;     /* learned hotlist; NULL = <model>/usage   */
     const char *state_path;     /* KDA/KV checkpoint dir; NULL = disabled  */
 } waste_cfg;

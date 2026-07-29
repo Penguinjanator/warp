@@ -99,40 +99,49 @@ in the record header.
 
 ### What the engine checks on the read path
 
-Every expert record is verified as it comes off the disk, and one that
-fails ends the generation with `WASTE_E_IO` naming the record — "expert
-412 of layer 37: checksum mismatch" — instead of answering with whatever
-the damaged bytes decode to. A cache hit is not re-checked: the unit
-being verified is bytes entering RAM, and re-checking resident records
-would cost a pass over every expert on every token.
+Two different things happen to every record that comes off the disk, and
+only one of them is optional.
+
+**Always: the header.** A record must carry the right magic, be the
+expert the bank index asked for at that offset, be the bank's stride
+long, be a VQ format with `lowrank_id == 0`, name a codebook that
+exists, and have ordered offsets that fit. All of it is derivable from
+the manifest, so it is derived rather than believed. This is O(1) per
+record and it is not a integrity feature — it is what keeps an offset out
+of a damaged header from reaching the arithmetic downstream, which is
+also why the checksum could not be bolted on without it: the offsets that
+say where the payload *ends* live in the header, so deciding how much to
+checksum from an unvalidated one would be a read past the buffer rather
+than a check. A short read is caught here too.
+
+**On request: the checksum.** `waste_cfg.verify_records`, `--verify` on
+the CLI, or `WASTE_VERIFY=1` in the environment. It is **off by
+default**, and that is a throughput decision: it is a pass over every
+record on every cache miss, about **5% on Kimi-Linear** (4.7% and 5.5%
+in two sittings — [LEARNED.md](LEARNED.md) §21) and about **1% on K3**,
+where 11.83 MB records make the read dominate — 7,287 misses at 0.376 ms
+of CRC each is 2.7 s of a 268 s run. Turn it on for a container that was
+copied, downloaded, or has sat on a disk you do not trust; leave it off
+for the one you converted locally and have been reading all week. A cache
+hit is never re-checked either way: the unit being verified is bytes
+entering RAM.
 
 The `crc32` covers the payload from the end of the header to the end of
 the per-channel scales, excluding the 4 KiB padding — bit for bit what
 `zlib.crc32` returns, since `tools/convert.py` is what writes it, and
-`tests/test_container.c` pins the two together against known values.
+`tests/test_container.c` pins the two together against known values. The
+implementation is [`src/crc32.c`](../src/crc32.c): 33 GB/s where the
+ARMv8 CRC extension is available, 2.7 GB/s from the slice-by-8 table
+everywhere else.
 
-The header is *outside* the checksum, so it is checked structurally
-instead, which is needed regardless: the offsets that say where the
-payload ends live in the header, and following an unvalidated offset to
-decide how much to checksum would be a read past the buffer rather than
-a check. A record must carry the right magic, be the expert the bank
-index asked for at that offset, be the bank's stride long, be a VQ
-format with `lowrank_id == 0`, name a codebook that exists, and have
-ordered offsets that fit. All of that is derivable from the manifest, so
-it is derived rather than believed.
+Either check failing ends the generation with `WASTE_E_IO`, and
+`waste_error_detail` names the record — "expert 412 of layer 37:
+checksum mismatch" — rather than answering with whatever the damaged
+bytes decode to. `tools/verify_container.py` checks every record's
+checksum unconditionally and is the right tool for auditing a container
+once, as against paying for it on every token.
 
-The cost is one pass over the record beside the read of the same bytes:
-about **5% of throughput on Kimi-Linear** (4.7% and 5.5% in two sittings,
-paired runs each way — [LEARNED.md](LEARNED.md) §21) and about **1% on
-K3**, where 11.83 MB records make the read dominate — 7,287 misses at
-0.376 ms of CRC each is 2.7 s of a 268 s run. `WASTE_VERIFY=0` skips the
-checksum, which is for measuring that number rather than for running on;
-the O(1) header checks stay on, since they are what keeps an offset from
-a damaged header out of the arithmetic. The CRC itself is
-[`src/crc32.c`](../src/crc32.c): 33 GB/s where the ARMv8 CRC extension is
-available, 2.7 GB/s from the slice-by-8 table everywhere else.
-
-Not checked: the trunk, which has no checksum in the format at all, and
+Not checked at all: the trunk, which has no checksum in the format, and
 the codebooks. Both are read once at load rather than per token, so the
 argument for a per-record check does not carry over — it is simply not
 built.

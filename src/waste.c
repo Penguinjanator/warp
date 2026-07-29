@@ -363,6 +363,9 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
             return rc == -2 ? WASTE_E_FORMAT : WASTE_E_IO;
         }
     }
+    /* Before the warm, which reads records too. The load already applied
+     * WASTE_VERIFY; this is the other way in, and it can only add. */
+    if (cfg.verify_records) c->m.verify = 1;
     quant_summary(c);
     c->tok = waste_tok_open(model_path);      /* optional */
     if (c->tok) waste_tok_set_eos(c->tok, c->m.cfg.eos_token_id);

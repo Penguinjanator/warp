@@ -878,7 +878,18 @@ argmax* and slightly different logits. There is no symptom to notice, so
 a container that rots after conversion is discovered by not being
 discovered.
 
-So it was measured rather than argued about.
+So it was measured rather than argued about — and then the measurement
+decided it, in the direction of leaving it off.
+
+**Where it landed.** The checksum is opt-in (`--verify`,
+`waste_cfg.verify_records`, `WASTE_VERIFY=1`) and the *header* checks are
+unconditional. That split is the actual result of this section: the part
+that costs 5% is a choice, and the part that costs nothing — magic, the
+record being the expert the index asked for, offsets that fit, short
+reads — is not, because it is memory safety rather than integrity and
+because the checksum could not have been written without it (see below).
+So the engine still refuses a truncated or spliced bank by default; what
+it no longer does by default is notice a bit flip inside a payload.
 
 **CRC throughput, one M-series core, over a whole record:**
 
@@ -896,7 +907,9 @@ what the unit can do. Three chains over three slices, stitched back
 together with zlib's GF(2) combine, cost two matrix walks per record —
 microseconds against a 0.38 ms pass.
 
-**End to end, `WASTE_VERIFY=0` against the default:**
+**End to end, the checksum on against off** (measured while it was still
+the default, with `WASTE_VERIFY=0` as the off side; the polarity of the
+switch changed afterwards, the numbers did not):
 
 | Kimi-Linear, 16 tokens, 5 GB budget | verify off | verify on | cost |
 |---|---|---|---|

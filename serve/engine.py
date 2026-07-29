@@ -85,6 +85,7 @@ class Cfg(C.Structure):
                 ("vision", C.c_int),
                 ("allow_substitutes", C.c_int),
                 ("expert_deferral", C.c_int),
+                ("verify_records", C.c_int),
                 ("usage_path", C.c_char_p),
                 ("state_path", C.c_char_p)]
 
@@ -358,6 +359,7 @@ class Engine:
                  vision: bool = False,
                  allow_substitutes: bool = False,
                  expert_deferral: bool = False,
+                 verify_records: bool = False,
                  usage_path: Optional[str] = None,
                  state_path: Optional[str] = None):
         self.lib = _lib()
@@ -377,6 +379,7 @@ class Engine:
         cfg.vision = 1 if vision else 0
         cfg.allow_substitutes = 1 if allow_substitutes else 0
         cfg.expert_deferral = 1 if expert_deferral else 0
+        cfg.verify_records = 1 if verify_records else 0
         # Keep the encoded bytes alive: c_char_p stores a borrowed pointer,
         # and a temporary would be freed before waste_open reads it.
         self._usage = usage_path.encode() if usage_path else None

@@ -137,13 +137,15 @@ smaller than RAM the kernel would cache everything, and the hit rates
 measured that way are a fiction that does not survive contact with a
 982 GB model.
 
-Every record is checked on the way in — its `crc32` against the payload,
-its header against what the manifest says should be at that offset — so a
-container that rots on disk stops the generation and names the record
-rather than answering with whatever the damaged bytes decode to. It costs
-about 5% on Kimi-Linear and about 1% on K3, where the read dominates.
-Records already in the cache are not re-checked: the thing being verified
-is bytes arriving from disk. See [docs/FORMAT.md](docs/FORMAT.md).
+Every record's header is checked on the way in — right magic, the expert
+the index asked for, offsets that fit — so a bank that has been truncated
+or spliced stops the generation and names the record instead of answering
+from the wrong bytes. That costs nothing measurable. The record also
+carries a `crc32` over its payload, and checking *that* is `--verify`,
+off by default: it is a pass over every record on every cache miss, about
+5% on Kimi-Linear and 1% on K3. Worth it for a container you copied or
+downloaded and have not read since; not worth it on every token of one
+you converted yourself. See [docs/FORMAT.md](docs/FORMAT.md).
 
 ### Three bits per expert weight
 
@@ -595,12 +597,14 @@ these out for yourself is worse than reading them here:
   page-cache bypass proven under load there: CI confirms Windows grants
   it on the runner's filesystem, which is not the same as measuring a hit
   rate against a container that does not fit in RAM;
-- expert records are checksummed on the read path and the **trunk is
-  not**. It has no checksum in the format at all, and neither do the
-  codebooks: both are read once at load rather than per token, so the
-  per-record argument does not carry over, and nothing has been built in
-  its place. A trunk that rots still gives wrong numbers rather than an
-  error;
+- **the expert checksum is off unless you ask for it** (`--verify`), and
+  the trunk has no checksum at all. The first is a decision — 5% of
+  throughput on every token, against a container that is usually fine —
+  and it means the default build of a rotted container still answers with
+  whatever the damaged bytes decode to. Run `--verify` once after copying
+  a container, or `tools/verify_container.py` to audit it offline. The
+  second is not a decision: the trunk and the codebooks have nothing to
+  check against in the format, and nothing has been built in its place;
 - every expert in a container is at the same bit width. The non-uniform
   per-expert allocation the format was designed around is **not coming**:
   it was measured on both models rather than built, and the importance it

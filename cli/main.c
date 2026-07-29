@@ -74,6 +74,7 @@ typedef struct {
     const char *image[WASTE_MAX_IMAGES_CLI];
     int n_image;
     int raw;
+    int verify;                     /* --verify: check every record's crc32 */
     const char *pos[MAX_POS];      /* MODEL, then the command's argument */
     int n_pos;
 } opts;
@@ -138,6 +139,7 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
         else if (!strcmp(a, "--learn")) o->learn = 1;
         else if (!strcmp(a, "--json")) o->json = 1;
         else if (!strcmp(a, "--raw")) o->raw = 1;
+        else if (!strcmp(a, "--verify")) o->verify = 1;
         else if (!strcmp(a, "-")) {                /* explicit stdin */
             if (o->n_pos >= MAX_POS) { fprintf(stderr, "too many arguments\n"); return -1; }
             o->pos[o->n_pos++] = "-";
@@ -212,6 +214,10 @@ static waste_status open_model(const char *path, const opts *o, waste_ctx **ctx)
     /* The tower is 434 MB that a text prompt would never touch, so it is
      * loaded only when there is an image to put through it. */
     cfg.vision = o->n_image > 0;
+    /* Off unless asked: a pass over every record on every miss, ~5% on
+     * Kimi-Linear. Worth it for a container that was copied or downloaded
+     * and has not been read since. */
+    cfg.verify_records = o->verify;
     return waste_open(path, &cfg, ctx);
 }
 
@@ -1106,12 +1112,15 @@ int main(int argc, char **argv)
                "given as - or simply piped in.\n\n"
                "options: --budget 8G  --ctx N  -n N  --temp F  --top-p F\n"
                "         --top-k N  --seed N  --threads N  --stop STR\n"
-               "         --file F  --json  -q  --learn\n"
+               "         --file F  --json  -q  --learn  --verify\n"
          "  --stop  ends generation when the text appears\n"
          "  --json  machine-readable output for eval, tokenize, plan,\n"
          "          info and bench\n"
          "  --learn records which experts the run used, so the next open\n"
-         "  starts with a warm cache instead of an empty one\n",
+         "  starts with a warm cache instead of an empty one\n"
+         "  --verify checks each expert record's checksum as it is read,\n"
+         "  for a container you have not read since copying it. Costs ~5%%\n"
+         "  on Kimi-Linear, ~1%% on K3; off otherwise\n",
                waste_version());
         return argc < 2 ? 2 : 0;
     }

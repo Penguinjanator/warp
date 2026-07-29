@@ -98,14 +98,16 @@ typedef struct {
     uint32_t crc32;          /* payload checksum: zlib's crc32 over the
                               * record from the end of this header to the
                               * end of the per-channel scales, excluding
-                              * the 4 KiB padding. Written by the converter
-                              * and checked by tools/verify_container.py
-                              * and by the engine, on every record that
-                              * comes off the disk — a cache hit is not
-                              * re-checked. It covers the payload only:
-                              * the header is outside it, and is checked
-                              * structurally instead. There is no
-                              * whole-container checksum.                   */
+                              * the 4 KiB padding. Always written, and
+                              * always checked by
+                              * tools/verify_container.py. The engine
+                              * checks it only when asked
+                              * (waste_cfg.verify_records, WASTE_VERIFY=1):
+                              * it is a pass over every record on every
+                              * miss, ~5% of throughput, so it is the
+                              * caller's call. What the engine always
+                              * checks is this header, which the crc32
+                              * does not cover — see model.c.            */
     uint32_t reserved1[2];
     /* payload follows, padded to 4 KiB multiple                            */
 } waste_expert_hdr;

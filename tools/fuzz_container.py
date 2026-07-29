@@ -185,10 +185,14 @@ def run_engine(container):
     a forward pass. test_forward is the shortest way to make it happen.
 
     A clean rejection from either is a pass; only a signal is a failure."""
+    # WASTE_VERIFY=1 because the checksum is off by default and this is
+    # the one place that wants it on: the payload-extent arithmetic behind
+    # it is exactly the code being fuzzed, and it never runs otherwise.
+    env = dict(os.environ, WASTE_VERIFY="1")
     for cmd in (["waste", "info", container], ["test_forward", container, IDS]):
         cmd[0] = os.path.join(HERE, cmd[0])
         r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.PIPE, timeout=TIMEOUT)
+                           stderr=subprocess.PIPE, timeout=TIMEOUT, env=env)
         if r.returncode != 0:
             break
     return r, cmd

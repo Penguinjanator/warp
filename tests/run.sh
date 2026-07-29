@@ -219,28 +219,30 @@ PY
 
     if ./test_forward "$CRC" "$IDS_CRC" /dev/null 0 >/dev/null 2>&1; then
         damage "$CRC"/experts-L1.bin 148          # inside the gate payload
-        out=$(./test_forward "$CRC" "$IDS_CRC" /dev/null 0 2>&1); rc=$?
+        out=$(WASTE_VERIFY=1 ./test_forward "$CRC" "$IDS_CRC" /dev/null 0 2>&1); rc=$?
         if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "checksum mismatch" &&
            printf '%s' "$out" | grep -qE "expert [0-9]+ of layer 1"; then
-            ok "a flipped bit in an expert payload is an error, and names the record"
+            ok "with verification on, a flipped bit is an error that names the record"
         else
-            no "corrupted expert record not caught (rc=$rc)"
+            no "corrupted expert record not caught with verification on (rc=$rc)"
         fi
-        # The contrast is the point: with the check off, that same
-        # container runs to completion and answers. That is the behaviour
-        # this replaced, and the reason the check is worth its 5%.
-        if WASTE_VERIFY=0 ./test_forward "$CRC" "$IDS_CRC" /dev/null 0 \
-               >/dev/null 2>&1; then
-            ok "WASTE_VERIFY=0 runs the damaged container, as the old engine did"
+        # The default is off, and asserting it is the point: the same
+        # container runs to completion and answers, because the checksum
+        # costs ~5% and is a choice the caller makes. If this ever starts
+        # failing, the default flipped without anyone deciding to.
+        if ./test_forward "$CRC" "$IDS_CRC" /dev/null 0 >/dev/null 2>&1; then
+            ok "by default the checksum is not read, and a damaged record answers"
         else
-            no "WASTE_VERIFY=0 did not skip verification"
+            no "verification is on by default — it is meant to be opt-in"
         fi
     else
         no "the undamaged synthetic container does not run"
     fi
 
     # A bank cut short of a whole record: the pread succeeds against the
-    # record before it, so only the header identity catches this one.
+    # record before it, so only the header identity catches this one — and
+    # no WASTE_VERIFY here, deliberately. The header checks are O(1) and
+    # always on; only the checksum is opt-in.
     if python3 tools/make_test_container.py "$TMP/trunc.waste" >/dev/null 2>&1; then
         python3 - "$TMP/trunc.waste/experts-L1.bin" <<'PY'
 import os, sys

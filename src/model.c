@@ -849,10 +849,12 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         m->expert_n[0] = m->expert_n[1] = lat;
         m->expert_m[2] = lat; m->expert_n[2] = c->moe_inter;
     }
-    /* Verification is on: a record that fails is an error, not a wrong
-     * answer. The knob is for measuring what it costs, the way
-     * WASTE_DIRECT=0 is for measuring the page-cache bypass. */
-    { const char *e = getenv("WASTE_VERIFY"); m->no_verify = e && *e == '0'; }
+    /* Checksum verification is off unless asked for — it costs a pass over
+     * every record on every miss, ~5% on Kimi-Linear. WASTE_VERIFY=1 turns
+     * it on for a process; waste_cfg.verify_records turns it on for one
+     * context, and waste.c sets this again after load. Either switch is
+     * enough; neither can turn it off, because off is where it starts. */
+    { const char *e = getenv("WASTE_VERIFY"); m->verify = e && *e != '0'; }
     int layers = js_get(&d, 0, "layers");
     for (int L = 0; L < c->n_layers; L++) {
         char key[16];
@@ -1117,12 +1119,12 @@ static rec_status record_check(const waste_model *m, int layer, int expert,
                                         m->expert_m[2]);
     if (scales > rec_bytes - h->chan_corr_off) return REC_E_HEADER;
 
-    /* Only the checksum is optional. The checks above are O(1) and are
-     * the ones keeping an offset from a damaged header out of the
-     * arithmetic downstream, so WASTE_VERIFY=0 skips the pass over the
-     * payload and nothing else — it is a knob for measuring the cost of
-     * that pass, not for turning the bounds off. */
-    if (m->no_verify) return REC_OK;
+    /* Only the checksum is optional, and it is off by default. The checks
+     * above are O(1) and are the ones keeping an offset from a damaged
+     * header out of the arithmetic downstream, so they always run: what
+     * the switch buys is the pass over the payload, and what it costs is
+     * that pass. Nothing here is ever skipped for memory safety. */
+    if (!m->verify) return REC_OK;
 
     const size_t payload = (size_t)h->chan_corr_off + scales - sizeof *h;
     if (waste_crc32(rec + sizeof *h, payload) != h->crc32) return REC_E_CRC;

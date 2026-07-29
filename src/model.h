@@ -143,11 +143,11 @@ typedef struct {
     int      direct_io;              /* 0 = a bank fell back to page cache  */
     /* A record that failed on the way in. Sticky until cleared, because
      * the forward pass that hit it is already wrong and the caller has to
-     * hear about it once rather than once per expert. WASTE_VERIFY=0 sets
-     * no_verify, which skips the checksum — the pass over the payload
-     * whose cost is the only reason to want the knob — and leaves the
-     * O(1) header checks on. */
-    int      read_error, bad_layer, bad_expert, no_verify;
+     * hear about it once rather than once per expert. A short read and a
+     * header that does not describe the record asked for are always
+     * caught; `verify` adds the crc32 over the payload, which is the part
+     * that costs, and it is off unless a caller asks — see waste.h. */
+    int      read_error, bad_layer, bad_expert, verify;
 } waste_model;
 
 /* cache_bytes: hard ceiling for the expert cache; 0 = no cache. */
