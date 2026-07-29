@@ -99,10 +99,18 @@ ifdef WASTE_NATIVE
 CFLAGS += -mcpu=native
 endif
 # Accelerator backends are build-time options, and each needs a source file
-# that registers it. None exists yet: the flags below were reachable but
-# only produced "Undefined symbols: _waste_register_metal" at link time.
-# Fail early and say why instead. Deleting a check is the last step of
-# adding the backend it guards.
+# that registers it. Metal has one — src/metal.m, so WASTE_ENABLE_METAL=1
+# builds and `waste version` then reports `backend Metal`. CUDA and BLAS do
+# not, and before these checks existed their flags were reachable and
+# produced only "Undefined symbols: _waste_register_cuda" at link time.
+# Fail early and say why instead.
+#
+# Metal keeps its check even though it passes: the guard is about the file
+# being there, not about the backend being unfinished, and it is what turns
+# a deleted or unstaged src/metal.m into a sentence rather than a link
+# error. Do not read the $(error) text below as the status of a backend —
+# it is the message for a missing file, and Make never expands it while the
+# file is present.
 ifdef WASTE_ENABLE_METAL
 ifeq (,$(wildcard src/metal.m))
 $(error WASTE_ENABLE_METAL=1, but src/metal.m does not exist — the Metal \
@@ -116,8 +124,8 @@ endif
 ifdef WASTE_ENABLE_CUDA
 ifeq (,$(wildcard src/cuda.cu))
 $(error WASTE_ENABLE_CUDA=1, but src/cuda.cu does not exist — the CUDA \
-backend is not implemented. Build without the flag: CPU+NEON is the only \
-backend this engine has)
+backend is not implemented. Build without the flag: CPU+NEON is the \
+default, and Metal is the only accelerator this engine has)
 endif
 CFLAGS += -DWASTE_ENABLE_CUDA=1
 SRC    += src/cuda.cu
@@ -126,8 +134,8 @@ endif
 ifdef WASTE_ENABLE_BLAS
 ifeq (,$(wildcard src/blas.c))
 $(error WASTE_ENABLE_BLAS=1, but src/blas.c does not exist — the BLAS \
-backend is not implemented. Build without the flag: CPU+NEON is the only \
-backend this engine has)
+backend is not implemented. Build without the flag: CPU+NEON is the \
+default, and Metal is the only accelerator this engine has)
 endif
 CFLAGS += -DWASTE_ENABLE_BLAS=1
 SRC    += src/blas.c
