@@ -1,13 +1,6 @@
 # WASTE — Weight-Aware Streaming Tensor Engine
 
-**Run a frontier model on the computer you already own.**
-
-WASTE is a C inference engine and an on-disk format built around one
-constraint: the model does not fit in RAM, and never will. A 2.78-trillion
-parameter mixture-of-experts activates about 4% of itself per token, so
-almost all of that weight is idle at any instant. WASTE keeps the idle
-part on disk, streams what a token actually needs, and spends every
-available byte of RAM on the part that repeats.
+**Kimi K3 — 2.78 trillion parameters — on a laptop.**
 
 ```
 $ waste run ~/models/k3.waste 'What is the capital of Italy?'
@@ -16,18 +9,51 @@ The capital of Italy is **Rome**.
 [16 tokens, 49.31 s, 0.32 tok/s | experts 3357 hit / 20195 miss = 14%]
 ```
 
-That is Kimi K3 — 2.78T parameters, 93 layers, 896 experts in each of the
-92 that are MoE — answering on a laptop, from a 982 GB container, in a
-46 GB budget the engine sized for itself. No `-n`: it stopped on its own
-end-of-message token after sixteen. Fifty seconds for one sentence, which
-is the honest headline number and the thing every optimization from here
-is aimed at.
+That is the full open-weights K3 — 93 layers, 896 experts in each of the
+92 that are MoE, multimodal — answering on a MacBook Pro, from a 982 GB
+container on the internal SSD, inside 46 GB of RAM. Not a distillation,
+not a pruned variant, not a smaller sibling. The model Moonshot published,
+with its own tokenizer, its own chat format and its own vision tower,
+running on hardware you can buy in a shop.
 
-**This is the first draft.** It runs, its numbers match a PyTorch
-reference to five decimal places, and it is slow. Everything below is the
-foundation for a long series of optimizations aimed at running this model
-at the highest efficiency the hardware allows. The measurements are a
-starting line, published so the next ones have something to beat.
+WASTE was written for that one model and that one constraint: **K3 does
+not fit in RAM, and no consumer machine will ever hold it.** It is 1.42 TB
+as published and 982 GB after conversion. But a mixture of experts
+activates about 4% of itself per token, so almost all of that weight is
+idle at any instant — and idle weight does not need to be in memory, it
+needs to be *reachable in time*. WASTE keeps it on disk in a layout where
+one expert costs exactly one read, streams what each token actually
+needs, and spends every remaining byte of RAM on the part that repeats.
+
+## Where this stands
+
+The engine is correct: every layer is validated against a PyTorch
+reference, the final logits agree to 3.6e-06, and the vision tower matches
+its own oracle to 2.3e-06. It is also slow — a third of a token per
+second, fifty seconds for the sentence above.
+
+Both of those matter, and the second one should not be read as a
+disclaimer. As far as we could find, nothing else runs a model of this
+size from disk on a consumer machine; the literature we surveyed has no
+demonstration of trillion-scale NVMe streaming at all, and the
+best-documented 671B-class recipes assume a server with a terabyte of
+DDR5. The interesting result is not the speed, it is that the whole thing
+is in the reachable range on hardware that costs less than a month of API
+bills — and that from here the question is engineering rather than
+feasibility. Half of a decode step is already disk I/O running near the
+drive's measured ceiling, so the levers are known: read fewer bytes per
+token, and keep more of them in RAM.
+
+What that opens up, concretely: a frontier-scale model that answers with
+no network, no per-token invoice, and nothing leaving the machine — which
+is the difference between "you may not send that data to an API" and "run
+it here". The format and the engine are not K3-specific in any deep way;
+K3 is simply the hardest case that exists today, and a model that streams
+at 2.78T streams comfortably at 48B.
+
+Every number in this document was measured on the commit it is published
+with, and the ones that were wrong are recorded as wrong in
+[docs/LEARNED.md](docs/LEARNED.md) rather than quietly corrected.
 
 ## Why the name
 
@@ -36,6 +62,37 @@ invoice, and once in the electricity of a datacenter running a model that
 would fit — barely, awkwardly, but genuinely — on hardware already sitting
 on a desk. WASTE means to be the first concrete step toward ending that
 waste of tokens. The acronym came second.
+
+## What you need
+
+| | |
+|---|---|
+| **disk, for the model** | **982 GB** for the converted container — plan a terabyte |
+| disk, to convert it | another 1.42 TB of staging for the published shards, freed afterwards |
+| **RAM** | **29.05 GB** minimum to open K3 at 4K context; **64 GB** for the numbers here |
+| storage speed | the container must be on internal NVMe — see below |
+| build | a C11 compiler and `make`. No BLAS, no CUDA, no Python at run time |
+
+Sizes here are powers of two, the way `df` and the engine both report
+them: the container is 982 GiB, which a disk vendor would call 1.05 TB.
+
+The RAM floor is what the engine refuses to start below, and it is almost
+entirely the 27.28 GB resident trunk. Useful throughput starts higher: on
+a 64 GB machine the engine gives itself a 46 GB budget, of which 17.56 GB
+is expert cache, and that is the top of the measured curve. A 32 GB
+machine can technically open the model and will page badly; treat 64 GB as
+the real requirement.
+
+**Storage speed is not a detail.** A token reads 17 GB of experts. On the
+internal SSD that is 12.78 GB/s and the model streams; over a USB
+enclosure it is 0.94 GB/s and the same token takes thirteen seconds.
+Convert onto internal NVMe, and use the external disk for the download
+only.
+
+If a terabyte is not available, the same engine and the same format run
+`Kimi-Linear-48B-A3B-Instruct` from a **19 GB** container with a
+**1.86 GB** floor, at 8.92 tok/s. That is the good path for trying WASTE
+out before committing a disk to K3.
 
 ## What it is
 
@@ -332,12 +389,26 @@ waste: no --budget, using 46.24 GB of 64.00 GB (expert cache 17.56 GB)
 
 ### Images
 
-K3 is multimodal, and so is the engine. `--image` puts a picture in front
-of the prompt; repeat it for several:
+K3 is multimodal — a 401M ViT, 27 layers, patch 14 — and so is the engine.
+`--image` attaches a picture; repeat it for several:
 
-```bash
-waste run ~/models/k3.waste "What is in this picture?" --image photo.png
 ```
+$ waste run ~/models/k3.waste 'What is in this picture?' --image landscape.png
+[landscape.png: 192 image tokens]
+The picture shows a simple, stylized landscape with:
+
+- A **blue sky** with a gradient from darker blue at the top to lighter blue near the horizon.
+- A **yellow sun** in the upper right.
+- A **gray hill or mountain** in the middle distance.
+- A **green field** covering the lower part of the image.
+[78 tokens, 234.25 s, 0.33 tok/s | experts 15314 hit / 99502 miss = 13%]
+```
+
+That is a 448×336 image, and every element of the description is in it —
+including the sky gradient, which is the kind of detail that separates a
+tower that works from one that merely runs. The picture was generated by a
+twenty-line script rather than photographed, so the answer can be checked
+against what was drawn instead of against an impression.
 
 PNG, JPEG, GIF, BMP, TGA and PSD, decoded by the one vendored header in
 `third_party/`. It works on `run`, `chat` and `eval`; inside a chat,
@@ -349,13 +420,14 @@ straight out of the expert cache.
 
 An image is not one token. The tower turns a 14-pixel patch grid into one
 embedding per merged 2×2 patch, and each occupies a position in the
-sequence — a 700×700 photo at the default budget is a few hundred of them,
-which is worth knowing before wondering where a context window went. The
-CLI prints the count:
-
-```
-[photo.png: 256 image tokens]
-```
+sequence — the 448×336 above is 192 of them, an 896×896 photo at the
+default budget is 256. That is worth knowing before wondering where a
+context window went, and it is most of what an image costs: the 234 s in
+the transcript is the 78 generated tokens alone, and the picture is paid
+for before that, in prefill. **An image is priced as text of the same
+length.** The tower is the cheap part — 15.7 s for a full 1024-patch
+image — and its output then walks through 92 MoE layers like any other
+token. Halving `max_patches` in `vision.json` halves the bill.
 
 Through the library it is three calls, because a host needs to size the
 prompt before committing to it:
@@ -433,16 +505,10 @@ It records what was measured, including the optimizations that were
 refuted — index-layout blocking, a 3-bit trunk, GPU offload — with the
 numbers that killed them.
 
-## Status
+## What is not there yet
 
-Version 0.5.0. Output is correct, validated layer by layer against a
-PyTorch reference on both models, and the vision tower against its own
-oracle to 2.3e-06. On a machine with both containers and the source
-weights the suite is 30 passed, 0 failed, 1 skipped (the skip is
-the vision check on the container without a tower). The API is not
-frozen.
-
-Known gaps, plainly:
+Version 0.5.0, and the API is not frozen. Stated plainly, because finding
+these out for yourself is worse than reading them here:
 
 - the chat template covers the text conversation and not tool calls,
   JSON response schemas, or the think channel. K3 builds its prompt with
@@ -461,7 +527,8 @@ Known gaps, plainly:
   rather than an error;
 - every expert in a container is at the same bit width — the non-uniform
   per-expert allocation the format was designed around is specified and
-  not built.
+  not built, and it is the largest unexplored lever on both the disk
+  footprint and the bytes read per token.
 
 ## License
 
