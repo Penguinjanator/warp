@@ -257,9 +257,12 @@ read fail `EINVAL` instead of merely running slow.
 Records for the same layer are contiguous and sorted by expert id.
 `subs-L{n}.bin` would mirror the layout at SUB1 precision (~5× smaller
 reads, used only when the engine's miss-latency budget is exceeded,
-HOBBIT-style, arXiv 2411.01433 — flag-gated because it breaks
+HOBBIT-style, arXiv 2411.01433 — it would need a flag, because it breaks
 bit-exactness). **Specified, not implemented:** the converter writes no
-substitute bank, and `waste_cfg.allow_substitutes` has nothing to read.
+substitute bank, so there is nothing to substitute. `waste_cfg` carried an
+`allow_substitutes` flag for this until 0.6.0; it was removed, because a
+switch the engine never read described a capability the engine did not
+have.
 
 ### trunk.bin
 

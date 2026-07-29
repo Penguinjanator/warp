@@ -20,10 +20,16 @@ typedef struct { char *text; int len; int32_t id; } tok_special;
 
 struct waste_tok {
     uint8_t *blob;          /* decoded token bytes, back to back           */
-    tok_entry *by_rank;     /* rank -> bytes                                */
-    int n_tokens;
+    tok_entry *by_rank;     /* insertion order -> bytes                     */
+    int n_tokens, cap_tokens;
     int32_t *hash;          /* open addressing: -> index into by_rank       */
     int hash_mask;
+    /* rank -> index into by_rank, for decode. Ranks in a tiktoken file are
+     * dense from 0, so a flat array is smaller than a hash and answers in
+     * one load. Decoding used to scan all 163840 entries per token, twice
+     * over (specials, then ranks), for every token generated. */
+    int32_t *by_id;
+    int32_t max_id;
     int bos, eos;
     tok_special *special;   /* longest-first, so <|a|> cannot mask <|ab|>  */
     int n_special;
@@ -171,8 +177,10 @@ waste_tok *waste_tok_open(const char *dir)
     fclose(f);
 
     waste_tok *t = (waste_tok *)calloc(1, sizeof *t);
+    if (!t) { free(raw); return NULL; }
     t->blob = (uint8_t *)malloc((size_t)sz);          /* decoded is smaller */
-    t->by_rank = (tok_entry *)malloc(sizeof(tok_entry) * 300000);
+    t->cap_tokens = 4096;
+    t->by_rank = (tok_entry *)malloc(sizeof(tok_entry) * (size_t)t->cap_tokens);
     if (!t->blob || !t->by_rank) { free(raw); waste_tok_free(t); return NULL; }
 
     size_t used = 0;
@@ -182,6 +190,18 @@ waste_tok *waste_tok_open(const char *dir)
         if (!nl) nl = end;
         char *sp = memchr(line, ' ', (size_t)(nl - line));
         if (sp) {
+            /* Grown rather than a fixed 300000, which was a bound on a
+             * vocabulary size taken from the one model in hand and
+             * enforced by nothing — a larger tokenizer.model wrote past
+             * the end of the array. */
+            if (t->n_tokens == t->cap_tokens) {
+                const int nc = t->cap_tokens * 2;
+                tok_entry *g = (tok_entry *)realloc(t->by_rank,
+                                                    sizeof(tok_entry) * (size_t)nc);
+                if (!g) { free(raw); waste_tok_free(t); return NULL; }
+                t->by_rank = g;
+                t->cap_tokens = nc;
+            }
             const int nb = b64decode(line, (int)(sp - line), t->blob + used);
             const int rank = atoi(sp + 1);
             t->by_rank[t->n_tokens].p = t->blob + used;
@@ -189,10 +209,26 @@ waste_tok *waste_tok_open(const char *dir)
             t->by_rank[t->n_tokens].rank = rank;
             t->n_tokens++;
             used += (size_t)nb;
+            /* Bounded the same way cfg_sane bounds vocab_size: the index
+             * below is a flat array, and a rank field of 2^31-1 in a file
+             * we did not write is an 8 GB allocation. */
+            if (rank > t->max_id && rank <= (1 << 24)) t->max_id = rank;
         }
         line = nl + 1;
     }
     free(raw);
+
+    {   /* rank -> entry, so decode is a lookup instead of a scan */
+        const size_t n = (size_t)t->max_id + 1;
+        t->by_id = (int32_t *)malloc(n * sizeof(int32_t));
+        if (!t->by_id) { waste_tok_free(t); return NULL; }
+        for (size_t i = 0; i < n; i++) t->by_id[i] = -1;
+        for (int i = 0; i < t->n_tokens; i++) {
+            const int r = t->by_rank[i].rank;
+            /* first wins, matching the scan this replaces */
+            if (r >= 0 && r <= t->max_id && t->by_id[r] < 0) t->by_id[r] = i;
+        }
+    }
 
     int hs = 1;
     while (hs < t->n_tokens * 2) hs <<= 1;
@@ -219,7 +255,7 @@ void waste_tok_free(waste_tok *t)
     if (!t) return;
     for (int i = 0; i < t->n_special; i++) free(t->special[i].text);
     free(t->special);
-    free(t->blob); free(t->by_rank); free(t->hash); free(t);
+    free(t->blob); free(t->by_rank); free(t->hash); free(t->by_id); free(t);
 }
 
 int waste_tok_vocab(const waste_tok *t) { return t->n_tokens; }
@@ -369,15 +405,17 @@ static int next_piece(const char *s, int len)
 
 /* ---- byte-pair merge ---------------------------------------------------- */
 
-#define MAXPIECE 256
+/* The merge loop below rescans the whole piece for each merge, so it is
+ * O(n^2) in the piece length. This bounds that — it is a window, not a
+ * limit: encode_piece feeds a longer pre-token through in windows. */
+#define MAXPIECE 1024
 
-static int encode_piece(const waste_tok *t, const uint8_t *p, int len,
-                        int32_t *out, int cap)
+static int encode_window(const waste_tok *t, const uint8_t *p, int len,
+                         int32_t *out, int cap)
 {
     if (len == 0) return 0;
     const int r = tok_rank(t, p, len);
     if (r >= 0) { if (cap < 1) return -1; out[0] = r; return 1; }
-    if (len > MAXPIECE) len = MAXPIECE;
 
     int start[MAXPIECE + 1], rank[MAXPIECE + 1], n = 0;
     for (int i = 0; i < len; i++) { start[n] = i; rank[n] = INT32_MAX; n++; }
@@ -407,6 +445,47 @@ static int encode_piece(const waste_tok *t, const uint8_t *p, int len,
     for (int i = 0; i < n; i++) {
         const int rr = tok_rank(t, p + start[i], start[i + 1] - start[i]);
         out[i] = rr < 0 ? 0 : rr;
+    }
+    return n;
+}
+
+/* One pre-token, every byte of it.
+ *
+ * A piece longer than the window is encoded in windows. It used to be
+ * *truncated* to 256 bytes while the caller advanced past the whole
+ * piece, so the rest was dropped from the prompt without a word. The
+ * pre-tokenizer gives Han its own branch and consumes an entire
+ * unpunctuated run, which put that cliff at 85 Chinese characters:
+ * `好` x 86 went in as 258 bytes and came back as 256, cut mid-codepoint.
+ * A markdown rule of 300 dashes and a run of 300 newlines went the same
+ * way. tiktoken has no such limit and round-trips all of them.
+ *
+ * Windowing is still a divergence from the reference, which runs the BPE
+ * over the whole regex match — but only at a seam, and only for pieces
+ * past 1024 bytes, which no ordinary text reaches. Upstream splits runs
+ * at 25000 characters for the same O(n^2) reason (transcribed in
+ * serve/engine.py as _MAX_RUN_CHARS), so the compromise is theirs; this
+ * one is merely tighter. Seams land on UTF-8 boundaries, so a window
+ * never splits a codepoint the way the truncation did. */
+static int encode_piece(const waste_tok *t, const uint8_t *p, int len,
+                        int32_t *out, int cap)
+{
+    if (len <= MAXPIECE) return encode_window(t, p, len, out, cap);
+
+    int n = 0, off = 0;
+    while (off < len) {
+        int w = len - off;
+        if (w > MAXPIECE) {
+            w = MAXPIECE;
+            /* back off to a codepoint boundary: a continuation byte is
+             * 10xxxxxx, so walk back while the byte *after* the window is
+             * one. Bounded by w > 1 for a piece that is not valid UTF-8. */
+            while (w > 1 && (p[off + w] & 0xC0) == 0x80) w--;
+        }
+        const int got = encode_window(t, p + off, w, out + n, cap - n);
+        if (got < 0) return -1;
+        n += got;
+        off += w;
     }
     return n;
 }
@@ -499,18 +578,21 @@ int waste_tok_decode1(const waste_tok *t, int32_t id, char *buf, int cap)
      * "response" — and why a stop string written in markers could never
      * match the text it was compared against. Encode and decode have to
      * agree about what a token is. */
+    if (cap <= 0) return 0;
     for (int i = 0; i < t->n_special; i++)
         if (t->special[i].id == id) {
             const int l = t->special[i].len < cap ? t->special[i].len : cap;
             memcpy(buf, t->special[i].text, (size_t)l);
             return l;
         }
-    for (int i = 0; i < t->n_tokens; i++)
-        if (t->by_rank[i].rank == id) {
+    if (id >= 0 && id <= t->max_id && t->by_id) {
+        const int32_t i = t->by_id[id];
+        if (i >= 0) {
             const int l = t->by_rank[i].len < cap ? t->by_rank[i].len : cap;
             memcpy(buf, t->by_rank[i].p, (size_t)l);
             return l;
         }
+    }
     return 0;
 }
 

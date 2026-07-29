@@ -37,6 +37,7 @@ struct waste_ctx {
     waste_cfg cfg;
     waste_memplan plan;
     char path[512];
+    char usage[512];         /* resolved hotlist path; cfg's is borrowed */
     int pos;                 /* next position in the sequence */
     int warmed;              /* experts preloaded from the hotlist */
     char quant[64];          /* composed at open, reported by get_info */
@@ -369,8 +370,15 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
     const uint64_t cache_bytes = budget - c->plan.floor_bytes +
                                  c->plan.min_expert_cache;
     {
+        waste_load_opts opt;
+        memset(&opt, 0, sizeof opt);
+        opt.cache_bytes = (size_t)cache_bytes;
+        opt.want_vision = cfg.vision;
+        opt.n_threads = cfg.n_threads;
+        opt.policy = (int)cfg.cache_policy;
+        opt.direct_io = cfg.use_direct_io;
         const int rc = waste_model_load(&c->m, model_path, (int)cfg.ctx_tokens,
-                                        (size_t)cache_bytes, cfg.vision);
+                                        &opt);
         if (rc) {
             /* The load allocates tensors, banks and the cache before it can
              * fail, and freeing only the context left all of it behind —
@@ -384,10 +392,17 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
      * WASTE_VERIFY; this is the other way in, and it can only add. */
     if (cfg.verify_records) c->m.verify = 1;
     quant_summary(c);
+    /* Resolved once: cfg.usage_path is borrowed from the caller and only
+     * has to outlive waste_open, so the context keeps its own copy. */
+    if (cfg.usage_path && cfg.usage_path[0])
+        snprintf(c->usage, sizeof c->usage, "%s", cfg.usage_path);
+    else
+        snprintf(c->usage, sizeof c->usage, "%s/usage.waste", model_path);
+    c->cfg.usage_path = c->usage;
     c->tok = waste_tok_open(model_path);      /* optional */
     if (c->tok) waste_tok_set_eos(c->tok, c->m.cfg.eos_token_id);
     /* warm the cache from what previous runs learned, if anything */
-    c->warmed = waste_model_warm_cache(&c->m, model_path);
+    c->warmed = waste_model_warm_cache(&c->m, c->usage);
     *out = c;
     return WASTE_OK;
 }
@@ -910,7 +925,7 @@ waste_status waste_model_get_info(const waste_ctx *c, waste_model_info *out)
 waste_status waste_save_usage(waste_ctx *c)
 {
     if (!c) return WASTE_E_ARG;
-    return waste_model_save_usage(&c->m, c->path) < 0 ? WASTE_E_IO : WASTE_OK;
+    return waste_model_save_usage(&c->m, c->usage) < 0 ? WASTE_E_IO : WASTE_OK;
 }
 
 waste_status waste_get_stats(const waste_ctx *c, waste_stats *out)

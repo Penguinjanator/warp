@@ -240,9 +240,12 @@ python3 -m serve MODEL [options]
   --host, --port, --model-id, --api-key
   --budget SIZE      hard RAM ceiling, e.g. 48G (0 = the engine chooses)
   --ctx N            context tokens
-  --threads, --io-threads, --cache {lfru,lru,pinned}, --direct-io
+  --threads N        compute threads (0 = one per core)
+  --cache {lfru,lru} expert-cache eviction policy
+  --no-direct-io     keep the page cache in the way (the bypass is on)
   --vision           load the vision tower
-  --allow-substitutes, --expert-deferral, --usage PATH
+  --verify           check every expert record's crc32 as it is read
+  --usage PATH       learned hotlist (default <model>/usage.waste)
   --max-tokens N     default cap when a request does not set one
   --no-thinking      answer without the think channel unless asked
   --allow-local-images

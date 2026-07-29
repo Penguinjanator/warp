@@ -45,7 +45,10 @@ WASTE_E_ARG = -5
 WASTE_E_UNSUPPORTED = -6
 WASTE_E_CANCELLED = -7
 
-CACHE_LFRU, CACHE_LRU, CACHE_PINNED = 0, 1, 2
+# waste.h's waste_cache_policy. There is no third: a "pinned" policy was
+# listed there and never implemented, so it selected LFRU like everything
+# else that was not 1.
+CACHE_LFRU, CACHE_LRU = 0, 1
 
 
 class EngineError(RuntimeError):
@@ -79,15 +82,11 @@ class Cfg(C.Structure):
     _fields_ = [("ram_budget_bytes", C.c_uint64),
                 ("ctx_tokens", C.c_uint32),
                 ("n_threads", C.c_int),
-                ("io_threads", C.c_int),
                 ("cache_policy", C.c_int),
                 ("use_direct_io", C.c_int),
                 ("vision", C.c_int),
-                ("allow_substitutes", C.c_int),
-                ("expert_deferral", C.c_int),
                 ("verify_records", C.c_int),
-                ("usage_path", C.c_char_p),
-                ("state_path", C.c_char_p)]
+                ("usage_path", C.c_char_p)]
 
 
 class GenParams(C.Structure):
@@ -353,15 +352,15 @@ class Engine:
                  ram_budget_bytes: int = 0,
                  ctx_tokens: int = 0,
                  n_threads: int = 0,
-                 io_threads: int = 0,
                  cache_policy: int = CACHE_LFRU,
-                 direct_io: bool = False,
+                 # waste_cfg_init's default, and the one the engine's own
+                 # hit-rate numbers are measured under. Defaulting to
+                 # False here quietly served every request with the page
+                 # cache in the way.
+                 direct_io: bool = True,
                  vision: bool = False,
-                 allow_substitutes: bool = False,
-                 expert_deferral: bool = False,
                  verify_records: bool = False,
-                 usage_path: Optional[str] = None,
-                 state_path: Optional[str] = None):
+                 usage_path: Optional[str] = None):
         self.lib = _lib()
         self.model_path = str(model_path)
         self._lock = threading.RLock()
@@ -373,19 +372,14 @@ class Engine:
         cfg.ram_budget_bytes = ram_budget_bytes
         cfg.ctx_tokens = ctx_tokens
         cfg.n_threads = n_threads
-        cfg.io_threads = io_threads
         cfg.cache_policy = cache_policy
         cfg.use_direct_io = 1 if direct_io else 0
         cfg.vision = 1 if vision else 0
-        cfg.allow_substitutes = 1 if allow_substitutes else 0
-        cfg.expert_deferral = 1 if expert_deferral else 0
         cfg.verify_records = 1 if verify_records else 0
         # Keep the encoded bytes alive: c_char_p stores a borrowed pointer,
         # and a temporary would be freed before waste_open reads it.
         self._usage = usage_path.encode() if usage_path else None
-        self._state = state_path.encode() if state_path else None
         cfg.usage_path = self._usage
-        cfg.state_path = self._state
 
         st = self.lib.waste_open(self.model_path.encode(), C.byref(cfg),
                                  C.byref(self._ctx))

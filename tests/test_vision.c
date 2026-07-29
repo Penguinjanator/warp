@@ -7,6 +7,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 int main(int argc, char **argv)
 {
@@ -16,7 +17,11 @@ int main(int argc, char **argv)
     }
     const int h = atoi(argv[3]), w = atoi(argv[4]);
     waste_model m;
-    if (waste_model_load(&m, argv[1], 512, 0, 1)) { fprintf(stderr, "load\n"); return 1; }
+    waste_load_opts lo;
+    memset(&lo, 0, sizeof lo);
+    lo.want_vision = 1;
+    lo.direct_io = 1;
+    if (waste_model_load(&m, argv[1], 512, &lo)) { fprintf(stderr, "load\n"); return 1; }
     if (!waste_vision_available(&m)) { fprintf(stderr, "no vision tower\n"); return 1; }
     fprintf(stderr, "vcfg: hidden %d heads %d qkv %d inter %d layers %d "
                     "pos %dx%d text %d eps %g\n",

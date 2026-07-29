@@ -64,7 +64,7 @@ static char *slurp(const char *path, size_t *len)
     return b;
 }
 
-static int bank_open(const char *path, size_t rec_bytes, int *direct);
+static int bank_open(const char *path, size_t rec_bytes, int want, int *direct);
 
 /* pread until the whole range lands; short reads are legal.
  *
@@ -681,17 +681,27 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
 }
 
 int waste_model_load(waste_model *m, const char *dir, int kv_cap,
-                     size_t cache_bytes, int want_vision)
+                     const waste_load_opts *opt)
 {
+    static const waste_load_opts defaults = { 0, 0, 0, 0, 1 };
+    if (!opt) opt = &defaults;
+    const size_t cache_bytes = opt->cache_bytes;
     memset(m, 0, sizeof *m);
-    m->want_vision = want_vision;
+    m->want_vision = opt->want_vision;
+    m->want_direct = opt->direct_io;
     if (prof_on < 0) { const char *e = getenv("WASTE_PROFILE"); prof_on = e && *e != '0'; }
     m->kv_cap = kv_cap;
     m->direct_io = 1;
     waste_backend_init(WASTE_BE_AUTO);
     {
+        /* An explicit count is the caller's decision and wins; the
+         * environment is the escape hatch for when there is no caller to
+         * ask, so it only fills in a 0. The pool is process-wide and
+         * initialises once — the first model in wins, which is why the
+         * header says so. */
         const char *e = getenv("WASTE_THREADS");
-        waste_pool_init(e ? atoi(e) : 0);
+        waste_pool_init(opt->n_threads > 0 ? opt->n_threads
+                                           : (e ? atoi(e) : 0));
     }
 
     char path[MAXP];
@@ -893,7 +903,8 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
          * division that produces rec_bytes has to happen in 64 bits. */
         const int64_t bytes = js_int(&d, js_get(&d, e, "bytes"), 0);
         m->bank[L].rec_bytes = m->bank[L].n_experts ? bytes / m->bank[L].n_experts : 0;
-        m->bank[L].fd = bank_open(path, m->bank[L].rec_bytes, &m->direct_io);
+        m->bank[L].fd = bank_open(path, m->bank[L].rec_bytes, m->want_direct,
+                                  &m->direct_io);
     }
     js_free(&d);
     free(src);
@@ -1003,7 +1014,8 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         int64_t rec = 0;
         for (int L = 0; L < c->n_layers; L++)
             if (m->bank[L].rec_bytes > rec) rec = m->bank[L].rec_bytes;
-        if (waste_ecache_init(&m->cache, cache_bytes, (size_t)rec, 0)) return -1;
+        if (waste_ecache_init(&m->cache, cache_bytes, (size_t)rec, opt->policy))
+            return -1;
         m->miss_buf = (uint8_t *)waste_dio_alloc((size_t)rec);
         if (!m->miss_buf) return -1;
     }
@@ -1077,16 +1089,29 @@ void waste_model_free(waste_model *m)
  * `*direct` is set to 0 if any bank ends up without the bypass, so `waste
  * info` can say the hit rates are being measured against a warm page
  * cache. Not validated on Linux from this machine — see LEARNED.md §14. */
-static int bank_open(const char *path, size_t rec_bytes, int *direct)
+static int bank_open(const char *path, size_t rec_bytes, int asked, int *direct)
 {
     (void)rec_bytes; (void)direct;
-    /* The escape hatch, for measuring what the page cache is worth. */
+    /* Two separate questions, and conflating them misreports one platform
+     * or the other.
+     *
+     * `want` is whether the caller wants the bypass at all:
+     * waste_cfg.use_direct_io, which is on by default, unless WASTE_DIRECT=0
+     * vetoes it — the escape hatch for measuring what the page cache is
+     * worth. `aligned` is whether O_DIRECT and FILE_FLAG_NO_BUFFERING can
+     * be used, since both refuse a transfer that is not a whole number of
+     * sectors and a misaligned record fails every read outright rather
+     * than merely running slow.
+     *
+     * macOS asks only the first: F_NOCACHE has no alignment contract, so a
+     * container whose records are not page multiples still gets the
+     * bypass there and `direct` must not be cleared for it. */
     const char *e = getenv("WASTE_DIRECT");
-    const int want = !(e && e[0] == '0') && rec_bytes &&
-                     rec_bytes % WASTE_DIO_ALIGN == 0;
-    (void)want;
+    const int want = asked && !(e && e[0] == '0');
+    const int aligned = rec_bytes && rec_bytes % WASTE_DIO_ALIGN == 0;
+    (void)want; (void)aligned;
 #if defined(_WIN32)
-    if (want) {
+    if (want && aligned) {
         const int fd = waste_open_stream(path, 1);
         if (fd >= 0) return fd;
     }
@@ -1096,7 +1121,7 @@ static int bank_open(const char *path, size_t rec_bytes, int *direct)
     return waste_open_stream(path, 0);
 #else
 #if defined(__linux__) && defined(O_DIRECT)
-    if (want) {
+    if (want && aligned) {
         const int fd = open(path, O_RDONLY | O_DIRECT);
         if (fd >= 0) return fd;
     }
@@ -1105,8 +1130,12 @@ static int bank_open(const char *path, size_t rec_bytes, int *direct)
     const int fd = open(path, O_RDONLY);
     if (fd < 0) return fd;
 #ifdef __APPLE__
-    fcntl(fd, F_NOCACHE, 1);          /* the engine owns caching */
-    fcntl(fd, F_RDAHEAD, 0);
+    if (want) {
+        fcntl(fd, F_NOCACHE, 1);      /* the engine owns caching */
+        fcntl(fd, F_RDAHEAD, 0);
+    } else {
+        *direct = 0;
+    }
 #elif defined(__linux__)
     /* No bypass available: at least stop the kernel reading ahead into
      * pages nothing will ask for. */
@@ -1843,12 +1872,10 @@ void waste_apply_attn_res(waste_model *m, const float *blockres, int nb,
     }
 }
 
-int waste_model_warm_cache(waste_model *m, const char *dir)
+int waste_model_warm_cache(waste_model *m, const char *path)
 {
     if (m->cache.n_slots <= 0) return 0;
-    char p[512];
-    snprintf(p, sizeof p, "%s/usage.waste", dir);
-    const int n = waste_ecache_warm(&m->cache, p, bank_fetch, m);
+    const int n = waste_ecache_warm(&m->cache, path, bank_fetch, m);
     /* Warming is best-effort: a usage file naming experts this container
      * does not have is stale, not broken, and must not be reported as a
      * read failure by the first generation that follows. */
@@ -1856,12 +1883,10 @@ int waste_model_warm_cache(waste_model *m, const char *dir)
     return n;
 }
 
-int waste_model_save_usage(const waste_model *m, const char *dir)
+int waste_model_save_usage(const waste_model *m, const char *path)
 {
     if (m->cache.n_slots <= 0) return 0;
-    char p[512];
-    snprintf(p, sizeof p, "%s/usage.waste", dir);
-    return waste_ecache_save_usage(&m->cache, p, m->cache.clock);
+    return waste_ecache_save_usage(&m->cache, path, m->cache.clock);
 }
 
 /* ---- session state ------------------------------------------------------

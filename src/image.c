@@ -9,14 +9,19 @@
  * the pixels out as [patches][3*14*14] in the channel-major order the patch
  * embedding's conv kernel expects.
  *
- * A caveat that matters more than the code: **K3 ships no preprocessor
- * config**. There is no preprocessor_config.json in the release and no
- * image mean/std anywhere in the modeling code or config, so the
- * normalization here is the CLIP convention every tower of this lineage
- * uses — and it is a choice, not a transcription. If image understanding
- * comes out subtly wrong while the tower itself matches its oracle to
- * 2.3e-06, this is the first thing to question. It is in vision.json so it
- * can be corrected without a rebuild.
+ * The mean and std are not chosen here: they come from vision.json, which
+ * the converter fills from the release's preprocessor_config.json —
+ * `media_proc_cfg` carries mean = std = 0.5, i.e. [-1, 1], and
+ * kimi_k3_vision_processing.py applies exactly those. This file's own
+ * fallback (see the caller in model.c) matches, and is only reached for a
+ * container converted without the file present.
+ *
+ * That paragraph used to say the release shipped no preprocessor config
+ * and that the normalization here was the CLIP convention, a guess. It
+ * ships one; the values were corrected and this comment was not, which is
+ * the worse of the two errors — it sent a reader debugging the tower to
+ * question the one number that had just been verified against the
+ * release. tests/run.sh checks it now.
  */
 
 #include "model.h"

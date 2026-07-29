@@ -21,12 +21,12 @@ if __package__ in (None, ""):                    # python3 serve/__main__.py
     __package__ = "serve"
 
 from . import api                                            # noqa: E402
-from .engine import (CACHE_LFRU, CACHE_LRU, CACHE_PINNED,    # noqa: E402
+from .engine import (CACHE_LFRU, CACHE_LRU,                  # noqa: E402
                      Engine, EngineError, build_info, physical_ram,
                      plan_memory)
 from .server import serve                                    # noqa: E402
 
-POLICIES = {"lfru": CACHE_LFRU, "lru": CACHE_LRU, "pinned": CACHE_PINNED}
+POLICIES = {"lfru": CACHE_LFRU, "lru": CACHE_LRU}
 
 
 def human(n: float) -> str:
@@ -80,18 +80,21 @@ examples:
                    help="hard RAM ceiling, e.g. 48G. 0 lets the engine choose")
     g.add_argument("--ctx", type=int, default=0, metavar="N",
                    help="context tokens (0 = container default)")
-    g.add_argument("--threads", type=int, default=0)
-    g.add_argument("--io-threads", type=int, default=0)
+    g.add_argument("--threads", type=int, default=0, metavar="N",
+                   help="compute threads (0 = one per core)")
     g.add_argument("--cache", choices=sorted(POLICIES), default="lfru")
-    g.add_argument("--direct-io", action="store_true",
-                   help="bypass the page cache")
+    g.add_argument("--no-direct-io", action="store_true",
+                   help="keep the page cache in the way. The bypass is on "
+                        "by default and is what makes the reported hit "
+                        "rates the engine's rather than the kernel's")
     g.add_argument("--vision", action="store_true",
                    help="load the vision tower, so requests may carry images")
-    g.add_argument("--allow-substitutes", action="store_true",
-                   help="low-bit expert on a cache miss; faster, not bit-exact")
-    g.add_argument("--expert-deferral", action="store_true")
+    g.add_argument("--verify", action="store_true",
+                   help="check every expert record's crc32 as it is read; "
+                        "for a container copied or downloaded and not read "
+                        "since. Costs ~5%% on Kimi-Linear, ~1%% on K3")
     g.add_argument("--usage", default=None, metavar="PATH",
-                   help="learned hotlist (default <model>/usage)")
+                   help="learned hotlist (default <model>/usage.waste)")
 
     s = ap.add_argument_group("serving")
     s.add_argument("--max-tokens", type=int, default=512,
@@ -139,12 +142,10 @@ examples:
             ram_budget_bytes=args.budget,
             ctx_tokens=args.ctx,
             n_threads=args.threads,
-            io_threads=args.io_threads,
             cache_policy=POLICIES[args.cache],
-            direct_io=args.direct_io,
+            direct_io=not args.no_direct_io,
             vision=args.vision,
-            allow_substitutes=args.allow_substitutes,
-            expert_deferral=args.expert_deferral,
+            verify_records=args.verify,
             usage_path=args.usage)
     except EngineError as e:
         print(f"{e}", file=sys.stderr)

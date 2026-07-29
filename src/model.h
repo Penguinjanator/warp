@@ -148,6 +148,7 @@ typedef struct {
     uint64_t expert_reads;
     waste_ecache cache;
     uint8_t *miss_buf;               /* used when the cache is disabled     */
+    int      want_direct;            /* the caller asked for the bypass     */
     int      direct_io;              /* 0 = a bank fell back to page cache  */
     /* A record that failed on the way in. Sticky until cleared, because
      * the forward pass that hit it is already wrong and the caller has to
@@ -158,11 +159,26 @@ typedef struct {
     int      read_error, bad_layer, bad_expert, verify;
 } waste_model;
 
-/* cache_bytes: hard ceiling for the expert cache; 0 = no cache. */
-/* want_vision loads the 434 MB vision tower; it has to be a parameter
- * because the first thing load does is zero the struct. */
+/* Everything the load needs that is not in the container. These are
+ * parameters rather than fields set beforehand because the first thing
+ * load does is zero the struct.
+ *
+ *   cache_bytes  hard ceiling for the expert cache; 0 = no cache
+ *   want_vision  load the 434 MB vision tower
+ *   n_threads    compute pool size; 0 = WASTE_THREADS, else hardware
+ *   policy       waste_cache_policy: 0 = LFRU, 1 = LRU
+ *   direct_io    ask for the page-cache bypass on the expert banks
+ */
+typedef struct {
+    size_t cache_bytes;
+    int    want_vision;
+    int    n_threads;
+    int    policy;
+    int    direct_io;
+} waste_load_opts;
+
 int  waste_model_load(waste_model *m, const char *dir, int kv_cap,
-                      size_t cache_bytes, int want_vision);
+                      const waste_load_opts *opt);
 void waste_model_free(waste_model *m);
 /* Runs one token; returns logits (vocab floats, owned by the model), or
  * NULL when an expert record failed to read or failed verification —
@@ -216,9 +232,10 @@ int waste_model_chunk_max(const waste_model *m);
  * AttnRes history. Saving it turns a cold re-prefill into a file read,
  * which at streaming speeds is minutes versus milliseconds. */
 /* Learned hotlist: which experts this workload uses, so the next run does
- * not start with an empty cache. Stored next to the container. */
-int waste_model_warm_cache(waste_model *m, const char *dir);
-int waste_model_save_usage(const waste_model *m, const char *dir);
+ * not start with an empty cache. `path` is the file itself, so a caller
+ * can keep one per workload rather than one per container. */
+int waste_model_warm_cache(waste_model *m, const char *path);
+int waste_model_save_usage(const waste_model *m, const char *path);
 
 int waste_model_state_save(const waste_model *m, const char *path, int pos);
 int waste_model_state_load(waste_model *m, const char *path, int *pos);

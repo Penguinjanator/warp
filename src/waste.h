@@ -54,8 +54,8 @@ extern "C" {
                               WASTE_VERSION_MINOR * 100 + \
                               WASTE_VERSION_PATCH)
 
-const char *waste_version(void);         /* e.g. "0.5.0"                    */
-int         waste_version_number(void);  /* e.g. 500                        */
+const char *waste_version(void);         /* e.g. "0.6.0"                    */
+int         waste_version_number(void);  /* e.g. 600                        */
 /* Build details: backend, SIMD, container format version. Never NULL. */
 const char *waste_build_info(void);
 
@@ -103,10 +103,13 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
 
 /* ---- configuration ----------------------------------------------------- */
 
+/* Both are implemented; there is no third. A "pinned" policy that honours
+ * the hotlist and never evicts it used to be listed here and was never
+ * written — waste_ecache_init took a policy argument the engine always
+ * passed 0 for, so every one of these selected LFRU. */
 typedef enum {
     WASTE_CACHE_LFRU = 0,  /* frequency-first, recency tiebreak (default)  */
     WASTE_CACHE_LRU = 1,
-    WASTE_CACHE_PINNED = 2, /* honour the baked/learned hotlist only       */
 } waste_cache_policy;
 
 typedef struct {
@@ -125,16 +128,36 @@ typedef struct {
      * floor_bytes. waste_memory_used reports what was actually resolved. */
     uint64_t ram_budget_bytes;
 
-    uint32_t ctx_tokens;        /* 0 = container default                   */
-    int      n_threads;         /* 0 = hardware concurrency                */
-    int      io_threads;        /* expert-fetch pool; 0 = auto             */
+    /* Longest sequence a context holds — prompt plus generation — and a
+     * hard bound rather than a hint, because MLA stores one latent per
+     * position and the cache is allocated to exactly this length.
+     * 0 = 4096. See waste_generate. */
+    uint32_t ctx_tokens;
+
+    /* Compute threads. 0 = hardware concurrency; WASTE_THREADS overrides
+     * a 0 but not a value set here.
+     *
+     * The pool is process-wide rather than per context: the first
+     * waste_open sizes it and later ones reuse it, so a host holding two
+     * models runs both on the same threads. The kernels split by row, so
+     * results do not depend on the count either way. */
+    int      n_threads;
 
     waste_cache_policy cache_policy;
-    int      use_direct_io;     /* bypass page cache (F_NOCACHE/O_DIRECT)  */
+
+    /* Read expert banks with the page cache out of the way: F_NOCACHE on
+     * macOS, O_DIRECT on Linux, FILE_FLAG_NO_BUFFERING on Windows.
+     * **On by default**, and it is what makes the hit rates the engine
+     * reports its own rather than the kernel's — with a 17 GB container
+     * on a 64 GB machine, measuring without it measures the kernel.
+     *
+     * A filesystem may refuse the bypass and a container whose records
+     * are not page multiples cannot use it; waste_stats.direct_io then
+     * comes back 0. WASTE_DIRECT=0 forces it off for a process, which is
+     * how to measure what the page cache is worth. */
+    int      use_direct_io;
+
     int      vision;            /* load the vision tower (434 MB on K3)    */
-    int      allow_substitutes; /* low-bit expert on cache miss (HOBBIT);
-                                   breaks bit-exactness, off by default    */
-    int      expert_deferral;   /* overlap expert fetch with next layer    */
 
     /* Check each expert record's crc32 as it comes off the disk. **Off by
      * default**, and that is a throughput decision rather than a claim
@@ -153,9 +176,26 @@ typedef struct {
      * enough; neither turns it off. */
     int      verify_records;
 
-    const char *usage_path;     /* learned hotlist; NULL = <model>/usage   */
-    const char *state_path;     /* KDA/KV checkpoint dir; NULL = disabled  */
+    /* Learned hotlist: which experts a previous run used, read at open to
+     * warm the cache and written by waste_save_usage. NULL = the
+     * container's own, <model_path>/usage.waste. Point it elsewhere to
+     * keep per-workload hotlists, or at a read-only path to warm from one
+     * without writing it back.
+     *
+     * The file is trusted only as a hint: entries naming a layer or an
+     * expert this container does not have are skipped, because it is one
+     * of the few files the engine reads that nobody asked it to. */
+    const char *usage_path;
 } waste_cfg;
+
+/* Removed in 0.6.0, having never done anything: `io_threads` (there is no
+ * expert-fetch pool — reads happen on the calling thread), `expert_deferral`
+ * (no overlap of a fetch with the next layer), `allow_substitutes` (WQ_SUB1
+ * substitute records are specified in the format and not written by the
+ * converter in v0, so there is nothing to substitute), and `state_path`
+ * (session state is persisted by calling waste_state_save/load, not by
+ * configuring a directory). Each was set by the CLI and the server and
+ * read by nothing. */
 
 /* Fills cfg with defaults. Always call this before setting fields, so
  * new fields added in later versions stay sane. */

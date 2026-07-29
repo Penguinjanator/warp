@@ -27,6 +27,23 @@ tests = [
  "emoji: cafe naive Zurich",
  'x=1;y=2;/*comment*/ printf("%d\\n", x+y);',
  "Perche' non funziona? Perche' si'.",
+ # Long single pre-tokens. The pre-tokenizer gives Han its own branch and
+ # consumes a whole unpunctuated run, so one of these is one piece — and
+ # the C side used to truncate a piece at 256 bytes while advancing past
+ # all of it, dropping the rest of the prompt without a word. The cliff
+ # was 85 Chinese characters. Nothing above was long enough to find it:
+ # twelve short ASCII strings is not a tokenizer corpus.
+ "好" * 86,
+ "好" * 200,
+ "=" * 400,
+ "-" * 300 + "\n" + "=" * 300,
+ "\n" * 300,
+ "a" * 400,
+ "好" * 90 + "! " + "=" * 300 + " fine",
+ # Everything here stays under the 1024-byte BPE window, where the C
+ # tokenizer is exact. Past it a piece is encoded in windows and can
+ # differ from tiktoken by a token per seam — deliberately, and
+ # documented in encode_piece. All bytes survive either way.
 ]
 out = subprocess.run([os.path.join(HERE, "test_tokenizer"), CONT, *tests],
                      capture_output=True, text=True).stdout.strip().split("\n")

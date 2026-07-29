@@ -1141,6 +1141,7 @@ int main(int argc, char **argv)
          "          info and bench\n"
          "  --learn records which experts the run used, so the next open\n"
          "  starts with a warm cache instead of an empty one\n"
+         "  --threads sets the compute pool; 0 (default) is one per core\n"
          "  --verify checks each expert record's checksum as it is read,\n"
          "  for a container you have not read since copying it. Costs ~5%%\n"
          "  on Kimi-Linear, ~1%% on K3; off otherwise\n",

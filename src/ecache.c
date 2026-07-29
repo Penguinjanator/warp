@@ -187,6 +187,18 @@ int waste_ecache_save_usage(const waste_ecache *c, const char *path,
     return rc;
 }
 
+/* Descending by hit count, ties by (layer, expert) so a given usage file
+ * warms the same way every run whatever qsort does with equal keys. */
+static int hits_desc(const void *a, const void *b)
+{
+    const waste_usage_ent *x = (const waste_usage_ent *)a;
+    const waste_usage_ent *y = (const waste_usage_ent *)b;
+    if (x->hits != y->hits) return x->hits > y->hits ? -1 : 1;
+    if (x->layer != y->layer) return x->layer < y->layer ? -1 : 1;
+    if (x->expert_id != y->expert_id) return x->expert_id < y->expert_id ? -1 : 1;
+    return 0;
+}
+
 /* Preload the hottest recorded experts, best first, until the cache is
  * full. Returns how many were loaded, or -1. */
 int waste_ecache_warm(waste_ecache *c, const char *path,
@@ -213,14 +225,12 @@ int waste_ecache_warm(waste_ecache *c, const char *path,
     }
     fclose(f);
 
-    /* hottest first; a partial selection is enough since we stop at n_slots */
+    /* Hottest first. This was a partial selection over the first n_slots,
+     * which is O(n_slots * n) — with K3's 46 GB cache that is 46000 by
+     * 46000, seconds of a cold open spent sorting before a single expert
+     * is read. The whole array sorted properly is n log n. */
+    qsort(ent, (size_t)n, sizeof *ent, hits_desc);
     const int want = (int)n < c->n_slots ? (int)n : c->n_slots;
-    for (int i = 0; i < want; i++) {
-        int best = i;
-        for (int j = i + 1; j < n; j++)
-            if (ent[j].hits > ent[best].hits) best = j;
-        const waste_usage_ent t = ent[i]; ent[i] = ent[best]; ent[best] = t;
-    }
 
     int loaded = 0;
     for (int i = 0; i < want; i++) {

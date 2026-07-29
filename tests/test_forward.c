@@ -43,7 +43,11 @@ int main(int argc, char **argv)
     double t0 = now();
     const char *cmb = getenv("WASTE_CACHE_MB");
     const size_t cache_bytes = (size_t)(cmb ? atoi(cmb) : 0) << 20;
-    if (waste_model_load(&m, dir, 4096, cache_bytes, 0)) { fprintf(stderr, "load failed\n"); return 1; }
+    waste_load_opts lo;
+    memset(&lo, 0, sizeof lo);
+    lo.cache_bytes = cache_bytes;
+    lo.direct_io = 1;
+    if (waste_model_load(&m, dir, 4096, &lo)) { fprintf(stderr, "load failed\n"); return 1; }
     printf("%s\n", waste_build_info());
     printf("loaded in %.1fs — %d layers, %d experts, top-%d, vocab %d; "
            "expert cache %d slots (%.0f MB, %.1f%% of the expert set)\n",
