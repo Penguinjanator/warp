@@ -119,10 +119,38 @@ get_small() {
 
 get_small model.safetensors.index.json
 if [ "$DRY" = 0 ] && [ "$CHECK_ONLY" = 0 ]; then
-    get_small config.json generation_config.json tokenizer.json \
-              tokenizer_config.json tiktoken.model preprocessor_config.json \
-              chat_template.jinja configuration_kimi_k3.py \
-              modeling_kimi_k3.py modeling_kimi_linear.py
+    # Ask the repo what it contains instead of guessing filenames. The
+    # hardcoded list this replaces cost real money: it did not know about
+    # encoding_k3.py, so the chat template looked absent and had to be
+    # reconstructed from a figure in the technical report; and it silently
+    # missed preprocessor_config.json, so the image normalization was the
+    # CLIP convention for a day when the release states mean = std = 0.5.
+    # A whitelist cannot report what it never knew to ask for.
+    SMALL=$(hcurl -sfL --max-time 60 "$API" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+for s in d.get("siblings", []):
+    f = s.get("rfilename", "")
+    # shards come down the resumable path; skip directories and the index
+    if f.endswith(".safetensors") or "/" in f or f == "model.safetensors.index.json":
+        continue
+    print(f)
+' 2>/dev/null)
+    if [ -n "$SMALL" ]; then
+        log "repo lists $(printf '%s\n' "$SMALL" | wc -l | tr -d ' ') small files"
+        # shellcheck disable=SC2086
+        get_small $SMALL
+    else
+        log "WARNING: could not list the repo; falling back to known names."
+        log "         Check $API by hand for files this misses."
+        get_small config.json generation_config.json tokenizer.json \
+                  tokenizer_config.json tiktoken.model preprocessor_config.json \
+                  chat_template.jinja configuration_kimi_k3.py \
+                  modeling_kimi_k3.py modeling_kimi_linear.py
+    fi
 fi
 
 [ -s "$DEST/model.safetensors.index.json" ] || {

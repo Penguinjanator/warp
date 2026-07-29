@@ -521,6 +521,66 @@ def main():
             f.write(tpl)
         print(f"chat template: copied ({len(tpl)} bytes)")
 
+    # ---- vision config ---------------------------------------------------
+    # The tower's shape lives in the release's nested vision_config, and the
+    # engine reads it from vision.json — only from there. Without this file
+    # waste_image_add returns WASTE_E_UNSUPPORTED and a multimodal container
+    # silently has no images, which is exactly what happened before it was
+    # written: the file had to be produced by hand after every conversion.
+    #
+    # Two keys are ours rather than the release's:
+    #   vt_rms_eps    the tower's RMSNorms are nn.RMSNorm(dim) with no eps,
+    #                 so PyTorch uses finfo(float32).eps. Written explicitly
+    #                 so the oracle in tools/vision_ref.py reads the same
+    #                 number the engine compiles in.
+    #   max_patches   our patch budget, i.e. how much of the context an
+    #                 image costs. The release's own limit is far higher
+    #                 (in_patch_limit 65536, 512 patches on a side); an
+    #                 image is priced as text of the same length, so this
+    #                 is a deliberate cap and halving it halves the prompt.
+    #
+    # image_mean/std are the release's, read from preprocessor_config.json,
+    # where `media_proc_cfg` is what kimi_k3_vision_processing.py actually
+    # applies. They were hardcoded to the CLIP constants here for exactly
+    # one day, on the belief that K3 shipped no preprocessor config — it
+    # does, and K3 normalizes to [-1, 1] with mean = std = 0.5, which is
+    # not what CLIP does. Guess nothing that the release states.
+    vc = cfg.get("_outer", {}).get("vision_config")
+    if vc:
+        vj = {k: v for k, v in vc.items() if not k.startswith("_")}
+        vj["vt_rms_eps"] = 1.1920928955078125e-07
+        mp = cfg.get("_outer", {}).get("media_placeholder_token_id")
+        if mp is not None:
+            vj["media_placeholder_token_id"] = mp
+        vj["max_patches"] = 1024
+
+        p_pre = os.path.join(args.src, "preprocessor_config.json")
+        if os.path.exists(p_pre):
+            mpc = json.load(open(p_pre)).get("media_proc_cfg", {})
+            for k in ("image_mean", "image_std"):
+                if mpc.get(k) is not None:
+                    vj[k] = mpc[k]
+            for k in ("patch_size", "in_patch_limit", "patch_limit_on_one_side"):
+                if mpc.get(k) is not None:
+                    vj[k] = mpc[k]
+            print(f"vision: normalization from preprocessor_config.json, "
+                  f"mean {vj.get('image_mean')}")
+        else:
+            # No config to read: say so loudly rather than invent constants.
+            # A tower fed the wrong normalization still matches its oracle,
+            # because the oracle reads this same file — the error hides.
+            vj["image_mean"] = [0.5, 0.5, 0.5]
+            vj["image_std"] = [0.5, 0.5, 0.5]
+            print("vision: WARNING no preprocessor_config.json in --src; "
+                  "assuming mean=std=0.5. Check it against the release.")
+
+        with io.open(os.path.join(args.out, "vision.json"), "w",
+                     encoding="utf-8") as f:
+            json.dump(vj, f, indent=1)
+        print(f"vision: {vj.get('vt_num_hidden_layers', '?')}-layer tower, "
+              f"patch {vj.get('patch_size', '?')}, "
+              f"max_patches {vj['max_patches']}")
+
     # ---- trunk ----------------------------------------------------------
     trunk_path = os.path.join(args.out, "trunk.bin")
     tindex = []
@@ -562,9 +622,21 @@ def main():
     print(f"trunk: {os.path.getsize(trunk_path)/2**20:.0f} MB, "
           f"{len(tindex)} tensors")
 
+    # `arch` is descriptive only — the engine derives its own from
+    # config._outer.architectures, because the *inner* architectures says
+    # KimiLinearForCausalLM on both models. It used to be written from
+    # model_type, which for K3 is the text model's and reads "kimi_linear"
+    # in a K3 container. Write what `waste info` reports, so a container
+    # inspected by hand and a container opened by the engine agree.
+    _hf = ((cfg.get("_outer", {}).get("architectures")
+            or cfg.get("architectures") or [""]))[0]
+    arch = ("kimi-k3" if "KimiK3" in _hf else
+            "kimi-linear" if "KimiLinear" in _hf else
+            _hf or cfg.get("model_type", "unknown"))
+
     manifest = {
         "format_version": 0,
-        "arch": cfg.get("model_type", "kimi"),
+        "arch": arch,
         "tensor_prefix": prefix,
         "config": cfg,
         "expert_quant": {"fmt": "VQ3R" if args.stages == 3 else "VQ2R",

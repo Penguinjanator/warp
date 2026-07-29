@@ -1,0 +1,6 @@
+{
+ "system": ["<|open|>message role=\"system\"<|sep|>", "<|close|>message<|sep|><|end_of_msg|>"],
+ "user": ["<|open|>message role=\"user\"<|sep|>", "<|close|>message<|sep|><|end_of_msg|>"],
+ "assistant": ["<|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>", "<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>"],
+ "open": "<|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>"
+}

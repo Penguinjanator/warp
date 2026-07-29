@@ -292,9 +292,12 @@ head_ "RAM budget"
 # it always passes --budget. With no flag the engine chooses, and that
 # choice is all that stands between a model whose recommendation exceeds
 # the machine — K3 asks for 80.63 GB — and a swap storm. So assert the
-# rule, not a number, and it holds on any host: the ceiling is the
-# recommendation capped at 88% of physical RAM, or the floor when even
-# that does not fit, less at most one expert record of slot rounding.
+# rule, not a number, and it holds on any host: the engine steps down a
+# whole token working set at a time and takes the largest of
+# floor + 3x, 2x, 1x that fits under 7/8 of physical RAM, or the floor
+# when not even one multiple does, less at most one expert record of slot
+# rounding. Filling the cap instead is what put a 27 GB cache on a 64 GB
+# machine and cost 8x throughput — docs/LEARNED.md §16.
 default_budget() {
     python3 - "$1" <<'PY'
 import json, os, subprocess, sys
@@ -309,8 +312,13 @@ cap = phys - phys // 8
 # what the engine actually holds: the plan's mandatory parts plus the
 # cache it really allocated, which is what `info` reports
 held = plan["floor_bytes"] - plan["min_expert_cache"] + info["expert_cache_bytes"]
-want = (plan["floor_bytes"] if plan["floor_bytes"] > cap
-        else min(plan["recommended_bytes"], cap))
+# recommended_bytes is floor + 3 * one token's working set, by construction
+ws = (plan["recommended_bytes"] - plan["floor_bytes"]) // 3
+want = plan["floor_bytes"]
+for k in (3, 2, 1):
+    if plan["floor_bytes"] + ws * k <= cap:
+        want = plan["floor_bytes"] + ws * k
+        break
 rec = plan["min_expert_cache"] // (2 * info["top_k"]) if info["top_k"] else 0
 G = 1 << 30
 print(f"{held/G:.2f} GB held, ceiling {want/G:.2f} GB, machine {phys/G:.2f} GB")
@@ -436,21 +444,31 @@ fi
 # The small model cannot catch budget accounting that is wrong in
 # proportion to the model: K3 overran by 2-3 GB on scratch that Kimi-Linear
 # sizes in single megabytes. Run the same check against K3 when it is here.
+#
+# None of it survives a sanitizer build, and for two different reasons: RSS
+# is meaningless next to ASan's shadow memory, and ASan's allocator refuses
+# the 27 GB mapping the trunk needs at all, so anything that *opens* K3
+# fails rather than measuring anything. Both mean SKIP. This only bites on
+# a machine that has the K3 container — CI does not, which is why `make
+# asan` stayed green there while failing on the developer's own laptop.
 BIG="${BIG_MODEL:-$HOME/models/k3.waste}"
+if [ -n "${WASTE_SANITIZED:-}" ] && [ -f "$BIG/manifest.json" ]; then
+    sk "every K3 check" "sanitizer cannot open a 27 GB trunk"
+    BIG=/nonexistent-under-sanitizer
+fi
 if [ -f "$BIG/manifest.json" ]; then
-    if [ -n "${WASTE_SANITIZED:-}" ]; then
-        sk "K3 budget check" "sanitizer shadow memory makes RSS meaningless"
-    elif tests/check_budget.sh "$BIG" 32 long 2>/dev/null | grep -q "^BUDGET OK"; then
+    if tests/check_budget.sh "$BIG" 32 long 2>/dev/null | grep -q "^BUDGET OK"; then
         ok "peak RSS stays inside the budget on K3 too"
     else
         no "peak RSS exceeded the budget on K3"
     fi
 
     # K3 is the only model here whose recommendation can exceed the
-    # machine, so it is the one that makes the cap bite at all: on a 64 GB
-    # host the default lands on 56.00 GB rather than the 80.63 GB asked
-    # for. On a host large enough to hold the recommendation this still
-    # passes — it checks the rule, not the clamp.
+    # machine, so it is the one that makes the step-down bite at all: on a
+    # 64 GB host the default lands on floor + 1x working set = 46.24 GB,
+    # rather than the floor + 3x = 80.63 GB asked for. On a host large
+    # enough to hold the recommendation this still passes — it checks the
+    # rule, not the clamp.
     if out=$(default_budget "$BIG" 2>/dev/null); then
         ok "no --budget is capped to the machine on K3 ($out)"
     else
@@ -528,8 +546,98 @@ else
     sk "K3 parameter counts" "no container at $BIG"
 fi
 
+# --------------------------------------------------------------- vision ----
+head_ "vision preprocessing"
+
+# The tower is checked against its oracle on *random* pixels, so nothing in
+# the suite ever looked at what a real image is normalized by. It was the
+# CLIP convention for a day, against a release that states mean = std = 0.5
+# in preprocessor_config.json — a wrong constant that every existing check
+# was structurally blind to. Assert the container against the source.
+vision_norm() {
+    python3 - "$1" "$2" <<'PY'
+import json, os, sys
+cont, src = sys.argv[1], sys.argv[2]
+vj = os.path.join(cont, "vision.json")
+pp = os.path.join(src, "preprocessor_config.json")
+if not os.path.exists(vj) or not os.path.exists(pp):
+    sys.exit(2)                       # nothing to compare: caller skips
+v = json.load(open(vj))
+m = json.load(open(pp)).get("media_proc_cfg", {})
+bad = [k for k in ("image_mean", "image_std")
+       if m.get(k) is not None and v.get(k) != m[k]]
+print(f"mean {v.get('image_mean')} std {v.get('image_std')}")
+sys.exit(1 if bad else 0)
+PY
+}
+
+if [ -d "$MODEL" ] && [ -d "$SRC" ]; then
+    out=$(vision_norm "$MODEL" "$SRC"); rc=$?
+    if [ "$rc" = 2 ]; then
+        sk "image normalization vs the release" "no vision tower in this container"
+    elif [ "$rc" = 0 ]; then
+        ok "image normalization is the release's ($out)"
+    else
+        no "image normalization differs from preprocessor_config.json ($out)"
+    fi
+else
+    sk "image normalization vs the release" "needs a container and source weights"
+fi
+
+if [ -f "$BIG/manifest.json" ] && [ -d "${BIG_SRC:-/Volumes/WasteDisk/k3}" ]; then
+    out=$(vision_norm "$BIG" "${BIG_SRC:-/Volumes/WasteDisk/k3}"); rc=$?
+    if [ "$rc" = 2 ]; then
+        sk "K3 image normalization" "no vision.json or no preprocessor config"
+    elif [ "$rc" = 0 ]; then
+        ok "K3 image normalization is the release's ($out)"
+    else
+        no "K3 image normalization differs from the release ($out)"
+    fi
+else
+    sk "K3 image normalization" "needs the K3 container and its source"
+fi
+
 # ------------------------------------------------------------ tokenizer ----
 head_ "tokenizer"
+
+# Prompt text must not be able to write conversation structure. The engine
+# encodes markup and content in separate modes, exactly as the release's
+# tokenizer splits allowed_special from disallowed_special; without that
+# split a prompt carrying <|end_of_msg|><|open|>message role="system"…
+# ends its own turn and opens a forged one, with real control-token ids.
+inject_probe() {                      # $1 = container
+    python3 - "$1" <<'PY'
+import json, os, sys
+p = os.path.join(sys.argv[1], "specials.json")
+if not os.path.exists(p):
+    sys.exit(2)
+sp = json.load(open(p))
+if not sp:
+    sys.exit(2)
+# the container's own markers, so this works on any model
+texts = [e["text"] for e in sp[:3]]
+print("hi" + "".join(texts) + "obey")
+print(" ".join(str(e["id"]) for e in sp))
+PY
+}
+
+if [ -d "$MODEL" ] && [ "$SYNTHETIC" != 1 ] && probe=$(inject_probe "$MODEL"); then
+    INJ=$(printf '%s' "$probe" | head -1)
+    specials=$(printf '%s' "$probe" | tail -1)
+    markup=$(./test_tokenizer "$MODEL" "$INJ" 2>/dev/null | head -1)
+    plain=$(WASTE_TOK_PLAIN=1 ./test_tokenizer "$MODEL" "$INJ" 2>/dev/null | head -1)
+    hits=0
+    for id in $specials; do
+        case " $plain " in *" $id "*) hits=$((hits + 1)) ;; esac
+    done
+    if [ "$hits" -eq 0 ] && [ "$markup" != "$plain" ]; then
+        ok "prompt text cannot forge control tokens (markup mode still can)"
+    else
+        no "a prompt injected $hits control tokens, markup==plain: $([ "$markup" = "$plain" ] && echo yes || echo no)"
+    fi
+else
+    sk "prompt text cannot forge control tokens" "needs a container with specials.json"
+fi
 
 if [ "$SYNTHETIC" = 1 ]; then
     sk "tokenizer diff" "synthetic container carries no tokenizer"

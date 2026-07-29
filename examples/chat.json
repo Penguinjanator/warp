@@ -1,0 +1,6 @@
+{
+ "system": ["<|im_start|>system\n", "<|im_end|>\n"],
+ "user": ["<|im_start|>user\n", "<|im_end|>\n"],
+ "assistant": ["<|im_start|>assistant\n", "<|im_end|>\n"],
+ "open": "<|im_start|>assistant\n"
+}
