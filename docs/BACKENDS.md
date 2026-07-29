@@ -137,8 +137,8 @@ the backend string reports what the binary *uses*, not what the silicon
 offers. Put the suffix back in the commit that adds the kernel.
 
 That equivalence is the contract every future backend must meet: **same
-results, only faster.** The Windows branches are written but not yet
-exercised — they need a CI runner before we claim Windows support.
+results, only faster.** Windows is not built and not claimed; what that
+costs is measured below.
 
 ## Machine-specific optimization: measured, not guessed (2026-07-27)
 
@@ -224,8 +224,9 @@ the platform I/O wrapper and the CI matrix all landed the following day
 and have their own sections below; what remains of it is CUDA, BLAS and
 Windows.)*
 
-The CUDA and BLAS backends, and a Windows runner — the Windows branches
-are written and have never been compiled.
+The CUDA and BLAS backends, and Windows — where "the branches are
+written" turned out to mean one branch, in dot-product detection. The
+measurement is at the end of this document.
 
 ## i8mm/SMMLA for the batched matmul: 2x on its own work, 1.2% overall
 
@@ -462,3 +463,40 @@ Those seven are what still needs real weights: the oracle diff (those
 logits belong to actual Kimi-Linear weights), the container round-trip
 against the source shards, and anything that drives the CLI with text —
 the synthetic container deliberately carries no tokenizer.
+
+## What Windows actually costs (2026-07-29)
+
+"The Windows branches are written" was generous: there is one, in
+dot-product detection. So the question was asked properly — cross-compile
+with MinGW-w64 and count what breaks:
+
+| translation unit | for Windows |
+|---|---|
+| `backend.c` `ecache.c` `image.c` `kda.c` `kda_neon.c` | compiles |
+| `tokenizer.c` `version.c` `vision.c` `waste.c` `cli/main.c` | compiles |
+| `simd_avx2.c` `simd_avx512.c` | compiles with their ISA flags |
+| `model.c` `vq.c` | **stop on one undeclared constant** |
+
+Ten of thirteen build unchanged, and the gap is three POSIX calls:
+
+| call | where | Windows equivalent |
+|---|---|---|
+| `sysconf(_SC_NPROCESSORS_ONLN)` | `threads.h` | `GetSystemInfo().dwNumberOfProcessors` |
+| `posix_memalign` | `ecache.c` | `_aligned_malloc` — and `_aligned_free` on the way out, which `free()` cannot do |
+| `pread` | `model.c` | `ReadFile` with `OVERLAPPED`, or the cache-bypass open below |
+
+Two of those are only *warnings* under gcc 13, which is the trap: an
+implicit declaration compiles and fails at link, so "it builds" would
+have been the wrong question. MinGW supplies pthreads through
+winpthreads, so the thread pool needs nothing.
+
+That is a small port — three shims plus `FILE_FLAG_NO_BUFFERING` for the
+page-cache bypass, which is where the real work is, since the whole
+expert-streaming argument rests on it. It is not done, and this document
+does not claim it.
+
+**CI pins the list.** A `windows-portability` job cross-compiles every
+translation unit and fails if a fourth POSIX dependency appears. It is
+not a build and passing it does not mean Windows works; it means the
+distance to Windows has not quietly grown. That is worth more than a job
+that is red every day for a reason nobody reads.

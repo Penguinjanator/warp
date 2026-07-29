@@ -115,6 +115,60 @@ jobs:
       - name: Fuzz the container parser under ASan/UBSan
         run: make fuzz-asan FUZZ_RUNS=400
 
+  windows-portability:
+    name: windows portability tripwire
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The engine has never been built for Windows, and the honest
+      # measure of that gap is small: cross-compiled with MinGW, every
+      # translation unit builds except for three POSIX calls with no
+      # Windows equivalent. This job pins that number. It is not a build
+      # — it does not link, and passing it does not mean Windows works —
+      # it fails when the list grows, so a fourth dependency is noticed
+      # when it is added rather than on the day someone attempts the port.
+      - name: MinGW cross-compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends gcc-mingw-w64-x86-64
+          x86_64-w64-mingw32-gcc --version | head -1
+
+      - name: Which POSIX calls still have no Windows path
+        run: |
+          set -u
+          CC=x86_64-w64-mingw32-gcc
+          known="posix_memalign pread sysconf"
+          found=""
+          for f in src/*.c cli/main.c; do
+            case "$f" in
+              *simd_avx2*)   X="-mavx2 -mfma" ;;
+              *simd_avx512*) X="-mavx512f -mavx512bw" ;;
+              *)             X="" ;;
+            esac
+            $CC -std=gnu11 -O1 -DVQ_SUPER=2 $X -c -o /tmp/o.o "$f" 2>/tmp/err || true
+            # implicit declarations become undefined symbols at link time;
+            # an undeclared identifier is a hard error already
+            n=$(sed -n "s/.*implicit declaration of function '\([a-z_0-9]*\)'.*/\1/p;
+                        s/.*error: '\([A-Z_0-9]*\)' undeclared.*/\1/p" /tmp/err)
+            found="$found $n"
+          done
+          found=$(printf '%s\n' $found | sort -u | tr '\n' ' ')
+          echo "unresolved on Windows: ${found:-none}"
+          extra=""
+          for s in $found; do
+            case " $known _SC_NPROCESSORS_ONLN " in
+              *" $s "*) ;;
+              *) extra="$extra $s" ;;
+            esac
+          done
+          if [ -n "$extra" ]; then
+            echo "::error::new POSIX dependencies with no Windows path:$extra"
+            echo "Add a _WIN32 branch, or widen the known list in this job"
+            exit 1
+          fi
+          echo "ok: still the three known gaps, and no more"
+
   guards:
     name: build guards
     runs-on: ubuntu-latest
