@@ -640,31 +640,82 @@ waste_status waste_eval(waste_ctx *c, const int32_t *tokens, size_t n,
     return WASTE_OK;
 }
 
+static int argmax(const float *logits, int vocab)
+{
+    int best = 0;
+    for (int i = 1; i < vocab; i++) if (logits[i] > logits[best]) best = i;
+    return best;
+}
+
+/* A candidate for the truncated paths. The id travels with the value so
+ * ties break by id on every libc's qsort rather than by whatever order
+ * that qsort happened to leave them in. */
+typedef struct { float v; int i; } cand;
+
+static int cand_cmp(const void *a, const void *b)
+{
+    const cand *x = (const cand *)a, *y = (const cand *)b;
+    if (x->v > y->v) return -1;
+    if (x->v < y->v) return 1;
+    return (x->i > y->i) - (x->i < y->i);
+}
+
+/* One token from the distribution.
+ *
+ * What the caller asked to truncate decides the work. With neither top-k
+ * nor top-p there is nothing to truncate: the full softmax *is* the
+ * distribution and ranking it buys nothing, so that case is one pass.
+ * With either, the candidates have to be ranked, and that is a sort.
+ *
+ * This used to be a selection sort over the top `k`, with `k` falling
+ * back to the whole vocabulary whenever top-k was unset — O(vocab^2).
+ * Measured on K3's 163840-entry vocabulary: 27.9 seconds per token,
+ * single threaded, for `--temp 0.8` with no `--top-k`. Every OpenAI
+ * client reached it, because top_k is not a field OpenAI has. */
 static int sample(const float *logits, int vocab, const waste_gen_params *p,
                   uint64_t *rng)
 {
-    if (p->temperature <= 0.0f) {
-        int best = 0;
-        for (int i = 1; i < vocab; i++) if (logits[i] > logits[best]) best = i;
-        return best;
-    }
-    /* top-k / top-p over a temperature-scaled softmax */
-    int k = p->top_k > 0 && p->top_k < vocab ? p->top_k : vocab;
-    int *idx = (int *)malloc((size_t)vocab * sizeof(int));
-    float *pr = (float *)malloc((size_t)vocab * sizeof(float));
-    if (!idx || !pr) { free(idx); free(pr); return 0; }
-    for (int i = 0; i < vocab; i++) idx[i] = i;
+    if (p->temperature <= 0.0f) return argmax(logits, vocab);
 
-    /* partial selection of the top k */
-    for (int i = 0; i < k; i++) {
-        int best = i;
-        for (int j = i + 1; j < vocab; j++)
-            if (logits[idx[j]] > logits[idx[best]]) best = j;
-        const int t = idx[i]; idx[i] = idx[best]; idx[best] = t;
+    /* Drawn once per call on every path, so a seed reproduces a run
+     * whatever the truncation settings are. */
+    *rng = *rng * 6364136223846793005ULL + 1442695040888963407ULL;
+    const float u = (float)((*rng >> 11) * 0x1.0p-53);
+
+    float mx = logits[0];
+    for (int i = 1; i < vocab; i++) if (logits[i] > mx) mx = logits[i];
+
+    const int k = (p->top_k > 0 && p->top_k < vocab) ? p->top_k : vocab;
+
+    if (k >= vocab && !(p->top_p < 1.0f)) {          /* nothing truncated */
+        float *pr = (float *)malloc((size_t)vocab * sizeof(float));
+        if (!pr) return argmax(logits, vocab);
+        float sum = 0;
+        for (int i = 0; i < vocab; i++) {
+            pr[i] = expf((logits[i] - mx) / p->temperature);
+            sum += pr[i];
+        }
+        const float r = u * sum;
+        float acc = 0;
+        int pick = vocab - 1;                 /* only reachable via rounding */
+        for (int i = 0; i < vocab; i++) {
+            acc += pr[i];
+            if (r <= acc) { pick = i; break; }
+        }
+        free(pr);
+        return pick;
     }
-    float mx = logits[idx[0]], sum = 0;
+
+    cand *cd = (cand *)malloc((size_t)vocab * sizeof *cd);
+    if (!cd) return argmax(logits, vocab);
+    for (int i = 0; i < vocab; i++) { cd[i].v = logits[i]; cd[i].i = i; }
+    qsort(cd, (size_t)vocab, sizeof *cd, cand_cmp);
+
+    float *pr = (float *)malloc((size_t)k * sizeof(float));
+    if (!pr) { free(cd); return argmax(logits, vocab); }
+    float sum = 0;
     for (int i = 0; i < k; i++) {
-        pr[i] = expf((logits[idx[i]] - mx) / p->temperature);
+        pr[i] = expf((cd[i].v - mx) / p->temperature);
         sum += pr[i];
     }
     float cum = 0;
@@ -673,15 +724,14 @@ static int sample(const float *logits, int vocab, const waste_gen_params *p,
         cum += pr[i] / sum;
         if (cum >= p->top_p) { last = i + 1; break; }
     }
-    *rng = *rng * 6364136223846793005ULL + 1442695040888963407ULL;
-    const float r = (float)((*rng >> 11) * 0x1.0p-53) * cum;
+    const float r = u * cum;
     float acc = 0;
-    int pick = idx[0];
+    int pick = cd[0].i;
     for (int i = 0; i < last; i++) {
         acc += pr[i] / sum;
-        if (r <= acc) { pick = idx[i]; break; }
+        if (r <= acc) { pick = cd[i].i; break; }
     }
-    free(idx); free(pr);
+    free(pr); free(cd);
     return pick;
 }
 
