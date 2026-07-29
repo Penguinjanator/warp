@@ -43,11 +43,21 @@ heterogeneous ops.
 
 ## How a backend gets in
 
-*Design, not inventory.* What exists today is the portable C baseline plus
-`kda_neon.c`, and inline NEON in `model.c` and `vq.c` for the quantized
-matvec and the VQ tables. There is no x86 SIMD, no SVE, no RVV and no
-accelerator: on anything but ARM the engine runs the baseline. The rest of
-this section describes where new backends plug in.
+*Design, not inventory.* Today's inventory, kept in one place so the rest
+of this section can stay about the mechanism:
+
+| backend | file | state |
+|---|---|---|
+| portable C baseline | `kda.c`, `model.c`, `vq.c` | always compiled in |
+| NEON | `kda_neon.c` + inline in `model.c`/`vq.c` | default on ARM |
+| AVX2 | `simd_avx2.c` | verified on Linux/x86_64 |
+| AVX-512 | `simd_avx512.c` | compiled and dispatched, never executed |
+| Metal | `metal.m` | correct, off by default, 22% slower |
+| CUDA, BLAS, ROCm | — | not implemented; the flag refuses to build |
+| SVE, RVV | — | not implemented |
+
+Details for each are in the dated sections below. The rest of this one
+describes where a new backend plugs in.
 
 **SIMD** (NEON, dotprod/i8mm, AVX2, AVX-512, SVE, RVV): one translation
 unit per ISA (`kda.c`, `kda_neon.c`, `kda_avx2.c`, …), each guarded by
@@ -57,11 +67,12 @@ for the target architecture are compiled in, and `waste_cpu_features()`
 picks at runtime — that is what lets a single x86 binary use AVX-512 on a
 machine that has it and AVX2 on one that does not.
 
-**Accelerators** (CUDA, Metal, BLAS, ROCm): build-time options. None is
-implemented yet — the dispatch table has hooks for them and the Makefile
-has the flags, but there is no `src/metal.m`, `src/cuda.cu` or
-`src/blas.c`. Setting a flag now stops the build with a message saying so
-rather than failing at link time on an undefined `waste_register_*`.
+**Accelerators** (CUDA, Metal, BLAS, ROCm): build-time options, each
+needing a source file that registers it. `src/metal.m` exists; `src/cuda.cu`
+and `src/blas.c` do not, and setting their flag stops the build with a
+message saying so rather than failing at link time on an undefined
+`waste_register_*`. Deleting that check is the last step of adding the
+backend it guards.
 
 ```
 make                     # CPU + SIMD only, zero extra dependencies
@@ -208,9 +219,13 @@ over the LUT accumulation, and Metal for the prefill GEMMs.
 
 ## Not yet done
 
-AVX2/AVX-512 modules, the CUDA/Metal/BLAS backends themselves, the platform
-I/O wrapper (currently `pread`/`F_NOCACHE` only, in `tools/diskbench.c`),
-and a CI matrix across the three OSes.
+*(This list is what was outstanding on 2026-07-27. AVX2, AVX-512, Metal,
+the platform I/O wrapper and the CI matrix all landed the following day
+and have their own sections below; what remains of it is CUDA, BLAS and
+Windows.)*
+
+The CUDA and BLAS backends, and a Windows runner — the Windows branches
+are written and have never been compiled.
 
 ## i8mm/SMMLA for the batched matmul: 2x on its own work, 1.2% overall
 
@@ -260,6 +275,11 @@ The engine had never been built on Linux. Docker, both architectures,
 | Linux arm64 | ok | 12 pass, 0 fail, 4 skip | `NEON` | correct |
 | Linux x86_64 | ok | 12 pass, 0 fail, 4 skip | `CPU` | correct |
 | macOS arm64 | ok | 17 pass | `NEON` | correct |
+
+*(2026-07-29: re-run on ubuntu:24.04 / gcc 13.3, model-free, after the CI
+defects in [LEARNED.md](LEARNED.md) §17 — both Linux targets 17 pass,
+0 fail, 8 skip, plus the sanitizer suite and 400 fuzz cases. x86_64 now
+names itself `AVX2` rather than `CPU`.)*
 
 Both Linux targets produce "The capital of France is Paris, and the
 capital of Italy is Rome" — the same continuation as macOS — and both
@@ -397,13 +417,17 @@ rest and exits 0.
 **The gap is now closed**, by `tools/make_test_container.py`: a valid
 1 MB container of deterministic noise, stdlib-only so it needs neither
 torch nor the converter's C extension. `tests/run.sh` builds one whenever
-no real container is given, which takes the model-less run from 4 checks
-to 13 — chunked prefill against token-at-a-time, int8 storage against
-f32, the SIMD backend against the CPU baseline, the expert cache against
-no cache, session-state round-trip, the RAM plan and the format-version
-guard all now run on every platform and in CI.
+no real container is given, which took the model-less run from 4 checks
+to 13 at the time — chunked prefill against token-at-a-time, int8 storage
+against f32, the SIMD backend against the CPU baseline, the expert cache
+against no cache, session-state round-trip, the RAM plan and the
+format-version guard all now run on every platform and in CI.
 
-What still needs real weights, and skips: the oracle diff (those logits
-belong to actual Kimi-Linear weights), the container round-trip against
-the source shards, and anything that drives the CLI with text — the
-synthetic container deliberately carries no tokenizer.
+Counts drift as checks are added, so take them from a run rather than
+from here. As of 2026-07-29 the suite is **31 checks**; without a container it is
+**19 pass / 0 fail / 10 skip**.
+
+Those seven are what still needs real weights: the oracle diff (those
+logits belong to actual Kimi-Linear weights), the container round-trip
+against the source shards, and anything that drives the CLI with text —
+the synthetic container deliberately carries no tokenizer.

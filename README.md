@@ -10,14 +10,18 @@ part on disk, streams what a token actually needs, and spends every
 available byte of RAM on the part that repeats.
 
 ```
-$ waste run k3.waste "The capital of France is" -n 16 --budget 46G
-The capital of France is Paris."}
-{"role": "user", "  content": "What is the capital of France
-[16 tokens, 50.4 s, 0.32 tok/s | experts 2784 hit / 20768 miss = 12%]
+$ waste run ~/models/k3.waste 'What is the capital of Italy?'
+waste: no --budget, using 46.24 GB of 64.00 GB (expert cache 17.56 GB)
+The capital of Italy is **Rome**.
+[16 tokens, 49.31 s, 0.32 tok/s | experts 3357 hit / 20195 miss = 14%]
 ```
 
-That is Kimi K3 — 2.78T parameters, 93 layers, 896 experts per layer —
-generating on a laptop, from a 982 GB container, inside a 46 GB budget.
+That is Kimi K3 — 2.78T parameters, 93 layers, 896 experts in each of the
+92 that are MoE — answering on a laptop, from a 982 GB container, in a
+46 GB budget the engine sized for itself. No `-n`: it stopped on its own
+end-of-message token after sixteen. Fifty seconds for one sentence, which
+is the honest headline number and the thing every optimization from here
+is aimed at.
 
 **This is the first draft.** It runs, its numbers match a PyTorch
 reference to five decimal places, and it is slow. Everything below is the
@@ -40,7 +44,7 @@ waste of tokens. The acronym came second.
 - **Zero dependencies.** No BLAS, no ONNX, no Python in the inference
   path, nothing to install. The Python under `tools/` converts models and
   validates the engine; it never runs alongside it.
-- **Fully embeddable.** Eighteen public functions in
+- **Fully embeddable.** Twenty-six public functions in
   [src/waste.h](src/waste.h): open a model under a RAM ceiling, generate,
   save the session, close. The CLI is a client of that API and touches
   nothing private — if the CLI can do it, so can an embedding host.
@@ -48,13 +52,17 @@ waste of tokens. The acronym came second.
 ```c
 waste_cfg cfg;
 waste_cfg_init(&cfg);
-cfg.ram_budget_bytes = 46ULL << 30;      /* a hard ceiling, not a hint */
+cfg.ram_budget_bytes = 46ULL << 30;  /* a hard ceiling, not a hint;
+                                        0 sizes it to this machine */
 
 waste_ctx *ctx;
-if (waste_open("k3.waste", &cfg, &ctx) != WASTE_OK) return 1;
+if (waste_open("/path/to/k3.waste", &cfg, &ctx) != WASTE_OK) return 1;
 waste_generate(ctx, ids, n, &params, on_token, user);
 waste_close(ctx);
 ```
+
+The path is the container directory the converter wrote — no `~`
+expansion here, that is the shell's job.
 
 ## How it works
 
@@ -93,24 +101,49 @@ not low — it is zero. Above it the curve bends sharply.
 
 | budget | expert cache | hit rate | decode |
 |---|---|---|---|
-| 32 GB | 3.1 GB | 0% | 0.31 tok/s |
-| 46 GB | 17.1 GB | 12% | 0.32 tok/s |
-| 52 GB | 23 GB | 25% | 0.33 tok/s |
-| 58 GB | 29.1 GB | 37% | **0.04 tok/s** |
+| 32 GB | 3.32 GB | 0% | 0.31 tok/s |
+| 46 GB | 17.32 GB | 13% | **0.32 tok/s** |
+| 52 GB | 23.32 GB | 27% | 0.11–0.14 tok/s |
+| 58 GB | 29.32 GB | 37% | 0.04 tok/s |
+
+Measured in that order, on an otherwise idle machine. Order matters:
+re-run *after* the 52 and 58 GB rows have driven the machine into paging,
+46 GB gives 0.22–0.25 rather than 0.32 — while reporting hit and miss
+counts identical to the digit. The engine is deterministic; the machine
+is not, and it does not fully recover between runs. Sweep upward.
 
 Everything in the memory design exists to get above that line, which is
 why the engine works to free RAM rather than to save it.
 
-**And there is a ceiling on the other side.** At 58 GB on a 64 GB machine
-the hit rate is the best of the run and the throughput is eight times
-worse — reproduced twice. The engine is inside its budget; the *machine*
-is not, so the OS pages out the expert cache, and a "hit" becomes a page
-fault instead of the disk read the engine was managing. One extra
-gigabyte of cache turned 0.32 tok/s into 0.04. The engine now warns when
-a budget leaves the machine less than 12% of its RAM, and holds itself to
-the same 12% when it has to pick a budget for itself — K3 asks for
-80.63 GB on its own numbers and gets 56.00 GB on this machine — but the
-real lesson is that a cache you do not control is not a cache.
+**And there is a ceiling on the other side, closer than it looks.** Read
+that table twice: the hit rate climbs all the way down. At 58 GB on a
+64 GB machine the cache serves 37% of experts from RAM and the engine is
+*eight times slower* than at 46 GB, where it serves 13%. The engine is
+inside its budget; the *machine* is not, so the OS pages out the expert
+cache, and a "hit" becomes a page fault instead of the disk read the
+engine was managing.
+
+So the usable window is narrow. It opens at ~46 GB, where the cache
+finally clears one token's working set, and it has already closed by 52 —
+on an otherwise idle machine, with 49 GB free before the run. It is also
+sharp enough to move under a change that looks unrelated: taking 1.11 GB
+of embedding table off the resident set fed straight into the cache at a
+fixed budget, and that was enough to push 58 GB from 0.32 tok/s to 0.04.
+
+**So the default does not fill the machine.** Expert cache is only worth
+anything in whole multiples of that working set, and the remainder above a
+multiple buys a few points of hit rate while pushing the machine towards
+paging. When it picks a budget for itself the engine steps down a whole
+working set at a time and takes the largest that fits under seven eighths
+of RAM: K3 asks for floor + 3× — 80.63 GB — and gets floor + 1× on this
+laptop, a 46 GB budget and a 17.56 GB cache. That is the top of the curve
+above, reached with no flag. A 128 GB machine still gets the full 3×.
+
+An earlier version took every byte up to the cap instead, which put a
+27 GB cache on this machine — between two budgets measured at 0.11 and
+0.04 tok/s. The real lesson is that a cache you do not control is not a
+cache, and the corollary is that an engine should stop asking for memory
+before the OS starts taking it back.
 
 ### Linear attention, and an absorbed KV cache
 
@@ -138,24 +171,25 @@ measured on the commit it is published with.
 
 | | |
 |---|---|
-| minimum RAM | **29.3 GB** at 4K context |
-| | 31.9 GB at 32K, 37.0 GB at 128K |
-| resident trunk | 27.5 GB |
+| minimum RAM | **29.05 GB** at 4K context |
+| | 30.54 GB at 32K, 35.63 GB at 128K, 83.21 GB at 1M |
+| resident trunk | 27.28 GB |
 | read per token | 17.0 GB at ~9.9 GB/s, near the SSD's measured ceiling |
 | model load | 20 s |
 | prefill | 0.47 tok/s chunked, 0.29 sequential |
-| decode | 0.31–0.33 tok/s, best around a 52 GB budget |
+| decode | 0.32–0.34 tok/s at the default budget, the best this machine gives |
 | vision tower | 15.7 s for a 1024-patch image, 27 layers |
 | image in a prompt | 256 positions for 896x896, 2.8 s each — as text |
 
 The floor is almost entirely the resident trunk. Useful throughput starts
 above ~46 GB, where the expert cache finally clears one token's working
-set, and ends around 52 GB, where the machine starts paging. Below the
-first line extra RAM buys nothing; above the second it costs.
+set, and is gone again by 52, where the machine starts paging. Below the
+first line extra RAM buys nothing; above the second it costs, badly. The
+window is one budget wide on this machine.
 
 The tower is not what an image costs. Encoding 1024 patches takes 15.7 s;
-the 256 positions it produces then go through 93 MoE layers like any other
-token, which is the other 731 s. An image is priced as text of the same
+the 256 positions it produces then go through the 92 MoE layers like any
+other token, which is the other 731 s. An image is priced as text of the same
 length, so the patch budget in `vision.json` is a real dial: halving the
 grid halves the prompt.
 
@@ -164,30 +198,50 @@ grid halves the prompt.
 | | |
 |---|---|
 | minimum RAM | 1.86 GB |
-| decode | **7.25 tok/s** at an 8 GB budget, 77% cache hit |
+| decode | **8.92 tok/s** at an 8 GB budget, 78% cache hit |
 
 The same engine and the same format, on a model that fits comfortably.
 This is what WASTE looks like when it is not fighting.
 
 ### Where the time goes
 
-Decode on K3, cold cache: expert I/O 48.5%, expert matmul 23.8%, KDA
-layers 14.9%, MLA 3.2%. The I/O already runs near the hardware limit, so
-it only gets cheaper by happening less often — which means cache, which
-means RAM. That is the whole optimization story so far, and the reason
-the next steps are about memory rather than arithmetic.
+Decode on K3, 17.32 GB of cache and still cold — 6.7% hit over ten steps,
+which is the state a fresh prompt starts in:
+
+| | share |
+|---|---|
+| MoE, all of it | **82.5%** |
+|   of which expert I/O | 53.5% |
+|   of which expert matmul | 20.0% |
+| KDA layers | 14.5% |
+| MLA layers | 2.8% |
+| lm_head | 0.2% |
+
+Reproduce with `WASTE_PROFILE=1 WASTE_CACHE_MB=17735 ./test_forward
+MODEL 1008,10484,318,15383,387 out.bin 5`. The I/O share falls as the
+cache warms, so a long session sits lower than this; the ranking does
+not change.
+
+The I/O already runs near the hardware limit — 17.0 GB per token at
+~9.9 GB/s against the SSD's measured 12.78 — so it only gets cheaper by
+happening less often, which means cache, which means RAM. That is the
+whole optimization story so far, and the reason the next steps are about
+memory rather than arithmetic.
 
 ## Getting started
 
 ```bash
-git clone <this repo> && cd waste
+git clone https://github.com/sqliteai/waste && cd waste
 make                          # libwaste.a, waste, libwastevq
-make check                    # 28 checks, about three minutes
+make check                    # 19 pass, 10 skip on a fresh clone
 ```
 
 No configure step and no dependency resolution. `make check` needs no
 model: it builds a small synthetic container and runs the engine against
-it.
+it. The ten skips are the checks that need real weights — the PyTorch
+oracle, the round-trip against the source shards, and anything driving
+the CLI with text, since the synthetic container carries no tokenizer.
+With both containers present the suite is 31 checks.
 
 ### Converting Kimi K3
 
@@ -246,21 +300,31 @@ for models we have not published.
 
 ### Running it
 
+The container is the directory the converter wrote, so give it that path —
+`~/models/k3.waste` throughout this README:
+
 ```bash
-waste run   k3.waste "The capital of France is" -n 32 --budget 46G
-waste chat  k3.waste --budget 46G           # multi-turn, state kept
-waste eval  k3.waste "2 + 2 =" --top-k 5    # next-token distribution
-waste plan  k3.waste --budget 46G           # what fits, and what does not
-echo "prompt" | waste run k3.waste          # stdin works too
+waste run   ~/models/k3.waste "The capital of France is" -n 32
+waste chat  ~/models/k3.waste                     # multi-turn, state kept
+waste eval  ~/models/k3.waste "2 + 2 =" --top-k 5 # next-token distribution
+waste plan  ~/models/k3.waste --budget 46G        # what fits, what does not
+echo "prompt" | waste run ~/models/k3.waste       # stdin works too
 ```
 
-`--budget` is optional. Left out, the engine takes the container's own
-recommendation and caps it at 88% of physical RAM — never below the floor,
-or it refuses to open — then says on stderr which ceiling it landed on, so
-the same command on two machines is not silently two different runs:
+`-n` is a cap, not a requirement: without it generation stops at the
+container's end-of-sequence token or at 128 tokens, whichever comes
+first. The examples pass it because 128 tokens of K3 is six minutes.
+
+`--budget` is optional, and leaving it out is the right default rather
+than a fallback: the engine takes the container's recommendation, steps it
+down a whole token working set at a time until it fits under seven eighths
+of physical RAM, and never goes below the floor — a budget you set
+explicitly under the floor is refused rather than swapped into. It then
+says on stderr what it landed on, so the same command on two machines is
+not silently two different runs:
 
 ```
-waste: no --budget, using 55.99 GB of 64.00 GB (expert cache 27.32 GB)
+waste: no --budget, using 46.24 GB of 64.00 GB (expert cache 17.56 GB)
 ```
 
 `waste --help` lists all nine commands. `--json` makes `eval`, `tokenize`,
@@ -272,10 +336,10 @@ K3 is multimodal, and so is the engine. `--image` puts a picture in front
 of the prompt; repeat it for several:
 
 ```bash
-waste run k3.waste "What is in this picture?" --image photo.png
+waste run ~/models/k3.waste "What is in this picture?" --image photo.png
 ```
 
-PNG, JPEG, GIF, BMP and TGA, decoded by the one vendored header in
+PNG, JPEG, GIF, BMP, TGA and PSD, decoded by the one vendored header in
 `third_party/`. It works on `run`, `chat` and `eval`; inside a chat,
 `/image FILE` attaches a picture to the next message, and it is spliced
 once — the positions are in the attention state afterwards, so later turns
@@ -303,25 +367,40 @@ waste_image_expand(ctx, raw, n, ids, cap, &n_ids); /* placeholder -> N   */
 waste_generate(ctx, ids, n_ids, &params, cb, u);   /* consumes the queue */
 ```
 
-One caveat, stated plainly because it is the thing most likely to be
-wrong: **K3 ships no preprocessor config**, so the pixel normalization is
-the CLIP convention this lineage of towers uses rather than a value read
-out of the release. It lives in `vision.json` and can be corrected without
-rebuilding.
+The tower's shape, the patch budget and the pixel normalization live in
+`vision.json`, which the converter writes from the release's own nested
+`vision_config` and from `preprocessor_config.json`. K3 normalizes to
+[-1, 1] with mean = std = 0.5.
+
+That last sentence was wrong here for a day, and the way it was wrong is
+worth keeping. This section used to say **K3 ships no preprocessor
+config**, so the normalization was "the CLIP convention this lineage of
+towers uses rather than a value read out of the release" — an assumption,
+labelled as one. The release does ship the file; the downloader fetched a
+hardcoded list of filenames and never asked the repo what it contained.
+The tower still matched its oracle at 2.3e-06 throughout, because the
+oracle is fed random pixels and never touches the normalization. An
+honest caveat is not a substitute for reading the file.
 
 ## Platforms
 
-| | build | tests | backend |
+| | build | model-free suite | backend |
 |---|---|---|---|
-| macOS arm64 | yes | 14/14 | NEON |
-| Linux arm64 | yes | 14/14 | NEON |
-| Linux x86_64 | yes | 14/14 | AVX2 |
+| macOS arm64 | yes | 19 pass / 0 fail / 10 skip | NEON |
+| Linux arm64 | yes | 17 pass / 0 fail / 11 skip | NEON |
+| Linux x86_64 | yes | 17 pass / 0 fail / 11 skip | AVX2 |
 | Windows | branches written, never compiled | — | — |
 
-The three run the same model-free suite — CI has no container, so
-`tests/run.sh` builds a synthetic one and the seven checks that need real
-weights say SKIP rather than passing quietly. Which is why the numbers
-match: the platform is the variable, the suite is not.
+The three run the same suite. CI has no container, so `tests/run.sh`
+builds a synthetic one and the checks that need real weights say SKIP
+rather than passing quietly. The Linux rows skip one more than macOS only
+because that image has no `uv`, which collapses the two kernel checks
+into a single skip; both also pass the sanitizer suite and 400 fuzz cases.
+
+The platform is the variable, the suite is not, and that is the point:
+both Linux targets produce the same continuation as macOS and pass
+*engine matches the PyTorch oracle* when given a container, so the
+numerics carry across architectures and compilers.
 
 SIMD is selected at run time from CPUID, so a single x86 binary uses
 AVX-512 where it exists and AVX2 where it does not. Accelerator backends
@@ -344,7 +423,8 @@ src/        the engine — 6,700 lines of C, no dependencies
 cli/        the CLI, a client of the public API
 tools/      conversion and validation (Python, never at run time)
 docs/       format, engine, backends, and what was learned
-tests/      28 checks, and a diff against a PyTorch oracle given a model
+tests/      31 checks, and a diff against a PyTorch oracle given a model
+examples/   chat.json for K3 and ChatML, the format a container carries
 third_party/ stb_image.h, the single vendored header — see its README
 ```
 
@@ -355,17 +435,33 @@ numbers that killed them.
 
 ## Status
 
-Version 0.1.0. Output is correct, validated layer by layer against a
+Version 0.5.0. Output is correct, validated layer by layer against a
 PyTorch reference on both models, and the vision tower against its own
-oracle to 2.3e-06. The API is not frozen.
+oracle to 2.3e-06. On a machine with both containers and the source
+weights the suite is 30 passed, 0 failed, 1 skipped (the skip is
+the vision check on the container without a tower). The API is not
+frozen.
 
-Known gaps, plainly: the image normalization constants are a convention
-rather than something read out of the K3 release, which ships no
-preprocessor config; AVX-512 compiles but has never executed on hardware
-that has it; Windows has never been built; there is no container checksum;
-and chat templates are applied from a declarative `chat.json` rather than
-by interpreting Jinja, so a model whose format is published only as a
-Jinja template needs that translated by hand.
+Known gaps, plainly:
+
+- the chat template covers the text conversation and not tool calls,
+  JSON response schemas, or the think channel. K3 builds its prompt with
+  a Python program rather than a Jinja template; `examples/chat-k3.json`
+  transcribes the part that fits four prefix/suffix strings, and
+  [examples/](examples/) says what it leaves out;
+- a container carries its chat format in `chat.json`, which the converter
+  cannot write because neither Kimi release distributes one — copy it in
+  from `examples/` or the CLI falls back to raw continuation;
+- AVX-512 compiles and dispatches but has never executed on hardware that
+  has it;
+- Windows has never been built;
+- the engine verifies no checksum on the read path. Records carry a
+  `crc32` that the converter writes and `tools/verify_container.py`
+  checks, but a container corrupted after conversion gives wrong numbers
+  rather than an error;
+- every expert in a container is at the same bit width — the non-uniform
+  per-expert allocation the format was designed around is specified and
+  not built.
 
 ## License
 

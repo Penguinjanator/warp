@@ -1,7 +1,13 @@
-# WASTE Container Format v0 (draft)
+# WASTE Container Format v0
 
-Status: **draft** — field sizes marked TBD are frozen after the K3 weights
-drop (July 27, 2026) when real tensor shapes and routing statistics are known.
+Status: **v0, frozen against the released weights.** This started as a
+pre-release design; the TBDs were settled on 2026-07-27 when K3 dropped
+and are recorded as answers below. Two things in it are *specified and
+not implemented* — the shared low-rank block and the SUB1 substitute
+bank — and both say so where they appear.
+
+`format_version` is enforced: a container from another version, or one
+without the field, is refused rather than read against the wrong rules.
 
 ## Design goals
 
@@ -36,36 +42,78 @@ conversion, multi-drive splitting):
 
 ```
 model.waste/
-  manifest.json        # config, tensor index, bit-allocation map, checksums
-  trunk.bin            # resident dense part, mmap-friendly
-  experts-L{layer}.bin # one expert bank per layer (or grouped, TBD)
-  subs-L{layer}.bin    # 1-bit substitute bank (optional)
+  manifest.json        # config, trunk tensor index, expert bank index
+  trunk.bin            # resident dense part
+  experts-L{layer}.bin # one expert bank per layer
   codebooks.bin        # VQ codebooks, resident
-  lowrank.bin          # shared low-rank factors — NOT written in v0, see below
+  tokenizer.model      # the model's tiktoken rank file, copied in
+  specials.json        # special-token ids and their exact strings
+  vision.json          # the tower's shape, if the container has one
+  chat.json            # conversation format — hand-written, see examples/
+  chat_template.jinja  # the release's own template, when it ships one
   usage.waste          # runtime-appended routing stats / learned hotlist
+  subs-L{layer}.bin    # 1-bit substitute bank — specified, NOT written in v0
+  lowrank.bin          # shared low-rank factors — specified, NOT written in v0
 ```
+
+Everything up to `usage.waste` is produced by `tools/convert.py`, except
+`chat.json`: neither Kimi release distributes a chat template, so that one
+is written by hand. See [examples/](../examples/).
 
 ### manifest.json
 
-JSON (hardened parser, treat as untrusted). Contains:
+JSON (hardened parser, treat as untrusted — `cfg_sane()` bounds every
+dimension, tensor sizes are bounded by the file that holds them, and the
+fuzzer in `tools/fuzz_container.py` exists for this file). Keys:
 
-- `config`: K3 hyperparameters (layers, n_experts=896, top_k=16, KDA/MLA
-  layer pattern, dims — TBD from release config.json).
-- `tensors[]`: name, file, offset, aligned_size, quant fmt, shape.
-- `bits[]`: per-(layer, expert) bit class from the GEMQ-style allocator.
-- `blake3` per file section for integrity.
+| key | what it holds |
+|---|---|
+| `format_version` | 0. Absent or different ⇒ refused |
+| `arch` | descriptive; the engine derives its own from `config` |
+| `tensor_prefix` | `language_model.` on K3, `""` on Kimi-Linear |
+| `config` | the release's own config verbatim, with the multimodal wrapper under `_outer` |
+| `expert_quant` | `stages`, `vec_dim`, `entries`, `index_block`, `bits_per_weight` |
+| `layers` | per MoE layer: `file`, `experts`, `bytes`, `codebook_base` |
+| `trunk` | per tensor: `name`, `fmt`, `off`, `shape`, `group`, `scale_off`, `bytes` |
+
+Two fields from the original design are **not** here. There is no
+`bits[]`: the GEMQ-style per-expert bit allocator was specified and never
+built, so every expert in a container is at the same width. And there is
+no `blake3` — the only checksum in the format is the per-expert `crc32`
+in the record header, written by the converter and checked by
+`tools/verify_container.py`. **The engine verifies nothing on the read
+path**, which is a deliberate omission (it would cost a pass over every
+expert on every miss) and a real gap: a container corrupted on disk
+produces wrong numbers rather than an error.
 
 ### Quantization formats (`fmt`)
 
 | fmt | name | bits/weight | use |
 |---|---|---|---|
 | 0 | F32 | 32 | norms, router, `e_score_correction_bias` |
-| 1 | F16/BF16 | 16 | low-rank factors, codebooks |
-| 2 | Q8G | 8 | shared experts, attention projections, MTP head |
-| 3 | Q4G | 4 (+f16 scale /g128) | trunk fallback, embeddings |
-| 4 | **VQ3R** | 3.01 (3 codebooks x 256, dim 8) | default for experts (Gate 3) |
-| 5 | **VQ2R** | 2.01 (2 codebooks x 256, dim 8) | only where Gate 3 quality allows |
-| 6 | **SUB1** | ~1.0 direct VQ | cache-miss substitutes |
+| 1 | F16/BF16 | 16 | codebooks; low-rank factors if they ever land |
+| 2 | Q8G | 8 (+f16 scale /g128) | Kimi-Linear's whole trunk; on K3, the vision tower and anything `--trunk-bits 8` |
+| 3 | Q4G | 4 (+f16 scale /g128) | K3's trunk default |
+| 4 | **VQ3R** | 3.00 (3 stages x 256 entries, dim 8) | default for experts (Gate 3) |
+| 5 | **VQ2R** | 2.00 (2 stages x 256 entries, dim 8) | only where Gate 3 quality allows |
+| 6 | **SUB1** | ~1.0 direct VQ | cache-miss substitutes — specified, not written |
+| 7 | **Q3G** | 3 (+f16 scale /g128) | implemented, default for nothing — see below |
+
+The bits/weight column for VQxR is exact — one byte of index per 8-dim
+vector per stage — plus one f16 scale per output row, i.e. 16/n_in
+amortized. A reader must take `stages`/`vec_dim`/`entries` from the
+manifest rather than from the format id.
+
+**Q3G exists and is not recommended.** The trunk is the RAM floor and the
+floor is what the expert cache does not get, so a 3-bit trunk looks like
+free cache. It was built and measured, twice. It does get the better hit
+rate — 29% against 12% at the same budget — and it is 1.4x slower anyway,
+because the scalar 3-bit unpack costs more in the trunk matvecs than the
+cache saves in I/O. Worse, generation collapses: K3's QAT covered the
+*expert* weights only, so the trunk has no trained tolerance for being
+squeezed, and the logits land 36% off. Vectorizing the unpack would not
+save it — the quality wall sits in front of the speed wall.
+[LEARNED.md](LEARNED.md) §13 has both measurements.
 
 **VQxR record** (per expert matrix): N stages of 8-dim VQ indices into
 per-layer codebooks of 256 entries each (N=3 for VQ3R, N=2 for VQ2R), plus
@@ -83,10 +131,17 @@ scale. Measured on real Kimi experts in Gate 3.
 `[row_block][vector_position][row_in_block][stage]`. The engine walks a
 tile of rows for one vector position at a time; in plain row-major order
 those rows sit `n_in/8 * stages` bytes apart, so each is a separate cache
-line. Blocked, a tile's indices for one position are contiguous — measured
-**1.44x** on the gather loop, which is ~40% of a token. The block size
-matches `VQ_TILE` in the engine; a reader must honour `index_block` (0 =
-plain row-major).
+line. Blocked, a tile's indices for one position are contiguous. The block
+size matches `VQ_TILE` in the engine; **a reader must honour
+`index_block`** (0 = plain row-major), because it changes where the bytes
+are, not merely how fast they are read.
+
+*The speed argument for it was refuted.* Blocking measured 1.44x on the
+gather loop in isolation and changed nothing in the real engine — the
+microbenchmark did not model 12 threads sharing L2 — and finding that out
+cost a full reconversion. The layout stays because containers are written
+in it and it is not worse; do not repeat the 1.44x as a result.
+[LEARNED.md](LEARNED.md) §7.
 
 ### Shared low-rank: on probation — specified, NOT implemented in v0
 
@@ -134,40 +189,86 @@ ExpertRec {
 ```
 
 One `pread` of `record_4k_blocks * 4096` bytes yields the whole expert.
-Records for the same layer are contiguous and sorted by expert id;
-`subs-L{n}.bin` mirrors the layout at SUB1 precision (~5× smaller reads,
-used only when the engine's miss-latency budget is exceeded, HOBBIT-style,
-arXiv 2411.01433 — flag-gated because it breaks bit-exactness).
+On K3 that record is **12 406 784 bytes, exactly 3029 pages** — which is
+what makes O_DIRECT possible, and why `bank_open` checks the alignment
+rather than assuming it: a record that is not a page multiple makes every
+read fail `EINVAL` instead of merely running slow.
+
+Records for the same layer are contiguous and sorted by expert id.
+`subs-L{n}.bin` would mirror the layout at SUB1 precision (~5× smaller
+reads, used only when the engine's miss-latency budget is exceeded,
+HOBBIT-style, arXiv 2411.01433 — flag-gated because it breaks
+bit-exactness). **Specified, not implemented:** the converter writes no
+substitute bank, and `waste_cfg.allow_substitutes` has nothing to read.
 
 ### trunk.bin
 
-Everything needed for a forward pass with zero expert reads: embeddings,
-KDA/MLA attention weights, routers, shared experts, norms, LM head, MTP
-head. mmap-able as one region; target ≤ 25 GB at the fmt mix above so a
-64 GB machine keeps ≥ 35 GB for the expert cache.
+Everything needed for a forward pass with zero expert reads: KDA/MLA
+attention weights, routers, shared experts, the latent MoE projections,
+norms and the LM head — plus the embedding table and, on a multimodal
+container, the vision tower.
+
+The last two are in the file but not in the resident set. `embed_tokens`
+is 1.11 GB of which one 7 KB row is read per token, so it stays on disk
+and the row is `pread` on use. The tower is loaded only when a caller
+asks for images, because its 434 MB otherwise come straight out of the
+expert cache. Everything else is touched in full on every token, so
+streaming it would cost more I/O than the freed cache could save.
+
+Measured on K3: 27.28 GB resident out of a 29.05 GB floor at 4K context.
+The pre-release target was ≤ 25 GB; the real trunk missed it, and that
+overshoot is most of why decode sits at 0.3 tok/s rather than 1.5.
 
 ### usage.waste
 
 Append-only runtime log: per-(layer, expert) hit counts + decayed recency
-for the LFRU policy, plus cross-layer routing pairs for the pilot/COUPLE
-prefetcher. The converter can also bake an initial hotlist measured on a
-calibration corpus.
+for the LFRU policy, written by `--learn` and preloaded on the next open
+so a run starts warm instead of empty. Measured on Kimi-Linear at a 5 GB
+budget: 1602 misses cold against 1175 warm, 61% → 72%. The
+cross-layer routing pairs for a pilot/COUPLE prefetcher have a field in
+the entry struct and no code behind them, and the converter cannot yet
+bake an initial hotlist from a calibration corpus.
 
-## Converter pipeline (tools/, to build)
+## Converter pipeline (`tools/convert.py`)
 
-1. Stream K3 release shards (MXFP4) one at a time — never needs the full
-   1.5 TB locally beyond the shard in flight + output.
-2. Dequant MXFP4 → f32 blocks. (No shared-basis pass in v0 — see "Shared
-   low-rank: on probation".)
-3. GEMQ-style bit allocation from an importance matrix (imatrix-style
-   pipeline; fallback: weight-energy heuristic Σrow²).
-4. Emit VQ codebooks (k-means in 8-dim space), indices, corrections;
-   verify with `--compare-tensor` byte/logit checks against the reference.
+1. Stream release shards one at a time — never needs the full 1.42 TB
+   locally beyond the shard in flight plus the output.
+2. Dequant MXFP4 → f32 blocks (`tools/mxfp4.py`, verified bit-identical
+   to `compressed_tensors`' own unpacker). Only the routed experts are
+   packed; the whole trunk, latent projections and shared experts
+   included, ships as plain bf16. No shared-basis pass — see "Shared
+   low-rank: on probation".
+3. Fit VQ codebooks by k-means in 8-dim space on a sample of experts
+   (`--cb-sample`, default 12), then load, quantize and write each expert
+   on its own, so peak memory is a few hundred MB regardless of model
+   size. Layers convert in separate processes (`--jobs`), each with its
+   own codebook file, merged by concatenation.
+4. Write the trunk, the tokenizer, the special tokens, the vision config
+   and the manifest. Verify with `tools/verify_container.py`, which
+   dequantizes records back and diffs them against the source weights.
 
-## Open questions (blocked on weights drop)
+**Step 3 of the original design is missing:** there is no GEMQ-style
+per-expert bit allocation from an importance matrix. Every expert in a
+container is at `--stages` bits. Non-uniform allocation remains the
+single largest unexplored lever on the disk footprint.
 
-- Real per-layer expert count/shape; whether 896 is flat or grouped.
-- MXFP4 → VQ requantization error compounding (research open question #2).
-- Whether SUB1 substitutes measurably hurt K3 quality (KDA layers may be
-  more sensitive than FFN literature suggests).
-- Optimal codebook granularity: per-layer vs per-expert-group.
+## Questions the weights drop answered
+
+- **Per-layer expert count and shape.** 896 flat, top-16, 92 MoE layers
+  of 93 — but operating on a 3584-wide *latent*, not the 7168 hidden,
+  which halves both the expert size and the per-token I/O.
+- **MXFP4 → VQ requantization error compounding.** It does not compound
+  badly: requantizing an already-4-bit source down to 3 costs about 2 pp
+  over rtn4-row (20.3% against 18.4%), close to the 19.4% measured
+  going to 3 bits from bf16 on Kimi-Linear. QAT-from-MXFP4 does appear
+  to leave the weights tolerant.
+- **Codebook granularity.** Per layer, 256 entries per stage, fitted on
+  12 sampled experts. Per-expert-group was never needed.
+
+## Still open
+
+- Whether SUB1 substitutes measurably hurt K3 quality — untestable until
+  the substitute bank is written at all.
+- Whether the shared low-rank basis survives an activation-weighted
+  metric (the revive-or-delete criterion above).
+- A read-path integrity check that does not cost a pass per miss.

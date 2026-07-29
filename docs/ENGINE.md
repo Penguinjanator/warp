@@ -26,14 +26,17 @@ files, argument parsing. Those belong to the host — the CLI included.
 ## 2. CLI as a first-class client
 
 `cli/` links the library and adds only host concerns: argv parsing, a
-terminal renderer for the token callback, REPL/history, an OpenAI-shaped
-server mode, and file I/O. **Rule: if the CLI needs a capability, it goes
-into `waste.h` first.** That keeps the embedded path honest — anything a
-user can do from the shell, a host program can do from C.
+terminal renderer for the token callback, REPL/history, and file I/O.
+**Rule: if the CLI needs a capability, it goes into `waste.h` first.**
+That keeps the embedded path honest — anything a user can do from the
+shell, a host program can do from C.
 
-Shipped in 0.1.0: `run`, `chat` (state kept across turns, `/reset`,
-`/stats`), `bench`, `plan`, `info`, `version`. Still to come: `serve`
-(HTTP) and `convert` (the converter is Python for now).
+Shipped in 0.5.0, nine commands: `run`, `chat` (state kept across turns,
+`/reset`, `/stats`, `/save`, `/load`, `/image`), `eval`, `tokenize`,
+`detokenize`, `bench`, `plan`, `info`, `version` — the full surface is
+tabulated at the end of this document. Still to come: `serve` (an HTTP
+endpoint; there is no server mode today) and `convert` (the converter is
+Python for now).
 
 Every one of them goes through `waste.h`. `plan` is the CLI face of
 `waste_plan_memory`, `bench` of `waste_get_stats`, `run`/`chat` of
@@ -41,25 +44,37 @@ Every one of them goes through `waste.h`. `plan` is the CLI face of
 embedding host would use to draw a progress UI.
 
 ```
-$ waste plan model.waste --budget 4G
-  resident trunk             1.91 GB
-  KDA state + KV cache       1.14 GB
-  scratch                      65 MB
+$ waste plan kimi-linear.waste --budget 4G
+  resident trunk             1.55 GB
+  KDA state + KV cache        106 MB
+  scratch                     175 MB
   minimum expert cache         41 MB
   ---------------------------------
-  FLOOR                      3.15 GB
-  recommended                4.75 GB
-  budget 4.00 GB -> expert cache 916 MB
+  FLOOR                      1.86 GB
+  recommended                3.47 GB
+  budget 4.00 GB -> expert cache 2.18 GB
 
-$ waste run model.waste "The capital of France is" -n 30 --budget 6G
+$ waste run kimi-linear.waste "The capital of France is" -n 16 --budget 8G
 The capital of France is Paris, and the capital of Italy is Rome. ...
-[30 tokens, 3.44 s, 8.72 tok/s | experts 4919 hit / 1321 miss = 79%]
+[16 tokens, 1.79 s, 8.92 tok/s | experts 2605 hit / 723 miss = 78%]
 ```
 
 A budget under the floor fails at open with `WASTE_E_RAM_BUDGET` and a
 pointer to `waste plan`, rather than swapping the machine.
 
 ### Tokenizer
+
+**Markup and content are encoded separately.** `waste_tokenize` treats
+`<|open|>` as the ordinary tokens it looks like; `waste_tokenize_markup`
+resolves it to a control token. A prompt is built by calling the second
+for the template and the first for everything a user, a document or a
+tool wrote — the split K3's own tokenizer makes with `allowed_special`
+versus `disallowed_special`. Concatenating the two into one string and
+encoding it once lets whoever supplied the content also write the
+structure: a prompt containing `<|end_of_msg|><|open|>message
+role="system"<|sep|>` closes its turn and opens a forged one, with real
+control-token ids. `waste tokenize` reports markup mode, because that
+command exists to check a template marker by marker.
 
 `src/tokenizer.c` implements the model's tiktoken BPE in C: base64 vocab,
 the pre-tokenization pattern (its Unicode classes coded directly rather
@@ -82,11 +97,25 @@ A budget of 0 asks the engine to choose, and the choice has to know the
 machine as well as the model. `recommended_bytes` is derived from the
 model alone — 80.63 GB on K3 — so taking it literally on a 64 GB laptop
 would have sized a 51.95 GB expert cache and swapped, which is precisely
-what the budget exists to prevent. The default is therefore the
-recommendation capped at 88% of physical RAM: 27.32 GB of cache on that
-machine. When even the floor is above the cap the engine runs at the
-floor and says so on stderr, because the alternative is refusing to open
-a model that does technically fit.
+what the budget exists to prevent.
+
+Capping it at what the machine can hold is necessary and not sufficient,
+because it then *spends* everything up to the cap. Expert cache is only
+worth anything in whole multiples of one token's working set — below one
+multiple it keeps nothing alive between tokens, and the fraction above a
+multiple buys a few points of hit rate while walking the machine into
+paging, where a hit costs a page fault. Filling a 7/8 cap gave K3 a
+27.32 GB cache on this laptop, sitting between two budgets measured at
+0.11 and 0.04 tok/s, when 17.5 GB runs at 0.33.
+
+So the default steps down a whole working set at a time and takes the
+largest that fits: `floor + 3x`, else `2x`, else `1x`, else the floor.
+K3 lands on `floor + 1x` here — a 46.24 GB budget, 17.56 GB of cache, and
+the top of the measured curve with no flag given. A 128 GB machine still
+gets the full `3x`, and a model whose recommendation already fits, like
+Kimi-Linear, is unaffected. When even the floor is above the cap the
+engine runs at the floor and says so on stderr, because the alternative
+is refusing to open a model that does technically fit.
 
 ### What the floor is made of
 
@@ -101,8 +130,16 @@ a model that does technically fit.
 Everything above the floor is expert cache, and that is the only knob
 that buys speed.
 
-### Measured for a K3-shaped config (60L, H=7168, 896 experts, top_k=16,
+### Estimated for a K3-shaped config (60L, H=7168, 896 experts, top_k=16,
 ### experts @2.12 bit, trunk @4.25 bit, ctx 32k — `tools/memplan.py`)
+
+> **Superseded.** This is the analytic estimate made before the weights
+> dropped, kept because the reasoning is the record. K3 turned out to be
+> 93 layers with a *latent* MoE at 3 bits, and the real figures are in
+> [K3.md](K3.md) and [LEARNED.md](LEARNED.md) §12: the floor is 29.05 GB
+> at 4K rather than 11.44, and decode is ~0.3 tok/s rather than the
+> 1.75 projected below. The shape of the curve held; the level did not.
+> Do not quote the numbers in this subsection.
 
 ```
 trunk                     10.32 GB   (attention 6.25, routers 1.41,
@@ -209,11 +246,17 @@ The CLI must never be able to do something the library cannot, and
 allocation path that can exceed the budget is a bug, not a tuning issue.
 
 `make check` runs everything: kernels against their reference
-implementations, the container round-trip, chunked prefill against
-token-at-a-time, int8 storage against f32, the SIMD backend against the
-CPU baseline, the cache against no cache, the engine against the PyTorch
-oracle, session round-trip, hotlist effect, budget enforcement including
-peak RSS, and the tokenizer against Python tiktoken. **16 checks.**
+implementations, the shard downloader's resume and skip paths against a
+local server, the image loader, the container round-trip, chunked prefill
+against token-at-a-time, int8 storage against f32, the SIMD backend
+against the CPU baseline, the cache against no cache, the engine against
+the PyTorch oracle, session round-trip, hotlist effect, budget
+enforcement including peak RSS on both models, the derived `info` and
+parameter counts, and the tokenizer against Python tiktoken.
+**31 checks** as of 2026-07-29, with both containers present. On a fresh
+clone with no model it is 29 items — 19 pass against the synthetic
+container and 10 say SKIP rather than passing quietly. Take the numbers
+from a run, not from here: they move as checks are added.
 
 It exists because this project twice lost hours to checks that silently
 did not run — once to objects compiled against a stale header, once to a
@@ -224,17 +267,22 @@ reported as SKIP, never as a pass.
 ## CLI surface (2026-07-28)
 
 Nine commands, and every public API function reachable from at least one
-of them:
+of them — the single exception being `waste_version_number`, the integer
+form of the version, which exists for a host's `#if` and has nothing to
+print:
 
 | command | uses |
 |---|---|
-| `run` | `waste_generate`, `waste_tokenize`, `waste_save_usage` |
+| `run` | `waste_generate`, `waste_tokenize`(+`_markup`), `waste_save_usage` |
 | `chat` | plus `waste_state_save/load/reset` |
 | `eval` | `waste_eval`, `waste_detokenize` |
 | `tokenize` / `detokenize` | `waste_tokenize`, `waste_detokenize` |
 | `bench` | `waste_get_stats` |
-| `plan` | `waste_plan_memory` |
+| `plan` | `waste_plan_memory`, `waste_physical_ram` |
 | `info` | `waste_model_get_info`, `waste_memory_used` |
+
+Images add three more, reachable from `run`, `chat` and `eval` via
+`--image`: `waste_image_add`, `waste_image_expand`, `waste_image_clear`.
 
 `eval` is the one worth knowing about: it runs the prompt and prints the
 next-token distribution without generating, which is how you get a logit

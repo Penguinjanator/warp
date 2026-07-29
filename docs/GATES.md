@@ -1,8 +1,25 @@
 # Feasibility gates
 
-Working rule (Marco, 2026-07-24): before every long/expensive operation, run
-a cheap real test that could kill it. Each gate below names the expensive
-step it protects, the test, and the recorded verdict.
+Working rule (Marco, 2026-07-24): before every long/expensive operation,
+run a cheap real test that could kill it. Each gate below names the
+expensive step it protects, the test, and the recorded verdict.
+
+**Read this as a log, not as a status page.** The gates are dated and kept
+as they were written, including the projections that the finished engine
+went on to beat or miss. Every gate has now run; where one carries a
+forecast, a note says what actually happened. The measured end-to-end
+numbers live in [LEARNED.md](LEARNED.md) §12 and §16 and in the README —
+those are the ones to quote.
+
+| gate | question | verdict |
+|---|---|---|
+| 0 | does the trace→simulate method work? | ✅ passed 2026-07-24 |
+| H | is the storage fast enough? | ✅ run 2026-07-27 — internal only |
+| 5 | does the real cache behave like the simulation? | ✅ run 2026-07-27 |
+| 1 | real K3 dimensions vs our estimates | ✅ answered 2026-07-27, see [K3.md](K3.md) |
+| 2 | real batch-1 routing on a Kimi MoE | ✅ run 2026-07-27 on Kimi-Linear |
+| 3 | quantization quality at 2–3 bit | ✅ run 2026-07-27, repeated on real K3 experts |
+| 4 | engine correctness | ✅ all three steps passed 2026-07-27 |
 
 ## Gate 0 — does the trace→simulate methodology work, and what does real
 ## batch-1 routing look like? ✅ PASSED (with a sobering data point)
@@ -106,6 +123,12 @@ budget swept.
 vs 71.9%. The real cache matches at the K3-relevant fraction and beats the
 simulation above it. The 1.5 tok/s projection for K3 on 64 GB stands.
 
+> **What happened instead:** ~0.3 tok/s. The hit-rate model held — the
+> floor below is the single most predictive number in the project — but
+> the projection assumed a cache several times larger than a 64 GB
+> machine can actually give K3 once the 27.28 GB trunk is resident, and
+> it costed only the I/O. Measured sweep in [LEARNED.md](LEARNED.md) §12.
+
 **The one place it is worse is the most useful finding.** At 3% the
 measured hit rate is 13.2% against a simulated 29.4%, and at 1.5% it is
 *exactly zero* — 2604 evictions in 2704 accesses. The reason: one token
@@ -122,13 +145,21 @@ oracle at rel 1.50e-06. Placement decides speed, never precision.
 *Consequence:* `memplan.py`'s hit curve now comes from this measurement
 rather than from simulation.
 
-## Gate 1 — real K3 dimensions vs our estimates. ⏳ waiting for weights
-## (release countdown: 2026-07-27 ~17:00 Europe/Rome)
+## Gate 1 — real K3 dimensions vs our estimates. ✅ ANSWERED 2026-07-27,
+## the day the weights dropped. The full read is in [K3.md](K3.md)
 
 *Protects:* buying/dedicating a 2 TB NVMe; all format TBDs.
 *Test:* `routing_stats.py fetch + math` on the released config/index.
 *Kill criterion:* per-token I/O or disk footprint far above estimates
 (>20 GB/token @2 bit, or >1 TB at 2.5 bit).
+
+*Verdict:* passed, but only because the MoE turned out to be **latent**.
+93 layers rather than the 60 assumed, 92 of them MoE, experts operating on
+a 3584-wide projection rather than the full 7168 hidden. At the 3-bit
+operating point that is 17.0 GB per cold token and 952 GB of experts on
+disk — inside the kill criterion on both axes, and roughly half what the
+naive non-latent reading of the config implied. Every format TBD is
+settled by the containers built since; see [FORMAT.md](FORMAT.md).
 
 ## Gate 2 — real batch-1 routing on a Kimi MoE. ✅ RUN 2026-07-27 on
 ## Kimi-Linear-48B (no GPU rental needed). Hit rates are BETTER than the
@@ -169,20 +200,38 @@ So ~1.5 tok/s on the target machine at 3 bits — the higher bit-width from
 Gate 3 costs less than feared, because the better-measured hit rate pays
 part of it back.
 
+> **Superseded by measurement.** The engine does ~0.3 tok/s on K3. Two
+> reasons, both in this table's assumptions. It gives a 64 GB machine
+> 52.9 GB of cache, where the real trunk is 27.28 GB resident and the
+> usable cache is 17 GB. And it counts disk time only, where expert I/O
+> is 53.5% of a cold decode step — so even instantaneous reads would
+> less than double it. Optimistic by about 5x.
+> See [LEARNED.md](LEARNED.md) §12 and §16.
+
 *Caveat:* 256 experts, not 896. The trend from OLMoE (64) to Kimi-Linear
 (256) is *falling* per-token reuse but *rising* concentration; which
 dominates at 896 is exactly what Gate 2b on K3 itself must answer.
 
-## Gate 3 — quantization quality at 2-2.5 bit. ⏳ needs weights (partial
-## download: a few expert shards only)
+## Gate 3 — quantization quality at 2-3 bit. ✅ RUN 2026-07-27 on
+## Kimi-Linear experts, then repeated on real K3 experts. 3 bits is the
+## operating point
 
 *Protects:* full conversion + engine integration.
-*Test:* KBVQ-style VQ2R/VQ3R on 2-3 layers' experts from downloaded
-shards; measure per-layer output MSE vs MXFP4 reference on calibration
-activations; compare against the same measurement on GLM-5.2 layers
-(our own known-good baseline).
-*Kill criterion:* reconstruction error ≫ GLM-5.2-at-int4 levels →
+*Test:* VQ2R/VQ3R against round-to-nearest at matched bit budgets on real
+experts (`tools/quant_lab.py`), weight error vs the source.
+*Kill criterion:* reconstruction error ≫ known-good int4 levels →
 raise bits (disk grows) or stop.
+
+*Verdict:* VQ beats RTN decisively below 4 bits, and 3 bits clears the
+bar: 19.4% weight error against the int4 baseline's 15.2%, where naive
+2-bit RTN collapses at 71.8%. 2-bit VQ stays unsafe at 33%. Repeated on
+real K3 experts after the drop — 20.3% at 3 bits, same conclusion — with
+the full tables in [LEARNED.md](LEARNED.md) §3 and [K3.md](K3.md).
+
+The same gate killed the format's original centrepiece: the KBVQ shared
+low-rank basis costs 0.12 bits and buys 0.3 pp, and loses badly at equal
+budget. It is specified, not implemented, and the revive-or-delete
+criterion is written into [FORMAT.md](FORMAT.md).
 
 ## Gate 4 — engine correctness. ✅ ALL THREE STEPS PASSED 2026-07-27
 

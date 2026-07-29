@@ -6,6 +6,14 @@ claim verification (3-vote refutation panels). Full model specs from the
 896 experts / 16 active per token, MXFP4 weights + QAT from SFT, Kimi Delta
 Attention + Gated MLA, 1M context, open weights July 27, 2026.
 
+> **This is the literature review that started the project, kept as
+> written.** Four days later the weights dropped and most of it was tested
+> against real measurements. Two entries below did not survive that
+> contact — the KBVQ shared basis and the throughput estimate — and each
+> is annotated where it appears. What the engine actually does is in
+> [LEARNED.md](LEARNED.md); what the format actually is, in
+> [FORMAT.md](FORMAT.md).
+
 ## Verified findings (survived 3-0 adversarial votes)
 
 ### Quantization
@@ -18,8 +26,15 @@ Attention + Gated MLA, 1M context, open weights July 27, 2026.
 - **KBVQ-MoE (ICLR 2026)** — strongest sub-4-bit result: shared low-rank
   components across experts kept FP16 (~0.1 bit/param overhead), per-expert
   residuals vector-quantized. Near-lossless at 3 bit; usable at 2 bit where
-  GPTQ collapses (PPL 11.87 vs 438 on Qwen3-30B-A3B). **Basis of the WASTE
-  format.** [arXiv:2602.11184](https://arxiv.org/pdf/2602.11184)
+  GPTQ collapses (PPL 11.87 vs 438 on Qwen3-30B-A3B).
+  [arXiv:2602.11184](https://arxiv.org/pdf/2602.11184)
+  **Half of it survived.** The residual VQ is the WASTE expert format and
+  earns its place — VQ beats round-to-nearest decisively below 4 bits. The
+  *shared low-rank* half was the original centrepiece and does not pay for
+  itself on Kimi's experts: 0.12 bits for 0.3 pp, and a loss at equal
+  budget. It is specified and not implemented, with a revive-or-delete
+  criterion in [FORMAT.md](FORMAT.md); the measurements are in
+  [LEARNED.md](LEARNED.md) §3.
 - **GEMQ (May 2026)** — global per-expert bit allocation (LP over expert
   importance, mix 1/2/3-bit) + cheap router fine-tune: Mixtral 87→16 GB with
   −7% MMLU. Quality cliff below 2 bits ⇒ **practical floor ~2–2.5
@@ -86,3 +101,13 @@ DeepSeek-R1/Kimi K2. These need first-party measurement, not literature.
 measurement. Same order as our own GLM-5.2 numbers at equivalent
 bytes/token. Sub-1 tok/s on a single ~3 GB/s SSD. Plan B if unacceptable:
 workload-driven expert pruning (drop the cold tail of 896 experts).
+
+> **Measured: ~0.3 tok/s.** Three things the estimate got wrong, all in
+> the same direction. 2 bits was unsafe, so experts are 3 — 17.0 GB per
+> cold token, not 12.5. The trunk is 27.28 GB resident on a 64 GB
+> machine, so the warm cache the second half assumed never fits. And the
+> I/O is under half a decode step, so even free reads would not give
+> 2–3 tok/s. The one part that held is the shape: this is an I/O-bound
+> engine whose only real lever is bytes read per token. Plan B — expert
+> pruning — is still unexplored, and so is the non-uniform bit allocation
+> that would make it cheap.
