@@ -109,6 +109,10 @@ void waste_backend_init(unsigned flags);
 /* e.g. "CPU", "NEON+dotprod", "AVX-512", "Metal". Never NULL. */
 const char *waste_backend_name(void);
 
+/* Release backend objects that borrow model-owned host allocations before
+ * a model is freed.  A no-op for backends that do not cache such objects. */
+void waste_backend_release_host_buffers(void);
+
 /* Each backend module defines a registration function with this shape:
  * it overwrites the slots it implements and returns a name, or NULL to
  * decline (compiled in, but no usable device on this machine). They are

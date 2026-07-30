@@ -429,6 +429,13 @@ class TestValidation(ServerTestCase):
         self.assertEqual(body["error"]["param"],
                          "messages[0].content[0].text")
 
+    def test_malformed_assistant_tool_call_is_a_400(self):
+        status, body = self.chat(messages=[{
+            "role": "assistant", "content": "", "tool_calls": [{}]}])
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["param"],
+                         "messages[0].tool_calls[0].function.name")
+
     def test_developer_role_is_accepted(self):
         """OpenAI's newer name for a system turn."""
         self.engine.reply = reply_plain("ok")

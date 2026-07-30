@@ -87,17 +87,15 @@ typedef struct {
     uint64_t min_expert_cache;   /* smallest cache that can run a layer    */
     uint64_t floor_bytes;        /* sum of the above: the hard minimum     */
     uint64_t recommended_bytes;  /* floor + a cache worth having           */
-    /* What the vision tower would add if cfg.vision were set; 0 for a
-     * container without one. Reported separately because the plan is
-     * computed before a caller has said whether it wants images, and
-     * because it is a real trade: on K3 it is 434 MB the expert cache
-     * does not get. waste_open folds it into the figures above when
-     * vision is on, so a budget resolved there already accounts for it. */
+    /* What vision would add if cfg.vision were set; 0 without a tower.
+     * Includes its weights, bounded source decode, tower activations and
+     * the queued image embeddings. waste_open folds it into the figures
+     * above when vision is on, so the resolved budget accounts for it. */
     uint64_t vision_bytes;
 } waste_memplan;
 
-/* Compute the memory floor for a container without loading weights.
- * ctx_tokens sizes the KV/state part. Cheap: reads the manifest only. */
+/* Compute the memory floor without loading weights. ctx_tokens sizes the
+ * KV/state part. Cheap: reads the manifest and optional vision config. */
 waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
                                waste_memplan *out);
 
@@ -157,7 +155,8 @@ typedef struct {
      * how to measure what the page cache is worth. */
     int      use_direct_io;
 
-    int      vision;            /* load the vision tower (434 MB on K3)    */
+    int      vision;            /* enable images; reserves vision_bytes,
+                                   1.12 GB on K3 — see waste_memplan       */
 
     /* Check each expert record's crc32 as it comes off the disk. **Off by
      * default**, and that is a throughput decision rather than a claim

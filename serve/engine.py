@@ -285,7 +285,15 @@ def physical_ram() -> int:
     return int(_lib().waste_physical_ram())
 
 
+def _bounded_int(name: str, value: int, lo: int, hi: int) -> int:
+    if (isinstance(value, bool) or not isinstance(value, int) or
+            not lo <= value <= hi):
+        raise ValueError(f"{name} must be an integer between {lo} and {hi}")
+    return value
+
+
 def plan_memory(model_path: str, ctx_tokens: int = 0) -> MemPlan:
+    ctx_tokens = _bounded_int("ctx_tokens", ctx_tokens, 0, (1 << 32) - 1)
     plan = MemPlan()
     st = _lib().waste_plan_memory(str(model_path).encode(), ctx_tokens,
                                   C.byref(plan))
@@ -361,6 +369,10 @@ class Engine:
                  vision: bool = False,
                  verify_records: bool = False,
                  usage_path: Optional[str] = None):
+        ram_budget_bytes = _bounded_int(
+            "ram_budget_bytes", ram_budget_bytes, 0, (1 << 64) - 1)
+        ctx_tokens = _bounded_int("ctx_tokens", ctx_tokens, 0, (1 << 32) - 1)
+        n_threads = _bounded_int("n_threads", n_threads, 0, (1 << 31) - 1)
         self.lib = _lib()
         self.model_path = str(model_path)
         self._lock = threading.RLock()
@@ -642,6 +654,11 @@ class Engine:
         self._check()
         if not prompt:
             raise EngineError("generate", WASTE_E_ARG, "empty prompt")
+        max_tokens = _bounded_int("max_tokens", max_tokens, 1, (1 << 32) - 1)
+        if seed is not None:
+            seed = _bounded_int("seed", seed, 0, (1 << 64) - 1)
+        if top_k is not None:
+            top_k = _bounded_int("top_k", top_k, 0, (1 << 31) - 1)
 
         params = GenParams()
         self.lib.waste_gen_params_init(C.byref(params))

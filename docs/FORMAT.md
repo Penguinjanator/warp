@@ -274,7 +274,9 @@ container, the vision tower.
 The last two are in the file but not in the resident set. `embed_tokens`
 is 1.11 GB of which one 7 KB row is read per token, so it stays on disk
 and the row is `pread` on use. The tower is loaded only when a caller
-asks for images, because its 434 MB otherwise come straight out of the
+asks for images: 434 MB of weights, and 1.12 GB reserved once the bounded
+source decode, the tower's activations and the queued image embeddings are
+counted, all of it otherwise straight out of the
 expert cache. Everything else is touched in full on every token, so
 streaming it would cost more I/O than the freed cache could save.
 

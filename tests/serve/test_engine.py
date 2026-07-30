@@ -21,6 +21,7 @@ Skipped, loudly, when libwaste has not been built.
 """
 
 import json
+import argparse
 import shutil
 import struct
 import subprocess
@@ -35,6 +36,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 from serve import engine as E                              # noqa: E402
 from serve import xtml                                     # noqa: E402
+from serve.__main__ import parse_size                      # noqa: E402
 from serve.regions import RegionParser                     # noqa: E402
 
 
@@ -123,6 +125,40 @@ class TestLibrary(EngineTestCase):
         ordinary = E.plan_memory(str(self.model), 512)
         changed = E.plan_memory(str(variant), 512)
         self.assertGreater(changed.scratch_bytes, ordinary.scratch_bytes)
+
+    def test_python_integer_bounds_are_checked_before_ctypes(self):
+        with self.assertRaises(ValueError):
+            E.plan_memory(str(self.model), -1)
+        with self.assertRaises(ValueError):
+            E.Engine(str(self.model), ram_budget_bytes=-1)
+        with self.assertRaises(ValueError):
+            E.Engine(str(self.model), ctx_tokens=1 << 40)
+
+    def test_size_parser_rejects_wraparound_values(self):
+        self.assertEqual(parse_size("1.5G"), 3 << 29)
+        for value in ("-1G", "1e100G", "nan", "inf"):
+            with (self.subTest(value=value),
+                  self.assertRaises(argparse.ArgumentTypeError)):
+                parse_size(value)
+
+    def test_vision_plan_includes_runtime_working_memory(self):
+        variant = Path(self.tmp) / "vision-plan.waste"
+        shutil.copytree(self.model, variant)
+        path = variant / "manifest.json"
+        manifest = json.loads(path.read_text())
+        manifest["tensor_prefix"] = "model."
+        path.write_text(json.dumps(manifest))
+        (variant / "vision.json").write_text(json.dumps({
+            "vt_hidden_size": 8, "vt_num_attention_heads": 2,
+            "qkv_hidden_size": 8, "vt_intermediate_size": 16,
+            "init_pos_emb_height": 2, "init_pos_emb_width": 2,
+            "text_hidden_size": 128, "max_patches": 4,
+        }))
+        plan = E.plan_memory(str(variant), 32)
+        optional_weight_bytes = sum(
+            t["bytes"] for t in manifest["trunk"]
+            if not t["name"].startswith("model."))
+        self.assertGreater(plan.vision_bytes, optional_weight_bytes)
 
     def test_missing_model_is_an_error_not_a_crash(self):
         with self.assertRaises(E.EngineError) as cm:
@@ -395,6 +431,29 @@ class TestState(EngineTestCase):
 
         self.engine.state_reset()
         self.engine.state_load(str(path))
+
+    @unittest.skipIf(sys.platform == "win32",
+                     "directory chmod is not a reliable Windows fault injector")
+    def test_failed_save_preserves_the_previous_checkpoint(self):
+        locked = Path(self.tmp) / "locked-state"
+        locked.mkdir()
+        path = locked / "session.state"
+        self.engine.state_save(str(path))
+        original = path.read_bytes()
+        locked.chmod(0o500)
+        try:
+            with self.assertRaises(E.EngineError):
+                self.engine.state_save(str(path))
+        finally:
+            locked.chmod(0o700)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_malformed_specials_file_does_not_crash_open(self):
+        variant = Path(self.tmp) / "bad-specials.waste"
+        shutil.copytree(self.model, variant)
+        (variant / "specials.json").write_text('[{"id" "text":"oops"}]')
+        other = E.Engine(str(variant), ram_budget_bytes=1 << 30)
+        other.close()
 
     def test_load_of_a_missing_file_is_an_error(self):
         with self.assertRaises(E.EngineError):

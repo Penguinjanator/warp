@@ -57,6 +57,20 @@ static int write_tga(const char *path, int w, int h,
     return 0;
 }
 
+static int write_tga_header(const char *path, int w, int h)
+{
+    unsigned char hdr[18] = {0};
+    hdr[2] = 2;
+    hdr[12] = (unsigned char)(w & 0xff); hdr[13] = (unsigned char)(w >> 8);
+    hdr[14] = (unsigned char)(h & 0xff); hdr[15] = (unsigned char)(h >> 8);
+    hdr[16] = 24; hdr[17] = 0x20;
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    const int bad = fwrite(hdr, 1, sizeof hdr, f) != sizeof hdr;
+    fclose(f);
+    return bad ? -1 : 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : ".";
@@ -115,6 +129,11 @@ int main(int argc, char **argv)
     ok(waste_image_load(path, 1024, MEAN, STD, &gh, &gw) == NULL, "garbage rejected");
     ok(waste_image_load("/nonexistent/x.png", 1024, MEAN, STD, &gh, &gw) == NULL,
        "missing file rejected");
+
+    /* Dimensions are checked before stb allocates the decoded RGB image. */
+    if (write_tga_header(path, 65535, 65535)) { printf("FAIL write huge header\n"); return 1; }
+    ok(waste_image_load(path, 1024, MEAN, STD, &gh, &gw) == NULL,
+       "oversized source rejected before decode");
     remove(path);
 
     printf(fails ? "IMAGE FAILED (%d)\n" : "IMAGE OK\n", fails);

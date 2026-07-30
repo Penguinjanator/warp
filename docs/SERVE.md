@@ -180,8 +180,10 @@ minute and a wasted hour.
 
 ### Images
 
-`--vision` loads the tower (434 MB on K3, out of the same budget the expert
-cache draws on). Images arrive as base64 `data:` URLs.
+`--vision` loads the tower (434 MB of weights on K3, and 1.12 GB reserved
+once the bounded source decode, the tower's activations and the queued image
+embeddings are counted — out of the same budget the expert cache draws on).
+Images arrive as base64 `data:` URLs.
 
 `http://` and `https://` URLs are **not fetched**. Doing so would make the
 server issue requests to addresses its clients choose, which is a

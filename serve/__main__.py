@@ -11,6 +11,7 @@ have to learn a second vocabulary to serve the same container.
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal, DecimalException
 import os
 import shutil
 import sys
@@ -46,9 +47,25 @@ def parse_size(text: str) -> int:
                 "G": 1 << 30, "T": 1 << 40}[t[-1]]
         t = t[:-1]
     try:
-        return int(float(t) * mult)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"not a size: {text}")
+        value = Decimal(t) * mult
+    except DecimalException:
+        raise argparse.ArgumentTypeError(f"not a size: {text}") from None
+    if not value.is_finite() or value < 0 or value > (1 << 64) - 1:
+        raise argparse.ArgumentTypeError(f"size is out of range: {text}")
+    return int(value)
+
+
+def bounded_int(lo: int, hi: int):
+    def parse(text: str) -> int:
+        try:
+            value = int(text, 10)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"not an integer: {text}") from None
+        if not lo <= value <= hi:
+            raise argparse.ArgumentTypeError(
+                f"integer must be between {lo} and {hi}: {text}")
+        return value
+    return parse
 
 
 def main(argv=None) -> int:
@@ -69,7 +86,7 @@ examples:
     ap.add_argument("--host", default="127.0.0.1",
                     help="default 127.0.0.1 — loopback only. Use 0.0.0.0 to "
                          "accept from the network, and set --api-key if you do")
-    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--port", type=bounded_int(0, 65535), default=8000)
     ap.add_argument("--model-id", default=None,
                     help="name reported by /v1/models (default: directory name)")
     ap.add_argument("--api-key", default=os.environ.get("WASTE_API_KEY"),
@@ -78,9 +95,11 @@ examples:
     g = ap.add_argument_group("engine")
     g.add_argument("--budget", type=parse_size, default=0, metavar="SIZE",
                    help="hard RAM ceiling, e.g. 48G. 0 lets the engine choose")
-    g.add_argument("--ctx", type=int, default=0, metavar="N",
+    g.add_argument("--ctx", type=bounded_int(0, (1 << 32) - 1),
+                   default=0, metavar="N",
                    help="context tokens (0 = container default)")
-    g.add_argument("--threads", type=int, default=0, metavar="N",
+    g.add_argument("--threads", type=bounded_int(0, (1 << 31) - 1),
+                   default=0, metavar="N",
                    help="compute threads (0 = one per core)")
     g.add_argument("--cache", choices=sorted(POLICIES), default="lfru")
     g.add_argument("--no-direct-io", action="store_true",
@@ -97,7 +116,8 @@ examples:
                    help="learned hotlist (default <model>/usage.waste)")
 
     s = ap.add_argument_group("serving")
-    s.add_argument("--max-tokens", type=int, default=512,
+    s.add_argument("--max-tokens", type=bounded_int(1, (1 << 32) - 1),
+                   default=512,
                    help="default cap when a request does not set one")
     s.add_argument("--no-thinking", action="store_true",
                    help="answer without the think channel unless a request "

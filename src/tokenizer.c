@@ -6,6 +6,8 @@
 #include "tokenizer.h"
 
 #include <stdio.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -124,14 +126,24 @@ static void load_specials(waste_tok *t, const char *dir)
 
     const char *p = buf;
     while ((p = strstr(p, "\"id\"")) != NULL) {
-        const int32_t id = (int32_t)strtol(strchr(p, ':') + 1, NULL, 10);
         const char *tk = strstr(p, "\"text\"");
         if (!tk) break;
+        const char *colon = strchr(p, ':');
+        if (!colon || colon > tk) { p += 4; continue; }
+        char *id_end = NULL;
+        errno = 0;
+        const long raw_id = strtol(colon + 1, &id_end, 10);
+        if (errno || id_end == colon + 1 || raw_id < 0 || raw_id > INT32_MAX) {
+            p = tk + 6;
+            continue;
+        }
+        const int32_t id = (int32_t)raw_id;
         const char *q = strchr(tk + 6, '"');
         if (!q) break;
         q++;
         const char *e = q;
         while (*e && *e != '"') e += (*e == '\\' && e[1]) ? 2 : 1;
+        if (!*e) break;
         const int len = (int)(e - q);
         if (len > 0) {
             if (t->n_special == cap) {

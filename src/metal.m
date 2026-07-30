@@ -29,6 +29,7 @@
 #include "waste_backend.h"
 
 #include <stdio.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -114,6 +115,7 @@ static struct {
     size_t scratch_x_cap, scratch_y_cap;
     size_t page;
 } g;
+static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static size_t mt_hash(const void *p)
 {
@@ -168,17 +170,26 @@ extern void waste_mvq_rows_f32(int b, int e, void *p);   /* CPU fallback */
 static void mvq_rows_f32_metal(int b, int e, void *p)
 {
     mvq_arg *a = (mvq_arg *)p;
+    pthread_mutex_lock(&g_mu);
     @autoreleasepool {
         id<MTLBuffer> bw = mt_wrap(a->W, (size_t)e * a->rowbytes);
         id<MTLBuffer> bs = mt_wrap(a->ws, (size_t)e * a->ng * sizeof(uint16_t));
-        if (!bw || !bs) { waste_mvq_rows_f32(b, e, p); return; }
+        if (!bw || !bs) {
+            pthread_mutex_unlock(&g_mu);
+            waste_mvq_rows_f32(b, e, p);
+            return;
+        }
 
         const float *x = (const float *)a->xs;
         id<MTLBuffer> bx = mt_scratch(&g.scratch_x, &g.scratch_x_cap,
                                       (size_t)a->in * sizeof(float));
         id<MTLBuffer> by = mt_scratch(&g.scratch_y, &g.scratch_y_cap,
                                       (size_t)e * sizeof(float));
-        if (!bx || !by) { waste_mvq_rows_f32(b, e, p); return; }
+        if (!bx || !by) {
+            pthread_mutex_unlock(&g_mu);
+            waste_mvq_rows_f32(b, e, p);
+            return;
+        }
         memcpy([bx contents], x, (size_t)a->in * sizeof(float));
 
         struct MtParams pr = { a->in, a->ng, a->group, a->bits,
@@ -203,32 +214,60 @@ static void mvq_rows_f32_metal(int b, int e, void *p)
         memcpy(a->y + b, (const float *)[by contents] + b,
                (size_t)(e - b) * sizeof(float));
     }
+    pthread_mutex_unlock(&g_mu);
 }
 
 /* ---- registration ------------------------------------------------------- */
 
 const char *waste_register_metal(waste_kernels *t)
 {
+    pthread_mutex_lock(&g_mu);
     @autoreleasepool {
-        if (g.ready) return g.ready > 0 ? "Metal" : NULL;
+        if (g.ready) {
+            const char *name = g.ready > 0 ? "Metal" : NULL;
+            pthread_mutex_unlock(&g_mu);
+            return name;
+        }
         g.dev = MTLCreateSystemDefaultDevice();
-        if (!g.dev || ![g.dev hasUnifiedMemory]) { g.ready = -1; return NULL; }
+        if (!g.dev || ![g.dev hasUnifiedMemory]) {
+            g.ready = -1;
+            pthread_mutex_unlock(&g_mu);
+            return NULL;
+        }
         NSError *err = nil;
         id<MTLLibrary> lib = [g.dev newLibraryWithSource:kSrc options:nil error:&err];
         if (!lib) {
             fprintf(stderr, "waste: Metal shader did not compile: %s\n",
                     [[err localizedDescription] UTF8String]);
             g.ready = -1;
+            pthread_mutex_unlock(&g_mu);
             return NULL;
         }
         id<MTLFunction> fn = [lib newFunctionWithName:@"mvq_f32"];
         g.mvq = [g.dev newComputePipelineStateWithFunction:fn error:&err];
         g.queue = [g.dev newCommandQueue];
-        if (!g.mvq || !g.queue) { g.ready = -1; return NULL; }
+        if (!g.mvq || !g.queue) {
+            g.ready = -1;
+            pthread_mutex_unlock(&g_mu);
+            return NULL;
+        }
         g.page = (size_t)getpagesize();
         g.ready = 1;
     }
     t->mvq_rows_f32 = mvq_rows_f32_metal;
     t->on_device = 1;      /* one dispatch for the whole range, not per thread */
+    pthread_mutex_unlock(&g_mu);
     return "Metal";
+}
+
+void waste_metal_release_host_buffers(void)
+{
+    pthread_mutex_lock(&g_mu);
+    @autoreleasepool {
+        for (size_t i = 0; i < MT_SLOTS; i++) {
+            g.slot[i].buf = nil;
+            g.slot[i].key = NULL;
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
 }

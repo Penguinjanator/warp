@@ -30,6 +30,7 @@ import argparse
 import io
 import json
 import os
+import shutil
 import struct
 import sys
 import time
@@ -345,9 +346,10 @@ def write_expert_record(f, layer, eid, cb_base, payloads, scales, shapes):
 
 def convert_layer(job):
     """One layer, in its own process. Layers share nothing: separate bank
-    file, separate codebook file, codebook ids assigned by the parent from
-    the layer's position, so the merge is a concatenation in layer order."""
-    (L, src, out, prefix, n_exp, stages, device, cb_sample, cb_base) = job
+    file and separate codebook file. The parent assigns either the cached
+    manifest base or a new base after the published codebook record count."""
+    (L, src, out, prefix, n_exp, stages, device, cb_sample, cb_base,
+     cached_ok) = job
     import time as _t
     bank = os.path.join(out, f"experts-L{L}.bin")
     cbf = os.path.join(out, f"codebooks-L{L}.bin")
@@ -355,7 +357,7 @@ def convert_layer(job):
     # is gone by then because the parent merged it into codebooks.bin — an
     # earlier version also required it here, which made every resume
     # re-convert the whole model.
-    if os.path.exists(bank):
+    if cached_ok and os.path.exists(bank):
         return (L, os.path.getsize(bank), cb_base, "cached")
 
     st = ST(src)
@@ -412,7 +414,8 @@ def main():
                     help="HF checkpoint directory, as published")
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", default="", help="comma list; default = all MoE layers")
-    ap.add_argument("--stages", type=int, default=3, help="3 = VQ3R, 2 = VQ2R")
+    ap.add_argument("--stages", type=int, choices=(2, 3), default=3,
+                    help="3 = VQ3R, 2 = VQ2R")
     ap.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu")
     ap.add_argument("--experts", type=int, default=0, help="limit experts (debug)")
     ap.add_argument("--trunk-bits", type=int, default=4, choices=(3, 4, 8),
@@ -429,6 +432,10 @@ def main():
     ap.add_argument("--cb-sample", type=int, default=12,
                     help="experts sampled per layer to fit the codebooks")
     args = ap.parse_args()
+    if args.jobs < 1:
+        ap.error("--jobs must be at least 1")
+    if args.cb_sample < 1:
+        ap.error("--cb-sample must be at least 1")
 
     os.makedirs(args.out, exist_ok=True)
     cfg = json.load(open(os.path.join(args.src, "config.json")))
@@ -452,16 +459,54 @@ def main():
               else list(range(first_dense, n_layers)))
 
     # ---- expert banks, one layer at a time ------------------------------
-    manifest_layers = {}
+    manifest_path = os.path.join(args.out, "manifest.json")
+    existing = None
+    if os.path.exists(manifest_path):
+        try:
+            existing = json.load(open(manifest_path))
+        except (OSError, ValueError):
+            existing = None
+
+    cb_record_bytes = struct.calcsize("<IHBBII") + CB_ENTRIES * VEC_DIM * 2
+    merged = os.path.join(args.out, "codebooks.bin")
+    old_books = 0
+    old_quant = existing.get("expert_quant", {}) if existing else {}
+    compatible = bool(
+        existing and os.path.exists(merged) and
+        old_quant.get("stages") == args.stages and
+        old_quant.get("vec_dim") == VEC_DIM and
+        old_quant.get("entries") == CB_ENTRIES and
+        os.path.getsize(merged) % cb_record_bytes == 0)
+    if compatible:
+        old_books = os.path.getsize(merged) // cb_record_bytes
+        manifest_layers = dict(existing.get("layers", {}))
+    else:
+        manifest_layers = {}
 
 
     def ename(L, e, tag):
         return f"{prefix}model.layers.{L}.block_sparse_moe.experts.{e}.{tag}.weight"
 
     n_cb_per_layer = 3 * args.stages
-    jobs = [(L, args.src, args.out, prefix, n_exp, args.stages, str(dev),
-             args.cb_sample, i * n_cb_per_layer)
-            for i, L in enumerate(layers)]
+    next_base = old_books
+    jobs = []
+    for L in layers:
+        meta = manifest_layers.get(str(L), {})
+        bank = os.path.join(args.out, f"experts-L{L}.bin")
+        base = meta.get("codebook_base", -1)
+        cached_ok = bool(
+            compatible and isinstance(base, int) and base >= 0 and
+            base + n_cb_per_layer <= old_books and
+            meta.get("experts") == n_exp and os.path.exists(bank) and
+            meta.get("bytes") == os.path.getsize(bank))
+        source_ok = (st.have(ename(L, 0, "w1")) or
+                     st.have(ename(L, 0, "w1") + "_packed"))
+        if not cached_ok:
+            base = next_base
+            if source_ok:
+                next_base += n_cb_per_layer
+        jobs.append((L, args.src, args.out, prefix, n_exp, args.stages,
+                     str(dev), args.cb_sample, base, cached_ok))
 
     if args.jobs > 1:
         import multiprocessing as mp
@@ -486,20 +531,33 @@ def main():
             manifest_layers[str(L)] = {"file": f"experts-L{L}.bin",
                                        "experts": n_exp, "bytes": sz,
                                        "codebook_base": base}
+        else:
+            manifest_layers.pop(str(L), None)
 
-    # merge the per-layer codebook files in layer order; ids were handed out
-    # from the same order, so the concatenation is already indexed correctly.
-    # If none are present every layer came from cache, and codebooks.bin is
-    # already correct — rewriting it would truncate it to nothing.
-    parts = [os.path.join(args.out, f"codebooks-L{L}.bin") for L in layers]
-    if any(os.path.exists(p) for p in parts):
-        merged = os.path.join(args.out, "codebooks.bin")
+    # Append new records after the already-published books. Cached layer
+    # bases come from the old manifest; new bases start at the old record
+    # count, so mixed resume cannot collide with or discard existing books.
+    parts = [(res[2], os.path.join(args.out, f"codebooks-L{res[0]}.bin"))
+             for res in results]
+    if any(os.path.exists(p) for _, p in parts):
         with open(merged + ".tmp", "wb") as cb_out:
-            for part in parts:
+            if compatible:
+                with open(merged, "rb") as old:
+                    shutil.copyfileobj(old, cb_out)
+            for base, part in sorted(parts):
                 if os.path.exists(part):
+                    if os.path.getsize(part) != n_cb_per_layer * cb_record_bytes:
+                        raise RuntimeError(f"malformed codebook part: {part}")
+                    expected = cb_out.tell() // cb_record_bytes
+                    if base != expected:
+                        raise RuntimeError(
+                            f"codebook base {base} does not follow existing "
+                            f"{expected} records")
                     with open(part, "rb") as pf:
-                        cb_out.write(pf.read())
+                        shutil.copyfileobj(pf, cb_out)
                     os.remove(part)
+            cb_out.flush()
+            os.fsync(cb_out.fileno())
         os.replace(merged + ".tmp", merged)
     else:
         print("codebooks: all layers cached, keeping existing codebooks.bin")
@@ -712,7 +770,6 @@ def main():
         "layers": manifest_layers,
         "trunk": tindex,
     }
-    manifest_path = os.path.join(args.out, "manifest.json")
     manifest_tmp = manifest_path + ".tmp"
     with open(manifest_tmp, "w") as f:
         json.dump(manifest, f, indent=1)

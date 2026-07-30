@@ -477,8 +477,10 @@ PNG, JPEG, GIF, BMP, TGA and PSD, decoded by the one vendored header in
 `/image FILE` attaches a picture to the next message, and it is spliced
 once — the positions are in the attention state afterwards, so later turns
 discuss the same photograph without re-encoding it. The 27-layer ViT is
-loaded only when an image is present, because its 434 MB otherwise come
-straight out of the expert cache.
+loaded only when an image is present. Its weights are 434 MB, but the
+reservation is 1.12 GB: the bounded source decode, the tower's activations
+and the queued image embeddings are memory too, and all of it otherwise
+comes straight out of the expert cache.
 
 An image is not one token. The tower turns a 14-pixel patch grid into one
 embedding per merged 2×2 patch, and each occupies a position in the

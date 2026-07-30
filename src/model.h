@@ -17,6 +17,11 @@
 
 #include "ecache.h"
 
+/* Public image requests are decoded before resize.  Keep the source-image
+ * allocation finite so the memory planner can include its true worst case. */
+#define WASTE_MAX_SOURCE_PIXELS (64u * 1024u * 1024u)
+#define WASTE_MAX_IMAGES 32
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -88,7 +93,7 @@ typedef struct {
 typedef struct {
     waste_config cfg;
     waste_vision_cfg vcfg;
-    int  want_vision;                /* load the tower's 434 MB or not     */
+    int  want_vision;                /* load the tower's 434 MB of weights */
     /* Image embeddings for the prefill about to run: one row per merged
      * patch, consumed in order at each media placeholder. */
     const float *media;
@@ -164,7 +169,7 @@ typedef struct {
  * load does is zero the struct.
  *
  *   cache_bytes  hard ceiling for the expert cache; 0 = no cache
- *   want_vision  load the 434 MB vision tower
+ *   want_vision  load the vision tower (434 MB of weights)
  *   n_threads    compute pool size; 0 = WASTE_THREADS, else hardware
  *   policy       waste_cache_policy: 0 = LFRU, 1 = LRU
  *   direct_io    ask for the page-cache bypass on the expert banks

@@ -531,7 +531,13 @@ def _render_assistant_segments(message: dict[str, Any],
     if tool_calls:
         segments.extend(_open_tag("tools"))
         for index, tool_call in enumerate(tool_calls, start=1):
+            if not isinstance(tool_call, dict):
+                raise XTMLError("Kimi K3 tool calls must be objects.")
             fn = tool_call.get("function", tool_call)
+            if (not isinstance(fn, dict) or
+                    not isinstance(fn.get("name"), str) or not fn["name"]):
+                raise XTMLError(
+                    "Kimi K3 tool calls require a non-empty function name.")
             segments.extend(_open_tag("call", [("tool", fn["name"]),
                                                ("index", index)]))
             args = fn.get("arguments", {})

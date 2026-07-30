@@ -28,10 +28,6 @@
 #include "tokenizer.h"
 #include "waste_backend.h"
 
-/* Enough for any prompt a person assembles by hand; a batch host that
- * wants more should run more contexts. */
-#define WASTE_MAX_IMAGES 32
-
 struct waste_ctx {
     waste_model m;
     waste_tok *tok;
@@ -192,6 +188,54 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
         out->trunk_bytes += nb;
     }
 
+    /* `vision_bytes` includes both optional weights and the peak memory of
+     * decoding/encoding images.  The latter used to be invisible to the
+     * advertised hard ceiling: stb decoded arbitrary source dimensions,
+     * the tower allocated its full activation set, and up to 32 projected
+     * images remained queued. */
+    if (out->vision_bytes) {
+        int vh = 1024, heads = 12, qkv = 1536, vi = 4096;
+        int ph = 64, pw = 64, th = 0, mp = 1024;
+        snprintf(p, sizeof p, "%s/vision.json", model_path);
+        char *vs = slurp_all(p);
+        if (vs) {
+            js_doc vd;
+            if (js_parse(&vd, vs) >= 0) {
+                vh = (int)js_int(&vd, js_get(&vd, 0, "vt_hidden_size"), vh);
+                heads = (int)js_int(&vd, js_get(&vd, 0, "vt_num_attention_heads"), heads);
+                qkv = (int)js_int(&vd, js_get(&vd, 0, "qkv_hidden_size"), qkv);
+                vi = (int)js_int(&vd, js_get(&vd, 0, "vt_intermediate_size"), vi);
+                ph = (int)js_int(&vd, js_get(&vd, 0, "init_pos_emb_height"), ph);
+                pw = (int)js_int(&vd, js_get(&vd, 0, "init_pos_emb_width"), pw);
+                th = (int)js_int(&vd, js_get(&vd, 0, "text_hidden_size"), 0);
+                mp = (int)js_int(&vd, js_get(&vd, 0, "max_patches"), mp);
+                js_free(&vd);
+            }
+            free(vs);
+        }
+        const int cfg_i = js_get(&d, 0, "config");
+        if (!th) th = (int)js_int(&d, js_get(&d, cfg_i, "hidden_size"), 0);
+        if (vh > 0 && vh <= (1 << 20) && heads > 0 && heads <= (1 << 16) &&
+            qkv > 0 && qkv <= (1 << 20) && vi > 0 && vi <= (1 << 22) &&
+            ph > 0 && ph <= (1 << 16) && pw > 0 && pw <= (1 << 16) &&
+            th > 0 && th <= (1 << 20) && mp >= 4 && mp <= (1 << 20)) {
+            const uint64_t L = (uint64_t)mp;
+            const uint64_t queue = (uint64_t)WASTE_MAX_IMAGES *
+                                   ((L + 3) / 4) * (uint64_t)th * 4;
+            const uint64_t pixels = L * 3u * 14u * 14u * 4u;
+            const uint64_t tower =
+                (3u * L * (uint64_t)vh +
+                 3u * L * (uint64_t)qkv + L * (uint64_t)qkv +
+                 L * (uint64_t)vi + L +
+                 (uint64_t)ph * (uint64_t)pw * (uint64_t)vh +
+                 2u * L * (uint64_t)vh) * 4u;
+            const uint64_t decode = (uint64_t)WASTE_MAX_SOURCE_PIXELS * 3u;
+            /* realloc may temporarily retain the previous queue while the
+             * enlarged one is allocated, so reserve two full queues. */
+            out->vision_bytes += 2u * queue + pixels + tower + decode;
+        }
+    }
+
     const int cfg = js_get(&d, 0, "config");
     const int layers = (int)js_int(&d, js_get(&d, cfg, "num_hidden_layers"), 0);
     const int hidden = (int)js_int(&d, js_get(&d, cfg, "hidden_size"), 0);
@@ -322,10 +366,10 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
     waste_status st = waste_plan_memory(model_path, cfg.ctx_tokens, &c->plan);
     if (st != WASTE_OK) { free(c); return st; }
 
-    /* The tower is real memory the moment it is asked for, so it has to be
-     * in the floor before the budget is resolved against it. */
+    /* Optional vision weights, decode buffers, tower activations and queued
+     * embeddings are real memory, so all of them enter the floor. */
     if (cfg.vision && c->plan.vision_bytes) {
-        c->plan.trunk_bytes += c->plan.vision_bytes;
+        c->plan.scratch_bytes += c->plan.vision_bytes;
         c->plan.floor_bytes += c->plan.vision_bytes;
         c->plan.recommended_bytes += c->plan.vision_bytes;
     }

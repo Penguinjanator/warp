@@ -28,12 +28,6 @@
 
 #define MAXTOK 8192
 
-/* Rolling window the --stop matcher works in: how much recent output is
- * kept to match a marker that straddles two pieces, and how much is held
- * back so the marker can still be cut off when it does match. Declared
- * here because parse_opts refuses a --stop that would not fit in it. */
-#define TAILCAP 256
-
 static int parse_size(const char *s, uint64_t *out)
 {
     char *end = NULL;
@@ -219,12 +213,6 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
     if (o->ctx == 0) { fprintf(stderr, "--ctx must be > 0\n"); return -1; }
     if (o->max_tokens == 0) { fprintf(stderr, "-n must be > 0\n"); return -1; }
     if (o->threads < 0) { fprintf(stderr, "--threads must be >= 0\n"); return -1; }
-    /* The matcher holds back one marker's worth of output, in a buffer of
-     * TAILCAP. A longer marker could never be held, let alone matched. */
-    if (o->stop && strlen(o->stop) >= TAILCAP - 1) {
-        fprintf(stderr, "--stop must be under %d characters\n", TAILCAP - 1);
-        return -1;
-    }
     return 0;
 }
 
@@ -317,76 +305,55 @@ typedef struct {
     uint64_t hit, miss;
     double ms;
     const char *stop;              /* --stop, or NULL                       */
-    char tail[TAILCAP];            /* recent output, for matching `stop`    */
-    size_t tail_n;
-    char pend[TAILCAP];            /* held back until the stop can't match  */
-    size_t pend_n;
+    char *pend;                    /* held back until the stop can't match  */
+    size_t pend_n, pend_cap;
+    int oom;
 } sink;
 
-/* A stop sequence can straddle two pieces, so match against a rolling tail
- * rather than the piece just produced. Returning nonzero cancels the
- * generation; waste_generate reports that as WASTE_E_CANCELLED, which the
- * caller treats as a normal finish. */
+/* A stop sequence can straddle pieces, so search a dynamic pending suffix
+ * rather than the piece just produced. Returning nonzero cancels generation;
+ * waste_generate reports that as WASTE_E_CANCELLED, a normal finish here. */
 static int on_token(const waste_token_info *i, const char *piece, void *user)
 {
     sink *s = (sink *)user;
-    /* With a stop sequence, hold back the last strlen(stop)-1 characters:
-     * once the marker is printed it cannot be unprinted, and a chat reply
-     * ending in a visible <|im_end|> is not a reply. */
-    if (!s->quiet) {
-        if (!s->stop || !*s->stop) { fputs(piece, stdout); fflush(stdout); }
-        else {
-            /* the whole marker, not one short: at match time it has
-             * to be entirely still in the buffer to be cut off */
-            const size_t hold = strlen(s->stop);
-            const size_t pl = strlen(piece);
-            if (s->pend_n + pl + 1 < sizeof s->pend) {
-                memcpy(s->pend + s->pend_n, piece, pl + 1);
-                s->pend_n += pl;
-            }
-            /* Emit everything except the last `hold` bytes still buffered.
-             * This used to test a count that included a piece the buffer
-             * had refused, so with a stop string longer than what was
-             * held back the subtraction wrapped and fwrite was handed
-             * SIZE_MAX. parse_opts now caps --stop as well. */
-            if (s->pend_n > hold) {
-                const size_t emit = s->pend_n - hold;
-                fwrite(s->pend, 1, emit, stdout);
-                fflush(stdout);
-                memmove(s->pend, s->pend + emit, s->pend_n - emit + 1);
-                s->pend_n -= emit;
-            }
-        }
-    }
     s->n++;
     s->hit += i->experts_hit;
     s->miss += i->experts_missed;
     s->ms += i->ms_total;
 
-    if (s->stop && *s->stop) {
+    if (!s->stop || !*s->stop) {
+        if (!s->quiet) { fputs(piece, stdout); fflush(stdout); }
+    } else {
         const size_t pl = strlen(piece);
-        if (pl >= TAILCAP) {
-            memcpy(s->tail, piece + pl - (TAILCAP - 1), TAILCAP - 1);
-            s->tail_n = TAILCAP - 1;
-        } else {
-            if (s->tail_n + pl > TAILCAP - 1) {
-                const size_t drop = s->tail_n + pl - (TAILCAP - 1);
-                memmove(s->tail, s->tail + drop, s->tail_n - drop);
-                s->tail_n -= drop;
-            }
-            memcpy(s->tail + s->tail_n, piece, pl);
-            s->tail_n += pl;
+        if (pl > SIZE_MAX - s->pend_n - 1) { s->oom = 1; return 1; }
+        const size_t need = s->pend_n + pl + 1;
+        if (need > s->pend_cap) {
+            size_t cap = s->pend_cap ? s->pend_cap : 256;
+            while (cap < need && cap <= SIZE_MAX / 2) cap *= 2;
+            if (cap < need) cap = need;
+            char *p = (char *)realloc(s->pend, cap);
+            if (!p) { s->oom = 1; return 1; }
+            s->pend = p;
+            s->pend_cap = cap;
         }
-        s->tail[s->tail_n] = 0;
-        if (strstr(s->tail, s->stop)) {
-            /* flush whatever was held back, minus the marker itself */
+        memcpy(s->pend + s->pend_n, piece, pl + 1);
+        s->pend_n += pl;
+
+        char *cut = strstr(s->pend, s->stop);
+        if (cut) {
             if (!s->quiet) {
-                char *cut = strstr(s->pend, s->stop);
-                fwrite(s->pend, 1, cut ? (size_t)(cut - s->pend) : 0, stdout);
+                fwrite(s->pend, 1, (size_t)(cut - s->pend), stdout);
                 fflush(stdout);
             }
-            s->pend_n = 0; s->pend[0] = 0;
+            s->pend_n = 0;
             return 1;
+        }
+        const size_t hold = strlen(s->stop);
+        if (s->pend_n > hold) {
+            const size_t emit = s->pend_n - hold;
+            if (!s->quiet) { fwrite(s->pend, 1, emit, stdout); fflush(stdout); }
+            memmove(s->pend, s->pend + emit, s->pend_n - emit + 1);
+            s->pend_n -= emit;
         }
     }
     return 0;
@@ -754,7 +721,9 @@ static int run_segs(waste_ctx *c, const opts *o, const seg *segs, int ns,
     if (!o->quiet && !o->no_echo && echo) fputs(echo, stdout);
     st = waste_generate(c, ids, n, &p, on_token, &s);
     if (!o->quiet && s.pend_n) fwrite(s.pend, 1, s.pend_n, stdout);
+    free(s.pend);
     printf("\n");
+    if (s.oom) return fail("stop matcher", WASTE_E_OOM);
     if (st != WASTE_OK && st != WASTE_E_CANCELLED) return fail_ctx("generate", st, c);
     /* A generation that ran out of context returns OK — the tokens it
      * produced are good — and stops mid-answer. Silence there reads as a

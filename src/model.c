@@ -14,6 +14,7 @@
 
 #include <limits.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,13 +40,16 @@ double waste_prof[16];
 uint64_t waste_prof_n[16];
 enum { P_LUTB, P_KDA, P_MLA, P_ROUTE, P_EDEQ, P_EMM, P_HEAD, P_LUTA, P_MM };
 static int prof_on = -1;
+static pthread_mutex_t prof_mu = PTHREAD_MUTEX_INITIALIZER;
 static double pnow(void)
 {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + t.tv_nsec / 1e9;
 }
 #define PROF_START(b) double _t##b = prof_on ? pnow() : 0
-#define PROF_END(b)   do { if (prof_on) { waste_prof[b] += pnow() - _t##b; waste_prof_n[b]++; } } while (0)
+#define PROF_END(b)   do { if (prof_on) { pthread_mutex_lock(&prof_mu); \
+    waste_prof[b] += pnow() - _t##b; waste_prof_n[b]++; \
+    pthread_mutex_unlock(&prof_mu); } } while (0)
 
 static char *slurp(const char *path, size_t *len)
 {
@@ -96,8 +100,11 @@ const waste_tensor *waste_find(const waste_model *m, const char *name)
 __attribute__((format(printf, 1, 2)))
 static const char *tname(const char *fmt, ...)
 {
-    static char buf[8][160];
-    static int turn = 0;
+    /* Distinct contexts may validate/execute concurrently.  The rotation
+     * solves same-expression aliasing; thread-local storage solves the
+     * otherwise-racy process-wide cursor and buffers. */
+    static _Thread_local char buf[8][160];
+    static _Thread_local unsigned turn;
     char *b = buf[turn++ & 7];
     va_list ap;
     va_start(ap, fmt);
@@ -156,6 +163,24 @@ static inline float dotf(const float *a, const float *b, int n)
 static int q8_off = 1;     /* 1 = keep the trunk stored as int8          */
 static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
 static int i8mm_on = 0;    /* SMMLA batched matmul; costs activation int8 */
+static pthread_once_t model_opts_once = PTHREAD_ONCE_INIT;
+
+static void model_opts_init(void)
+{
+    const char *e = getenv("WASTE_PROFILE");
+    prof_on = e && *e != '0';
+    e = getenv("WASTE_Q8");
+    if (e && *e == '0') q8_off = 0;
+    e = getenv("WASTE_SDOT");
+    sdot_on = e && *e != '0';
+    /* Here with the rest of them: read per-load, this was the one env
+     * switch still written by every concurrent waste_model_load.
+     * waste_cpu_features() is self-caching and does not need the backend. */
+    e = getenv("WASTE_I8MM");
+    i8mm_on = e ? (*e != '0')
+                : 0;     /* off by default until it earns it — see below */
+    if (i8mm_on && !(waste_cpu_features() & WASTE_CPU_I8MM)) i8mm_on = 0;
+}
 
 /* One weight from a 3-bit stream: values sit LSB-first at bit offset 3*i,
  * biased by +4, with a guard byte so two loads are always safe. Identical
@@ -841,7 +866,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     for (int L = 0; L < WASTE_MAX_LAYERS; L++) m->bank[L].fd = -1;
     m->want_vision = opt->want_vision;
     m->want_direct = opt->direct_io;
-    if (prof_on < 0) { const char *e = getenv("WASTE_PROFILE"); prof_on = e && *e != '0'; }
+    pthread_once(&model_opts_once, model_opts_init);
     m->kv_cap = kv_cap;
     m->direct_io = 1;
     waste_backend_init(WASTE_BE_AUTO);
@@ -860,12 +885,6 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     snprintf(path, sizeof path, "%s/manifest.json", dir);
     char *src = slurp(path, NULL);
     if (!src) return -1;
-    { const char *e = getenv("WASTE_Q8"); if (e && *e == '0') q8_off = 0; }
-    { const char *e = getenv("WASTE_SDOT"); sdot_on = e && *e != '0'; }
-    { const char *e = getenv("WASTE_I8MM");
-      i8mm_on = e ? (*e != '0')
-                  : 0;   /* off by default until it earns it — see below */
-      if (i8mm_on && !(waste_cpu_features() & WASTE_CPU_I8MM)) i8mm_on = 0; }
     js_doc d;
     if (js_parse(&d, src) < 0) { free(src); return -1; }
 
@@ -1214,6 +1233,9 @@ void waste_model_free(waste_model *m)
      * a failed load left behind, so nothing here may assume the load got
      * as far as its own allocation. */
     if (!m->t) m->n_tensors = 0;
+    /* Device backends may hold no-copy wrappers keyed by these host
+     * addresses.  Drop them while the allocations are still alive. */
+    waste_backend_release_host_buffers();
     for (int i = 0; i < m->n_tensors; i++) {
         waste_dio_free(m->t[i].data); waste_dio_free(m->t[i].q);
         waste_dio_free(m->t[i].qs);
@@ -2091,8 +2113,16 @@ static void state_fill(const waste_model *m, waste_state_hdr *h, int pos)
 int waste_model_state_save(const waste_model *m, const char *path, int pos)
 {
     const waste_config *c = &m->cfg;
-    FILE *f = fopen(path, "wb");
-    if (!f) return -1;
+    static _Atomic unsigned save_seq;
+    const size_t pn = strlen(path);
+    char *tmp = (char *)malloc(pn + 64);
+    if (!tmp) return -1;
+    snprintf(tmp, pn + 64, "%s.tmp.%ld.%u", path, (long)getpid(),
+             atomic_fetch_add(&save_seq, 1));
+    const int tfd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | WASTE_O_BINARY, 0600);
+    if (tfd < 0) { free(tmp); return -1; }
+    FILE *f = fdopen(tfd, "wb");
+    if (!f) { close(tfd); remove(tmp); free(tmp); return -1; }
     waste_state_hdr h;
     state_fill(m, &h, pos);
     int rc = fwrite(&h, sizeof h, 1, f) == 1 ? 0 : -1;
@@ -2115,8 +2145,11 @@ int waste_model_state_save(const waste_model *m, const char *path, int pos)
         if (fwrite(m->blockres, sizeof(float), n, f) != n) rc = -1;
     }
     if (!rc && fwrite(m->x, sizeof(float), (size_t)c->hidden, f) != (size_t)c->hidden) rc = -1;
-    fclose(f);
-    if (rc) remove(path);
+    if (!rc && waste_sync_file(f)) rc = -1;
+    if (fclose(f)) rc = -1;
+    if (!rc && waste_replace_file(tmp, path)) rc = -1;
+    if (rc) remove(tmp);
+    free(tmp);
     return rc;
 }
 

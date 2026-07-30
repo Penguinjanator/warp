@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #if defined(_WIN32)
   #include <windows.h>
@@ -37,6 +38,8 @@ waste_kernels waste_k;
 
 static const char *g_backend_name = "uninitialized";
 static int g_initialized = 0;
+static pthread_mutex_t g_init_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_feature_mu = PTHREAD_MUTEX_INITIALIZER;
 
 /* Backend registration functions, linked in only when their translation
  * unit is compiled. Each returns a name, or NULL to decline at runtime. */
@@ -95,7 +98,8 @@ uint32_t waste_cpu_features(void)
 {
     static uint32_t cached = 0;
     static int done = 0;
-    if (done) return cached;
+    pthread_mutex_lock(&g_feature_mu);
+    if (done) { pthread_mutex_unlock(&g_feature_mu); return cached; }
 
     uint32_t f = 0;
 
@@ -155,6 +159,7 @@ uint32_t waste_cpu_features(void)
 #endif
 
     cached = f; done = 1;
+    pthread_mutex_unlock(&g_feature_mu);
     return f;
 }
 
@@ -162,7 +167,8 @@ uint32_t waste_cpu_features(void)
 
 void waste_backend_init(unsigned flags)
 {
-    if (g_initialized) return;
+    pthread_mutex_lock(&g_init_mu);
+    if (g_initialized) { pthread_mutex_unlock(&g_init_mu); return; }
 
     /* 1. universal baseline — always present, always correct */
     g_backend_name = waste_kda_register_cpu(&waste_k);
@@ -170,7 +176,7 @@ void waste_backend_init(unsigned flags)
 
     const char *env = getenv("WASTE_BACKEND");
     if (env && strcmp(env, "cpu") == 0) flags |= WASTE_BE_FORCE_CPU;
-    if (flags & WASTE_BE_FORCE_CPU) return;
+    if (flags & WASTE_BE_FORCE_CPU) { pthread_mutex_unlock(&g_init_mu); return; }
 
     /* 2. best in-process SIMD backend for this machine */
     const uint32_t f = waste_cpu_features();
@@ -191,7 +197,7 @@ void waste_backend_init(unsigned flags)
 
     /* 3. accelerators: compiled in only when enabled at build time, and
      * still free to decline if this machine has no usable device. */
-    if (flags & WASTE_BE_NO_DEVICE) return;
+    if (flags & WASTE_BE_NO_DEVICE) { pthread_mutex_unlock(&g_init_mu); return; }
     const char *n = NULL;
 #if defined(WASTE_ENABLE_CUDA)
     if ((n = waste_register_cuda(&waste_k))) g_backend_name = n;
@@ -203,10 +209,21 @@ void waste_backend_init(unsigned flags)
     if ((n = waste_register_blas(&waste_k))) g_backend_name = n;
 #endif
     (void)n;
+    pthread_mutex_unlock(&g_init_mu);
 }
 
 const char *waste_backend_name(void)
 {
-    if (!g_initialized) waste_backend_init(WASTE_BE_AUTO);
+    /* Always pass through the init mutex: an unsynchronised read of the
+     * completion flag could observe a half-published dispatch table. */
+    waste_backend_init(WASTE_BE_AUTO);
     return g_backend_name;
+}
+
+void waste_backend_release_host_buffers(void)
+{
+#if defined(WASTE_ENABLE_METAL)
+    extern void waste_metal_release_host_buffers(void);
+    waste_metal_release_host_buffers();
+#endif
 }

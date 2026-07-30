@@ -264,6 +264,11 @@ class TestStructure(unittest.TestCase):
                     {"id": "a", "type": "function",
                      "function": {"name": "f", "arguments": "[1,2,3]"}}]}])
 
+    def test_tool_call_without_a_function_name_is_an_error(self):
+        with self.assertRaises(xtml.XTMLError):
+            xtml.build_chat_segments(messages=[
+                {"role": "assistant", "content": "", "tool_calls": [{}]}])
+
     def test_image_prompt_format(self):
         self.assertEqual(
             xtml.image_prompt(640, 480),

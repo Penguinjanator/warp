@@ -72,6 +72,12 @@ float *waste_image_load(const char *path, int max_patches,
                         int *out_h, int *out_w)
 {
     int sw = 0, sh = 0, ch = 0;
+    if (!stbi_info(path, &sw, &sh, &ch) || sw <= 0 || sh <= 0 ||
+        (uint64_t)sw * (uint64_t)sh > WASTE_MAX_SOURCE_PIXELS) {
+        fprintf(stderr, "waste: image dimensions are invalid or exceed the %u-pixel limit: %s\n",
+                WASTE_MAX_SOURCE_PIXELS, path ? path : "(null)");
+        return NULL;
+    }
     unsigned char *img = stbi_load(path, &sw, &sh, &ch, 3);
     if (!img) {
         fprintf(stderr, "waste: cannot decode %s: %s\n", path, stbi_failure_reason());

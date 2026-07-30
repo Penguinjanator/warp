@@ -29,6 +29,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #ifdef _WIN32
 
@@ -116,6 +117,17 @@ static inline uint64_t waste_physical_ram_bytes(void)
     return GlobalMemoryStatusEx(&st) ? (uint64_t)st.ullTotalPhys : 0;
 }
 
+static inline int waste_sync_file(FILE *f)
+{
+    return fflush(f) || _commit(_fileno(f));
+}
+
+static inline int waste_replace_file(const char *src, const char *dst)
+{
+    return MoveFileExA(src, dst, MOVEFILE_REPLACE_EXISTING |
+                       MOVEFILE_WRITE_THROUGH) ? 0 : -1;
+}
+
 /* The Windows half of the page-cache bypass, which is the part of this
  * port that actually matters: the expert-streaming argument is that the
  * hit rate we measure is ours and not the kernel's.
@@ -176,6 +188,16 @@ static inline int64_t waste_file_size(int fd)
 {
     const off_t n = lseek(fd, 0, SEEK_END);
     return n < 0 ? -1 : (int64_t)n;
+}
+
+static inline int waste_sync_file(FILE *f)
+{
+    return fflush(f) || fsync(fileno(f));
+}
+
+static inline int waste_replace_file(const char *src, const char *dst)
+{
+    return rename(src, dst);
 }
 
 #endif /* _WIN32 */

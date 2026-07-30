@@ -107,6 +107,32 @@ def validate_messages(messages: Any) -> list[dict]:
                         part.get("text"), str):
                     raise APIError(f"{param}.text must be a string",
                                    param=f"{param}.text")
+        calls = m.get("tool_calls")
+        if calls is not None:
+            param = f"messages[{i}].tool_calls"
+            if role != "assistant":
+                raise APIError(f"{param} is only valid for assistant messages",
+                               param=param)
+            if not isinstance(calls, list):
+                raise APIError(f"{param} must be an array", param=param)
+            for j, call in enumerate(calls):
+                cp = f"{param}[{j}]"
+                if not isinstance(call, dict):
+                    raise APIError(f"{cp} must be an object", param=cp)
+                fn = call.get("function", call)
+                if not isinstance(fn, dict):
+                    raise APIError(f"{cp}.function must be an object",
+                                   param=f"{cp}.function")
+                if not isinstance(fn.get("name"), str) or not fn["name"]:
+                    raise APIError(
+                        f"{cp}.function.name must be a non-empty string",
+                        param=f"{cp}.function.name")
+                arguments = fn.get("arguments")
+                if (arguments is not None and
+                        not isinstance(arguments, (dict, str))):
+                    raise APIError(
+                        f"{cp}.function.arguments must be an object or JSON string",
+                        param=f"{cp}.function.arguments")
         m = dict(m)
         if role == "developer":
             # OpenAI's newer name for a system turn. K3 has one system role,
