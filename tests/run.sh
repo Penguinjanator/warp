@@ -737,6 +737,21 @@ else
     sk "tokenizer diff" "needs uv, a container and source weights"
 fi
 
+# ------------------------------------------------------------ converter ----
+head_ "converter"
+
+# Resume is the one converter behaviour that cannot be checked by looking at
+# a finished container: it is about the partial states a crash leaves. The
+# quantizer is stubbed out, so this needs neither torch nor source weights.
+if ! command -v python3 >/dev/null 2>&1; then
+    sk "convert.py resume" "python3 not installed"
+elif out=$(python3 tests/test_convert_resume.py 2>&1); then
+    ok "resume reuses finished layers and never renumbers their codebooks"
+else
+    no "convert.py resume"
+    printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5
+fi
+
 # ---------------------------------------------------------------- serve ----
 head_ "serve (OpenAI-compatible server)"
 

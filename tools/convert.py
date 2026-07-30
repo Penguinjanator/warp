@@ -342,21 +342,40 @@ def write_expert_record(f, layer, eid, cb_base, payloads, scales, shapes):
     return blocks
 
 
+def bank_codebook_base(path):
+    """The codebook base a finished bank was written with, or -1.
+
+    Every record carries it absolutely — the engine reads codebook_id from
+    the record, not from the manifest — so a bank that already exists has a
+    base that is not ours to reassign. Reading it back is what lets a run
+    interrupted before it published a manifest still resume.
+    """
+    try:
+        with open(path, "rb") as f:
+            hdr = f.read(12)
+    except OSError:
+        return -1
+    if len(hdr) < 12 or struct.unpack_from("<I", hdr, 0)[0] != MAGIC_EXPERT:
+        return -1
+    return struct.unpack_from("<H", hdr, 10)[0]
+
+
 # ------------------------------------------------------------- worker ----
 
 def convert_layer(job):
     """One layer, in its own process. Layers share nothing: separate bank
-    file and separate codebook file. The parent assigns either the cached
-    manifest base or a new base after the published codebook record count."""
+    file and separate codebook file. The parent decides the base — from the
+    published manifest, from an existing bank's own records, or new after
+    the published record count — and never renumbers a bank that exists."""
     (L, src, out, prefix, n_exp, stages, device, cb_sample, cb_base,
      cached_ok) = job
     import time as _t
     bank = os.path.join(out, f"experts-L{L}.bin")
     cbf = os.path.join(out, f"codebooks-L{L}.bin")
-    # A finished bank means the layer is done. The per-layer codebook file
-    # is gone by then because the parent merged it into codebooks.bin — an
-    # earlier version also required it here, which made every resume
-    # re-convert the whole model.
+    # Whether a finished bank counts as done is the parent's call: it is the
+    # only side that can see the manifest, the merged codebooks and this
+    # bank's own base together. Deciding it here — from the bank's existence
+    # alone — is what used to renumber a resumed layer's codebooks.
     if cached_ok and os.path.exists(bank):
         return (L, os.path.getsize(bank), cb_base, "cached")
 
@@ -493,18 +512,40 @@ def main():
     for L in layers:
         meta = manifest_layers.get(str(L), {})
         bank = os.path.join(args.out, f"experts-L{L}.bin")
+        part = os.path.join(args.out, f"codebooks-L{L}.bin")
         base = meta.get("codebook_base", -1)
         cached_ok = bool(
             compatible and isinstance(base, int) and base >= 0 and
             base + n_cb_per_layer <= old_books and
             meta.get("experts") == n_exp and os.path.exists(bank) and
             meta.get("bytes") == os.path.getsize(bank))
+        if not cached_ok:
+            # A run interrupted before it published anything leaves no
+            # manifest and no codebooks.bin, so there is nothing to read a
+            # base from — and re-deriving one positionally is the bug this
+            # scheme exists to avoid. But a finished bank names its own
+            # base in every record it holds, and its unmerged codebook part
+            # is still on disk beside it. Together those are a complete,
+            # self-describing layer, so honour them.
+            recovered = bank_codebook_base(bank)
+            # Bounded by the whole model, not by this invocation's --layers:
+            # the base in the bank reflects the run that wrote it, which may
+            # have been converting far more layers than this one is.
+            if (old_books <= recovered <=
+                    old_books + n_layers * n_cb_per_layer and
+                    os.path.exists(part) and
+                    os.path.getsize(part) == n_cb_per_layer * cb_record_bytes
+                    and os.path.getsize(bank) > 0):
+                base = recovered
+                cached_ok = True
         source_ok = (st.have(ename(L, 0, "w1")) or
                      st.have(ename(L, 0, "w1") + "_packed"))
         if not cached_ok:
             base = next_base
             if source_ok:
                 next_base += n_cb_per_layer
+        elif base + n_cb_per_layer > next_base:
+            next_base = base + n_cb_per_layer
         jobs.append((L, args.src, args.out, prefix, n_exp, args.stages,
                      str(dev), args.cb_sample, base, cached_ok))
 
@@ -534,9 +575,10 @@ def main():
         else:
             manifest_layers.pop(str(L), None)
 
-    # Append new records after the already-published books. Cached layer
-    # bases come from the old manifest; new bases start at the old record
-    # count, so mixed resume cannot collide with or discard existing books.
+    # Append new records after the already-published books. A cached base
+    # comes from the old manifest or from the bank itself; a new one starts
+    # at the old record count. Either way the base is fixed before we get
+    # here, so this writes each part *at* its base and never renumbers.
     parts = [(res[2], os.path.join(args.out, f"codebooks-L{res[0]}.bin"))
              for res in results]
     if any(os.path.exists(p) for _, p in parts):
@@ -549,10 +591,19 @@ def main():
                     if os.path.getsize(part) != n_cb_per_layer * cb_record_bytes:
                         raise RuntimeError(f"malformed codebook part: {part}")
                     expected = cb_out.tell() // cb_record_bytes
-                    if base != expected:
+                    if base < expected:
                         raise RuntimeError(
-                            f"codebook base {base} does not follow existing "
-                            f"{expected} records")
+                            f"codebook base {base} overlaps the {expected} "
+                            f"records already written")
+                    if base > expected:
+                        # A resume can recover a bank whose base sits past
+                        # the end of what is being written, because an
+                        # earlier run finished a layer this invocation is
+                        # not redoing. No record names the ids in between,
+                        # so pad them: the bases inside the banks are the
+                        # engine's truth and cannot be moved.
+                        cb_out.write(b"\0" * ((base - expected) *
+                                              cb_record_bytes))
                     with open(part, "rb") as pf:
                         shutil.copyfileobj(pf, cb_out)
                     os.remove(part)
