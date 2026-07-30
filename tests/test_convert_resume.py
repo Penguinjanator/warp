@@ -33,6 +33,18 @@ N_LAYERS, N_EXPERTS, FIRST_DENSE, STAGES = 6, 4, 1, 3
 MOE_LAYERS = list(range(FIRST_DENSE, N_LAYERS))
 
 
+TRUNK_TENSOR = "model.norm.weight"      # one small f32 trunk tensor is enough
+
+
+class FakeTensor:
+    """Just enough tensor for the trunk loop's f32 branch."""
+    shape = (8,)
+
+    def dim(self): return 1
+    def numel(self): return 8
+    def float(self): return self
+
+
 def install_stubs():
     torch = types.ModuleType("torch")
     torch.device = lambda s: s
@@ -43,13 +55,22 @@ def install_stubs():
 
     class ST:
         def __init__(self, src): pass
-        def have(self, name): return ".experts." in name and "_packed" not in name
-        def names(self): return []
+
+        def have(self, name):
+            if name == TRUNK_TENSOR:
+                return True
+            return ".experts." in name and "_packed" not in name
+
+        def tensor(self, name): return FakeTensor()
+        def names(self): return [TRUNK_TENSOR]
     mx.ST = ST
     sys.modules["mxfp4"] = mx
     sys.path.insert(0, os.path.join(REPO, "tools"))
     import convert
-    convert.ShardReader = lambda src: types.SimpleNamespace(names=lambda: [])
+    convert.ShardReader = lambda src: types.SimpleNamespace(
+        names=lambda: [TRUNK_TENSOR])
+    # Serialization is not what this checks, and the real one needs torch.
+    convert.raw_bytes = lambda t: b"\0" * (t.numel() * 4)
     return convert
 
 
@@ -83,19 +104,27 @@ def fake_convert_layer(job):
 CONV.convert_layer = fake_convert_layer
 
 
-def run(out, src, layers=None, jobs=1):
+def run(out, src, layers=None, jobs=1, skip_trunk=False, want_rc=0):
     del converted[:]
     argv = ["convert.py", "--src", src, "--out", out, "--jobs", str(jobs),
             "--stages", str(STAGES)]
     if layers:
         argv += ["--layers", ",".join(str(x) for x in layers)]
+    if skip_trunk:
+        argv += ["--skip-trunk"]
     old = sys.argv
     sys.argv = argv
     try:
-        CONV.main()
+        rc = CONV.main()
     finally:
         sys.argv = old
+    assert rc == want_rc, f"convert.main() returned {rc}, wanted {want_rc}"
     return list(converted)
+
+
+def manifest(out):
+    p = os.path.join(out, "manifest.json")
+    return json.load(open(p)) if os.path.exists(p) else None
 
 
 def books(out):
@@ -203,6 +232,32 @@ def main():
         ck(b[base3:base3 + PER_LAYER] ==
            list(range(base3, base3 + PER_LAYER)),
            "its records sit at that base in codebooks.bin")
+
+        print("--skip-trunk keeps the trunk and still publishes")
+        out = os.path.join(tmp, "skiptrunk.waste")
+        run(out, src, layers=[1])
+        keep = manifest(out)["trunk"]
+        trunk_before = open(os.path.join(out, "trunk.bin"), "rb").read()
+        did = run(out, src, layers=[2], skip_trunk=True)
+        ck(did == [2], f"converts the layer it was asked for {did}")
+        m = manifest(out)
+        ck("2" in m["layers"],
+           "and the manifest it publishes lists that layer")
+        ck(m["trunk"] == keep,
+           "carrying the trunk index forward instead of emptying it")
+        ck(open(os.path.join(out, "trunk.bin"), "rb").read() == trunk_before,
+           "and leaving trunk.bin itself untouched")
+        ok, why = check_consistency(out, [1, 2])
+        ck(ok, f"both banks index their own records ({why})")
+        ck(not os.path.exists(os.path.join(out, "trunk.bin.tmp")),
+           "no staged trunk left behind")
+
+        print("--skip-trunk with no published trunk to keep")
+        out = os.path.join(tmp, "notrunk.waste")
+        os.makedirs(out)
+        did = run(out, src, layers=[1], skip_trunk=True, want_rc=1)
+        ck(manifest(out) is None,
+           "refuses rather than publish a manifest with an empty trunk")
 
         print("a bank whose codebook part was lost cannot be trusted")
         out = os.path.join(tmp, "lostpart.waste")

@@ -443,7 +443,9 @@ def main():
     ap.add_argument("--trunk8", action="store_true",
                     help="keep the whole trunk at 8 bits (needs the RAM)")
     ap.add_argument("--skip-trunk", action="store_true",
-                    help="experts only (the trunk is unchanged between runs)")
+                    help="experts only; keeps the trunk and the trunk index "
+                         "the existing manifest describes, and republishes "
+                         "the manifest with the layers this run converted")
     ap.add_argument("--jobs", type=int, default=3,
                     help="layers converted in parallel; measured sweet spot "
                          "is 3 — beyond that the native encoder is already "
@@ -755,47 +757,65 @@ def main():
     trunk_tmp = trunk_path + ".tmp"
     tindex = []
     if args.skip_trunk:
-        print("skipping trunk")
-        return 0
-    # Keep the currently published trunk intact for the entire conversion.
-    # A K3 trunk takes hours to rebuild; opening the final path with "wb"
-    # destroyed a working container at the start of that interval.
-    with open(trunk_tmp, "wb") as tf:
-        for name in sorted(sr.names()):
-            if ".experts." in name or name.endswith(("_packed", "_scale")):
-                continue
-            if not st.have(name):
-                continue                      # shard not downloaded yet
-            t = st.tensor(name)
-            off = tf.tell()
-            if t.dim() == 1 or t.numel() < 1 << 16:
-                tf.write(raw_bytes(t.float()))
-                tindex.append({"name": name, "fmt": FMT_F32, "off": off,
-                               "shape": list(t.shape),
-                               "bytes": tf.tell() - off})
-            else:
-                # 4 bits for the bulk; the embedding table and the output
-                # head keep 8, they are small and sit at both ends of the
-                # network where error is least forgiving
-                big = not (name.endswith("embed_tokens.weight")
-                           or name.endswith("lm_head.weight"))
-                bits = 8 if (args.trunk8 or not big) else args.trunk_bits
-                if bits == 3:
-                    q, sc, shape = quantize_q3g(t); fmt = FMT_Q3G
-                elif bits == 4:
-                    q, sc, shape = quantize_q4g(t); fmt = FMT_Q4G
+        # "The trunk is unchanged between runs" — so carry its published
+        # index forward and still publish. Returning here instead left the
+        # banks this run had just converted unreferenced by any manifest,
+        # and the codebooks.bin the merge had already replaced described by
+        # an old one: a container that reports itself as fine and whose
+        # layer bases point into records that are no longer there.
+        tindex = (existing or {}).get("trunk")
+        if not isinstance(tindex, list) or not tindex:
+            print(f"--skip-trunk keeps the trunk {manifest_path} describes, "
+                  "and it describes none — convert once without it",
+                  file=sys.stderr)
+            return 1
+        if not os.path.exists(trunk_path):
+            print(f"--skip-trunk needs {trunk_path}, which is not there",
+                  file=sys.stderr)
+            return 1
+        print(f"skipping trunk: keeping the published {len(tindex)} tensors")
+    else:
+        # Keep the currently published trunk intact for the entire
+        # conversion. A K3 trunk takes hours to rebuild; opening the final
+        # path with "wb" destroyed a working container at the start of that
+        # interval.
+        with open(trunk_tmp, "wb") as tf:
+            for name in sorted(sr.names()):
+                if ".experts." in name or name.endswith(("_packed", "_scale")):
+                    continue
+                if not st.have(name):
+                    continue                  # shard not downloaded yet
+                t = st.tensor(name)
+                off = tf.tell()
+                if t.dim() == 1 or t.numel() < 1 << 16:
+                    tf.write(raw_bytes(t.float()))
+                    tindex.append({"name": name, "fmt": FMT_F32, "off": off,
+                                   "shape": list(t.shape),
+                                   "bytes": tf.tell() - off})
                 else:
-                    q, sc, shape = quantize_q8g(t); fmt = FMT_Q8G
-                tf.write(raw_bytes(q))
-                sc_off = tf.tell()
-                tf.write(raw_bytes(sc))
-                tindex.append({"name": name, "fmt": fmt,
-                               "off": off, "shape": shape, "group": 128,
-                               "scale_off": sc_off, "bytes": tf.tell() - off})
-        tf.flush()
-        os.fsync(tf.fileno())
-    print(f"trunk: {os.path.getsize(trunk_tmp)/2**20:.0f} MB, "
-          f"{len(tindex)} tensors")
+                    # 4 bits for the bulk; the embedding table and the output
+                    # head keep 8, they are small and sit at both ends of the
+                    # network where error is least forgiving
+                    big = not (name.endswith("embed_tokens.weight")
+                               or name.endswith("lm_head.weight"))
+                    bits = 8 if (args.trunk8 or not big) else args.trunk_bits
+                    if bits == 3:
+                        q, sc, shape = quantize_q3g(t); fmt = FMT_Q3G
+                    elif bits == 4:
+                        q, sc, shape = quantize_q4g(t); fmt = FMT_Q4G
+                    else:
+                        q, sc, shape = quantize_q8g(t); fmt = FMT_Q8G
+                    tf.write(raw_bytes(q))
+                    sc_off = tf.tell()
+                    tf.write(raw_bytes(sc))
+                    tindex.append({"name": name, "fmt": fmt,
+                                   "off": off, "shape": shape, "group": 128,
+                                   "scale_off": sc_off,
+                                   "bytes": tf.tell() - off})
+            tf.flush()
+            os.fsync(tf.fileno())
+        print(f"trunk: {os.path.getsize(trunk_tmp)/2**20:.0f} MB, "
+              f"{len(tindex)} tensors")
 
     # `arch` is descriptive only — the engine derives its own from
     # config._outer.architectures, because the *inner* architectures says
@@ -821,6 +841,15 @@ def main():
         "layers": manifest_layers,
         "trunk": tindex,
     }
+    # A manifest that lists fewer expert layers than the one it replaces
+    # publishes a container the engine will refuse to open, and the banks it
+    # drops are still on disk taking up room. Never intended; say so.
+    dropped = sorted(set((existing or {}).get("layers", {})) -
+                     set(manifest_layers), key=int)
+    if dropped:
+        print(f"WARNING dropping {len(dropped)} expert layer(s) the previous "
+              f"manifest listed: {', '.join(dropped)}", file=sys.stderr)
+
     manifest_tmp = manifest_path + ".tmp"
     with open(manifest_tmp, "w") as f:
         json.dump(manifest, f, indent=1)
@@ -828,7 +857,8 @@ def main():
         os.fsync(f.fileno())
     # The manifest is the commit record and is always published last.  An
     # exception before these replaces leaves the old container untouched.
-    os.replace(trunk_tmp, trunk_path)
+    if not args.skip_trunk:
+        os.replace(trunk_tmp, trunk_path)
     os.replace(manifest_tmp, manifest_path)
     print(f"wrote {args.out}/manifest.json")
     return 0

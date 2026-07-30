@@ -746,7 +746,7 @@ head_ "converter"
 if ! command -v python3 >/dev/null 2>&1; then
     sk "convert.py resume" "python3 not installed"
 elif out=$(python3 tests/test_convert_resume.py 2>&1); then
-    ok "resume reuses finished layers and never renumbers their codebooks"
+    ok "resume keeps finished layers, never renumbers them, and publishes"
 else
     no "convert.py resume"
     printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5
