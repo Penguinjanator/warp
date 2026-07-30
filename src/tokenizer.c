@@ -110,9 +110,9 @@ static void load_specials(waste_tok *t, const char *dir)
     snprintf(path, sizeof path, "%s/specials.json", dir);
     FILE *f = fopen(path, "rb");
     if (!f) return;
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END)) { fclose(f); return; }
     const long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    if (n < 0 || fseek(f, 0, SEEK_SET)) { fclose(f); return; }
     char *buf = (char *)malloc((size_t)n + 1);
     if (!buf || fread(buf, 1, (size_t)n, f) != (size_t)n) { free(buf); fclose(f); return; }
     buf[n] = 0;
@@ -168,9 +168,9 @@ waste_tok *waste_tok_open(const char *dir)
     }
     if (!f) return NULL;
 
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END)) { fclose(f); return NULL; }
     long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    if (sz < 0 || fseek(f, 0, SEEK_SET)) { fclose(f); return NULL; }
     char *raw = (char *)malloc((size_t)sz + 1);
     if (!raw || fread(raw, 1, (size_t)sz, f) != (size_t)sz) { free(raw); fclose(f); return NULL; }
     raw[sz] = 0;
@@ -570,7 +570,7 @@ int waste_tok_encode(const waste_tok *t, const char *text, int32_t *out,
     return n;
 }
 
-int waste_tok_decode1(const waste_tok *t, int32_t id, char *buf, int cap)
+int waste_tok_decode_len1(const waste_tok *t, int32_t id)
 {
     /* Specials first: they are not in the rank table, and returning zero
      * bytes for them silently deleted them from every decode. That is how
@@ -578,22 +578,29 @@ int waste_tok_decode1(const waste_tok *t, int32_t id, char *buf, int cap)
      * "response" — and why a stop string written in markers could never
      * match the text it was compared against. Encode and decode have to
      * agree about what a token is. */
-    if (cap <= 0) return 0;
+    for (int i = 0; i < t->n_special; i++)
+        if (t->special[i].id == id) return t->special[i].len;
+    if (id >= 0 && id <= t->max_id && t->by_id) {
+        const int32_t i = t->by_id[id];
+        if (i >= 0) return t->by_rank[i].len;
+    }
+    return 0;
+}
+
+int waste_tok_decode1(const waste_tok *t, int32_t id, char *buf, int cap)
+{
+    if (!buf || cap <= 0) return 0;
+    const int full = waste_tok_decode_len1(t, id);
+    const int l = full < cap ? full : cap;
+    if (!l) return 0;
     for (int i = 0; i < t->n_special; i++)
         if (t->special[i].id == id) {
-            const int l = t->special[i].len < cap ? t->special[i].len : cap;
             memcpy(buf, t->special[i].text, (size_t)l);
             return l;
         }
-    if (id >= 0 && id <= t->max_id && t->by_id) {
-        const int32_t i = t->by_id[id];
-        if (i >= 0) {
-            const int l = t->by_rank[i].len < cap ? t->by_rank[i].len : cap;
-            memcpy(buf, t->by_rank[i].p, (size_t)l);
-            return l;
-        }
-    }
-    return 0;
+    const int32_t i = t->by_id[id];
+    memcpy(buf, t->by_rank[i].p, (size_t)l);
+    return l;
 }
 
 int waste_tok_decode(const waste_tok *t, const int32_t *ids, int n,

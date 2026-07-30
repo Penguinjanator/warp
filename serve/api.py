@@ -89,6 +89,24 @@ def validate_messages(messages: Any) -> list[dict]:
             raise APIError(
                 f"messages[{i}].role must be one of {sorted(roles)}",
                 param=f"messages[{i}].role")
+        content = m.get("content")
+        if content is not None and not isinstance(content, (str, list)):
+            raise APIError(
+                f"messages[{i}].content must be a string, an array, or null",
+                param=f"messages[{i}].content")
+        if isinstance(content, list):
+            for j, part in enumerate(content):
+                param = f"messages[{i}].content[{j}]"
+                if not isinstance(part, dict):
+                    raise APIError(f"{param} must be an object", param=param)
+                kind = part.get("type")
+                if not isinstance(kind, str) or not kind:
+                    raise APIError(f"{param}.type must be a non-empty string",
+                                   param=f"{param}.type")
+                if kind not in ("image", "image_url") and not isinstance(
+                        part.get("text"), str):
+                    raise APIError(f"{param}.text must be a string",
+                                   param=f"{param}.text")
         m = dict(m)
         if role == "developer":
             # OpenAI's newer name for a system turn. K3 has one system role,

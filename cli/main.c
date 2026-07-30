@@ -18,6 +18,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <string.h>
 #include <unistd.h>
@@ -32,17 +34,61 @@
  * here because parse_opts refuses a --stop that would not fit in it. */
 #define TAILCAP 256
 
-static uint64_t parse_size(const char *s)
+static int parse_size(const char *s, uint64_t *out)
 {
-    char *end;
+    char *end = NULL;
+    errno = 0;
     double v = strtod(s, &end);
-    while (*end == ' ') end++;
-    switch (*end) {
-    case 'g': case 'G': return (uint64_t)(v * (1ULL << 30));
-    case 'm': case 'M': return (uint64_t)(v * (1ULL << 20));
-    case 'k': case 'K': return (uint64_t)(v * (1ULL << 10));
-    default: return (uint64_t)v;
-    }
+    if (errno || end == s || !isfinite(v) || v < 0.0) return -1;
+    while (isspace((unsigned char)*end)) end++;
+    uint64_t mul = 1;
+    if (*end == 'g' || *end == 'G') { mul = 1ULL << 30; end++; }
+    else if (*end == 'm' || *end == 'M') { mul = 1ULL << 20; end++; }
+    else if (*end == 'k' || *end == 'K') { mul = 1ULL << 10; end++; }
+    if (*end == 'b' || *end == 'B') end++;
+    while (isspace((unsigned char)*end)) end++;
+    if (*end || v >= (double)UINT64_MAX / (double)mul) return -1;
+    *out = (uint64_t)(v * (double)mul);
+    return 0;
+}
+
+static int parse_u64(const char *s, uint64_t *out)
+{
+    if (!s || *s == '-') return -1;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long long v = strtoull(s, &end, 10);
+    while (end && isspace((unsigned char)*end)) end++;
+    if (errno || end == s || !end || *end) return -1;
+    *out = (uint64_t)v;
+    return 0;
+}
+
+static int parse_u32(const char *s, uint32_t *out)
+{
+    uint64_t v = 0;
+    if (parse_u64(s, &v) || v > UINT32_MAX) return -1;
+    *out = (uint32_t)v;
+    return 0;
+}
+
+static int parse_nonnegative_int(const char *s, int *out)
+{
+    uint64_t v = 0;
+    if (parse_u64(s, &v) || v > INT_MAX) return -1;
+    *out = (int)v;
+    return 0;
+}
+
+static int parse_float(const char *s, float *out)
+{
+    char *end = NULL;
+    errno = 0;
+    const float v = strtof(s, &end);
+    while (end && isspace((unsigned char)*end)) end++;
+    if (errno || end == s || !end || *end || !isfinite(v)) return -1;
+    *out = v;
+    return 0;
 }
 
 static void human(uint64_t b, char *out, size_t cap)
@@ -123,14 +169,15 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
             }
         }
         const char *v = need ? argv[i + 1] : NULL;
-        if (!strcmp(a, "--budget")) o->budget = parse_size(v);
-        else if (!strcmp(a, "--ctx")) o->ctx = (uint32_t)atoi(v);
-        else if (!strcmp(a, "-n")) o->max_tokens = (uint32_t)atoi(v);
-        else if (!strcmp(a, "--temp")) o->temperature = (float)atof(v);
-        else if (!strcmp(a, "--top-p")) o->top_p = (float)atof(v);
-        else if (!strcmp(a, "--top-k")) o->top_k = atoi(v);
-        else if (!strcmp(a, "--seed")) o->seed = strtoull(v, NULL, 10);
-        else if (!strcmp(a, "--threads")) o->threads = atoi(v);
+        int bad = 0;
+        if (!strcmp(a, "--budget")) bad = parse_size(v, &o->budget);
+        else if (!strcmp(a, "--ctx")) bad = parse_u32(v, &o->ctx);
+        else if (!strcmp(a, "-n")) bad = parse_u32(v, &o->max_tokens);
+        else if (!strcmp(a, "--temp")) bad = parse_float(v, &o->temperature);
+        else if (!strcmp(a, "--top-p")) bad = parse_float(v, &o->top_p);
+        else if (!strcmp(a, "--top-k")) bad = parse_nonnegative_int(v, &o->top_k);
+        else if (!strcmp(a, "--seed")) bad = parse_u64(v, &o->seed);
+        else if (!strcmp(a, "--threads")) bad = parse_nonnegative_int(v, &o->threads);
         else if (!strcmp(a, "--file")) o->file = v;
         else if (!strcmp(a, "--stop")) o->stop = v;
         else if (!strcmp(a, "--system")) o->system = v;
@@ -158,6 +205,10 @@ static int parse_opts(int argc, char **argv, int from, opts *o)
                 return -1;
             }
             o->pos[o->n_pos++] = a;
+        }
+        if (bad) {
+            fprintf(stderr, "invalid value for %s: %s\n", a, v ? v : "");
+            return -1;
         }
         i += need;
     }
@@ -846,15 +897,25 @@ static int cmd_chat(int argc, char **argv)
 
     /* The system turn goes in once, before anything else. */
     if (templated && o.system && *o.system) {
-        char sysbuf[4096];
-        snprintf(sysbuf, sizeof sysbuf, "%s%s%s",
-                 fmt.sys_p, o.system, fmt.sys_s);
         opts q = o;
-        q.quiet = 1;
-        q.max_tokens = 1;
         q.n_image = 0;              /* a picture belongs to a user turn */
-        run_prompt(c, &q, sysbuf, 0);
-        waste_state_reset(c);       /* keep the text, drop the sampled token */
+        const seg system_turn[3] = {
+            { fmt.sys_p, 1 }, { o.system, 0 }, { fmt.sys_s, 1 },
+        };
+        int32_t ids[MAXTOK];
+        size_t n = 0;
+        if (build_prompt_segs(c, &q, system_turn, 3, ids, MAXTOK, &n)) {
+            waste_close(c);
+            return 1;
+        }
+        /* Prefill only.  Generating one token and resetting cannot remove
+         * just that token: reset also erases the system turn itself. */
+        const waste_status es = waste_eval(c, ids, n, NULL, NULL);
+        if (es != WASTE_OK) {
+            const int rc = fail_ctx("system prompt", es, c);
+            waste_close(c);
+            return rc;
+        }
     }
     /* Attached paths live here rather than in strdup'd memory: image[]
      * otherwise mixes argv pointers with owned ones and /reset in a long
@@ -996,6 +1057,28 @@ static int cmd_bench(int argc, char **argv)
     return 0;
 }
 
+static char *detokenize_alloc(waste_ctx *c, const int32_t *ids, size_t n,
+                              size_t *used, waste_status *status)
+{
+    size_t cap = n <= (SIZE_MAX - 64) / 4 ? n * 4 + 64 : 0;
+    if (cap < 64) cap = 64;
+    char *out = (char *)malloc(cap);
+    if (!out) { *status = WASTE_E_OOM; return NULL; }
+    for (;;) {
+        size_t need = 0;
+        *status = waste_detokenize(c, ids, n, out, cap, &need);
+        if (*status == WASTE_OK) { *used = need; return out; }
+        if (*status != WASTE_E_ARG || need >= SIZE_MAX - 1) {
+            free(out);
+            return NULL;
+        }
+        cap = need + 1;
+        char *grown = (char *)realloc(out, cap);
+        if (!grown) { free(out); *status = WASTE_E_OOM; return NULL; }
+        out = grown;
+    }
+}
+
 /* Tokenize and detokenize: the round trip the engine does on every prompt,
  * exposed because debugging a container without it means guessing. */
 static int cmd_tokens(int argc, char **argv, int decode)
@@ -1019,11 +1102,11 @@ static int cmd_tokens(int argc, char **argv, int decode)
         size_t n = 0;
         for (char *t = strtok(text, " ,\t\n"); t && n < MAXTOK; t = strtok(NULL, " ,\t\n"))
             ids[n++] = (int32_t)atoi(t);
-        char out[8192];
         size_t used = 0;
-        const waste_status d = waste_detokenize(c, ids, n, out, sizeof out, &used);
-        if (d != WASTE_OK) rc = fail("detokenize", d);
-        else printf("%.*s\n", (int)used, out);
+        waste_status d = WASTE_OK;
+        char *out = detokenize_alloc(c, ids, n, &used, &d);
+        if (!out) rc = fail("detokenize", d);
+        else { fwrite(out, 1, used, stdout); putchar('\n'); free(out); }
     } else {
         int32_t ids[MAXTOK];
         size_t n = 0;
@@ -1101,14 +1184,16 @@ static int cmd_eval(int argc, char **argv)
         }
         picked[i] = (int32_t)best;
         const double pr = exp((double)(bv - mx)) / sum;
-        char piece[64] = "";
         size_t used = 0;
         const int32_t one = (int32_t)best;
-        waste_detokenize(c, &one, 1, piece, sizeof piece, &used);
+        waste_status ds = WASTE_OK;
+        char *piece = detokenize_alloc(c, &one, 1, &used, &ds);
         if (o.json)
             printf("%s{\"id\":%zu,\"logit\":%.4f,\"prob\":%.6f}", i ? "," : "", best, bv, pr);
         else
-            printf("  %6zu  %8.4f  %7.4f  %.*s\n", best, bv, pr, (int)used, piece);
+            printf("  %6zu  %8.4f  %7.4f  %.*s\n", best, bv, pr,
+                   piece ? (int)used : 0, piece ? piece : "");
+        free(piece);
     }
     if (o.json) printf("]}\n");
 

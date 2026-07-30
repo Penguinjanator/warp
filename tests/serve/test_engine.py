@@ -20,7 +20,9 @@ Skipped, loudly, when libwaste has not been built.
     make libwaste.dylib && python3 tests/serve/test_engine.py
 """
 
+import json
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -110,6 +112,18 @@ class TestLibrary(EngineTestCase):
             + plan.min_expert_cache,
             "floor_bytes is documented as the sum of the parts")
 
+    def test_plan_uses_manifest_vq_geometry(self):
+        variant = Path(self.tmp) / "vq-plan.waste"
+        shutil.copytree(self.model, variant)
+        path = variant / "manifest.json"
+        manifest = json.loads(path.read_text())
+        manifest["expert_quant"].update(
+            {"stages": 8, "vec_dim": 1, "entries": 256})
+        path.write_text(json.dumps(manifest))
+        ordinary = E.plan_memory(str(self.model), 512)
+        changed = E.plan_memory(str(variant), 512)
+        self.assertGreater(changed.scratch_bytes, ordinary.scratch_bytes)
+
     def test_missing_model_is_an_error_not_a_crash(self):
         with self.assertRaises(E.EngineError) as cm:
             E.Engine(str(Path(self.tmp) / "nope.waste"))
@@ -195,6 +209,14 @@ class TestTokenizer(EngineTestCase):
         text = "word " * 5000
         ids = self.engine.tokenize(text)
         self.assertGreater(len(ids), 0)
+        self.assertEqual(self.engine.detokenize(ids), text)
+
+    def test_many_long_tokens_grow_the_decode_buffer(self):
+        one = self.engine.tokenize("weather")
+        self.assertEqual(len(one), 1)
+        ids = one * 500
+        text = "weather" * 500
+        self.assertLess(4 * len(ids) + 64, len(text))
         self.assertEqual(self.engine.detokenize(ids), text)
 
 
@@ -378,6 +400,65 @@ class TestState(EngineTestCase):
         with self.assertRaises(E.EngineError):
             self.engine.state_load(str(Path(self.tmp) / "nope.state"))
 
+    def test_truncated_state_does_not_modify_the_live_context(self):
+        good = Path(self.tmp) / "good.state"
+        bad = Path(self.tmp) / "truncated.state"
+        after = Path(self.tmp) / "after.state"
+        self.engine.generate(self.engine.tokenize("hello"),
+                             lambda *a: True, max_tokens=4)
+        self.engine.state_save(str(good))
+        original = good.read_bytes()
+        bad.write_bytes(original[:-4])
+        with self.assertRaises(E.EngineError):
+            self.engine.state_load(str(bad))
+        self.engine.state_save(str(after))
+        self.assertEqual(after.read_bytes(), original)
+
+    def test_out_of_range_checkpoint_position_is_rejected(self):
+        good = Path(self.tmp) / "position-good.state"
+        bad = Path(self.tmp) / "position-bad.state"
+        self.engine.generate(self.engine.tokenize("hello"),
+                             lambda *a: True, max_tokens=2)
+        self.engine.state_save(str(good))
+        payload = bytearray(good.read_bytes())
+        struct.pack_into("<i", payload, 48, 1_000_000)
+        bad.write_bytes(payload)
+        with self.assertRaises(E.EngineError) as cm:
+            self.engine.state_load(str(bad))
+        self.assertEqual(cm.exception.status, E.WASTE_E_FORMAT)
+
+
+class TestMalformedContainer(EngineTestCase):
+    def test_missing_layer_norm_is_rejected_at_open(self):
+        broken = Path(self.tmp) / "missing-norm.waste"
+        shutil.copytree(self.model, broken)
+        manifest_path = broken / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["trunk"] = [t for t in manifest["trunk"]
+                             if t["name"] !=
+                             "model.layers.0.input_layernorm.weight"]
+        manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaises(E.EngineError) as cm:
+            E.Engine(str(broken), ram_budget_bytes=1 << 30)
+        self.assertEqual(cm.exception.status, E.WASTE_E_FORMAT)
+
+    def test_invalid_vision_geometry_is_rejected_at_open(self):
+        broken = Path(self.tmp) / "bad-vision.waste"
+        shutil.copytree(self.model, broken)
+        manifest_path = broken / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        tower = dict(manifest["trunk"][0])
+        tower["name"] = "vision_tower.patch_embed.proj.weight"
+        manifest["trunk"].append(tower)
+        manifest_path.write_text(json.dumps(manifest))
+        (broken / "vision.json").write_text(json.dumps({
+            "vt_num_attention_heads": 0,
+            "media_placeholder_token_id": 1,
+        }))
+        with self.assertRaises(E.EngineError) as cm:
+            E.Engine(str(broken), ram_budget_bytes=1 << 30, vision=True)
+        self.assertEqual(cm.exception.status, E.WASTE_E_FORMAT)
+
 
 class TestVision(EngineTestCase):
     def test_images_need_the_tower(self):
@@ -389,6 +470,37 @@ class TestVision(EngineTestCase):
 
 
 class TestConcurrency(EngineTestCase):
+    def test_distinct_contexts_can_use_the_shared_pool_concurrently(self):
+        import threading
+
+        other = E.Engine(str(self.model), ram_budget_bytes=1 << 30)
+        barrier = threading.Barrier(2)
+        outputs = [None, None]
+        errors = []
+
+        def run(index, engine):
+            try:
+                barrier.wait(timeout=10)
+                ids = []
+                engine.generate(engine.tokenize("hello"),
+                                lambda tid, *_: ids.append(tid) or True,
+                                temperature=0.0, max_tokens=8)
+                outputs[index] = ids
+            except Exception as exc:  # surfaced in the parent test thread
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run, args=(0, self.engine)),
+                   threading.Thread(target=run, args=(1, other))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+        other.close()
+        self.assertFalse(any(thread.is_alive() for thread in threads),
+                         "shared worker pool deadlocked")
+        self.assertFalse(errors, errors)
+        self.assertEqual(outputs[0], outputs[1])
+
     def test_generations_serialize(self):
         """A waste_ctx takes one caller; the lock is what makes that true.
 

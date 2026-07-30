@@ -51,6 +51,7 @@ int  waste_tok_encode(const waste_tok *t, const char *text, int32_t *out,
                       int cap, int allow_special);
 
 /* Decodes one token into `buf`; returns bytes written (no NUL). */
+int  waste_tok_decode_len1(const waste_tok *t, int32_t id);
 int  waste_tok_decode1(const waste_tok *t, int32_t id, char *buf, int cap);
 int  waste_tok_decode(const waste_tok *t, const int32_t *ids, int n,
                       char *buf, int cap);

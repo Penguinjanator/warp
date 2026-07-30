@@ -11,6 +11,7 @@
 
 #include "waste.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -225,10 +226,20 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
     const int vocab = (int)js_int(&d, js_get(&d, cfg, "vocab_size"), 0);
     const int lat = (int)js_int(&d, js_get(&d, cfg, "routed_expert_hidden_size"), hidden);
     const int n_shared = (int)js_int(&d, js_get(&d, cfg, "num_shared_experts"), 1);
+    const int n_shared_eff = n_shared ? n_shared : 1;
     const int ares = (int)js_int(&d, js_get(&d, cfg, "attn_res_block_size"), 0);
+    const int eq = js_get(&d, 0, "expert_quant");
+    const int stages = (int)js_int(&d, js_get(&d, eq, "stages"), 3);
+    const int vec_dim = (int)js_int(&d, js_get(&d, eq, "vec_dim"), 8);
+    const int entries = (int)js_int(&d, js_get(&d, eq, "entries"), 256);
+    if (stages < 1 || stages > 8 || vec_dim < 1 || vec_dim > 64 ||
+        entries < 1 || entries > 256) {
+        js_free(&d); free(src); return WASTE_E_FORMAT;
+    }
     const int nb = ares ? layers / ares + 2 : 1;
     const int big = hidden > kh * kd ? hidden : kh * kd;
     const int wide = hidden > lat ? hidden : lat;
+    int lut_wide = wide > moe_inter ? wide : moe_inter;
     const int T = WASTE_CHUNK_MAX;
 
     uint64_t sc = 0;
@@ -252,8 +263,14 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
     sc += (uint64_t)(nb + 4) * hidden * 4;                  /* AttnRes buffers */
     /* chunked prefill, allocated on first use and never freed */
     sc += (uint64_t)T * hidden * 4 * 3;                     /* cx/cnorm/cresid */
-    sc += ((uint64_t)(2 * T + 1) * (wide / 8) * 3 * 256 + 64) * 4;   /* LUTs   */
-    sc += ((uint64_t)T * (2 * moe_inter * n_shared + hidden) + 64) * 4;
+    {   /* Decode keeps three LUTs and chunked prefill keeps 2*T+1.
+         * Both allocations use the container's VQ geometry. */
+        const uint64_t lut = (uint64_t)(lut_wide / vec_dim + 1) *
+                             (uint64_t)stages * (uint64_t)entries;
+        sc += ((uint64_t)(2 * T + 1) * lut + 64) * 4;       /* m->cq  */
+        sc += 3 * lut * 4;                                  /* m->lut */
+    }
+    sc += ((uint64_t)T * (2 * moe_inter * n_shared_eff + hidden) + 64) * 4;
     sc += (uint64_t)T * (2 * lat + 2 * hidden) * 4;
     sc += (uint64_t)2 * T * dense_inter * 4;
     sc += (uint64_t)3 * moe_inter * lat * 4;                /* one expert      */
@@ -461,9 +478,18 @@ waste_status waste_detokenize(waste_ctx *c, const int32_t *ids, size_t n,
      * out[0] — a one-byte overflow of a zero-byte buffer. */
     if (!cap) return WASTE_E_ARG;
     if (!c->tok) return WASTE_E_UNSUPPORTED;
+    if (n > INT_MAX || cap > INT_MAX) return WASTE_E_ARG;
+    size_t need = 0;
+    for (size_t i = 0; i < n; i++) {
+        const int one = waste_tok_decode_len1(c->tok, ids[i]);
+        if ((size_t)one > SIZE_MAX - need) return WASTE_E_ARG;
+        need += (size_t)one;
+    }
+    *n_out = need;
+    if (need >= cap) { out[0] = 0; return WASTE_E_ARG; }
     const int got = waste_tok_decode(c->tok, ids, (int)n, out, (int)cap - 1);
-    out[got < 0 ? 0 : got] = 0;
-    *n_out = (size_t)(got < 0 ? 0 : got);
+    out[got] = 0;
+    *n_out = (size_t)got;
     return WASTE_OK;
 }
 
@@ -791,7 +817,6 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
     c->stats.sec_total += nowf() - t0;
     if (!lg) return read_error_report(c);
 
-    char piece[64];
     waste_status st = WASTE_OK;
     int cur = sample(lg, c->m.cfg.vocab, &p, &rng);
     for (uint32_t t = 0; t < p.max_tokens; t++) {
@@ -821,10 +846,18 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
             info.experts_missed = (uint32_t)(c->m.cache.misses - mb);
             info.bytes_read = c->m.cache.bytes_read - bb;
             info.ms_total = dt * 1000.0;
-            int pn = 0;
-            if (c->tok) pn = waste_tok_decode1(c->tok, cur, piece, (int)sizeof piece - 1);
+            char local[256], *piece = local;
+            int pn = 0, need = 0;
+            if (c->tok) need = waste_tok_decode_len1(c->tok, cur);
+            if ((size_t)need + 1 > sizeof local) {
+                piece = (char *)malloc((size_t)need + 1);
+                if (!piece) return WASTE_E_OOM;
+            }
+            if (c->tok) pn = waste_tok_decode1(c->tok, cur, piece, need);
             piece[pn] = 0;
-            if (cb(&info, piece, user) != 0) return WASTE_E_CANCELLED;
+            const int cancelled = cb(&info, piece, user) != 0;
+            if (piece != local) free(piece);
+            if (cancelled) return WASTE_E_CANCELLED;
         }
         /* `cur` was sampled from the previous step and has already gone to
          * the callback; it is the token after it that has no logits. The
@@ -856,6 +889,12 @@ void waste_state_reset(waste_ctx *c)
                    (size_t)3 * cf->kda_heads * cf->kda_dim * (cf->conv_k - 1) * sizeof(float));
         c->m.n_kv[L] = 0;
     }
+    c->m.n_blockres = 0;
+    if (c->m.x) memset(c->m.x, 0, (size_t)cf->hidden * sizeof(float));
+    if (c->m.blockres && cf->attn_res_block) {
+        const int nb = cf->n_layers / cf->attn_res_block + 2;
+        memset(c->m.blockres, 0, (size_t)nb * cf->hidden * sizeof(float));
+    }
 }
 
 waste_status waste_state_save(waste_ctx *c, const char *path)
@@ -870,7 +909,10 @@ waste_status waste_state_load(waste_ctx *c, const char *path)
     int pos = 0;
     const int rc = waste_model_state_load(&c->m, path, &pos);
     if (rc == -2) return WASTE_E_FORMAT;      /* built for a different model */
-    if (rc) return WASTE_E_IO;
+    if (rc) {
+        if (rc == -3) waste_state_reset(c);
+        return WASTE_E_IO;
+    }
     c->pos = pos;
     return WASTE_OK;
 }

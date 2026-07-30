@@ -195,12 +195,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             path = self.path.split("?", 1)[0].rstrip("/") or "/"
             if not self._authorized():
+                self.close_connection = True
                 raise api.APIError("invalid API key", status=401,
                                    type="authentication_error")
             if path == "/v1/chat/completions":
                 return self._chat()
             if path == "/v1/completions":
                 return self._completions()
+            self.close_connection = True
             raise api.APIError(f"no route for POST {path}", status=404,
                                type="not_found_error")
         except api.APIError as e:
@@ -297,23 +299,46 @@ class Handler(BaseHTTPRequestHandler):
         client stops the generation rather than paying for all of it.
         """
         engine = self.server.engine
-        state = {"n": 0, "stopped": False}
+        stops = [s for s in stops if s]
+        state = {"n": 0, "stopped": False, "content_sent": 0}
+
+        def stop_at(text):
+            hits = [p for s in stops if (p := text.find(s)) >= 0]
+            return min(hits) if hits else None
+
+        def safe_content_end(text):
+            """Exclude a suffix that may become a stop on the next token."""
+            end = len(text)
+            for s in stops:
+                limit = min(len(s) - 1, len(text))
+                for n in range(limit, 0, -1):
+                    if text.endswith(s[:n]):
+                        end = min(end, len(text) - n)
+                        break
+            return end
+
+        def deliver(delta, *, final=False):
+            hit = stop_at(parser.content)
+            if hit is not None:
+                parser.content = parser.content[:hit]
+            end = len(parser.content) if final or hit is not None else safe_content_end(
+                parser.content)
+            sent = state["content_sent"]
+            delta.content = parser.content[sent:end] if end >= sent else ""
+            state["content_sent"] = end
+            if delta.reasoning or delta.content or delta.tool_calls:
+                on_delta(delta)
+            return hit is not None
 
         def on_token(token_id, piece, info):
             state["n"] += 1
             delta = parser.feed_token(token_id, piece)
-            if delta.reasoning or delta.content or delta.tool_calls:
-                on_delta(delta)
+            if deliver(delta, final=parser.finished):
+                state["stopped"] = True
+                return False
             if parser.finished:
                 state["stopped"] = True
                 return False
-            # Stop strings are matched against the answer only: a sequence
-            # the client wants to stop at should not be defused by landing
-            # in the reasoning channel, nor should reasoning text trip it.
-            for s in stops:
-                if s and s in parser.content:
-                    state["stopped"] = True
-                    return False
             return True
 
         completed = engine.generate(
@@ -322,7 +347,10 @@ class Handler(BaseHTTPRequestHandler):
             top_k=opts["top_k"], seed=opts["seed"],
             max_tokens=opts["max_tokens"],
             stop_tokens=self.server.stop_tokens or None)
-        parser.finish()
+        tail = parser.finish()
+        if not state["stopped"]:
+            if deliver(tail, final=True):
+                state["stopped"] = True
         hit_limit = completed and state["n"] >= opts["max_tokens"]
         return state["n"], hit_limit, state["stopped"]
 

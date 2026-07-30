@@ -12,6 +12,7 @@
 #define _GNU_SOURCE
 #include "model.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -591,6 +592,134 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
     return 0;
 }
 
+static int tensor_matrix_ok(const waste_model *m, const char *name, int rows, int cols)
+{
+    const waste_tensor *t = waste_find(m, name);
+    return t && t->ndim == 2 && t->shape[0] == rows && t->shape[1] == cols &&
+           (t->data || t->q || t->on_disk);
+}
+
+static int tensor_vector_ok(const waste_model *m, const char *name, int n)
+{
+    const waste_tensor *t = waste_find(m, name);
+    return t && t->n == (size_t)n && t->data;
+}
+
+static int tensor_data_ok(const waste_model *m, const char *name, size_t n)
+{
+    const waste_tensor *t = waste_find(m, name);
+    return t && t->n >= n && t->data;
+}
+
+static int bad_tensor(const char *name)
+{
+    fprintf(stderr, "waste: required tensor is missing or has the wrong shape: %s\n",
+            name);
+    return 0;
+}
+
+#define REQUIRE_MATRIX(name, rows, cols) \
+    do { const char *rn_ = (name); if (!tensor_matrix_ok(m, rn_, (rows), (cols))) \
+        return bad_tensor(rn_); } while (0)
+#define REQUIRE_VECTOR(name, n) \
+    do { const char *rn_ = (name); if (!tensor_vector_ok(m, rn_, (n))) \
+        return bad_tensor(rn_); } while (0)
+#define REQUIRE_DATA(name, n) \
+    do { const char *rn_ = (name); if (!tensor_data_ok(m, rn_, (n))) \
+        return bad_tensor(rn_); } while (0)
+
+/* Validate every tensor shape the text forward pass indexes.  Kernel calls
+ * receive dimensions from config rather than from the tensor, so merely
+ * checking that a name exists is not enough: a shorter, correctly named
+ * tensor is an out-of-bounds read. */
+static int validate_text_tensors(waste_model *m)
+{
+    const waste_config *c = &m->cfg;
+    const int hid = c->hidden;
+    REQUIRE_MATRIX(tname("%smodel.embed_tokens.weight", c->prefix), c->vocab, hid);
+    REQUIRE_VECTOR(tname("%smodel.norm.weight", c->prefix), hid);
+    REQUIRE_MATRIX(tname("%slm_head.weight", c->prefix), c->vocab, hid);
+
+    for (int L = 0; L < c->n_layers; L++) {
+        REQUIRE_VECTOR(tname("%smodel.layers.%d.input_layernorm.weight", c->prefix, L), hid);
+        REQUIRE_VECTOR(tname("%smodel.layers.%d.post_attention_layernorm.weight", c->prefix, L), hid);
+
+        if (c->kda_layer[L]) {
+            const int H = c->kda_heads, D = c->kda_dim, C = H * D;
+            const char *kind[3] = { "q", "k", "v" };
+            for (int i = 0; i < 3; i++) {
+                REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.%s_proj.weight",
+                                     c->prefix, L, kind[i]), C, hid);
+                REQUIRE_DATA(tname("%smodel.layers.%d.self_attn.%s_conv1d.weight",
+                                   c->prefix, L, kind[i]), (size_t)C * c->conv_k);
+            }
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.f_a_proj.weight", c->prefix, L), D, hid);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.f_b_proj.weight", c->prefix, L), C, D);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.b_proj.weight", c->prefix, L), H, hid);
+            REQUIRE_DATA(tname("%smodel.layers.%d.self_attn.A_log", c->prefix, L), H);
+            REQUIRE_DATA(tname("%smodel.layers.%d.self_attn.dt_bias", c->prefix, L), C);
+            if (c->full_rank_gate) {
+                REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.g_proj.weight", c->prefix, L), C, hid);
+            } else {
+                REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.g_a_proj.weight", c->prefix, L), D, hid);
+                REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.g_b_proj.weight", c->prefix, L), C, D);
+            }
+            REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attn.o_norm.weight", c->prefix, L), D);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L), hid, C);
+        } else {
+            const int qd = c->qk_nope + c->qk_rope;
+            if (c->q_lora) {
+                REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.q_a_proj.weight", c->prefix, L), c->q_lora, hid);
+                REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attn.q_a_layernorm.weight", c->prefix, L), c->q_lora);
+                REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.q_b_proj.weight", c->prefix, L), c->n_heads * qd, c->q_lora);
+            } else {
+                REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.q_proj.weight", c->prefix, L), c->n_heads * qd, hid);
+            }
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.kv_a_proj_with_mqa.weight", c->prefix, L), c->kv_lora + c->qk_rope, hid);
+            REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attn.kv_a_layernorm.weight", c->prefix, L), c->kv_lora);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.kv_b_proj.weight", c->prefix, L), c->n_heads * (c->qk_nope + c->v_head), c->kv_lora);
+            if (c->mla_output_gate)
+                REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.g_proj.weight", c->prefix, L), c->n_heads * c->v_head, hid);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L), hid, c->n_heads * c->v_head);
+        }
+
+        if (c->attn_res_block) {
+            REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attention_res_norm.weight", c->prefix, L), hid);
+            REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attention_res_proj.weight", c->prefix, L), hid);
+            REQUIRE_VECTOR(tname("%smodel.layers.%d.mlp_res_norm.weight", c->prefix, L), hid);
+            REQUIRE_VECTOR(tname("%smodel.layers.%d.mlp_res_proj.weight", c->prefix, L), hid);
+        }
+
+        if (c->n_experts && L >= c->first_dense) {
+            const int lat = c->latent_dim ? c->latent_dim : hid;
+            const int shared = c->moe_inter * (c->n_shared ? c->n_shared : 1);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L), c->n_experts, hid);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight", c->prefix, L), shared, hid);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.shared_experts.up_proj.weight", c->prefix, L), shared, hid);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight", c->prefix, L), hid, shared);
+            if (c->latent_dim) {
+                REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.routed_expert_down_proj.weight", c->prefix, L), lat, hid);
+                REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.routed_expert_up_proj.weight", c->prefix, L), hid, lat);
+                if (c->latent_norm)
+                    REQUIRE_VECTOR(tname("%smodel.layers.%d.block_sparse_moe.routed_expert_norm.weight", c->prefix, L), lat);
+            }
+        } else {
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.mlp.gate_proj.weight", c->prefix, L), c->dense_inter, hid);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.mlp.up_proj.weight", c->prefix, L), c->dense_inter, hid);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.mlp.down_proj.weight", c->prefix, L), hid, c->dense_inter);
+        }
+    }
+    if (c->attn_res_block) {
+        REQUIRE_VECTOR(tname("%smodel.output_attn_res_norm.weight", c->prefix), hid);
+        REQUIRE_VECTOR(tname("%smodel.output_attn_res_proj.weight", c->prefix), hid);
+    }
+    return 1;
+}
+
+#undef REQUIRE_MATRIX
+#undef REQUIRE_VECTOR
+#undef REQUIRE_DATA
+
 /* A manifest is untrusted input, and these numbers size allocations and
  * bound loops that index fixed arrays. A config claiming 200 layers walks
  * off the end of waste_model's [WASTE_MAX_LAYERS] arrays; one claiming
@@ -613,12 +742,33 @@ static int cfg_sane(const waste_config *c)
     if (c->kda_heads < 0 || c->kda_heads > (1 << 16)) return 0;
     if (c->kda_dim   < 0 || c->kda_dim   > (1 << 16)) return 0;
     if (c->conv_k    < 0 || c->conv_k    > 64) return 0;
-    if (c->kv_lora   < 0 || c->q_lora    < 0) return 0;
-    if (c->qk_nope   < 0 || c->qk_rope   < 0 || c->v_head < 0) return 0;
+    if (c->kv_lora < 0 || c->kv_lora > (1 << 20) ||
+        c->q_lora < 0 || c->q_lora > (1 << 20)) return 0;
+    if (c->qk_nope < 0 || c->qk_nope > (1 << 20) ||
+        c->qk_rope < 0 || c->qk_rope > (1 << 20) ||
+        c->v_head < 0 || c->v_head > (1 << 20)) return 0;
     if (c->first_dense < 0 || c->first_dense > c->n_layers) return 0;
     if (c->n_shared  < 0 || c->n_shared  > 64) return 0;
     if (c->latent_dim < 0 || c->latent_dim > (1 << 20)) return 0;
     if (c->attn_res_block < 0 || c->attn_res_block > c->n_layers) return 0;
+    int n_kda = 0;
+    for (int L = 0; L < c->n_layers; L++) n_kda += !!c->kda_layer[L];
+    if (n_kda) {
+        if (c->kda_heads < 1 || c->kda_dim < 1 || c->conv_k < 1) return 0;
+        if ((int64_t)c->kda_heads * c->kda_dim > INT_MAX) return 0;
+    }
+    if (n_kda < c->n_layers) {
+        const int64_t qd = (int64_t)c->qk_nope + c->qk_rope;
+        if (c->kv_lora < 1 || qd < 1 || c->v_head < 1) return 0;
+        if ((int64_t)c->n_heads * qd > INT_MAX ||
+            (int64_t)c->n_heads * c->v_head > INT_MAX ||
+            (int64_t)c->n_heads * (c->qk_nope + c->v_head) > INT_MAX)
+            return 0;
+    }
+    if (c->n_experts && c->moe_inter < 1) return 0;
+    if ((!c->n_experts || c->first_dense) && c->dense_inter < 1) return 0;
+    if ((int64_t)c->moe_inter * (c->n_shared ? c->n_shared : 1) > INT_MAX)
+        return 0;
     return 1;
 }
 
@@ -687,6 +837,8 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     if (!opt) opt = &defaults;
     const size_t cache_bytes = opt->cache_bytes;
     memset(m, 0, sizeof *m);
+    m->trunk_fd = -1;
+    for (int L = 0; L < WASTE_MAX_LAYERS; L++) m->bank[L].fd = -1;
     m->want_vision = opt->want_vision;
     m->want_direct = opt->direct_io;
     if (prof_on < 0) { const char *e = getenv("WASTE_PROFILE"); prof_on = e && *e != '0'; }
@@ -834,6 +986,30 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
             free(vs);
         }
     }
+    if (m->want_vision && waste_find(m, "vision_tower.patch_embed.proj.weight")) {
+        const waste_vision_cfg *v = &m->vcfg;
+        int sane = v->hidden > 0 && v->hidden <= (1 << 20) &&
+                   v->heads > 0 && v->heads <= (1 << 16) &&
+                   v->qkv_hidden > 0 && v->qkv_hidden <= (1 << 20) &&
+                   v->qkv_hidden % v->heads == 0 &&
+                   v->inter > 0 && v->inter <= (1 << 22) &&
+                   v->layers > 0 && v->layers <= 256 &&
+                   v->pos_h > 0 && v->pos_h <= (1 << 16) &&
+                   v->pos_w > 0 && v->pos_w <= (1 << 16) &&
+                   v->text_hidden == c->hidden && v->patch == 14 &&
+                   v->media_token >= 0 && v->media_token < c->vocab &&
+                   v->max_patches >= 4 && v->max_patches <= (1 << 20) &&
+                   isfinite(v->eps) && v->eps > 0.0f &&
+                   isfinite(v->proj_eps) && v->proj_eps > 0.0f;
+        for (int k = 0; k < 3; k++)
+            sane = sane && isfinite(v->mean[k]) && isfinite(v->std[k]) &&
+                   v->std[k] > 0.0f;
+        if (!sane) {
+            fprintf(stderr, "waste: vision.json geometry is unsupported or out of range\n");
+            js_free(&d); free(src);
+            return -2;
+        }
+    }
 
     /* codebooks */
     snprintf(path, sizeof path, "%s/codebooks.bin", dir);
@@ -893,7 +1069,11 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         char key[16];
         snprintf(key, sizeof key, "%d", L);
         int e = js_get(&d, layers, key);
-        if (e < 0) continue;
+        const int expected = c->n_experts && L >= c->first_dense;
+        if (e < 0) {
+            if (expected) { js_free(&d); free(src); return -2; }
+            continue;
+        }
         char fn[64];
         js_str(&d, js_get(&d, e, "file"), fn, sizeof fn);
         snprintf(path, sizeof path, "%s/%s", dir, fn);
@@ -902,29 +1082,21 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         /* A layer's bank passes 2 GB well before K3's largest does, so the
          * division that produces rec_bytes has to happen in 64 bits. */
         const int64_t bytes = js_int(&d, js_get(&d, e, "bytes"), 0);
+        if (!expected || m->bank[L].n_experts != c->n_experts || bytes <= 0 ||
+            bytes % m->bank[L].n_experts != 0 || m->bank[L].cb_base < 0 ||
+            3 * m->stages > m->n_books ||
+            m->bank[L].cb_base > m->n_books - 3 * m->stages) {
+            js_free(&d); free(src); return -2;
+        }
         m->bank[L].rec_bytes = m->bank[L].n_experts ? bytes / m->bank[L].n_experts : 0;
         m->bank[L].fd = bank_open(path, m->bank[L].rec_bytes, m->want_direct,
                                   &m->direct_io);
+        if (m->bank[L].fd < 0) { js_free(&d); free(src); return -1; }
     }
     js_free(&d);
     free(src);
 
-    /* The three the forward pass reads for every token of every model,
-     * whatever its architecture: the embedding row, the final norm and
-     * the head. A trunk index that has lost them — an empty list, a
-     * truncated one — otherwise loads, and the first token dereferences
-     * the NULL that waste_find returns. Checking every tensor the pass
-     * might want would mean a second copy of its naming rules, and a
-     * wrong entry there would refuse a container that works; these three
-     * are unconditional, so the check cannot be wrong about them. */
-    {
-        static const char *req[] = { "%smodel.embed_tokens.weight",
-                                     "%smodel.norm.weight",
-                                     "%slm_head.weight" };
-        for (size_t i = 0; i < sizeof req / sizeof *req; i++)
-            if (!waste_find(m, tname(req[i], c->prefix)))
-                return -2;               /* -> WASTE_E_FORMAT */
-    }
+    if (!validate_text_tensors(m)) return -2;      /* -> WASTE_E_FORMAT */
 
     /* state + scratch */
     const int H = c->kda_heads, D = c->kda_dim, C = H * D;
@@ -1047,14 +1219,14 @@ void waste_model_free(waste_model *m)
         waste_dio_free(m->t[i].qs);
     }
     free(m->t);
-    if (m->trunk_fd > 0) close(m->trunk_fd);
+    if (m->trunk_fd >= 0) close(m->trunk_fd);
     free(m->embrow); free(m->embsc);
     free(m->mmxq); free(m->mmxs);
     free(m->codebooks);
     free(m->codebooksT);
     for (int L = 0; L < 128; L++) {
         free(m->S[L]); free(m->conv[L]); free(m->latcache[L]);
-        if (m->bank[L].fd > 0) close(m->bank[L].fd);
+        if (m->bank[L].fd >= 0) close(m->bank[L].fd);
     }
     free(m->x); free(m->h); free(m->tmp); free(m->att); free(m->logits);
     free(m->ff); free(m->e_gate); free(m->e_up); free(m->e_down); free(m->lut);
@@ -1685,8 +1857,9 @@ static void mla_layer(waste_model *m, int L, const float *in, float *out, int po
     memcpy(m->latcache[L] + (size_t)pos * latd, ckv, (size_t)latd * sizeof(float));
     /* WASTE_DUMP_LATENT=path appends the cached latent and the absorbed
      * query, the two things a KV-cache quantizer has to keep faithful. */
-    if (getenv("WASTE_DUMP_LATENT")) {
-        FILE *df = fopen(getenv("WASTE_DUMP_LATENT"), "ab");
+    const char *dump_latent = getenv("WASTE_DUMP_LATENT");
+    if (dump_latent) {
+        FILE *df = fopen(dump_latent, "ab");
         if (df) { fwrite(ckv, sizeof(float), (size_t)latd, df); fclose(df); }
     }
     m->n_kv[L] = pos + 1;
@@ -1955,7 +2128,9 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
     waste_state_hdr h, want;
     state_fill(m, &want, 0);
     if (fread(&h, sizeof h, 1, f) != 1) { fclose(f); return -1; }
-    /* every shape must match; pos and n_blockres are the payload */
+    /* Every shape must match; pos and n_blockres are payload, but they also
+     * bound array indices and therefore need validation before the first
+     * byte of live state is replaced. */
     if (h.magic != want.magic || h.version != want.version ||
         h.n_layers != want.n_layers || h.hidden != want.hidden ||
         h.kda_heads != want.kda_heads || h.kda_dim != want.kda_dim ||
@@ -1967,6 +2142,49 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
     }
 
     const int H = c->kda_heads, D = c->kda_dim, C = H * D;
+    const int nb_max = c->attn_res_block
+                     ? c->n_layers / c->attn_res_block + 2 : 0;
+    if (h.pos < 0 || h.pos == INT32_MAX ||
+        (m->has_mla && h.pos > m->kv_cap) ||
+        h.n_blockres < 0 || h.n_blockres > nb_max) {
+        fclose(f);
+        return -2;
+    }
+
+    /* First walk the complete payload without touching the model.  This
+     * rejects truncated files and bad per-layer KV counts up front, so the
+     * ordinary failure paths preserve the current conversation. */
+    const int64_t fsize_i = waste_file_size(fileno(f));
+    uint64_t off = sizeof h;
+    if (fsize_i < 0) { fclose(f); return -1; }
+    const uint64_t fsize = (uint64_t)fsize_i;
+    for (int L = 0; L < c->n_layers; L++) {
+        uint64_t bytes = 0;
+        if (c->kda_layer[L]) {
+            bytes = ((uint64_t)H * D * D + (uint64_t)3 * C * (c->conv_k - 1)) * 4;
+        } else {
+            int32_t nkv = 0;
+            if (off > fsize || fsize - off < sizeof nkv ||
+                waste_pread(fileno(f), &nkv, sizeof nkv, (int64_t)off) != sizeof nkv) {
+                fclose(f); return -2;
+            }
+            if (nkv < 0 || nkv > m->kv_cap || nkv != h.pos) {
+                fclose(f); return -2;
+            }
+            bytes = sizeof nkv + (uint64_t)nkv * (c->kv_lora + c->qk_rope) * 4;
+        }
+        if (off > fsize || bytes > fsize - off) { fclose(f); return -2; }
+        off += bytes;
+    }
+    {
+        const uint64_t tail = (uint64_t)h.n_blockres * c->hidden * 4 +
+                              (uint64_t)c->hidden * 4;
+        if (off > fsize || tail > fsize - off || off + tail != fsize) {
+            fclose(f); return -2;
+        }
+    }
+    if (fseek(f, (long)sizeof h, SEEK_SET)) { fclose(f); return -1; }
+
     int rc = 0;
     for (int L = 0; L < c->n_layers && !rc; L++) {
         if (c->kda_layer[L]) {
@@ -1982,13 +2200,6 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
             m->n_kv[L] = nkv;
         }
     }
-    /* n_blockres is payload, not shape, so the checks above do not cover
-     * it — and it decides how much is read into a buffer allocated for
-     * n_layers/attn_res_block + 2 rows. A state file claiming more than
-     * that read past the end of it. */
-    const int nb_max = c->attn_res_block
-                     ? c->n_layers / c->attn_res_block + 2 : 0;
-    if (h.n_blockres < 0 || h.n_blockres > nb_max) { fclose(f); return -2; }
     m->n_blockres = h.n_blockres;
     if (!rc && c->attn_res_block && h.n_blockres > 0) {
         const size_t n = (size_t)h.n_blockres * c->hidden;
@@ -1997,7 +2208,11 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
     if (!rc && fread(m->x, sizeof(float), (size_t)c->hidden, f) != (size_t)c->hidden) rc = -1;
     fclose(f);
     if (!rc && pos) *pos = h.pos;
-    return rc;
+    /* -3 means the file changed or the device failed after the successful
+     * preflight and live state may have been touched.  The public wrapper
+     * resets the context in that exceptional case rather than leaving a
+     * mixture of two conversations. */
+    return rc ? -3 : 0;
 }
 
 /* ---- chunked prefill ---------------------------------------------------
@@ -2653,8 +2868,9 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         /* WASTE_DUMP_HIDDEN=path appends the residual stream after every
          * layer, so a divergence against the PyTorch oracle can be bisected
          * to the layer that introduces it. */
-        if (getenv("WASTE_DUMP_HIDDEN")) {
-            FILE *df = fopen(getenv("WASTE_DUMP_HIDDEN"), L ? "ab" : "wb");
+        const char *dump_hidden = getenv("WASTE_DUMP_HIDDEN");
+        if (dump_hidden) {
+            FILE *df = fopen(dump_hidden, L ? "ab" : "wb");
             if (df) { fwrite(m->x, sizeof(float), (size_t)hid, df); fclose(df); }
         }
     }

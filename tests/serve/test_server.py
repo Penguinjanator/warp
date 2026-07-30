@@ -17,6 +17,7 @@ a tool call to assert about.
 """
 
 import json
+import http.client
 import socket
 import sys
 import threading
@@ -224,8 +225,14 @@ class TestChatCompletions(ServerTestCase):
         self.engine.reply = reply_plain("keep this STOP drop this")
         _, body = self.chat(stop="STOP")
         content = body["choices"][0]["message"]["content"]
-        self.assertTrue(content.startswith("keep this "), content)
-        self.assertNotIn("drop this", content)
+        self.assertEqual(content, "keep this ")
+
+    def test_stream_stop_string_is_not_emitted(self):
+        self.engine.reply = reply_plain("keep this STOP drop this")
+        events = self.stream(stop="STOP")
+        content = "".join(c.get("delta", {}).get("content", "")
+                          for e in events[:-1] for c in e.get("choices", []))
+        self.assertEqual(content, "keep this ")
 
     def test_sampling_options_reach_the_engine(self):
         self.engine.reply = reply_plain("ok")
@@ -408,6 +415,19 @@ class TestValidation(ServerTestCase):
                                                 "content": "hi"}]})
         self.assertEqual(status, 400)
         self.assertIn("role", body["error"]["param"])
+
+    def test_non_string_message_content_is_a_400(self):
+        status, body = self.chat(messages=[{"role": "user", "content": 1}])
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["param"], "messages[0].content")
+
+    def test_malformed_content_part_is_a_400(self):
+        status, body = self.chat(messages=[{"role": "user", "content": [
+            {"type": "text"}
+        ]}])
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["param"],
+                         "messages[0].content[0].text")
 
     def test_developer_role_is_accepted(self):
         """OpenAI's newer name for a system turn."""
@@ -627,6 +647,18 @@ class TestAuth(ServerTestCase):
         status, _ = self.post("/v1/chat/completions",
                               {"messages": [{"role": "user", "content": "x"}]})
         self.assertEqual(status, 401)
+
+    def test_rejected_post_closes_connection_with_unread_body(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        payload = json.dumps({"messages": [{"role": "user",
+                                             "content": "x"}]})
+        conn.request("POST", "/v1/chat/completions", payload,
+                     {"Content-Type": "application/json"})
+        response = conn.getresponse()
+        self.assertEqual(response.status, 401)
+        self.assertEqual(response.getheader("Connection"), "close")
+        response.read()
+        conn.close()
 
 
 class TestConcurrency(ServerTestCase):

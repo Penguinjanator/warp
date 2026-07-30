@@ -36,6 +36,12 @@ typedef struct {
 } waste_pool;
 
 static waste_pool g_pool;
+/* The pool is shared by every model in this translation unit.  One lock
+ * makes first-use initialization deterministic; the other owns a complete
+ * submitted job, because the fields in waste_pool are the job descriptor
+ * itself and cannot represent two callers at once. */
+static pthread_mutex_t g_pool_init_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_pool_run_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void *waste__worker(void *p)
 {
@@ -69,15 +75,22 @@ static inline int waste_hw_threads(void) { return waste_cpu_count(); }
 
 static inline void waste_pool_init(int nthreads)
 {
-    if (g_pool.nthreads) return;
+    pthread_mutex_lock(&g_pool_init_mu);
+    if (g_pool.nthreads) { pthread_mutex_unlock(&g_pool_init_mu); return; }
     if (nthreads <= 0) nthreads = waste_hw_threads();
     if (nthreads > 64) nthreads = 64;
+    if (nthreads < 1) nthreads = 1;
     pthread_mutex_init(&g_pool.mu, NULL);
     pthread_cond_init(&g_pool.start, NULL);
     pthread_cond_init(&g_pool.done, NULL);
-    g_pool.nthreads = nthreads;
-    for (int i = 0; i < nthreads - 1; i++)
-        pthread_create(&g_pool.th[i], NULL, waste__worker, &g_pool);
+    /* Count only workers that actually exist.  Waiting for a failed
+     * pthread_create as though it were alive otherwise hangs forever. */
+    g_pool.nthreads = 1;
+    for (int i = 0; i < nthreads - 1; i++) {
+        if (pthread_create(&g_pool.th[i], NULL, waste__worker, &g_pool)) break;
+        g_pool.nthreads++;
+    }
+    pthread_mutex_unlock(&g_pool_init_mu);
 }
 
 /* Runs fn over [0,n) split into chunks; every chunk boundary is a multiple
@@ -91,6 +104,10 @@ static inline void waste_parallel_for(int n, int min_chunk, waste_range_fn fn, v
      * their data (the VQ tile) need every range to start on a boundary. */
     chunk = ((chunk + min_chunk - 1) / min_chunk) * min_chunk;
 
+    /* Keep the descriptor stable until every worker has left this job.
+     * Distinct waste_ctx instances may be called concurrently even though
+     * they reuse this process-wide pool. */
+    pthread_mutex_lock(&g_pool_run_mu);
     pthread_mutex_lock(&g_pool.mu);
     g_pool.fn = fn; g_pool.arg = arg; g_pool.n = n; g_pool.chunk = chunk;
     g_pool.next_chunk = 0;
@@ -114,6 +131,7 @@ static inline void waste_parallel_for(int n, int min_chunk, waste_range_fn fn, v
     pthread_mutex_lock(&g_pool.mu);
     while (g_pool.active > 0) pthread_cond_wait(&g_pool.done, &g_pool.mu);
     pthread_mutex_unlock(&g_pool.mu);
+    pthread_mutex_unlock(&g_pool_run_mu);
 }
 
 static inline void waste_pool_shutdown(void)

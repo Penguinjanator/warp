@@ -250,6 +250,8 @@ waste_status waste_tokenize(waste_ctx *ctx, const char *text, int add_bos,
  * wrote the content the ability to write the structure too. */
 waste_status waste_tokenize_markup(waste_ctx *ctx, const char *text, int add_bos,
                                    int32_t *out_tokens, size_t cap, size_t *n_out);
+/* On a short output buffer returns WASTE_E_ARG and stores the required byte
+ * count (not including the trailing NUL) in n_out. */
 waste_status waste_detokenize(waste_ctx *ctx, const int32_t *tokens, size_t n,
                               char *out, size_t cap, size_t *n_out);
 

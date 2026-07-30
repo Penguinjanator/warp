@@ -37,6 +37,38 @@ import zlib
 
 import torch
 
+
+def atomic_copyfile(src, dst):
+    """Copy a published sidecar without exposing a partially written file."""
+    tmp = dst + ".tmp"
+    with open(src, "rb") as inp, open(tmp, "wb") as out:
+        while True:
+            chunk = inp.read(1 << 20)
+            if not chunk:
+                break
+            out.write(chunk)
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(tmp, dst)
+
+
+def atomic_json(path, value):
+    tmp = path + ".tmp"
+    with io.open(tmp, "w", encoding="utf-8") as out:
+        json.dump(value, out, indent=1)
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(tmp, path)
+
+
+def atomic_text(path, value):
+    tmp = path + ".tmp"
+    with io.open(tmp, "w", encoding="utf-8") as out:
+        out.write(value)
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(tmp, path)
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mxfp4 import ST                                            # noqa: E402
 
@@ -474,11 +506,10 @@ def main():
 
 
     # ---- tokenizer: copy it in so the container is self-contained -------
-    import shutil
     for name in ("tiktoken.model", "tokenizer.model"):
         src_tok = os.path.join(args.src, name)
         if os.path.exists(src_tok):
-            shutil.copyfile(src_tok, os.path.join(args.out, "tokenizer.model"))
+            atomic_copyfile(src_tok, os.path.join(args.out, "tokenizer.model"))
             print(f"tokenizer: copied {name}")
             break
 
@@ -493,9 +524,8 @@ def main():
         specials = sorted(((int(i), v["content"]) for i, v in dec.items()),
                           key=lambda x: x[0])
         if specials:
-            with io.open(os.path.join(args.out, "specials.json"), "w",
-                         encoding="utf-8") as f:
-                json.dump([{"id": i, "text": t} for i, t in specials], f, indent=1)
+            atomic_json(os.path.join(args.out, "specials.json"),
+                        [{"id": i, "text": t} for i, t in specials])
             print(f"special tokens: {len(specials)} written")
 
     # ---- chat template ---------------------------------------------------
@@ -516,9 +546,7 @@ def main():
         if os.path.exists(p_cfg):
             tpl = json.load(open(p_cfg)).get("chat_template")
     if tpl:
-        with io.open(os.path.join(args.out, "chat_template.jinja"), "w",
-                     encoding="utf-8") as f:
-            f.write(tpl)
+        atomic_text(os.path.join(args.out, "chat_template.jinja"), tpl)
         print(f"chat template: copied ({len(tpl)} bytes)")
 
     # ---- chat.json -------------------------------------------------------
@@ -544,7 +572,7 @@ def main():
         _src_tmpl = os.path.join(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__))), "examples", _name)
         if os.path.exists(_src_tmpl):
-            shutil.copyfile(_src_tmpl, _dst)
+            atomic_copyfile(_src_tmpl, _dst)
             print(f"chat.json: {_name} — `waste chat` will use it")
         else:
             print(f"chat.json: examples/{_name} not found; the CLI will "
@@ -608,20 +636,22 @@ def main():
             print("vision: WARNING no preprocessor_config.json in --src; "
                   "assuming mean=std=0.5. Check it against the release.")
 
-        with io.open(os.path.join(args.out, "vision.json"), "w",
-                     encoding="utf-8") as f:
-            json.dump(vj, f, indent=1)
+        atomic_json(os.path.join(args.out, "vision.json"), vj)
         print(f"vision: {vj.get('vt_num_hidden_layers', '?')}-layer tower, "
               f"patch {vj.get('patch_size', '?')}, "
               f"max_patches {vj['max_patches']}")
 
     # ---- trunk ----------------------------------------------------------
     trunk_path = os.path.join(args.out, "trunk.bin")
+    trunk_tmp = trunk_path + ".tmp"
     tindex = []
     if args.skip_trunk:
         print("skipping trunk")
         return 0
-    with open(trunk_path, "wb") as tf:
+    # Keep the currently published trunk intact for the entire conversion.
+    # A K3 trunk takes hours to rebuild; opening the final path with "wb"
+    # destroyed a working container at the start of that interval.
+    with open(trunk_tmp, "wb") as tf:
         for name in sorted(sr.names()):
             if ".experts." in name or name.endswith(("_packed", "_scale")):
                 continue
@@ -653,7 +683,9 @@ def main():
                 tindex.append({"name": name, "fmt": fmt,
                                "off": off, "shape": shape, "group": 128,
                                "scale_off": sc_off, "bytes": tf.tell() - off})
-    print(f"trunk: {os.path.getsize(trunk_path)/2**20:.0f} MB, "
+        tf.flush()
+        os.fsync(tf.fileno())
+    print(f"trunk: {os.path.getsize(trunk_tmp)/2**20:.0f} MB, "
           f"{len(tindex)} tensors")
 
     # `arch` is descriptive only — the engine derives its own from
@@ -680,8 +712,16 @@ def main():
         "layers": manifest_layers,
         "trunk": tindex,
     }
-    with open(os.path.join(args.out, "manifest.json"), "w") as f:
+    manifest_path = os.path.join(args.out, "manifest.json")
+    manifest_tmp = manifest_path + ".tmp"
+    with open(manifest_tmp, "w") as f:
         json.dump(manifest, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    # The manifest is the commit record and is always published last.  An
+    # exception before these replaces leaves the old container untouched.
+    os.replace(trunk_tmp, trunk_path)
+    os.replace(manifest_tmp, manifest_path)
     print(f"wrote {args.out}/manifest.json")
     return 0
 
