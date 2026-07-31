@@ -10,7 +10,12 @@ not silently accept. This serves a directory with real 206 responses, or
 with Range support switched off, so both branches of the worker's resume
 logic can be exercised without touching the network.
 
-  python3 tests/range_server.py DIR PORT [--no-range]
+  python3 tests/range_server.py DIR PORT [--no-range] [--port-file F]
+
+PORT 0 asks the kernel for a free one, which is what the caller should
+use: a hardcoded port is a check that fails on any machine already running
+something there, and it fails as "resume" rather than as "that port is
+taken". --port-file is how the caller learns which port it got.
 """
 
 import http.server
@@ -62,9 +67,26 @@ def make_handler(root, ranges):
 
 
 def main():
-    root, port = sys.argv[1], int(sys.argv[2])
-    ranges = "--no-range" not in sys.argv
-    srv = http.server.HTTPServer(("127.0.0.1", port), make_handler(root, ranges))
+    argv = sys.argv[1:]
+    port_file = None
+    if "--port-file" in argv:
+        i = argv.index("--port-file")
+        port_file = argv[i + 1]
+        del argv[i:i + 2]
+    ranges = "--no-range" not in argv
+    root, port = [a for a in argv if not a.startswith("--")][:2]
+    srv = http.server.HTTPServer(("127.0.0.1", int(port)), make_handler(root, ranges))
+
+    # Hand the real port back only after the constructor has bound and
+    # listened, so a caller that sees this file can connect immediately —
+    # anything arriving before serve_forever() waits in the backlog rather
+    # than being refused. Written under a temp name and renamed, so a
+    # caller polling for the file never reads half a number.
+    if port_file:
+        with open(port_file + ".tmp", "w") as f:
+            f.write(str(srv.server_address[1]))
+        os.replace(port_file + ".tmp", port_file)
+
     srv.serve_forever()
 
 
