@@ -343,6 +343,19 @@ jobs:
       - name: Build with the default compiler variable
         run: make -j4
 
+      # MSYS2 ships a cc symlink, so the runner is friendlier than the stock
+      # MinGW-w64 install in #3 — and the defect only appears when cc is
+      # missing. Make the runner look like the machine that found it, or
+      # this job would guard everything except the thing it was added for.
+      - name: Build again with no cc on PATH, as stock MinGW has none
+        run: |
+          ccp="$(command -v cc)"
+          echo "hiding $ccp"
+          mv "$ccp" "$ccp.hidden"
+          make clean >/dev/null
+          make -j4
+          mv "$ccp.hidden" "$ccp"
+
       - name: Build the checkers
         run: make test -j4
 

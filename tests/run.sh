@@ -123,7 +123,10 @@ start_server() {                       # $@ = extra server args; sets PORT, RSRV
 FT="$TMP/fetch"
 mkdir -p "$FT/srv" "$FT/dst"
 if stat --version >/dev/null 2>&1; then SM=gnu; else SM=bsd; fi
-python3 -c "open('$FT/srv/s.bin','wb').write(bytes(range(256))*4096)"
+# The path goes in argv, not into the source: MSYS2 rewrites POSIX paths in
+# a native program's arguments and cannot rewrite one quoted inside -c, so
+# Windows Python was handed /tmp/... verbatim and could not find it.
+python3 -c "import sys; open(sys.argv[1],'wb').write(bytes(range(256))*4096)" "$FT/srv/s.bin"
 
 # The worker the downloader generates is curl, so without curl these three
 # report the downloader broken when what is missing is a tool — which is the
