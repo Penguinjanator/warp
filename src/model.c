@@ -855,6 +855,9 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     }
 }
 
+/* Defined below, next to record_check; the cache needs it at load. */
+static int bank_fetch(void *user, int layer, int expert, uint8_t *dst);
+
 int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                      const waste_load_opts *opt)
 {
@@ -862,6 +865,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     if (!opt) opt = &defaults;
     const size_t cache_bytes = opt->cache_bytes;
     memset(m, 0, sizeof *m);
+    pthread_mutex_init(&m->fetch_mu, NULL);
     m->trunk_fd = -1;
     for (int L = 0; L < WASTE_MAX_LAYERS; L++) m->bank[L].fd = -1;
     m->want_vision = opt->want_vision;
@@ -1209,6 +1213,20 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
             return -1;
         m->miss_buf = (uint8_t *)waste_dio_alloc((size_t)rec);
         if (!m->miss_buf) return -1;
+
+        /* Read-ahead. The internal SSD reaches 12.89 GB/s at queue depth 2
+         * against 10.73 at depth 1, so two readers is the whole of the
+         * bandwidth story; the rest of the win is that a pread no longer
+         * blocks the matmuls. WASTE_IO_THREADS=0 restores the synchronous
+         * path exactly, which is what the cache-vs-no-cache checks compare
+         * against. */
+        int nio = 2, depth = 2;
+        const char *e = getenv("WASTE_IO_THREADS");
+        if (e) nio = atoi(e);
+        e = getenv("WASTE_IO_DEPTH");
+        if (e) depth = atoi(e);
+        if (depth < nio) depth = nio;
+        waste_ecache_io_start(&m->cache, bank_fetch, m, nio, depth);
     }
     /* Every buffer the forward pass dereferences without asking, not the
      * five that used to be listed here — a NULL m->tmp or m->att is a
@@ -1229,6 +1247,13 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
 
 void waste_model_free(waste_model *m)
 {
+    /* Before anything else: the reader threads pread on the bank fds, and
+     * those are closed further down. Stopping them here rather than in
+     * waste_ecache_free — which runs last — is the difference between a
+     * clean shutdown and a read on a descriptor that has been closed and
+     * possibly reused. */
+    waste_ecache_io_stop(&m->cache);
+
     /* Reachable on a partially-built model now that waste_open frees what
      * a failed load left behind, so nothing here may assume the load got
      * as far as its own allocation. */
@@ -1256,8 +1281,9 @@ void waste_model_free(waste_model *m)
     free(m->blockres); free(m->prefix_sum); free(m->ares);
     free(m->cx); free(m->cnorm); free(m->cresid); free(m->cq); free(m->ckv);
     free(m->clat); free(m->cff); free(m->cexp); free(m->cblockres);
-    free(m->cprefix); free(m->croute); free(m->crw);
+    free(m->cprefix); free(m->croute); free(m->crw); free(m->cused);
     waste_ecache_free(&m->cache);
+    pthread_mutex_destroy(&m->fetch_mu);
 }
 
 /* ---- expert dequant ---------------------------------------------------- */
@@ -1365,6 +1391,7 @@ typedef enum {
     REC_E_READ,      /* short read                                        */
     REC_E_HEADER,    /* magic, identity, offsets                          */
     REC_E_CRC,       /* the payload is not what the converter wrote       */
+    REC_E_NOSLOT,    /* the cache could not free a slot to read into      */
 } rec_status;
 
 static rec_status record_check(const waste_model *m, int layer, int expert,
@@ -1414,6 +1441,22 @@ static rec_status record_check(const waste_model *m, int layer, int expert,
  * and then the check that it is the record it says it is.
  * The offset is computed in 64 bits before the multiply: a bank of 384
  * experts crosses 2 GB well before the biggest layer does. */
+/* First failure wins: it is the one with a cause worth reporting, and the
+ * layer and expert of the twentieth tell nobody anything. With read-ahead
+ * on, "first" is decided by the lock rather than by program order — any of
+ * the concurrent failures is equally the one to report. */
+static int bank_fail(waste_model *m, rec_status st, int layer, int expert)
+{
+    pthread_mutex_lock(&m->fetch_mu);
+    if (!m->read_error) {
+        m->read_error = (int)st;
+        m->bad_layer = layer;
+        m->bad_expert = expert;
+    }
+    pthread_mutex_unlock(&m->fetch_mu);
+    return -1;
+}
+
 static int bank_fetch(void *user, int layer, int expert, uint8_t *dst)
 {
     waste_model *m = (waste_model *)user;
@@ -1427,36 +1470,35 @@ static int bank_fetch(void *user, int layer, int expert, uint8_t *dst)
                           layer >= WASTE_MAX_LAYERS;
     waste_bank *b = bad_layer ? NULL : &m->bank[layer];
     if (bad_layer || expert < 0 || expert >= b->n_experts ||
-        b->fd < 0 || b->rec_bytes <= 0) {
-        if (!m->read_error) {
-            m->read_error = (int)REC_E_HEADER;
-            m->bad_layer = layer;
-            m->bad_expert = expert;
-        }
-        return -1;
-    }
+        b->fd < 0 || b->rec_bytes <= 0)
+        return bank_fail(m, REC_E_HEADER, layer, expert);
+
+    /* pread is positional, so the reader threads share the bank's fd
+     * without a seek to race over. */
     const int64_t got = waste_pread(b->fd, dst, (size_t)b->rec_bytes,
                                     (int64_t)expert * (int64_t)b->rec_bytes);
     rec_status st = got == (int64_t)b->rec_bytes ? REC_OK : REC_E_READ;
     if (st == REC_OK) st = record_check(m, layer, expert, dst);
-    if (st != REC_OK) {
-        /* First failure wins: it is the one with a cause worth reporting,
-         * and the layer and expert of the twentieth tell nobody anything. */
-        if (!m->read_error) {
-            m->read_error = (int)st;
-            m->bad_layer = layer;
-            m->bad_expert = expert;
-        }
-        return -1;
-    }
+    if (st != REC_OK) return bank_fail(m, st, layer, expert);
+
+    pthread_mutex_lock(&m->fetch_mu);
     m->expert_reads++;
+    pthread_mutex_unlock(&m->fetch_mu);
     return 0;
 }
 
 static const uint8_t *read_expert(waste_model *m, int L, int eid)
 {
-    if (m->cache.n_slots > 0)
-        return waste_ecache_get(&m->cache, L, eid, bank_fetch, m);
+    if (m->cache.n_slots > 0) {
+        const uint8_t *r = waste_ecache_get(&m->cache, L, eid, bank_fetch, m);
+        /* A cache that cannot free a slot never reaches bank_fetch, so
+         * nothing downstream would have recorded a reason and the layer
+         * would go on to sum the experts it did get. The whole point of
+         * the read_error channel is that a token computed with missing
+         * experts is reported rather than answered. */
+        if (!r && !m->read_error) bank_fail(m, REC_E_NOSLOT, L, eid);
+        return r;
+    }
     m->cache.misses++;
     m->cache.bytes_read += (size_t)m->bank[L].rec_bytes;
     return bank_fetch(m, L, eid, m->miss_buf) == 0 ? m->miss_buf : NULL;
@@ -1470,6 +1512,7 @@ const char *waste_model_read_error(const waste_model *m, int *layer, int *expert
     switch (m->read_error) {
         case REC_E_READ:   return "short read";
         case REC_E_HEADER: return "record header is not what the bank index describes";
+        case REC_E_NOSLOT: return "expert cache could not free a slot to read into";
         default:           return "checksum mismatch";
     }
 }
@@ -1960,6 +2003,11 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     }
     for (int j = 0; j < K; j++) w[j] *= c->routed_scale;
     if (routed) for (int j = 0; j < K; j++) routed[j] = idx[j];
+
+    /* Every id this layer will read is known here, before the first read.
+     * Handing them over lets the cache keep reads in flight while the
+     * matmuls below run; without read-ahead it does nothing. */
+    waste_ecache_hint(&m->cache, L, idx, K);
 
     const int inter = c->moe_inter;
     float *ga = m->ff, *ub = ga + inter, *acc = m->e_gate;
@@ -2459,7 +2507,7 @@ static int prefill_alloc(waste_model *m, int T)
 
     free(m->cx); free(m->cnorm); free(m->cresid); free(m->cq); free(m->ckv);
     free(m->clat); free(m->cff); free(m->cexp); free(m->cblockres);
-    free(m->cprefix); free(m->croute); free(m->crw);
+    free(m->cprefix); free(m->croute); free(m->crw); free(m->cused);
 
     m->cx     = (float *)calloc((size_t)T * hid, sizeof(float));
     m->cnorm  = (float *)calloc((size_t)T * hid, sizeof(float));
@@ -2492,10 +2540,13 @@ static int prefill_alloc(waste_model *m, int T)
     m->cprefix   = (float *)calloc((size_t)T * hid, sizeof(float));
     m->croute = (int *)calloc((size_t)T * 64, sizeof(int));
     m->crw    = (float *)calloc((size_t)T * 64, sizeof(float));
+    /* The distinct experts of a chunk are at most one per (token, slot),
+     * so croute's shape bounds this one too. */
+    m->cused  = (int *)calloc((size_t)T * 64, sizeof(int));
     m->chunk_cap = T;
     return (m->cx && m->cnorm && m->cresid && m->cq && m->ckv && m->clat &&
             m->cff && m->cexp && m->cblockres && m->cprefix && m->croute &&
-            m->crw) ? 0 : -1;
+            m->crw && m->cused) ? 0 : -1;
 }
 
 /* MoE over a whole chunk.
@@ -2566,15 +2617,28 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
 
     float *ga = m->cff, *ub = ga + inter, *acc = m->cff + 2 * inter;
 
-    for (int e = 0; e < E; e++) {
-        int used = 0;
-        for (int i = 0; i < nT * K; i++) if (route[i] == e) { used = 1; break; }
-        if (!used) continue;
+    /* Collect the distinct experts first, so their reads can be handed to
+     * the cache ahead of the arithmetic. The order is the same ascending
+     * one the loop below consumes, which is what lets the read-ahead be a
+     * queue rather than a guess. A chunk can name more experts than one
+     * hint holds, so it is fed in windows; the pipeline drains once per
+     * window, which costs one read's latency per WASTE_PF_MAX experts. */
+    int *used_ids = m->cused;
+    int n_used = 0;
+    for (int e = 0; e < E; e++)
+        for (int i = 0; i < nT * K; i++)
+            if (route[i] == e) { used_ids[n_used++] = e; break; }
+
+    for (int w = 0; w < n_used; w += WASTE_PF_MAX) {
+    const int wn = n_used - w < WASTE_PF_MAX ? n_used - w : WASTE_PF_MAX;
+    waste_ecache_hint(&m->cache, L, used_ids + w, wn);
+    for (int u = w; u < w + wn; u++) {
+        const int e = used_ids[u];
 
         PROF_START(P_EDEQ);
         const uint8_t *rec = read_expert(m, L, e);
         PROF_END(P_EDEQ);
-        if (!rec) break;                 /* see moe_layer: the chunk is lost */
+        if (!rec) goto chunk_lost;       /* see moe_layer: the chunk is lost */
         const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
         const uint16_t *s16 = (const uint16_t *)(rec + h->chan_corr_off);
 
@@ -2614,6 +2678,8 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
         }
         PROF_END(P_EMM);
     }
+    }
+chunk_lost:
 
     if (c->latent_dim) {
         if (c->latent_norm) {

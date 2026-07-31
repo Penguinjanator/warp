@@ -960,3 +960,69 @@ reads unconditionally — embeddings, final norm, head — are now required
 at load. Checking *every* tensor the pass might want would mean a second
 copy of its naming rules, and a wrong entry there would refuse a
 container that works; these three cannot be wrong.
+
+## 22. The reads were serial, and half the step was waiting (2026-07-31)
+
+An outside article on running K3 through AirLLM — at ~5 minutes per token,
+against this engine's 3 seconds — turned out to have exactly one thing this
+project did not: it overlaps loading with compute. WASTE did not. `moe_layer`
+picked its top-16 and then read them one at a time, `pread` by blocking
+`pread`, with the arithmetic waiting on each.
+
+The ids were all known before the first read. They come out of the routing
+loop directly above, sixteen independent reads sitting in an array.
+
+**What it was worth.** Two reader threads, depth 2, alternating runs at the
+same budget so the paging state is shared:
+
+| | 16 tokens | tok/s |
+|---|---|---|
+| synchronous | 47.90 / 48.81 / 54.32 / 66.46 s | 0.24–0.33 |
+| **read-ahead** | **31.09 / 31.34 / 32.31 / 32.88 s** | **0.49–0.51** |
+
+**1.5–1.6x**, with `experts 3357 hit / 20195 miss` identical in every single
+run — the cache does exactly what it did before, the time is what changed.
+Chunked prefill gains less, ~1.35x, which is the same result read the other
+way: a chunk already spreads each expert over several tokens, so there is
+proportionally less I/O to hide.
+
+The second column is worth as much as the first. The synchronous runs spread
+39%; the read-ahead runs spread 6%. A blocking read inherits every hesitation
+the machine has, and a queue absorbs them.
+
+Three things this required, and two of them were mistakes first.
+
+**The pin that never expired.** A slot with a read in flight cannot be an
+eviction candidate, so slots carry a pin stamped with the current hint
+generation, and bumping the generation is what releases the previous layer's.
+The synchronous claim path took a pin too — and with read-ahead off the
+generation never advances, so every slot a synchronous read claimed stayed
+pinned forever. The victim sampler ran out of candidates within one cache-full
+of tokens and returned -1.
+
+**And -1 was silent.** `read_expert` returned NULL, `moe_layer` did what it
+has always done on an unreadable expert — `break`, and let `m->read_error`
+carry the reason out — except that nothing had set `read_error`, because
+`bank_fetch` was never reached. The engine answered, with the experts it
+happened to have: *"Italy's capital is Italy. Italy's capital is Italy."*,
+128 tokens of it, exit status 0. A wrong answer with no error is the failure
+this project spends the most effort not having, and it took a default-off
+code path one build to produce one. `REC_E_NOSLOT` exists now, and
+`read_expert` records it when the cache returns NULL without a cause.
+
+**The teardown order.** `waste_model_free` closes the bank fds before it
+frees the cache, which is where the reader threads get stopped — so a reader
+could have been mid-`pread` on a closed, possibly reused descriptor. The
+threads are stopped first now, before anything else is torn down.
+
+Method notes, both familiar:
+
+- **The default path is not the tested path.** The suite runs with read-ahead
+  on, so the synchronous fallback — the thing every measurement in this file
+  before today was made on — had no check at all. `WASTE_IO_THREADS=0`
+  against the default is now one, and it is the check that would have caught
+  the pin in seconds instead of in a K3 run.
+- **The disk was never the reason to do this.** The sweep says the internal
+  SSD gives 10.73 GB/s at queue depth 1 and 12.89 at depth 2 — a 20% band.
+  The other 1.3x came from not standing still, which is not a number a
+  bandwidth measurement can show.

@@ -5,6 +5,7 @@
 
 #include "ecache.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +14,8 @@
 #include "waste_format.h"
 
 #define EC_SAMPLE 16      /* victims sampled per eviction (Redis-style)     */
+#define EC_QCAP   256     /* outstanding read requests                      */
+#define EC_MAXIO  8       /* reader threads                                 */
 
 /* Rounding the length up as well as the address is not decoration: both
  * O_DIRECT and FILE_FLAG_NO_BUFFERING refuse a transfer whose length is
@@ -37,6 +40,125 @@ static uint32_t ec_hash(int32_t k)
     return x;
 }
 
+/* ---- reader threads -----------------------------------------------------
+ *
+ * One mutex covers the whole cache: slot metadata, the hash, the counters,
+ * the hint cursor and this queue. It is held for pointer arithmetic only —
+ * never across a fetch, which is the entire point — so contention between
+ * the compute thread and the readers is not measurable next to an 11.83 MB
+ * pread.
+ *
+ * A worker owns slot->data exclusively while the slot is EC_INFLIGHT: the
+ * victim sampler will not choose an in-flight slot and get() will not read
+ * one until it has been marked ready, so the payload itself needs no lock.
+ */
+
+typedef struct { int slot, layer, expert; } eio_job;
+
+struct waste_eio {
+    pthread_t th[EC_MAXIO];
+    int nthreads;
+    pthread_mutex_t mu;
+    pthread_cond_t  work;   /* a job was queued, or stop was set            */
+    pthread_cond_t  done;   /* some slot left EC_INFLIGHT                   */
+    eio_job q[EC_QCAP];
+    int qhead, qn, stop;
+    waste_ecache *c;
+};
+
+static void ec_lock(waste_ecache *c)   { if (c->io) pthread_mutex_lock(&c->io->mu); }
+static void ec_unlock(waste_ecache *c) { if (c->io) pthread_mutex_unlock(&c->io->mu); }
+
+static void *eio_worker(void *p)
+{
+    struct waste_eio *io = (struct waste_eio *)p;
+    waste_ecache *c = io->c;
+    for (;;) {
+        pthread_mutex_lock(&io->mu);
+        while (!io->stop && io->qn == 0) pthread_cond_wait(&io->work, &io->mu);
+        if (io->stop && io->qn == 0) { pthread_mutex_unlock(&io->mu); return NULL; }
+        const eio_job j = io->q[io->qhead];
+        io->qhead = (io->qhead + 1) % EC_QCAP;
+        io->qn--;
+        pthread_mutex_unlock(&io->mu);
+
+        const int rc = c->fetch(c->fetch_user, j.layer, j.expert,
+                                c->slot[j.slot].data);
+
+        pthread_mutex_lock(&io->mu);
+        c->slot[j.slot].state = rc == 0 ? (uint8_t)EC_READY : (uint8_t)EC_FAILED;
+        pthread_cond_broadcast(&io->done);
+        pthread_mutex_unlock(&io->mu);
+    }
+}
+
+/* caller holds the lock */
+static int eio_push(struct waste_eio *io, int slot, int layer, int expert)
+{
+    if (io->qn == EC_QCAP) return -1;
+    io->q[(io->qhead + io->qn) % EC_QCAP] = (eio_job){ slot, layer, expert };
+    io->qn++;
+    pthread_cond_signal(&io->work);
+    return 0;
+}
+
+int waste_ecache_io_start(waste_ecache *c, waste_fetch_fn fetch, void *user,
+                          int nthreads, int depth)
+{
+    if (c->io || nthreads <= 0 || c->n_slots <= 0 || !fetch) return 0;
+    if (nthreads > EC_MAXIO) nthreads = EC_MAXIO;
+    /* Every pinned slot is one the victim sampler may not take, so the
+     * pipeline can never be allowed to reach the size of the cache. */
+    if (depth < 1) depth = 1;
+    if (depth > c->n_slots / 4) depth = c->n_slots / 4;
+    if (depth < 1) return 0;
+
+    struct waste_eio *io = (struct waste_eio *)calloc(1, sizeof *io);
+    if (!io) return -1;
+    io->c = c;
+    if (pthread_mutex_init(&io->mu, NULL)) { free(io); return -1; }
+    pthread_cond_init(&io->work, NULL);
+    pthread_cond_init(&io->done, NULL);
+
+    c->fetch = fetch;
+    c->fetch_user = user;
+    c->depth = depth;
+    c->io = io;                       /* readers dereference c->io->mu     */
+
+    for (int i = 0; i < nthreads; i++) {
+        if (pthread_create(&io->th[i], NULL, eio_worker, io)) break;
+        io->nthreads++;
+    }
+    if (io->nthreads == 0) {          /* nothing started: stay synchronous */
+        c->io = NULL;
+        pthread_cond_destroy(&io->work);
+        pthread_cond_destroy(&io->done);
+        pthread_mutex_destroy(&io->mu);
+        free(io);
+        return -1;
+    }
+    return 0;
+}
+
+void waste_ecache_io_stop(waste_ecache *c)
+{
+    struct waste_eio *io = c->io;
+    if (!io) return;
+    pthread_mutex_lock(&io->mu);
+    io->stop = 1;
+    pthread_cond_broadcast(&io->work);
+    pthread_mutex_unlock(&io->mu);
+    for (int i = 0; i < io->nthreads; i++) pthread_join(io->th[i], NULL);
+    /* Drop the pointer before the mutex dies: ec_lock tests c->io. */
+    c->io = NULL;
+    pthread_cond_destroy(&io->work);
+    pthread_cond_destroy(&io->done);
+    pthread_mutex_destroy(&io->mu);
+    free(io);
+}
+
+/* ---- cache -------------------------------------------------------------- */
+
 int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
                       int policy)
 {
@@ -45,6 +167,9 @@ int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
     c->budget_bytes = budget_bytes;
     c->policy = policy;
     c->rng = 0x9e3779b9u;
+    /* Generations start at 1 so that a slot's zeroed pin means "never
+     * hinted" rather than "pinned by the current batch". */
+    c->pf_gen = 1;
     if (!rec_bytes || budget_bytes < rec_bytes) return 0;   /* no cache */
 
     c->n_slots = (int)(budget_bytes / rec_bytes);
@@ -59,6 +184,7 @@ int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
 
     for (int i = 0; i < c->n_slots; i++) {
         c->slot[i].key = -1;
+        c->slot[i].state = EC_EMPTY;
         c->slot[i].data = (uint8_t *)waste_dio_alloc(rec_bytes);
         if (!c->slot[i].data) { waste_ecache_free(c); return -1; }
     }
@@ -67,6 +193,7 @@ int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
 
 void waste_ecache_free(waste_ecache *c)
 {
+    waste_ecache_io_stop(c);
     if (c->slot) {
         for (int i = 0; i < c->n_slots; i++) waste_dio_free(c->slot[i].data);
         free(c->slot);
@@ -103,11 +230,19 @@ static void ec_rehash(waste_ecache *c)
         if (c->slot[i].key >= 0) ec_insert(c, c->slot[i].key, i);
 }
 
+/* A slot is untouchable while a reader owns its buffer, and while the hint
+ * that reserved it is still being consumed — otherwise a deep pipeline
+ * evicts the record it just read, one layer before it is used. */
+static int ec_pinned(const waste_ecache *c, int i)
+{
+    return c->slot[i].state == EC_INFLIGHT || c->slot[i].pin == c->pf_gen;
+}
+
 static int ec_victim(waste_ecache *c)
 {
     /* free slot first */
     for (int i = 0; i < c->n_slots; i++)
-        if (c->slot[i].key < 0) return i;
+        if (c->slot[i].state == EC_EMPTY) return i;
 
     int best = -1;
     uint32_t best_h = 0;
@@ -115,6 +250,7 @@ static int ec_victim(waste_ecache *c)
     for (int s = 0; s < EC_SAMPLE; s++) {
         c->rng = c->rng * 1664525u + 1013904223u;
         const int i = (int)(c->rng % (uint32_t)c->n_slots);
+        if (ec_pinned(c, i)) continue;
         const waste_eslot *sl = &c->slot[i];
         int better;
         if (c->policy == 1)                       /* LRU */
@@ -124,42 +260,157 @@ static int ec_victim(waste_ecache *c)
                      (sl->hits == best_h && sl->last < best_l);
         if (better) { best = i; best_h = sl->hits; best_l = sl->last; }
     }
+    /* A sample that lands entirely on pinned slots is not an error, it is
+     * the small-cache case: fall back to a scan rather than to no cache. */
+    if (best < 0)
+        for (int i = 0; i < c->n_slots; i++)
+            if (!ec_pinned(c, i)) { best = i; break; }
     return best;
+}
+
+/* Claim `vi` for `key`, counting the read that is about to happen. Caller
+ * holds the lock.
+ *
+ * `fresh` marks a read the current hint issued, and it is also what decides
+ * the pin: a synchronous claim must NOT take one. Pinning it looked
+ * harmless and was not — with read-ahead off the generation never advances,
+ * so every slot a synchronous read claimed stayed pinned for the life of
+ * the process, the victim sampler ran out of candidates, and the forward
+ * pass quietly continued with the experts it had. EC_INFLIGHT alone already
+ * protects a slot whose buffer is being written. */
+static void ec_claim(waste_ecache *c, int vi, int32_t key, int fresh)
+{
+    const int had = c->slot[vi].key >= 0;
+    c->slot[vi].key = key;
+    c->slot[vi].state = EC_INFLIGHT;
+    c->slot[vi].fresh = (uint8_t)fresh;
+    c->slot[vi].pin = fresh ? c->pf_gen : 0;
+    c->slot[vi].hits = 1;
+    c->slot[vi].last = c->clock;
+    if (had) { c->evictions++; ec_rehash(c); }
+    else ec_insert(c, key, vi);
+    c->misses++;
+    c->bytes_read += c->rec_bytes;
+}
+
+static void ec_drop(waste_ecache *c, int vi)
+{
+    c->slot[vi].key = -1;
+    c->slot[vi].state = EC_EMPTY;
+    c->slot[vi].fresh = 0;
+    c->slot[vi].pin = 0;
+    ec_rehash(c);
+}
+
+/* Release one more read into the pipe. Caller holds the lock. */
+static void ec_issue_next(waste_ecache *c)
+{
+    if (!c->io) return;               /* pf_n is 0 without it, but say so  */
+    while (c->pf_issued < c->pf_n) {
+        const int eid = c->pf_ids[c->pf_issued++];
+        const int32_t key = ec_key(c->pf_layer, eid);
+        const int si = ec_lookup(c, key);
+        if (si >= 0) {
+            /* Already here or already coming. It costs no I/O, so it does
+             * not consume pipeline depth either — keep looking. */
+            c->slot[si].pin = c->pf_gen;
+            continue;
+        }
+        const int vi = ec_victim(c);
+        if (vi < 0) { c->pf_issued--; return; }   /* retry on the next get */
+        ec_claim(c, vi, key, 1);
+        c->prefetched++;
+        if (eio_push(c->io, vi, c->pf_layer, eid) != 0) {
+            /* queue full: undo, and let get() fetch it synchronously */
+            c->prefetched--;
+            c->misses--;
+            c->bytes_read -= c->rec_bytes;
+            ec_drop(c, vi);
+            c->pf_issued--;
+        }
+        return;
+    }
+}
+
+void waste_ecache_hint(waste_ecache *c, int layer, const int *ids, int n)
+{
+    if (!c->io || c->n_slots <= 0 || n <= 0) return;
+
+    ec_lock(c);
+    /* Bumping the generation is what unpins the previous layer's records:
+     * they are finished with by the time the next hint is placed, and no
+     * explicit release can be forgotten on an error path. */
+    c->pf_gen++;
+    c->pf_layer = layer;
+    c->pf_n = n > WASTE_PF_MAX ? WASTE_PF_MAX : n;
+    /* Never pin more than a quarter of the cache. */
+    if (c->pf_n > c->n_slots / 4) c->pf_n = c->n_slots / 4;
+    for (int i = 0; i < c->pf_n; i++) c->pf_ids[i] = ids[i];
+    c->pf_issued = 0;
+    for (int d = 0; d < c->depth; d++) ec_issue_next(c);
+    ec_unlock(c);
 }
 
 const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
                                 waste_fetch_fn fetch, void *user)
 {
     const int32_t key = ec_key(layer, expert);
+
+    ec_lock(c);
     c->clock++;
 
     if (c->n_slots > 0) {
-        const int si = ec_lookup(c, key);
+        int si = ec_lookup(c, key);
         if (si >= 0) {
-            c->hits++;
-            c->slot[si].hits++;
+            while (c->io && c->slot[si].state == EC_INFLIGHT)
+                pthread_cond_wait(&c->io->done, &c->io->mu);
+            if (c->slot[si].state != EC_READY) {   /* failed, or lost its reader */
+                ec_drop(c, si);
+                ec_issue_next(c);
+                ec_unlock(c);
+                return NULL;
+            }
+            /* A record this hint brought in was already counted as a miss
+             * when its read was issued; counting it again here would turn
+             * every prefetch into a fictitious hit. */
+            if (c->slot[si].fresh) c->slot[si].fresh = 0;
+            else { c->hits++; c->slot[si].hits++; }
             c->slot[si].last = c->clock;
-            return c->slot[si].data;
+            uint8_t *d = c->slot[si].data;
+            ec_issue_next(c);
+            ec_unlock(c);
+            return d;
         }
     }
 
-    c->misses++;
-    c->bytes_read += c->rec_bytes;
-
-    if (c->n_slots == 0) return NULL;      /* caller falls back to its own buf */
-
-    const int vi = ec_victim(c);
-    const int had = c->slot[vi].key >= 0;
-    if (fetch(user, layer, expert, c->slot[vi].data) != 0) {
-        c->slot[vi].key = -1;
-        if (had) { c->evictions++; ec_rehash(c); }
+    if (c->n_slots == 0) {                 /* caller falls back to its own buf */
+        c->misses++;
+        c->bytes_read += c->rec_bytes;
+        ec_unlock(c);
         return NULL;
     }
-    if (had) { c->evictions++; c->slot[vi].key = key; ec_rehash(c); }
-    else { c->slot[vi].key = key; ec_insert(c, key, vi); }
-    c->slot[vi].hits = 1;
-    c->slot[vi].last = c->clock;
-    return c->slot[vi].data;
+
+    /* Not resident and not hinted: read it here, but still through a slot,
+     * so a reader thread cannot pick the same one meanwhile. */
+    const int vi = ec_victim(c);
+    if (vi < 0) { ec_unlock(c); return NULL; }
+    ec_claim(c, vi, key, 0);
+    uint8_t *dst = c->slot[vi].data;
+    ec_unlock(c);
+
+    const int rc = fetch(user, layer, expert, dst);
+
+    ec_lock(c);
+    if (rc != 0) {
+        ec_drop(c, vi);
+        ec_unlock(c);
+        return NULL;
+    }
+    c->slot[vi].state = EC_READY;
+    if (c->io) pthread_cond_broadcast(&c->io->done);
+    ec_issue_next(c);
+    ec_unlock(c);
+    return dst;
 }
 
 /* ---- learned hotlist ---------------------------------------------------- */
@@ -173,7 +424,7 @@ int waste_ecache_save_usage(const waste_ecache *c, const char *path,
     waste_usage_hdr h = { WASTE_MAGIC_USAGE, 1, tokens };
     int rc = fwrite(&h, sizeof h, 1, f) == 1 ? 0 : -1;
     for (int i = 0; i < c->n_slots && !rc; i++) {
-        if (c->slot[i].key < 0) continue;
+        if (c->slot[i].key < 0 || c->slot[i].state != EC_READY) continue;
         waste_usage_ent e;
         e.layer = (uint16_t)(c->slot[i].key >> 16);
         e.expert_id = (uint16_t)(c->slot[i].key & 0xFFFF);
@@ -241,6 +492,7 @@ int waste_ecache_warm(waste_ecache *c, const char *path,
         if (fetch(user, ent[i].layer, ent[i].expert_id, c->slot[vi].data) != 0) continue;
         const int had = c->slot[vi].key >= 0;
         c->slot[vi].key = key;
+        c->slot[vi].state = EC_READY;
         c->slot[vi].hits = ent[i].hits;
         c->slot[vi].last = ++c->clock;
         if (had) ec_rehash(c); else ec_insert(c, key, vi);

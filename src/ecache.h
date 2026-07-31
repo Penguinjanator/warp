@@ -32,12 +32,34 @@
 extern "C" {
 #endif
 
+/* `fetch(user, layer, expert, dst)` must fill rec_bytes and return 0.
+ * With read-ahead on it is called from the reader threads as well as the
+ * caller's, so an implementation must be safe to enter concurrently. */
+typedef int (*waste_fetch_fn)(void *user, int layer, int expert, uint8_t *dst);
+
+enum {
+    EC_EMPTY = 0,        /* no record, and none on the way                  */
+    EC_READY,            /* data is the record named by key                 */
+    EC_INFLIGHT,         /* an I/O thread is filling data right now         */
+    EC_FAILED            /* the read for key failed; get() reports and drops */
+};
+
 typedef struct {
     int32_t  key;        /* layer<<16 | expert, or -1 when empty            */
+    uint8_t  state;      /* one of the EC_* above                           */
+    uint8_t  fresh;      /* read was issued for this batch: not a hit yet   */
     uint32_t hits;       /* LFRU frequency term                             */
     uint64_t last;       /* LFRU recency term                               */
+    uint64_t pin;        /* hint generation holding it; 0 = evictable       */
     uint8_t *data;
 } waste_eslot;
+
+/* The most experts one hint may name. top_k is bounded at 64 by cfg_sane,
+ * so a decode hint always fits; a prefill chunk names more and is clipped,
+ * which costs read-ahead on the tail and nothing else. */
+#define WASTE_PF_MAX 64
+
+struct waste_eio;        /* opaque: the reader threads and their queue      */
 
 typedef struct {
     waste_eslot *slot;
@@ -45,8 +67,20 @@ typedef struct {
     int n_slots, hash_mask;
     size_t rec_bytes, budget_bytes;
     uint64_t clock, hits, misses, bytes_read, evictions;
+    uint64_t prefetched; /* misses whose read was started before it blocked */
     unsigned rng;
     int policy;          /* 0 = LFRU, 1 = LRU                               */
+
+    /* read-ahead; io == NULL means every fetch is synchronous, which is
+     * what the engine did before 0.7.0 and still does when asked for zero
+     * reader threads. */
+    struct waste_eio *io;
+    waste_fetch_fn fetch;
+    void *fetch_user;
+    int depth;                       /* reads kept in flight               */
+    uint64_t pf_gen;                 /* current hint generation, never 0   */
+    int pf_ids[WASTE_PF_MAX];
+    int pf_layer, pf_n, pf_issued;
 } waste_ecache;
 
 /* O_DIRECT requires the destination buffer to be aligned to the device's
@@ -66,11 +100,31 @@ int  waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
 void waste_ecache_free(waste_ecache *c);
 
 /* Returns a pointer to the expert's record bytes, reading it through
- * `fetch` on a miss. `fetch(user, layer, expert, dst)` must fill rec_bytes
- * and return 0 on success. NULL on failure. */
-typedef int (*waste_fetch_fn)(void *user, int layer, int expert, uint8_t *dst);
+ * `fetch` on a miss, or waiting for the read a hint already started.
+ * NULL on failure. */
 const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
                                 waste_fetch_fn fetch, void *user);
+
+/* ---- read-ahead ---------------------------------------------------------
+ *
+ * The disk is nearly saturated at queue depth 1 (10.73 of 12.89 GB/s on the
+ * internal SSD at K3's 11.83 MB record), so this is not about bandwidth: it
+ * is that a blocking pread stops the arithmetic. A MoE layer knows all of
+ * its top-K expert ids before it reads the first one, so the reads can be
+ * issued ahead and consumed as the matmuls finish. docs/EFFICIENCY.md has
+ * the measurement.
+ *
+ * nthreads 0 leaves every fetch synchronous. Returns 0 on success; failing
+ * to start the threads is not fatal, the cache simply stays synchronous. */
+int  waste_ecache_io_start(waste_ecache *c, waste_fetch_fn fetch, void *user,
+                           int nthreads, int depth);
+void waste_ecache_io_stop(waste_ecache *c);
+
+/* Name the records this layer is about to ask for, in the order it will ask.
+ * Reads for the first `depth` of them that are not resident start now, and
+ * each waste_ecache_get releases one more into the pipe. Calling it with a
+ * synchronous cache is a no-op, so call sites need no conditional. */
+void waste_ecache_hint(waste_ecache *c, int layer, const int *ids, int n);
 
 /* Persist / restore which experts this workload actually uses. Gate 5
  * measured a 0% hit rate until the cache exceeds one token's working set;

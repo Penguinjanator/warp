@@ -6,16 +6,16 @@
 $ waste run ~/models/k3.waste 'What is the capital of Italy?'
 waste: no --budget, using 46.24 GB of 64.00 GB (expert cache 17.56 GB)
 The capital of Italy is **Rome**.
-[16 tokens, 49.31 s, 0.32 tok/s | experts 3357 hit / 20195 miss = 14%]
+[16 tokens, 31.09 s, 0.51 tok/s | experts 3357 hit / 20195 miss = 14%]
 ```
 
 WASTE is an embeddable inference engine written in C, with no third-party runtime dependencies. It keeps the model trunk in memory, streams selected experts directly from disk, and uses the remaining RAM as a bounded expert cache.
 
-Its current proof point is the complete open-weights Kimi K3 model: 2.78 trillion parameters, converted into a 982 GiB container and running on a 64 GB MacBook Pro at 0.32–0.34 tokens per second. **This is not a distilled, pruned, or reduced variant**.
+Its current proof point is the complete open-weights Kimi K3 model: 2.78 trillion parameters, converted into a 982 GiB container and running on a 64 GB MacBook Pro at 0.49–0.51 tokens per second. **This is not a distilled, pruned, or reduced variant**.
 
 | Model               | Container | Minimum RAM | Tested speed    |
 | ------------------- | --------- | ----------- | --------------- |
-| **Kimi K3 2.78T**   | 982 GiB   | 29.05 GiB   | 0.32–0.34 tok/s |
+| **Kimi K3 2.78T**   | 982 GiB   | 29.05 GiB   | 0.49–0.51 tok/s |
 | **Kimi-Linear 48B** | 19 GiB    | 1.86 GiB    | 8.92 tok/s      |
 
 WASTE was written for that one model and that one constraint: **K3 does
@@ -184,6 +184,11 @@ re-run *after* the 52 and 58 GB rows have driven the machine into paging,
 counts identical to the digit. The engine is deterministic; the machine
 is not, and it does not fully recover between runs. Sweep upward.
 
+The decode column predates read-ahead and has not been re-swept: 46 GB now
+runs at 0.51 rather than 0.32. The shape is what the table is for, and
+read-ahead does not move it — it hides I/O behind arithmetic, which makes
+every row faster and none of them a different budget.
+
 Everything in the memory design exists to get above that line, which is
 why the engine works to free RAM rather than to save it.
 
@@ -246,10 +251,10 @@ measured on the commit it is published with.
 | minimum RAM | **29.05 GB** at 4K context |
 | | 30.54 GB at 32K, 35.63 GB at 128K, 83.21 GB at 1M |
 | resident trunk | 27.28 GB |
-| read per token | 17.0 GB at ~9.9 GB/s, near the SSD's measured ceiling |
+| read per token | 17.0 GB, read ahead on two threads so it overlaps the matmuls |
 | model load | 20 s |
-| prefill | 0.47 tok/s chunked, 0.29 sequential |
-| decode | 0.32–0.34 tok/s at the default budget, the best this machine gives |
+| prefill | 0.47 tok/s chunked, 0.29 sequential (before read-ahead) |
+| decode | 0.49–0.51 tok/s at the default budget, the best this machine gives |
 | vision tower | 15.7 s for a 1024-patch image, 27 layers |
 | image in a prompt | 256 positions for 896x896, 2.8 s each — as text |
 
