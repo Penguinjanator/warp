@@ -29,6 +29,75 @@ void *waste_dio_alloc(size_t n)
 
 void waste_dio_free(void *p) { waste_aligned_free(p); }
 
+/* ---- purgeable slots ----------------------------------------------------
+ *
+ * Measured before it was built: a volatile<->nonvolatile round trip costs
+ * 0.33 us, i.e. 0.5 ms over a K3 token's 1472 experts, and vm_allocate
+ * returns 16 KiB-aligned pages so O_DIRECT is unaffected.
+ *
+ * The contract that matters: a purged object reads back as zeros, which
+ * would be a silently wrong expert. So a slot is made nonvolatile *before*
+ * anything reads or writes it, and the state that comes back says whether
+ * the kernel took it in the meantime. Never read a volatile slot.
+ */
+#ifdef __APPLE__
+#include <mach/mach.h>
+
+static void *ec_purge_alloc(size_t n)
+{
+    vm_address_t a = 0;
+    if (vm_allocate(mach_task_self(), &a, n,
+                    VM_FLAGS_ANYWHERE | VM_FLAGS_PURGABLE) != KERN_SUCCESS)
+        return NULL;
+    return (void *)a;
+}
+
+static void ec_purge_free(void *p, size_t n)
+{
+    if (p) vm_deallocate(mach_task_self(), (vm_address_t)p, n);
+}
+
+/* Returns 1 if the kernel had reclaimed it, i.e. the record is gone. */
+static int ec_nonvolatile(waste_ecache *c, int si)
+{
+    if (!c->purgeable) return 0;
+    int st = VM_PURGABLE_NONVOLATILE;
+    if (vm_purgable_control(mach_task_self(), (vm_address_t)c->slot[si].data,
+                            VM_PURGABLE_SET_STATE, &st) != KERN_SUCCESS)
+        return 0;
+    return (st & VM_PURGABLE_EMPTY) != 0;
+}
+
+static void ec_volatile(waste_ecache *c, int si)
+{
+    if (!c->purgeable) return;
+    int st = VM_PURGABLE_VOLATILE;
+    vm_purgable_control(mach_task_self(), (vm_address_t)c->slot[si].data,
+                        VM_PURGABLE_SET_STATE, &st);
+}
+#else
+/* Linux's nearest equivalent is MADV_FREE plus a sentinel page to notice
+ * the drop; it is not written, so the flag simply does nothing there. */
+static void *ec_purge_alloc(size_t n) { (void)n; return NULL; }
+static void  ec_purge_free(void *p, size_t n) { (void)p; (void)n; }
+static int   ec_nonvolatile(waste_ecache *c, int si) { (void)c; (void)si; return 0; }
+static void  ec_volatile(waste_ecache *c, int si) { (void)c; (void)si; }
+#endif
+
+/* The slot the last get() handed out stays nonvolatile while its caller
+ * uses it, and is released here on the next one — moe_layer and moe_chunk
+ * both finish with a record before asking for the next. */
+static void ec_release_last(waste_ecache *c)
+{
+    if (c->last_used < 0) return;
+    /* Only if it is still a finished record: a slot that has since been
+     * reclaimed for another expert may have a reader writing into it, and
+     * a volatile object under an in-flight write is how a purged page
+     * becomes a silently zeroed weight. */
+    if (c->slot[c->last_used].state == EC_READY) ec_volatile(c, c->last_used);
+    c->last_used = -1;
+}
+
 static int32_t ec_key(int layer, int expert) { return (layer << 16) | expert; }
 
 static uint32_t ec_hash(int32_t k)
@@ -170,6 +239,9 @@ int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
     /* Generations start at 1 so that a slot's zeroed pin means "never
      * hinted" rather than "pinned by the current batch". */
     c->pf_gen = 1;
+    c->last_used = -1;
+    {   const char *e = getenv("WASTE_PURGEABLE");
+        c->purgeable = e && *e != '0'; }
     if (!rec_bytes || budget_bytes < rec_bytes) return 0;   /* no cache */
 
     c->n_slots = (int)(budget_bytes / rec_bytes);
@@ -182,10 +254,23 @@ int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
     if (!c->slot || !c->hash) { waste_ecache_free(c); return -1; }
     memset(c->hash, 0xff, (size_t)hs * sizeof *c->hash);   /* all -1 */
 
+    c->slot_bytes = (rec_bytes + WASTE_DIO_ALIGN - 1) / WASTE_DIO_ALIGN *
+                    WASTE_DIO_ALIGN;
     for (int i = 0; i < c->n_slots; i++) {
         c->slot[i].key = -1;
         c->slot[i].state = EC_EMPTY;
-        c->slot[i].data = (uint8_t *)waste_dio_alloc(rec_bytes);
+        c->slot[i].data = c->purgeable
+                              ? (uint8_t *)ec_purge_alloc(c->slot_bytes)
+                              : (uint8_t *)waste_dio_alloc(rec_bytes);
+        /* A purgeable allocation that fails is not a reason to refuse the
+         * model: fall back to ordinary memory for the whole cache, since a
+         * mix would have to remember which slot came from where. */
+        if (!c->slot[i].data && c->purgeable) {
+            for (int j = 0; j < i; j++) ec_purge_free(c->slot[j].data, c->slot_bytes);
+            c->purgeable = 0;
+            i = -1;
+            continue;
+        }
         if (!c->slot[i].data) { waste_ecache_free(c); return -1; }
     }
     return 0;
@@ -195,7 +280,10 @@ void waste_ecache_free(waste_ecache *c)
 {
     waste_ecache_io_stop(c);
     if (c->slot) {
-        for (int i = 0; i < c->n_slots; i++) waste_dio_free(c->slot[i].data);
+        for (int i = 0; i < c->n_slots; i++) {
+            if (c->purgeable) ec_purge_free(c->slot[i].data, c->slot_bytes);
+            else waste_dio_free(c->slot[i].data);
+        }
         free(c->slot);
     }
     free(c->hash);
@@ -235,7 +323,14 @@ static void ec_rehash(waste_ecache *c)
  * evicts the record it just read, one layer before it is used. */
 static int ec_pinned(const waste_ecache *c, int i)
 {
-    return c->slot[i].state == EC_INFLIGHT || c->slot[i].pin == c->pf_gen;
+    /* last_used is the record the caller is holding a pointer to right now.
+     * get() releases one more read into the pipe before it returns, so
+     * without this the reader threads could be handed the very slot whose
+     * bytes the caller is about to multiply. The hint path pins it anyway;
+     * the synchronous fallback inside get() does not, and that is the hole
+     * this closes. */
+    return c->slot[i].state == EC_INFLIGHT || c->slot[i].pin == c->pf_gen ||
+           i == c->last_used;
 }
 
 static int ec_victim(waste_ecache *c)
@@ -280,6 +375,10 @@ static int ec_victim(waste_ecache *c)
  * protects a slot whose buffer is being written. */
 static void ec_claim(waste_ecache *c, int vi, int32_t key, int fresh)
 {
+    /* Whoever fills this slot is about to write into it, so it has to stop
+     * being volatile first; whether the kernel had already taken the old
+     * record is of no interest, it is being overwritten either way. */
+    ec_nonvolatile(c, vi);
     const int had = c->slot[vi].key >= 0;
     c->slot[vi].key = key;
     c->slot[vi].state = EC_INFLIGHT;
@@ -358,6 +457,7 @@ const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
 
     ec_lock(c);
     c->clock++;
+    ec_release_last(c);
 
     if (c->n_slots > 0) {
         int si = ec_lookup(c, key);
@@ -370,16 +470,27 @@ const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
                 ec_unlock(c);
                 return NULL;
             }
-            /* A record this hint brought in was already counted as a miss
-             * when its read was issued; counting it again here would turn
-             * every prefetch into a fictitious hit. */
-            if (c->slot[si].fresh) c->slot[si].fresh = 0;
-            else { c->hits++; c->slot[si].hits++; }
-            c->slot[si].last = c->clock;
-            uint8_t *d = c->slot[si].data;
-            ec_issue_next(c);
-            ec_unlock(c);
-            return d;
+            /* Claim it back from the kernel before reading a byte of it. A
+             * purged object reads as zeros, so this test is the difference
+             * between a miss and a silently wrong expert. */
+            if (ec_nonvolatile(c, si)) {
+                c->purged++;
+                ec_drop(c, si);
+                si = -1;                       /* fall through and re-read */
+            }
+            if (si >= 0) {
+                /* A record this hint brought in was already counted as a
+                 * miss when its read was issued; counting it again here
+                 * would turn every prefetch into a fictitious hit. */
+                if (c->slot[si].fresh) c->slot[si].fresh = 0;
+                else { c->hits++; c->slot[si].hits++; }
+                c->slot[si].last = c->clock;
+                uint8_t *d = c->slot[si].data;
+                c->last_used = si;
+                ec_issue_next(c);
+                ec_unlock(c);
+                return d;
+            }
         }
     }
 
@@ -407,6 +518,7 @@ const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
         return NULL;
     }
     c->slot[vi].state = EC_READY;
+    c->last_used = vi;
     if (c->io) pthread_cond_broadcast(&c->io->done);
     ec_issue_next(c);
     ec_unlock(c);
@@ -496,6 +608,7 @@ int waste_ecache_warm(waste_ecache *c, const char *path,
         c->slot[vi].hits = ent[i].hits;
         c->slot[vi].last = ++c->clock;
         if (had) ec_rehash(c); else ec_insert(c, key, vi);
+        ec_volatile(c, vi);        /* warmed and idle: the kernel may have it */
         loaded++;
     }
     free(ent);

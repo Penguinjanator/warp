@@ -81,6 +81,17 @@ typedef struct {
     uint64_t pf_gen;                 /* current hint generation, never 0   */
     int pf_ids[WASTE_PF_MAX];
     int pf_layer, pf_n, pf_issued;
+
+    /* Purgeable slots (WASTE_PURGEABLE=1, macOS). A slot is volatile while
+     * idle, so under pressure the kernel drops it instead of compressing
+     * and swapping it, and the engine re-reads what it dropped — which is
+     * the pread it already knows how to do. LEARNED.md §16 is why: the
+     * cliff there is not the cache missing, it is a cache hit turning into
+     * a page fault. Off by default; it is a prototype. */
+    int purgeable;
+    size_t slot_bytes;               /* what was handed to vm_allocate     */
+    int last_used;                   /* held nonvolatile until the next get */
+    uint64_t purged;                 /* slots the kernel reclaimed         */
 } waste_ecache;
 
 /* O_DIRECT requires the destination buffer to be aligned to the device's
