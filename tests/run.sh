@@ -92,49 +92,77 @@ fetch_worker() {                       # $1 = generated worker path
     bash "$FT/gen.sh"
 }
 
+# The port comes from the kernel, not from this file. Two fixed ones (8731,
+# 8732) cost an afternoon on a machine already running something on the
+# first: range_server.py could not bind, the worker talked to whatever else
+# was listening, and the failure surfaced as "resume" and "state-file skip"
+# — two checks blaming the code under test for the environment. Nothing
+# here needs a *particular* port, only a free one, so ask for one and read
+# back what was given. The `sleep 1` this replaces was the other half of
+# the same bug: a fixed wait is either too long or, on a loaded machine,
+# not long enough.
+start_server() {                       # $@ = extra server args; sets PORT, RSRV
+    local pf="$FT/port"
+    rm -f "$pf" "$pf.tmp"
+    python3 tests/range_server.py "$FT/srv" 0 --port-file "$pf" "$@" \
+        >/dev/null 2>&1 &
+    RSRV=$!
+    PORT=
+    for _ in $(seq 100); do            # 10 s, in 100 ms steps
+        [ -s "$pf" ] && { PORT=$(cat "$pf"); break; }
+        kill -0 "$RSRV" 2>/dev/null || break   # it died; stop waiting
+        sleep 0.1
+    done
+    # A server that never reported is still a process, and the caller below
+    # only kills the ones it was told about — CI reported exactly one
+    # orphaned Python the first time this path fired.
+    [ -n "$PORT" ] || { kill "$RSRV" 2>/dev/null; wait "$RSRV" 2>/dev/null; }
+    [ -n "$PORT" ]
+}
+
 FT="$TMP/fetch"
 mkdir -p "$FT/srv" "$FT/dst"
 if stat --version >/dev/null 2>&1; then SM=gnu; else SM=bsd; fi
 python3 -c "open('$FT/srv/s.bin','wb').write(bytes(range(256))*4096)"
 
-PORT=8731
-python3 tests/range_server.py "$FT/srv" $PORT >/dev/null 2>&1 &
-RSRV=$!
-sleep 1
-head -c 400000 "$FT/srv/s.bin" > "$FT/dst/s.bin"
-fetch_worker $PORT $SM
-: > "$FT/dst/.st"
-bash "$FT/dst/.worker.sh" s.bin >/dev/null 2>&1
-if cmp -s "$FT/srv/s.bin" "$FT/dst/s.bin" && grep -q "^s.bin$" "$FT/dst/.st"; then
-    ok "a truncated shard resumes and verifies against Content-Length"
+if ! start_server; then
+    no "range server did not start (resume, state-file skip not run)"
 else
-    no "resume"
+    head -c 400000 "$FT/srv/s.bin" > "$FT/dst/s.bin"
+    fetch_worker $PORT $SM
+    : > "$FT/dst/.st"
+    bash "$FT/dst/.worker.sh" s.bin >/dev/null 2>&1
+    if cmp -s "$FT/srv/s.bin" "$FT/dst/s.bin" && grep -q "^s.bin$" "$FT/dst/.st"; then
+        ok "a truncated shard resumes and verifies against Content-Length"
+    else
+        no "resume"
+    fi
+    # second pass: recorded in the state file, so not even a HEAD goes out
+    before=$(wc -l < "$FT/dst/log")
+    bash "$FT/dst/.worker.sh" s.bin >/dev/null 2>&1
+    if [ "$(wc -l < "$FT/dst/log")" = "$before" ]; then
+        ok "a completed shard is skipped without a request"
+    else
+        no "state-file skip"
+    fi
+    kill $RSRV 2>/dev/null; wait $RSRV 2>/dev/null
 fi
-# second pass: recorded in the state file, so not even a HEAD goes out
-before=$(wc -l < "$FT/dst/log")
-bash "$FT/dst/.worker.sh" s.bin >/dev/null 2>&1
-if [ "$(wc -l < "$FT/dst/log")" = "$before" ]; then
-    ok "a completed shard is skipped without a request"
-else
-    no "state-file skip"
-fi
-kill $RSRV 2>/dev/null; wait $RSRV 2>/dev/null
 
-PORT=8732
-python3 tests/range_server.py "$FT/srv" $PORT --no-range >/dev/null 2>&1 &
-RSRV=$!
-sleep 1
-rm -f "$FT/dst/s.bin" "$FT/dst/.st" "$FT/dst/log"
-head -c 400000 "$FT/srv/s.bin" > "$FT/dst/s.bin"
-fetch_worker $PORT $SM
-: > "$FT/dst/.st"
-bash "$FT/dst/.worker.sh" s.bin >/dev/null 2>&1
-if cmp -s "$FT/srv/s.bin" "$FT/dst/s.bin"; then
-    ok "a server without Range support restarts the shard instead of giving up"
+if ! start_server --no-range; then
+    no "range server did not start (no-range fallback not run)"
 else
-    no "no-range fallback"
+    rm -f "$FT/dst/s.bin" "$FT/dst/.st" "$FT/dst/log"
+    head -c 400000 "$FT/srv/s.bin" > "$FT/dst/s.bin"
+    fetch_worker $PORT $SM
+    : > "$FT/dst/.st"
+    bash "$FT/dst/.worker.sh" s.bin >/dev/null 2>&1
+    if cmp -s "$FT/srv/s.bin" "$FT/dst/s.bin"; then
+        ok "a server without Range support restarts the shard instead of giving up"
+    else
+        no "no-range fallback"
+    fi
+    kill $RSRV 2>/dev/null; wait $RSRV 2>/dev/null
 fi
-kill $RSRV 2>/dev/null; wait $RSRV 2>/dev/null
 
 # ---------------------------------------------------------------- image ----
 head_ "image"
