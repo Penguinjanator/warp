@@ -1134,3 +1134,79 @@ synchronous fallback inside `get` did not. `ec_pinned` covers `last_used`
 now. Read-ahead had been green on 37 checks and against the oracle for a day
 by then — the window is one layer wide and needs the sampler to land on one
 slot out of 1483.
+
+## 25. The gather loop was not the bottleneck (2026-07-31)
+
+§22 hid the expert reads behind the arithmetic and §24 closed the memory
+levers, and [EFFICIENCY.md](EFFICIENCY.md) concluded from the model
+`max(1.17 I/O, 1.03 matmul)` that the engine was now arithmetic-bound, with
+`vq_rows` the thing left to fix. So `vq_rows` was fixed.
+
+**The profile says it was not the thing to fix.** Six decode steps of K3
+with read-ahead on:
+
+| stage | s | share |
+|---|---|---|
+| expert I/O | 9.95 | **54.8%** |
+| expert matmul | 4.94 | 27.2% |
+| — of which LUT apply | 4.34 | 23.9% |
+| kda | 1.69 | 9.3% |
+| LUT build | 0.48 | 2.7% |
+
+The reads are still **twice** the arithmetic. The projection had
+overestimated the matmul and underestimated the wait, and nothing checked it
+against a profile before it became a plan.
+
+**The optimization is real and small.** Three table lookups per row are the
+algorithm; the three index bytes read one at a time are not. Eight rows are
+24 consecutive bytes, so six word loads replace 24 byte loads — 64 memory
+operations per eight rows down to 46, eight gather chains instead of four,
+bit-identical output.
+
+| | `waste bench` | `waste run`, 32 tokens | K3, LUT apply at 6 threads |
+|---|---|---|---|
+| before | 8.45 tok/s | 10.53 tok/s | 3.09 s |
+| after | **8.73–8.78** (+3.6%) | **10.88–10.93** (+3.5%) | **3.00 s** (+3%) |
+
+Kept: it is free, and Kimi-Linear is the model whose container fits in RAM,
+where this bucket is most of a step. On K3, 3% of 22% is 0.7% and does not
+clear the noise of a streaming decode.
+
+**That table said +6.6% before it was measured properly.** The baseline came
+from an hour earlier in the same session; run back to back against the
+previous commit's `model.c` it is 3.5%, and three harnesses then agree on
+3–3.6%. §16 established that a row taken after the machine has been worked
+is measured on a different computer. It says nothing about which direction
+the drift goes, and here it flattered the change — the harder case to
+notice, because the number was the one being hoped for.
+
+**Two refutations, and the first is §7 arriving from the other side.**
+
+*Accumulators in registers.* Turn the loops inside out for an eight-row
+sub-tile and the running sums live in registers, deleting all the `acc`
+load/store traffic: 30 memory operations per eight rows instead of 46, and
+still bit-exact, because each row sums over `v` ascending either way. It is
+**17% slower** — 8.93 against 11.08 tok/s. Consecutive `v` sit 192 bytes
+apart, so a sub-tile re-walks the block's whole index span and touches about
+five cache lines for each one it uses. §7 found a layout that was 1.44x in
+isolation and nothing in place; this is a change that is 35% fewer memory
+operations on paper and a loss in place. **Counting operations does not
+predict this loop. Counting cache lines does.**
+
+*`VQ_SUPER`.* Swept 1, 2, 4, 8 on both models: 11.12–11.20 tok/s on
+Kimi-Linear, 4.33–4.35 s on K3. Flat. §7's table-bandwidth theory stays
+refuted even with a third of the index loads removed.
+
+**One finding worth keeping.** The apply saturates at **six threads**, which
+is exactly this machine's performance-core count: 2 → 6 threads is
+7.31 → 2.99 s, and 6 → 18 is 2.99 → 2.89. The twelve efficiency cores are
+worth 3% between them. §10 noted that a single-threaded run lands on an
+E-core; this is the same asymmetry seen from the top.
+
+The method note is about the order, not the code. **A projection that names
+the next bottleneck should be checked against a profile before it becomes a
+plan.** The profile cost one command and would have said, before any of this
+was written, that the arithmetic was 27% and the reads were 55%. The work
+was not wasted — it is bit-exact and it made the model that fits in RAM
+3.5% faster — but it was chosen by arithmetic on an estimate rather than by
+measurement, which is the thing this file exists to stop.

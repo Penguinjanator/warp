@@ -1662,15 +1662,41 @@ static void vq_rows(int b, int e, void *p)
                 float *ac = acc + (size_t)j * VQ_TILE;
                 /* Each gather is load -> address -> load, a ~5-cycle chain.
                  * Four rows are independent, so interleaving them keeps
-                 * four chains in flight instead of one. */
+                 * four chains in flight instead of one.
+                 *
+                 * The three table loads per row are the algorithm and cannot
+                 * go. The index bytes can: eight rows are twenty-four
+                 * consecutive bytes, so six word loads and some shifting
+                 * replace twenty-four byte loads. Per eight rows that is 64
+                 * memory operations down to 46, and eight independent chains
+                 * instead of four.
+                 *
+                 * Worth what it is worth: +3.5% end to end on Kimi-Linear,
+                 * where this bucket is most of a step, and 3% of the bucket
+                 * on K3, where expert I/O is twice the arithmetic and the
+                 * gain does not reach the clock. docs/EFFICIENCY.md §5.
+                 *
+                 * Little-endian is already assumed throughout — the record
+                 * headers are read as structs — so byte k of the word is
+                 * shift 8k. */
                 int r = 0;
                 if (st == 3) {
-                    for (; r + 4 <= nr; r += 4, ix += 4 * 3) {
-                        const float t0 = blk[ix[0]] + blk[en + ix[1]] + blk[2 * en + ix[2]];
-                        const float t1 = blk[ix[3]] + blk[en + ix[4]] + blk[2 * en + ix[5]];
-                        const float t2 = blk[ix[6]] + blk[en + ix[7]] + blk[2 * en + ix[8]];
-                        const float t3 = blk[ix[9]] + blk[en + ix[10]] + blk[2 * en + ix[11]];
+                    const float *b1 = blk + en, *b2 = blk + 2 * en;
+                    for (; r + 8 <= nr; r += 8, ix += 8 * 3) {
+                        uint32_t w0, w1, w2, w3, w4, w5;
+                        memcpy(&w0, ix,      4); memcpy(&w1, ix +  4, 4);
+                        memcpy(&w2, ix +  8, 4); memcpy(&w3, ix + 12, 4);
+                        memcpy(&w4, ix + 16, 4); memcpy(&w5, ix + 20, 4);
+                        const float t0 = blk[w0 & 0xff]         + b1[(w0 >>  8) & 0xff] + b2[(w0 >> 16) & 0xff];
+                        const float t1 = blk[w0 >> 24]          + b1[w1 & 0xff]         + b2[(w1 >>  8) & 0xff];
+                        const float t2 = blk[(w1 >> 16) & 0xff] + b1[w1 >> 24]          + b2[w2 & 0xff];
+                        const float t3 = blk[(w2 >>  8) & 0xff] + b1[(w2 >> 16) & 0xff] + b2[w2 >> 24];
+                        const float t4 = blk[w3 & 0xff]         + b1[(w3 >>  8) & 0xff] + b2[(w3 >> 16) & 0xff];
+                        const float t5 = blk[w3 >> 24]          + b1[w4 & 0xff]         + b2[(w4 >>  8) & 0xff];
+                        const float t6 = blk[(w4 >> 16) & 0xff] + b1[w4 >> 24]          + b2[w5 & 0xff];
+                        const float t7 = blk[(w5 >>  8) & 0xff] + b1[(w5 >> 16) & 0xff] + b2[w5 >> 24];
                         ac[r] += t0; ac[r + 1] += t1; ac[r + 2] += t2; ac[r + 3] += t3;
+                        ac[r + 4] += t4; ac[r + 5] += t5; ac[r + 6] += t6; ac[r + 7] += t7;
                     }
                 }
                 for (; r < nr; r++, ix += st) {

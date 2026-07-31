@@ -327,12 +327,66 @@ Refuted with measurements, in this repo:
 **Where that leaves it.** One of the four levers survived contact. (A)
 shipped and is worth 1.5–1.6x; (B), (C) and (D) are all refuted, each by a
 measurement that cost hours rather than the days building them would have.
-The engine went 0.33 → 0.51 tok/s and is now arithmetic-bound: with I/O
-overlapped, `max(1.17 I/O, 1.03 matmul)` is a near tie, and every remaining
-idea on the I/O side is pushing on the side that is already hidden.
 
-So the honest next question is not which bytes to stop reading. It is
-whether `vq_rows` can gather faster — three dependent loads per row,
-unrolled by four, with `VQ_SUPER` already swept. That is the whole of the
-remaining headroom, and this document has nothing measured to say about it
-yet.
+> **Correction (2026-07-31).** This section used to say the engine was now
+> arithmetic-bound, from the model `max(1.17 I/O, 1.03 matmul)`. That was a
+> projection, and the profile disagrees. With read-ahead on, six decode
+> steps of K3 give **expert I/O 54.8%, expert matmul 27.2%** — the reads are
+> still twice the arithmetic. The model overestimated the matmul and
+> underestimated the wait. §5 has what came of acting on it anyway.
+
+## 5. `vq_rows`, optimized against the wrong premise
+
+Acting on the corrected profile rather than the projection would have said
+not to bother. It was done first and is kept, because it is bit-identical
+and free, and because what it measured is worth having.
+
+**What shipped.** The inner loop does three table lookups per row, which are
+the algorithm, and read the three index bytes one at a time, which are not:
+eight rows are 24 consecutive bytes, so six word loads and some shifting
+replace 24 byte loads. Per eight rows, 64 memory operations become 46, with
+eight independent gather chains instead of four.
+
+Measured back to back against the previous commit's `model.c`, both
+harnesses, on one sitting:
+
+| | `waste bench` | `waste run`, 32 tokens | K3, LUT apply at 6 threads |
+|---|---|---|---|
+| before | 8.45 tok/s | 10.53 tok/s | 3.09 s |
+| after | **8.73–8.78** (+3.6%) | **10.88–10.93** (+3.5%) | **3.00 s** (+3%) |
+
+Three harnesses agreeing on 3–3.6% is the result. On K3 that is 3% of a
+bucket worth 22% of a step — around 0.7% end to end, which does not clear
+the noise. **The loop got faster and the model did not.** That is what
+"expert I/O is twice the arithmetic" means in practice.
+
+The first version of this table said +6.6%, from a baseline taken an hour
+earlier in the same session rather than back to back. §16 says a row
+measured after the machine has been worked is measured on a different
+computer, and it is just as true when the drift flatters the change.
+
+**Two things measured and refused on the way:**
+
+- **Accumulators in registers.** Turning the loops inside out for an
+  eight-row sub-tile keeps the running sums in registers and deletes the
+  `acc` load/store traffic entirely — 30 memory operations per eight rows
+  instead of 46, and bit-exact, since each row still sums over `v`
+  ascending. It is **17% slower** (8.93 against 11.08 tok/s). Consecutive
+  `v` are 192 bytes apart, so the sub-tile re-walks the block's whole index
+  span once per sub-tile and touches five cache lines for every one it
+  uses. Locality beat operation count, which is §7's lesson arriving from
+  the other side.
+- **`VQ_SUPER`**, which controls how often the LUT is re-streamed. Swept 1,
+  2, 4, 8 on both models: 11.12 → 11.20 tok/s on Kimi-Linear and 4.33–4.35 s
+  on K3. Flat. §7 refuted the table-bandwidth theory once already; it is
+  still refuted with a third of the index loads gone.
+
+**And one thing found.** The apply saturates at **six threads** — exactly
+this machine's performance-core count. 2 → 6 threads is 7.31 → 2.99 s, and
+6 → 18 is 2.99 → 2.89. The twelve efficiency cores are worth 3%.
+
+**What is actually left.** The engine is I/O-bound again, 2:1, and every I/O
+lever in this document has been measured and refused. The remaining headroom
+is not in this file: it is a faster disk, or a machine whose RAM holds more
+than a token's working set. On this one, 0.49–0.54 tok/s is close to what
+the hardware gives.
