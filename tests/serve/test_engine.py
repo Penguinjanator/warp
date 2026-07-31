@@ -22,6 +22,7 @@ Skipped, loudly, when libwaste has not been built.
 
 import json
 import argparse
+import os
 import shutil
 import struct
 import subprocess
@@ -432,8 +433,18 @@ class TestState(EngineTestCase):
         self.engine.state_reset()
         self.engine.state_load(str(path))
 
+    # Both skips are the same statement: this check needs the save to fail,
+    # and it makes it fail by taking write permission off the directory. A
+    # user who is not subject to directory permissions is not a user this
+    # can inject a fault into — root has CAP_DAC_OVERRIDE and creates the
+    # temp file anyway, so the save succeeds, no error is raised, and the
+    # check reports the engine broken for something the engine did right.
+    # It surfaced in Docker, which runs as root by default; macOS and the
+    # GitHub Linux runners are ordinary users and do exercise it.
     @unittest.skipIf(sys.platform == "win32",
                      "directory chmod is not a reliable Windows fault injector")
+    @unittest.skipIf(getattr(os, "geteuid", lambda: 1)() == 0,
+                     "root bypasses directory permissions, so chmod injects no fault")
     def test_failed_save_preserves_the_previous_checkpoint(self):
         locked = Path(self.tmp) / "locked-state"
         locked.mkdir()

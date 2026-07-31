@@ -1348,3 +1348,43 @@ reported as SKIP. Debian slim and a bare MinGW both lack it. `make check` in
 `Dockerfile.test` goes from 4 failures to 1; the remaining one is a `serve`
 checkpoint test that passes in isolation and fails under the suite, which is
 its own issue and not this one.
+
+## 28. The fault injector that could not inject (2026-07-31)
+
+The last red check in `Dockerfile.test` was
+`test_failed_save_preserves_the_previous_checkpoint`, and it was red only
+there: green on macOS, green on the GitHub Linux runners, skipped on
+Windows. It passed in isolation and failed under the suite, which is the
+shape of a test-ordering bug and was not one — in isolation the library had
+not been built, so it skipped.
+
+The check takes write permission off a directory, saves into it, and
+expects `EngineError`. **Docker runs as root, and root has
+CAP_DAC_OVERRIDE**: the temp file is created regardless, the save succeeds,
+no error is raised, and the check reports the engine broken for something
+the engine did right. Confirmed by running it twice in the same container:
+
+```
+as root     FAILED (failures=1)
+as tester   OK
+```
+
+So the fix is a skip, and it is the same statement the file already made
+one line above — `sys.platform == "win32"` is skipped because "directory
+chmod is not a reliable Windows fault injector". A user not subject to
+directory permissions is not a user this can inject a fault into either.
+`make check` in `Dockerfile.test` is now 21 passed, 0 failed, 15 skipped.
+
+Two notes.
+
+**A test that cannot fail correctly is worse than an absent one**, and this
+is the second time in two days that the same shape appeared: §26's
+`bank_open` gate reported `direct_io: false` for a container that would
+have worked, and this reported a save defect for a save that worked. Both
+were the check being wrong about its own preconditions.
+
+**The environment was the variable, and it was invisible.** Nothing in the
+failure named root; the traceback said only `EngineError not raised`. What
+identified it was running the same test as a different user in the same
+container — the cheapest possible A/B, and the one worth reaching for when
+a check is green on three machines and red on the fourth.
