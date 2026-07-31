@@ -1026,3 +1026,42 @@ Method notes, both familiar:
   SSD gives 10.73 GB/s at queue depth 1 and 12.89 at depth 2 — a 20% band.
   The other 1.3x came from not standing still, which is not a number a
   bandwidth measurement can show.
+
+## 23. The router has no tail to demote (2026-07-31)
+
+[EFFICIENCY.md](EFFICIENCY.md) proposed reordering the expert record so its
+residual VQ stages are contiguous planes rather than interleaved bytes. That
+would make any prefix of the stages a single coalesced read, which in turn
+would allow reading two stages instead of three for the experts a token
+barely uses — the one lever that cuts I/O *and* arithmetic, since `vq_rows`
+does exactly `stages` gathers per row.
+
+It rests on one assumption: that the top-16 is top-heavy. `WASTE_DUMP_ROUTE`
+now writes the renormalized weights, and it is not.
+
+| rank | 1 | 2 | 4 | 8 | 12 | 16 |
+|---|---|---|---|---|---|---|
+| mean weight | 0.149 | 0.108 | 0.077 | 0.055 | 0.043 | 0.032 |
+
+1104 rows, 12 decode tokens over 92 MoE layers. First to sixteenth is a
+factor of **4.6**, and **ranks 9–16 carry 33.3% of the mass**. Per layer the
+tail runs 21.6% to 48.4%, so there is no subset of layers to apply it to
+either. Kimi-Linear says the same: 3.8x across its top-8, bottom half 32.0%.
+
+Priced with §20's own `err² = err3² + mass(S)·delta`, demoting ranks 9–16
+takes the expert error from 19.5% to **24.9%** for 16.7% of the reads; the
+gentlest version, ranks 13–16, gives 22.0% for 8.3%. A K3 expert costs 20.3%
+at 3 bits from MXFP4 and that is the measured safe point. Both rows are past
+it, and both sit on the straight line §20 already described — "the exchange
+rate is fixed and both ends of it are bad".
+
+So the format change was not made, for the price of an afternoon against a
+982 GB reconversion. This is Gate 6 again with a different assumption in the
+same place: §20 found the *experts* homogeneous in how hard they are to
+quantize, and this finds the *router* homogeneous in how much it leans on
+them. Two independent flatnesses, and between them they close per-expert bit
+allocation in both its static and its per-activation form.
+
+The instrument stays — four lines behind an env var — because it is the
+first thing to run against any new container, and it is the difference
+between believing a router is peaked and knowing it is not.

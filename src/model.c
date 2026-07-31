@@ -163,6 +163,7 @@ static inline float dotf(const float *a, const float *b, int n)
 static int q8_off = 1;     /* 1 = keep the trunk stored as int8          */
 static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
 static int i8mm_on = 0;    /* SMMLA batched matmul; costs activation int8 */
+static const char *dump_route = NULL;  /* WASTE_DUMP_ROUTE, see moe_layer */
 static pthread_once_t model_opts_once = PTHREAD_ONCE_INIT;
 
 static void model_opts_init(void)
@@ -180,6 +181,9 @@ static void model_opts_init(void)
     i8mm_on = e ? (*e != '0')
                 : 0;     /* off by default until it earns it — see below */
     if (i8mm_on && !(waste_cpu_features() & WASTE_CPU_I8MM)) i8mm_on = 0;
+    /* Read once rather than per layer per token: moe_layer runs 92
+     * times a token and getenv is not free. */
+    dump_route = getenv("WASTE_DUMP_ROUTE");
 }
 
 /* One weight from a 3-bit stream: values sit LSB-first at bit offset 3*i,
@@ -2003,6 +2007,21 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     }
     for (int j = 0; j < K; j++) w[j] *= c->routed_scale;
     if (routed) for (int j = 0; j < K; j++) routed[j] = idx[j];
+
+    /* WASTE_DUMP_ROUTE=path appends one line per (token, layer): the layer,
+     * then the renormalized weight of each of the top-K in selection order.
+     * What it is for is deciding whether the tail of the top-K carries
+     * enough mass to be worth reading at lower precision — docs/EFFICIENCY.md
+     * lever C, which is gated on this and nothing else. */
+    if (dump_route) {
+        FILE *df = fopen(dump_route, "a");
+        if (df) {
+            fprintf(df, "%d", L);
+            for (int j = 0; j < K; j++) fprintf(df, " %.6g", w[j]);
+            fputc('\n', df);
+            fclose(df);
+        }
+    }
 
     /* Every id this layer will read is known here, before the first read.
      * Handing them over lets the cache keep reads in flight while the

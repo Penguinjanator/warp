@@ -149,7 +149,7 @@ being aggressive. Linux equivalent is `MADV_FREE` plus a sentinel.
 The most speculative item here, and the one that attacks the worst number
 the project has measured.
 
-### C. Stage-major records — the only lever that cuts both buckets
+### C. Stage-major records — measured and dropped
 
 Today a record is `[hdr][gate][up][down][scales]`, and within a matrix
 `[row_block][vec_pos][row_in_block][stage]`: **stages are interleaved at the
@@ -185,10 +185,53 @@ from §20's closing note (demoting the cold tail saves disk and ~0% of the
 reads, because cold experts are not read) in that it demotes what is being
 read *now*.
 
-**The measurement that gates it**, and it is an afternoon rather than a
-982 GB / 4.7 h reconversion: the distribution of renormalized routing weight
-across the top-16. If ranks 9–16 carry under 10% of the mass the lever is
-worth ~17% on both buckets; if they carry 30% it is not worth building.
+**The measurement that gates it — run, and it says no (2026-07-31).**
+
+The whole lever rests on the top-16 being top-heavy: demote the tail only if
+the tail is light. `WASTE_DUMP_ROUTE=path` writes one line per (token, layer)
+with the renormalized weights; 1104 rows from 12 K3 decode tokens over 92 MoE
+layers:
+
+| rank | 1 | 2 | 4 | 8 | 12 | 16 |
+|---|---|---|---|---|---|---|
+| mean weight | 0.149 | 0.108 | 0.077 | 0.055 | 0.043 | 0.032 |
+
+**Rank 1 to rank 16 is a factor of 4.6, and ranks 9–16 carry 33.3% of the
+mass** — a third, where the lever needed under a tenth. It is not a
+per-layer effect either: the tail mass runs 21.6% to 48.4% across the 92
+layers, no layer peaked enough to demote selectively.
+
+Cross-checked on Kimi-Linear, the same way §20 did when it wanted to know
+whether K3's QAT was what flattened its experts: top-8 with
+`routed_scaling_factor` 2.446, ranks 1 to 8 run 0.243 to 0.064 once
+normalized — a factor of 3.8 — and the bottom half carries **32.0%**. The
+same number on a different model, a different expert count and a different
+top-k. **The routers in this family do not concentrate**, and that is a
+property of the family rather than of K3.
+
+Priced with §20's own formula, `err² = err3² + mass(S)·delta`:
+
+| demoted | mass | expert error | I/O and compute saved |
+|---|---|---|---|
+| ranks 9–16 | 33.3% | 19.5% → **24.9%** | 16.7% |
+| ranks 13–16 | 14.5% | 19.5% → **22.0%** | 8.3% |
+
+19.5% is the measured operating point and 20.3% is what a K3 expert costs at
+3 bits from MXFP4; 24.9% is well past both, for a sixth of the reads. That is
+the same straight line §20 found for static allocation — "the exchange rate is
+fixed and both ends of it are bad" — and per-activation allocation lands on it
+rather than escaping it.
+
+**So the layout change is not worth making**, and the reason is one level
+deeper than §20's: K3 is homogeneous in how hard its experts are to quantize
+*and* in how much weight its router gives them. There is no tail to demote
+because the router does not make one.
+
+What would revive it: a router whose weights are actually peaked (a different
+model), or a demotion whose error cost is far below the residual-stage
+ladder's 19.5 → 33.2. Both are somebody else's model, not a tuning change
+here. The instrument stays in the tree — the dump is four lines behind an
+env var — because the question recurs for every new container.
 
 ### D. Batching and speculative decoding — refuted for this machine
 
@@ -235,9 +278,16 @@ Refuted with measurements, in this repo:
 
 ## 6. Order
 
-1. **Asynchronous expert prefetch** (A). Bit-exact, no reconversion, no
-   quality risk. The rest of this document is optional; this is not.
-2. **Measure the top-16 routing weight distribution** — an afternoon, and it
-   decides (C) before committing 4.7 h of reconversion.
-3. **Prototype the purgeable cache** (B).
-4. **Stage-major layout** (C), if 2 clears it.
+1. ~~**Asynchronous expert prefetch** (A)~~ — **done**, 1.5–1.6x, shipped
+   in 0.7.0. §22 of [LEARNED.md](LEARNED.md) has what it cost.
+2. ~~**Measure the top-16 routing weight distribution**~~ — **done**, and it
+   refused (C) for the price of an afternoon rather than a 4.7 h
+   reconversion. The tail is a third of the mass, not a tenth.
+3. **Prototype the purgeable cache** (B) — the one lever left with room in
+   it, and the only one that attacks §16's cliff.
+4. ~~**Stage-major layout** (C)~~ — cancelled by 2.
+
+After (A), the remaining headroom is smaller than this document first
+suggested. (B) is worth ~1.2x on top of what shipped, and past it the
+engine is arithmetic-bound: the honest next question is not which bytes to
+stop reading, it is whether `vq_rows` can be made to gather faster.
