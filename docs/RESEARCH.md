@@ -125,3 +125,12 @@ workload-driven expert pruning (drop the cold tail of 896 experts).
 > same measurement is why pruning would have to be justified on its own
 > terms: dropping the cold tail costs disk, which is not scarce, and
 > saves almost none of the reads, which are.
+
+> **And the "only real lever" was wrong too (2026-07-31).** Bytes per token
+> is what this section names, and every lever on it has since been measured
+> and refused — per-activation bit allocation because the router has no
+> tail, a larger cache because the machine will not leave it resident. What
+> actually paid was not reading fewer bytes but not *waiting* for them:
+> overlapping the reads with the arithmetic is ~1.6x on K3, and it took no
+> format change at all. [EFFICIENCY.md](EFFICIENCY.md) is the ledger,
+> [LEARNED.md](LEARNED.md) §22–25 the account.

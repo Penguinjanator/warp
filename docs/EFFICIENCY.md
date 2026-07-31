@@ -1,7 +1,9 @@
 # Where the remaining speed is (2026-07-31)
 
-K3 decodes at 0.33 tok/s on this machine. This document is the measured
-answer to "what is left", written after an outside article
+K3 decoded at 0.33 tok/s when this was written and does **0.49–0.53** now;
+§4A is the one change that did it, and §4B–D and §5 are what was measured
+and refused. This document is the account of "what is left", started after
+an outside article
 ([AirLLM](https://github.com/lyogavin/airllm) running K3 at ~5 minutes per
 token) prompted a review of the streaming path. The article itself has
 nothing this engine wants — WASTE is ~100x faster and never expands an
@@ -14,10 +16,12 @@ inputs named, because the point of this document is to decide what to build
 next and a projection dressed as a measurement is how that decision goes
 wrong.
 
-## 1. The engine is not I/O-bound. It is half I/O-bound.
+## 1. Grouping tokens removes the I/O and none of the compute
 
-This is the finding everything else follows from, and it is the opposite of
-what the offloading literature assumes.
+This is the finding §4D follows from, and it is the opposite of what the
+offloading literature assumes: there, compute is free and the transfer is
+the wall, so putting more tokens in flight is the answer. Here the two are
+the same order of magnitude and it is not.
 
 Measured with `waste chat … /stats` (cumulative counters, so they include
 prefill) at a budget on the floor, so the cache cannot flatter the count.
@@ -102,7 +106,7 @@ Baseline **3.03 s/token (0.33 tok/s)** at the default budget (17.56 GB
 cache, 13% hit). Decomposed at the margin: **I/O 1.41 s, expert matmul
 1.03 s, everything else 0.50 s**.
 
-### A. Pipeline I/O against compute — **built, 1.5–1.6x measured**
+### A. Pipeline I/O against compute — **built, ~1.6x measured**
 
 Turns a sum into a maximum. With two reads in flight the I/O also runs at
 12.89 GB/s rather than 10.73, so 1.41 → 1.17 s.
@@ -110,9 +114,12 @@ Turns a sum into a maximum. With two reads in flight the I/O also runs at
     before:     1.41 + 1.03 + 0.50 = 2.94 s
     pipelined:  max(1.17, 1.03) + 0.50 = 1.67 s   ->  1.81x projected
 
-**Shipped in 0.7.0 and measured at 1.5–1.6x**: 16 tokens in 31.09 s against
-47.90 s synchronous, 0.51 tok/s against 0.33, with `3357 hit / 20195 miss`
-identical in every run. Chunked prefill gains ~1.35x, because a chunk
+**Shipped, and measured at ~1.6x.** Two binaries built separately from
+`main` and this branch, alternated on one machine: K3 goes 48.41 → 30.03 s
+and 58.61 → 32.85 s for 16 tokens, 0.27–0.33 → 0.49–0.53 tok/s, with
+`3357 hit / 20195 miss` identical in every run of both. Kimi-Linear gains
+too, since 22% of its accesses still miss: `run` 8.96 → 10.81 tok/s and
+`bench` 7.24 → 8.77, both about **1.21x**. Chunked prefill gains ~1.35x, because a chunk
 already spreads each expert over several tokens and has less I/O to hide.
 The projection was 1.81x; the gap is the per-layer LUT build, which is
 serialized ahead of the applies and cannot hide the layer's first read.
@@ -290,50 +297,33 @@ So:
 Recorded here because it is the first thing anyone who reads that literature
 will try to build.
 
-### E. Past ~2x the bottleneck is arithmetic
+### E. Where the bottleneck actually is
 
-(A) and (B) together leave `max(0.85 I/O, 1.03 matmul)` — the matmul wins,
-and the engine is compute-bound. From there *every* I/O-side lever — bigger
-cache, batching, speculation, expert pruning — hits the same wall at ~2x.
+This section used to argue from `max(0.85 I/O, 1.03 matmul)` that (A) and
+(B) together would leave the engine compute-bound, and that a faster
+`vq_rows` was therefore the thing left to build. **The profile says
+otherwise, and §5 is what came of believing the arithmetic instead.**
 
-What is left past it: (C), and a faster `vq_rows`. That loop is three
-dependent gathers per row unrolled by four; `VQ_SUPER` has already been
-swept (1 and 2 tie, 4+ is worse). Stage-major planes would at least turn one
-interleaved stream into three sequential ones, which the hardware prefetcher
-can see.
+Six decode steps of K3 with read-ahead on:
 
-## 5. Do not rebuild these
+| stage | s | share |
+|---|---|---|
+| expert I/O | 9.95 | **54.8%** |
+| expert matmul | 4.94 | 27.2% |
+| — of which LUT apply | 4.34 | 23.9% |
+| kda | 1.69 | 9.3% |
+| LUT build | 0.48 | 2.7% |
 
-Refuted with measurements, in this repo:
+The reads are still **twice** the arithmetic even after (A) hides them
+behind it. The projection had overestimated the matmul and underestimated
+the wait, and nothing checked it against a profile before it became a plan.
 
-- 2-bit experts — 34% error ([LEARNED.md](LEARNED.md) §3, [K3.md](K3.md))
-- static per-expert bit allocation — Gate 6 / §20, delta flat 1.01–1.15x
-- KBVQ shared low-rank — §3, pending only the activation-weighted rerun
-- a 3-bit trunk — §13, the quality wall sits in front of the speed wall
-- streaming `lm_head` — §13, a net loss of ~0.8 GB/token
-
-## 6. Order
-
-1. ~~**Asynchronous expert prefetch** (A)~~ — **done**, 1.5–1.6x, shipped
-   in 0.7.0. §22 of [LEARNED.md](LEARNED.md) has what it cost.
-2. ~~**Measure the top-16 routing weight distribution**~~ — **done**, and it
-   refused (C) for the price of an afternoon rather than a 4.7 h
-   reconversion. The tail is a third of the mass, not a tenth.
-3. ~~**Prototype the purgeable cache** (B)~~ — **done**, and it is not a
-   speedup: volatile memory is memory the kernel takes. Kept off by default
-   as an escape hatch for an over-large `--budget`.
-4. ~~**Stage-major layout** (C)~~ — cancelled by 2.
-
-**Where that leaves it.** One of the four levers survived contact. (A)
-shipped and is worth 1.5–1.6x; (B), (C) and (D) are all refuted, each by a
-measurement that cost hours rather than the days building them would have.
-
-> **Correction (2026-07-31).** This section used to say the engine was now
-> arithmetic-bound, from the model `max(1.17 I/O, 1.03 matmul)`. That was a
-> projection, and the profile disagrees. With read-ahead on, six decode
-> steps of K3 give **expert I/O 54.8%, expert matmul 27.2%** — the reads are
-> still twice the arithmetic. The model overestimated the matmul and
-> underestimated the wait. §5 has what came of acting on it anyway.
+So the wall is not where this document first put it. Every I/O-side lever
+here — bigger cache, batching, speculation, per-activation precision — has
+been measured and refused for its own reason, and the arithmetic is not
+what is holding the clock either. On this machine the remaining headroom is
+hardware: a faster disk, or RAM that holds more than one token's working
+set.
 
 ## 5. `vq_rows`, optimized against the wrong premise
 
@@ -390,3 +380,31 @@ lever in this document has been measured and refused. The remaining headroom
 is not in this file: it is a faster disk, or a machine whose RAM holds more
 than a token's working set. On this one, 0.49–0.54 tok/s is close to what
 the hardware gives.
+
+## 6. Do not rebuild these
+
+Refuted with measurements, in this repo:
+
+- 2-bit experts — 34% error ([LEARNED.md](LEARNED.md) §3, [K3.md](K3.md))
+- static per-expert bit allocation — Gate 6 / §20, delta flat 1.01–1.15x
+- KBVQ shared low-rank — §3, pending only the activation-weighted rerun
+- a 3-bit trunk — §13, the quality wall sits in front of the speed wall
+- streaming `lm_head` — §13, a net loss of ~0.8 GB/token
+
+## 7. Order
+
+1. ~~**Asynchronous expert prefetch** (A)~~ — **done**, ~1.6x. §22 of
+   [LEARNED.md](LEARNED.md) has what it cost.
+2. ~~**Measure the top-16 routing weight distribution**~~ — **done**, and it
+   refused (C) for the price of an afternoon rather than a 4.7 h
+   reconversion. The tail is a third of the mass, not a tenth.
+3. ~~**Prototype the purgeable cache** (B)~~ — **done**, and it is not a
+   speedup: volatile memory is memory the kernel takes. Kept off by default
+   as an escape hatch for an over-large `--budget`.
+4. ~~**Stage-major layout** (C)~~ — cancelled by 2.
+
+**Where that leaves it.** One of the four levers survived contact. (A)
+shipped and is worth ~1.6x on K3 and 1.21x on Kimi-Linear; (B), (C) and (D)
+are all refuted, each by a measurement that cost hours rather than the days
+building them would have. §5 is the one that was built before it was
+measured, and §4E is the profile that would have said not to.

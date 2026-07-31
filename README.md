@@ -16,7 +16,7 @@ Its current proof point is the complete open-weights Kimi K3 model: 2.78 trillio
 | Model               | Container | Minimum RAM | Tested speed    |
 | ------------------- | --------- | ----------- | --------------- |
 | **Kimi K3 2.78T**   | 982 GiB   | 29.05 GiB   | 0.49–0.54 tok/s |
-| **Kimi-Linear 48B** | 19 GiB    | 1.86 GiB    | 8.92 tok/s      |
+| **Kimi-Linear 48B** | 19 GiB    | 1.87 GiB    | 10.7 tok/s      |
 
 WASTE was written for that one model and that one constraint: **K3 does
 not fit in the RAM of current mainstream consumer systems.** It is 1.42 TB
@@ -31,8 +31,8 @@ needs, and spends every remaining byte of RAM on the part that repeats.
 
 The engine is correct: every layer is validated against a PyTorch
 reference, the final logits agree to 3.6e-06, and the vision tower matches
-its own oracle to 2.3e-06. It is also slow — half a token per
-second, thirty seconds for the sentence above.
+its own oracle to 2.3e-06. It is also slow — half a token per second,
+thirty seconds for the sentence above.
 
 Both of those matter, and the second one should not be read as a
 disclaimer. We are not aware of another published demonstration of a
@@ -47,13 +47,15 @@ consumer machine — and that from here the question is engineering rather
 than feasibility.
 
 Where the levers were is not where they are. Overlapping the expert reads
-with the arithmetic was worth 1.5–1.6x and shipped; the two that looked
-bigger — reading fewer bytes per token, and keeping more of them in RAM —
-were both measured and both refused, one because this family's router has
-no tail to demote and one because a cache the machine will not leave
-resident cannot be bought at any price. With the I/O hidden the engine is
-now very nearly arithmetic-bound, and [docs/EFFICIENCY.md](docs/EFFICIENCY.md)
-is the account of how each of those was priced.
+with the arithmetic was worth ~1.6x and shipped; the two that looked bigger
+— reading fewer bytes per token, and keeping more of them in RAM — were both
+measured and both refused, one because this family's router has no tail to
+demote and one because a cache the machine will not leave resident cannot be
+bought at any price. Even with the reads overlapped they are still 55% of a
+decode step against the arithmetic's 27%, so what is left is a faster disk
+or a machine with more RAM, not another pass over the kernels.
+[docs/EFFICIENCY.md](docs/EFFICIENCY.md) is the account of how each of those
+was priced, including the two that were built before being measured.
 
 What that opens up, concretely: a frontier-scale model that answers with
 no network, no per-token invoice, and nothing leaving the machine — which
@@ -102,7 +104,7 @@ only.
 
 If a terabyte is not available, the same engine and the same format run
 `Kimi-Linear-48B-A3B-Instruct` from a **19 GB** container with a
-**1.86 GB** floor, at 8.92 tok/s. That is the good path for trying WASTE
+**1.87 GB** floor, at 10.7 tok/s. That is the good path for trying WASTE
 out before committing a disk to K3.
 
 ## What it is
@@ -281,8 +283,8 @@ grid halves the prompt.
 
 | | |
 |---|---|
-| minimum RAM | 1.86 GB |
-| decode | **8.92 tok/s** at an 8 GB budget, 78% cache hit |
+| minimum RAM | 1.87 GB |
+| decode | **10.7 tok/s** at an 8 GB budget, 78% cache hit |
 
 The same engine and the same format, on a model that fits comfortably.
 This is what WASTE looks like when it is not fighting.
@@ -477,6 +479,10 @@ The picture shows a simple, stylized landscape with:
 - A **green field** covering the lower part of the image.
 [78 tokens, 234.25 s, 0.33 tok/s | experts 15314 hit / 99502 miss = 13%]
 ```
+
+(That transcript predates read-ahead and its timing line is the old one —
+the picture it was run against is not in this repository, so it is left as
+recorded rather than re-timed. Same tokens, about 1.6x less waiting.)
 
 That is a 448×336 image, and every element of the description is in it —
 including the sky gradient, which is the kind of detail that separates a

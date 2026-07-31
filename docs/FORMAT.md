@@ -282,7 +282,8 @@ streaming it would cost more I/O than the freed cache could save.
 
 Measured on K3: 27.28 GB resident out of a 29.05 GB floor at 4K context.
 The pre-release target was ≤ 25 GB; the real trunk missed it, and that
-overshoot is most of why decode sits at 0.3 tok/s rather than 1.5.
+overshoot is most of why decode sits at 0.5 tok/s rather than 1.5. (0.3
+before read-ahead — [EFFICIENCY.md](EFFICIENCY.md).)
 
 ### usage.waste
 

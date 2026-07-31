@@ -47,16 +47,16 @@ embedding host would use to draw a progress UI.
 $ waste plan kimi-linear.waste --budget 4G
   resident trunk             1.55 GB
   KDA state + KV cache        106 MB
-  scratch                     175 MB
+  scratch                     178 MB
   minimum expert cache         41 MB
   ---------------------------------
-  FLOOR                      1.86 GB
-  recommended                3.47 GB
-  budget 4.00 GB -> expert cache 2.18 GB
+  FLOOR                      1.87 GB
+  recommended                3.48 GB
+  budget 4.00 GB -> expert cache 2.17 GB
 
 $ waste run kimi-linear.waste "The capital of France is" -n 16 --budget 8G
 The capital of France is Paris, and the capital of Italy is Rome. ...
-[16 tokens, 1.79 s, 8.92 tok/s | experts 2605 hit / 723 miss = 78%]
+[16 tokens, 1.49 s, 10.72 tok/s | experts 2605 hit / 723 miss = 78%]
 ```
 
 A budget under the floor fails at open with `WASTE_E_RAM_BUDGET` and a
@@ -106,7 +106,9 @@ multiple it keeps nothing alive between tokens, and the fraction above a
 multiple buys a few points of hit rate while walking the machine into
 paging, where a hit costs a page fault. Filling a 7/8 cap gave K3 a
 27.32 GB cache on this laptop, sitting between two budgets measured at
-0.11 and 0.04 tok/s, when 17.5 GB runs at 0.33.
+0.11 and 0.04 tok/s, when 17.5 GB runs at 0.33. (Those three are the
+pre-read-ahead sweep; the ratios between them are the point and read-ahead
+does not change them — see [EFFICIENCY.md](EFFICIENCY.md).)
 
 So the default steps down a whole working set at a time and takes the
 largest that fits: `floor + 3x`, else `2x`, else `1x`, else the floor.
@@ -253,7 +255,7 @@ against the CPU baseline, the cache against no cache, the engine against
 the PyTorch oracle, session round-trip, hotlist effect, budget
 enforcement including peak RSS on both models, the derived `info` and
 parameter counts, and the tokenizer against Python tiktoken.
-**31 checks** as of 2026-07-29, with both containers present. On a fresh
+**38 checks** as of 2026-07-31, with both containers present. On a fresh
 clone with no model it is 29 items — 19 pass against the synthetic
 container and 10 say SKIP rather than passing quietly. Take the numbers
 from a run, not from here: they move as checks are added.
