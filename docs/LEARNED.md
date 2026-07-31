@@ -1065,3 +1065,72 @@ allocation in both its static and its per-activation form.
 The instrument stays — four lines behind an env var — because it is the
 first thing to run against any new container, and it is the difference
 between believing a router is peaked and knowing it is not.
+
+## 24. Volatile memory is memory you have given away (2026-07-31)
+
+§16 is the worst number in this file: a 29.32 GB expert cache reaches a 37%
+hit rate and runs at **0.04 tok/s**, eight times slower than a 17.32 GB
+cache at 13%. The engine stays inside its budget, the machine does not, and
+a cache hit becomes a page fault instead of the `pread` the engine was
+managing.
+
+That reading blamed the OS for mishandling the engine's memory, and it
+suggested an answer: **purgeable memory**. Allocate each slot with
+`VM_FLAGS_PURGABLE`, mark it volatile while idle, and under pressure the
+kernel discards it outright rather than compressing and swapping it. A
+discarded slot is a miss, and a miss is a read. The cliff becomes a slope.
+
+Gated first, as the rule says: a volatile/nonvolatile round trip costs
+0.33 us — 0.5 ms over a K3 token's 1472 experts — `vm_allocate` returns
+16 KiB pages so O_DIRECT is unaffected, and the logits come out
+bit-identical. Cheap enough to build.
+
+**It works, and it is still not worth turning on.** 8 tokens, read-ahead on:
+
+| budget | cache | purgeable | hit | decode |
+|---|---|---|---|---|
+| 46.25 GB (default) | 17.56 GB | off | 19% | **0.49–0.52 tok/s** |
+| 46.25 GB (default) | 17.56 GB | on | **0–1%** | 0.29–0.33 tok/s |
+| 58 GB | 29.32 GB | off | 39% | **0.04 tok/s** |
+| 58 GB | 29.32 GB | on | 0–21% | **0.22–0.25 tok/s** |
+
+At an over-large budget it is **6x faster** and does exactly what it was
+built to do. At the budget that actually works it costs **1.6x**, because
+the hit rate falls to nothing: macOS reclaims volatile objects eagerly, not
+only under pressure, so a cache that would have stayed resident is taken
+anyway.
+
+One cause under both rows, and it is the correction to §16. **The memory was
+never the engine's.** Purgeable does not offer "keep more cache"; it offers
+"lose it cheaply or lose it expensively". The 37% hit rate in the third row
+is real, and every hit in it is a page fault, and no flag changes that — the
+pages are not there. A cache above what the machine will leave resident
+cannot be bought at any price, and the default budget resolver, which steps
+down a whole working set at a time and takes the largest that fits, was
+already picking the only size that works.
+
+So the projected ~2x from "fixing" the cliff does not exist. What is kept is
+the escape hatch: `WASTE_PURGEABLE=1` turns a badly-chosen `--budget` from a
+6x catastrophe into a 2x slowdown, which is worth having and is worth having
+off by default.
+
+Two method notes:
+
+- **The gate measured the wrong thing, and was still right to run.** It
+  asked whether the mechanism was affordable — 0.33 us, yes — and that
+  question was worth an hour. It could not have asked whether the kernel
+  would leave the pages alone, because that only appears against a 29 GB
+  cache on a busy machine. A cheap gate is not a substitute for the
+  measurement, it is what makes the measurement worth setting up.
+- **A result that reverses between two configurations is the useful kind.**
+  Had it only been measured at 58 GB it would have shipped on by default as
+  a 6x win, and every ordinary run would have got 1.6x slower.
+
+And one defect this found, unrelated to memory but caught by the same work:
+`waste_ecache_get` releases one more read into the pipe *before* it returns,
+and nothing stopped the victim sampler choosing the slot whose bytes the
+caller was about to multiply. The hint path pinned it as a side effect; the
+synchronous fallback inside `get` did not. `ec_pinned` covers `last_used`
+now. Read-ahead had been green on 37 checks and against the oracle for a day
+by then — the window is one layer wide and needs the sampler to land on one
+slot out of 1483.

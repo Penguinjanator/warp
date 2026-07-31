@@ -127,7 +127,7 @@ Shape confirmed in the literature: SP-MoE ([arXiv:2510.10302](https://arxiv.org/
 reports 1.07–3.5x from asynchronous prefetch with a cutoff-layer policy;
 MoE-SpeQ ([arXiv:2511.14102](https://arxiv.org/abs/2511.14102)) similar.
 
-### B. The paging cliff — up to ~2.0x, but it is research
+### B. The paging cliff — built, measured, and it is not a speedup
 
 [LEARNED.md](LEARNED.md) §16: 17.32 GB of cache gives 13% hit at 0.32 tok/s;
 29.32 GB gives 37% hit at **0.04 tok/s**. The engine caps itself at
@@ -146,8 +146,44 @@ as a miss, which is exactly the `pread` it already knows how to do. The 8x
 cliff becomes graceful degradation and the default budget can go back to
 being aggressive. Linux equivalent is `MADV_FREE` plus a sentinel.
 
-The most speculative item here, and the one that attacks the worst number
-the project has measured.
+**Built and measured (2026-07-31), and the hypothesis was wrong in an
+instructive way.** `WASTE_PURGEABLE=1`, 8 tokens, read-ahead on:
+
+| budget | cache | purgeable | hit | decode |
+|---|---|---|---|---|
+| 46.25 GB (default) | 17.56 GB | off | 19% | **0.49–0.52 tok/s** |
+| 46.25 GB (default) | 17.56 GB | on | **0–1%** | 0.29–0.33 tok/s |
+| 58 GB | 29.32 GB | off | 39% | **0.04 tok/s** |
+| 58 GB | 29.32 GB | on | 0–21% | **0.22–0.25 tok/s** |
+
+Read the last two rows first: at an over-large budget purgeable is **6x
+faster**, exactly as designed — the kernel discards a slot instead of
+swapping it, the engine re-reads, and the cliff becomes a slope.
+
+Now read the first two. **At the budget that actually works, purgeable
+costs 1.6x**, because the hit rate goes to nothing. macOS reclaims volatile
+objects eagerly, not only under pressure, so a cache that would have stayed
+resident is taken anyway.
+
+Both rows have one cause, and it is the finding: **volatile memory is
+memory you have given away.** The choice purgeable offers is not "keep more
+cache", it is "lose it cheaply or lose it expensively". §16's cliff was
+never the OS mismanaging the engine's memory — the memory was never the
+engine's, and the 39% hit rate in the third row is real while every hit in
+it is a page fault.
+
+So the projected 1.98x does not exist. A cache above what the machine will
+leave resident cannot be had at any price, and the default budget resolver
+— which steps down a whole working set at a time — was already choosing the
+only size that works.
+
+**Kept, off by default, as an escape hatch**: it turns a 6x catastrophe from
+a badly-chosen `--budget` into a 2x slowdown. Turning it on at a sane budget
+is a mistake, which is why it says so here and in `waste.h`. Bit-identical
+either way; `tests/run.sh` checks that.
+
+Linux's `MADV_FREE` equivalent is not written, and this result is the reason
+to expect little from it.
 
 ### C. Stage-major records — measured and dropped
 
@@ -283,11 +319,20 @@ Refuted with measurements, in this repo:
 2. ~~**Measure the top-16 routing weight distribution**~~ — **done**, and it
    refused (C) for the price of an afternoon rather than a 4.7 h
    reconversion. The tail is a third of the mass, not a tenth.
-3. **Prototype the purgeable cache** (B) — the one lever left with room in
-   it, and the only one that attacks §16's cliff.
+3. ~~**Prototype the purgeable cache** (B)~~ — **done**, and it is not a
+   speedup: volatile memory is memory the kernel takes. Kept off by default
+   as an escape hatch for an over-large `--budget`.
 4. ~~**Stage-major layout** (C)~~ — cancelled by 2.
 
-After (A), the remaining headroom is smaller than this document first
-suggested. (B) is worth ~1.2x on top of what shipped, and past it the
-engine is arithmetic-bound: the honest next question is not which bytes to
-stop reading, it is whether `vq_rows` can be made to gather faster.
+**Where that leaves it.** One of the four levers survived contact. (A)
+shipped and is worth 1.5–1.6x; (B), (C) and (D) are all refuted, each by a
+measurement that cost hours rather than the days building them would have.
+The engine went 0.33 → 0.51 tok/s and is now arithmetic-bound: with I/O
+overlapped, `max(1.17 I/O, 1.03 matmul)` is a near tie, and every remaining
+idea on the I/O side is pushing on the side that is already hidden.
+
+So the honest next question is not which bytes to stop reading. It is
+whether `vq_rows` can gather faster — three dependent loads per row,
+unrolled by four, with `VQ_SUPER` already swept. That is the whole of the
+remaining headroom, and this document has nothing measured to say about it
+yet.
