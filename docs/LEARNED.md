@@ -1282,3 +1282,69 @@ Three notes worth keeping:
   this suite's own rule says it must SKIP. The fourth is a `serve`
   checkpoint test that passes in isolation and fails under the suite. None
   of them touch `model.c`; all of them are their own issue.
+
+## 27. Windows built for a year and was never built on (2026-07-31)
+
+[Issue #3](https://github.com/sqliteai/waste/issues/3), from Tadden Moore and
+the AGi Dream Team Family, is the first native Windows x86_64 run of this
+engine: MinGW-w64 GCC 13.1.0, the AVX-512 backend executing for the first
+time anywhere, and the KDA kernel matching the `fla` oracle to **4.5e-08** —
+the same order as Apple Silicon's 4.1e-08, off ARM for the first time. The
+serve suite passed 167/167 against a natively built `libwaste.dll`.
+
+It also came with four defects, none in the engine and all in the parts CI
+could not reach. `windows-build` cross-compiles on Linux; `windows-run`
+executes those artifacts. **Nothing had ever built on Windows or run
+`tests/run.sh` there**, so the Makefile's platform detection, the shell
+harness and the Python checkers were unexercised on the platform they were
+written for.
+
+| | what broke | why CI missed it |
+|---|---|---|
+| `Makefile` | `CC ?= cc`; stock MinGW has no `cc.exe`, `-dumpmachine` answered nothing, `ARCH` fell back to `uname -m` — which on MSYS says x86_64 and never contains "mingw" — so `WINDOWS`, `EXE` and `SOEXT` stayed unset and a Windows build was configured as a Linux one | CI always passes `CC=` explicitly |
+| `tests/run.sh` | `SOEXT=so` unless Darwin; Git-Bash says `MINGW64_NT-…`, so it asked make for `libwaste.so` and reported a build failure for a library that had built fine | run.sh never ran on Windows |
+| `tools/kda_ref.py` | opened the extensionless `test_kda`; MinGW emits `test_kda.exe` | same |
+| `tests/run.sh` | `subprocess.run(["./waste", …])` does not go through Git-Bash's name resolution, and `os.sysconf` does not exist in Windows CPython | same |
+
+The RAM one is worth its own line. The fix is not a Python
+`GlobalMemoryStatusEx`: `waste plan --json` grew a `physical_ram_bytes`
+field, because the human output already printed the number and
+`waste_physical_ram()` already existed. The alternative was a second copy of
+platform code living in a test.
+
+**The job that keeps it fixed found three more before it went green.**
+MSYS2 MINGW64, no `CC=` on the make line, and the whole of `tests/run.sh`:
+
+- the download checks built their fixture with `python3 -c "open('$FT/…')"`.
+  MSYS2 rewrites POSIX paths in a native program's **argv** and cannot
+  rewrite one quoted inside `-c`, so Windows Python got `/tmp/…` verbatim.
+- `tests/test_state.c` hardcoded `/tmp/waste_state_test.bin`, which a native
+  Windows binary reads as `C:\tmp\…`. The save failed and the check reported
+  the session state broken on the platform where nothing about it was wrong.
+- and the job was not testing the thing it was added for: **MSYS2 ships a
+  `cc` symlink**, so the default resolved and the Makefile fallback never
+  ran. It now hides `cc` and builds again, because the machine that found
+  the defect did not have one.
+
+Green: **24 passed, 0 failed, 12 skipped** on `windows-latest`.
+
+Three notes.
+
+**MINGW64 and not MSYS, deliberately.** MSYS2's own python is a Cygwin-style
+build with `os.sysconf` and POSIX name resolution. Running the suite under it
+would have passed while defects 3 and 4 survived — a job that agrees with you
+is worse than no job.
+
+**Docker cannot do this.** Windows containers need a Windows host, so a Linux
+container can only cross-compile — which is exactly what CI already did and
+exactly what missed all of it. Docker did earn its place twice here, for the
+Linux side: reproducing §26 and proving the Makefile fallback by deleting
+`/usr/bin/cc`.
+
+**And one found by accident, on Linux.** The three download checks *fail*
+when `curl` is absent rather than skipping — the one thing this suite says it
+must never do, since [ENGINE.md](ENGINE.md) states a missing prerequisite is
+reported as SKIP. Debian slim and a bare MinGW both lack it. `make check` in
+`Dockerfile.test` goes from 4 failures to 1; the remaining one is a `serve`
+checkpoint test that passes in isolation and fails under the suite, which is
+its own issue and not this one.
