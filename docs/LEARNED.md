@@ -414,7 +414,8 @@ read fail EINVAL instead of merely running slow. The buffers came from
 `malloc`; cache slots and the miss buffer now come from `waste_dio_alloc`
 (posix_memalign, 4 KiB).
 
-Filesystems can refuse O_DIRECT — tmpfs does — so there is a fallback to
+Filesystems can refuse O_DIRECT — tmpfs did until Linux 6.1, and on the
+6.12 kernel used to test §26 it accepts it — so there is a fallback to
 a plain open plus `posix_fadvise(POSIX_FADV_RANDOM)`, which at least
 stops readahead. When any bank falls back, `waste_stats.direct_io` goes
 to 0 and `waste bench` says the hit rate is partly the kernel's. A
@@ -1210,3 +1211,74 @@ was written, that the arithmetic was 27% and the reads were 55%. The work
 was not wasted — it is bit-exact and it made the model that fits in RAM
 3.5% faster — but it was chosen by arithmetic on an estimate rather than by
 measurement, which is the thing this file exists to stop.
+
+## 26. The bypass Linux never got (2026-07-31)
+
+§14 wrote the Linux O_DIRECT path blind and said so: "None of this is
+validated on Linux… the first real Linux run should be treated as the
+actual test." Someone ran it. [Issue #4](https://github.com/sqliteai/waste/issues/4),
+from Kevin McCoy, reports that Linux opened every expert bank with ordinary
+buffered `O_RDONLY` and said `"direct_io": false`.
+
+The cause is one identifier. `bank_open` gated the flag on
+
+```c
+const int aligned = rec_bytes && rec_bytes % WASTE_DIO_ALIGN == 0;
+```
+
+and `WASTE_DIO_ALIGN` is **16384** — the alignment the engine gives its
+*buffers*, chosen so Metal's `newBufferWithBytesNoCopy` gets a whole Apple
+Silicon page. What O_DIRECT constrains is the offset and the length, and the
+format guarantees those in units of `WASTE_ALIGN`, **4096**. The two
+constants answer different questions and one was standing in for the other.
+
+No container has ever passed that test, and none ever could:
+
+| | record | ÷ 4096 | ÷ 16384 |
+|---|---|---|---|
+| Kimi-Linear | 2 666 496 (651 pages) | 0 | 12288 |
+| Kimi K3 | 12 406 784 (3029 pages) | 0 | 4096 |
+| synthetic test container | 12 288 (3 pages) | 0 | 12288 |
+
+§14 chose 3029 pages as evidence the alignment was checked rather than
+assumed — and the check it was checked against could not accept it.
+
+**Confirmed before it was fixed**, because "Linux reports false" has two
+possible causes and only one of them is this. In a Debian container on a
+6.12 kernel, `dd iflag=direct` reads the engine's own bank file at both 4096
+and 12288 bytes: the filesystem was willing the whole time, and the engine
+was refusing itself. After the fix the same container reports
+`"direct_io": true`.
+
+**The fix is not only the constant.** The eligibility test is necessary and
+not sufficient: O_DIRECT accepts the `open` and then fails every transfer
+the device does not like, so with the gate loosened a device wanting more
+than 4 KiB would open unbuffered and die on the first expert of the first
+token. `bank_probe` now reads one block at offset 0 — a page per bank at
+load — and the fd is kept only if that succeeds. Verified by forcing the
+probe to fail: `direct_io` goes back to false and the container still opens
+and reads.
+
+The patch attached to the issue was not applied. It was read for its
+diagnosis, which was right, and the fix was written here — an issue body is
+a report, not a change, and the probe is not in it.
+
+Three notes worth keeping:
+
+- **A constant named for one thing will be used for another.** Both are
+  alignments, both are powers of two, both are about direct I/O, and the
+  wrong one compiles. The comment on `WASTE_DIO_ALIGN` in `ecache.h`
+  explains why it is 16 KiB and that explanation is what made it look like
+  the right answer here.
+- **The platform that cannot run the test is the platform that gets the
+  bug.** §14 knew this and wrote it down, and the bug still shipped and
+  still took an outside report to find. Writing "unverified" in a document
+  is not a substitute for a run — the same lesson as §18, where an
+  assumption recorded honestly read as settled after a day.
+- **`make check` on Linux is not green**, and was not before this change
+  either: 20 pass, 4 fail, 12 skip on a pristine tree in the same
+  container. Three are the download script, which needs `curl` and does not
+  have it in `Dockerfile.test` — a missing prerequisite that FAILs where
+  this suite's own rule says it must SKIP. The fourth is a `serve`
+  checkpoint test that passes in isolation and fails under the suite. None
+  of them touch `model.c`; all of them are their own issue.
