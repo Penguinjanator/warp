@@ -479,6 +479,13 @@ static int cmd_plan(int argc, char **argv)
                (unsigned long long)p.min_expert_cache,
                (unsigned long long)p.floor_bytes,
                (unsigned long long)p.recommended_bytes);
+        /* The human form already says "machine N GB" and the JSON did not,
+         * so anything reading this had to work out physical RAM for itself
+         * — which on Windows means neither sysconf nor /proc exists and the
+         * caller reimplements GlobalMemoryStatusEx. The engine already
+         * knows; 0 when it cannot tell. */
+        printf(",\"physical_ram_bytes\":%llu",
+               (unsigned long long)waste_physical_ram());
         if (p.vision_bytes)
             printf(",\"vision_bytes\":%llu", (unsigned long long)p.vision_bytes);
         if (o.budget)

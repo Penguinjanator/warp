@@ -58,8 +58,25 @@ int main(int argc, char **argv)
     waste_gen_params_init(&p);
     p.max_tokens = 6;
 
-    /* run the prompt, save, then continue */
-    const char *path = "/tmp/waste_state_test.bin";
+    /* run the prompt, save, then continue.
+     *
+     * The path was "/tmp/waste_state_test.bin". A native Windows binary
+     * reads that as C:\tmp\..., which usually does not exist, so the save
+     * failed and this check reported the session state broken on the one
+     * platform where nothing about the state was wrong. MSYS2 rewrites
+     * POSIX paths in argv for native programs; it cannot rewrite a string
+     * literal. TEMP first on Windows because MSYS2 sets TMPDIR to /tmp
+     * there and that is the same trap again. */
+    char pathbuf[512];
+#ifdef _WIN32
+    const char *td = getenv("TEMP");
+    if (!td) td = getenv("TMP");
+#else
+    const char *td = getenv("TMPDIR");
+#endif
+    if (!td || !*td) td = ".";
+    snprintf(pathbuf, sizeof pathbuf, "%s/waste_state_test.bin", td);
+    const char *path = pathbuf;
     sink a = {{0}, 0};
     const float *lg;
     size_t vocab = 0;
