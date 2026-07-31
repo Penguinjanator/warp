@@ -1313,6 +1313,24 @@ void waste_model_free(waste_model *m)
  * `*direct` is set to 0 if any bank ends up without the bypass, so `waste
  * info` can say the hit rates are being measured against a warm page
  * cache. Not validated on Linux from this machine — see LEARNED.md §14. */
+/* O_DIRECT and FILE_FLAG_NO_BUFFERING both accept the open and then fail
+ * every transfer whose offset, length or buffer is not aligned to the
+ * device's logical block — which the caller cannot know from the file. So
+ * the eligibility test below is necessary and not sufficient, and the only
+ * honest confirmation is a transfer: one block at offset 0, a page per bank
+ * at load. Without it, a device wanting more than WASTE_ALIGN would open
+ * unbuffered and then fail on the first expert of the first token. */
+#if defined(_WIN32) || (defined(__linux__) && defined(O_DIRECT))
+static int bank_probe(int fd)
+{
+    void *buf = waste_dio_alloc(WASTE_ALIGN);
+    if (!buf) return 0;
+    const int64_t got = waste_pread(fd, buf, WASTE_ALIGN, 0);
+    waste_dio_free(buf);
+    return got == (int64_t)WASTE_ALIGN;
+}
+#endif
+
 static int bank_open(const char *path, size_t rec_bytes, int asked, int *direct)
 {
     (void)rec_bytes; (void)direct;
@@ -1332,12 +1350,22 @@ static int bank_open(const char *path, size_t rec_bytes, int asked, int *direct)
      * bypass there and `direct` must not be cleared for it. */
     const char *e = getenv("WASTE_DIRECT");
     const int want = asked && !(e && e[0] == '0');
-    const int aligned = rec_bytes && rec_bytes % WASTE_DIO_ALIGN == 0;
+    /* WASTE_ALIGN, not WASTE_DIO_ALIGN. The two are different questions and
+     * conflating them cost every Linux run its bypass: 16 KiB is what the
+     * engine aligns its *buffers* to, because Metal wants a whole page,
+     * while what O_DIRECT constrains is the offset and the length — and the
+     * format guarantees those in 4 KiB units. No container has ever been a
+     * 16 KiB multiple (Kimi-Linear's record is 651 pages, K3's is 3029), so
+     * this test was false for every model that exists and Linux silently
+     * read through the page cache while reporting it. Reported as issue #4;
+     * macOS was unaffected, F_NOCACHE having no alignment contract. */
+    const int aligned = rec_bytes && rec_bytes % WASTE_ALIGN == 0;
     (void)want; (void)aligned;
 #if defined(_WIN32)
     if (want && aligned) {
         const int fd = waste_open_stream(path, 1);
-        if (fd >= 0) return fd;
+        if (fd >= 0 && bank_probe(fd)) return fd;
+        if (fd >= 0) close(fd);
     }
     *direct = 0;
     /* Second call rather than a retry flag: the first CreateFileA failed,
@@ -1347,7 +1375,10 @@ static int bank_open(const char *path, size_t rec_bytes, int asked, int *direct)
 #if defined(__linux__) && defined(O_DIRECT)
     if (want && aligned) {
         const int fd = open(path, O_RDONLY | O_DIRECT);
-        if (fd >= 0) return fd;
+        /* tmpfs accepts the flag and refuses the read; so would a device
+         * wanting a bigger block than the format aligns to. */
+        if (fd >= 0 && bank_probe(fd)) return fd;
+        if (fd >= 0) close(fd);
     }
     *direct = 0;
 #endif
