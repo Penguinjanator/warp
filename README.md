@@ -31,8 +31,8 @@ needs, and spends every remaining byte of RAM on the part that repeats.
 
 The engine is correct: every layer is validated against a PyTorch
 reference, the final logits agree to 3.6e-06, and the vision tower matches
-its own oracle to 2.3e-06. It is also slow — a third of a token per
-second, fifty seconds for the sentence above.
+its own oracle to 2.3e-06. It is also slow — half a token per
+second, thirty seconds for the sentence above.
 
 Both of those matter, and the second one should not be read as a
 disclaimer. We are not aware of another published demonstration of a
@@ -44,9 +44,16 @@ bibliography and no comparison table, so read it as an invitation to send
 a counter-example, not as a result. The interesting part is not the
 speed, it is that the whole thing is in the reachable range on a single
 consumer machine — and that from here the question is engineering rather
-than feasibility. Half of a decode step is already disk I/O running near
-the drive's measured ceiling, so the levers are known: read fewer bytes
-per token, and keep more of them in RAM.
+than feasibility.
+
+Where the levers were is not where they are. Overlapping the expert reads
+with the arithmetic was worth 1.5–1.6x and shipped; the two that looked
+bigger — reading fewer bytes per token, and keeping more of them in RAM —
+were both measured and both refused, one because this family's router has
+no tail to demote and one because a cache the machine will not leave
+resident cannot be bought at any price. With the I/O hidden the engine is
+now very nearly arithmetic-bound, and [docs/EFFICIENCY.md](docs/EFFICIENCY.md)
+is the account of how each of those was priced.
 
 What that opens up, concretely: a frontier-scale model that answers with
 no network, no per-token invoice, and nothing leaving the machine — which
