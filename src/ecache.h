@@ -89,6 +89,8 @@ typedef struct {
      * cliff there is not the cache missing, it is a cache hit turning into
      * a page fault. Off by default; it is a prototype. */
     int purgeable;
+    int wired;                       /* WASTE_MLOCK: slots pinned in RAM   */
+    int wire_failed;                 /* how many mlock calls were refused  */
     size_t slot_bytes;               /* what was handed to vm_allocate     */
     int last_used;                   /* held nonvolatile until the next get */
     uint64_t purged;                 /* slots the kernel reclaimed         */

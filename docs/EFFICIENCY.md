@@ -192,6 +192,18 @@ either way; `tests/run.sh` checks that.
 Linux's `MADV_FREE` equivalent is not written, and this result is the reason
 to expect little from it.
 
+**The opposite bargain was tried too (`WASTE_MLOCK=1`, also off by
+default).** Wiring the slots halves the cliff — 52 GiB goes 0.06 → 0.15
+tok/s and 58 GiB 0.03 → 0.06 — and still lands three times under the default
+budget, because it pins the cold part: the cache hits 19–30% while the
+27.5 GiB trunk is read in full every token. At 58 GiB it is impossible
+anyway, 56.82 GiB of trunk plus cache against a 52.48 GiB
+`vm.user_wire_limit`. What it *does* buy is at the budget that already
+works: five alternated runs give a median 0.51 against 0.42 and a spread of
+12% against 38%, because the pageable arm degrades on a machine that has
+been worked and the wired one does not. That is §16's "sweep upward, never
+downward" bought back. [LEARNED.md](LEARNED.md) §30.
+
 ### C. Stage-major records — measured and dropped
 
 Today a record is `[hdr][gate][up][down][scales]`, and within a matrix

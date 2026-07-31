@@ -1461,3 +1461,74 @@ routing over the model's own output. The router is the same and the hidden
 states are real, but a self-generated continuation is more repetitive, so
 if anything these numbers are pessimistic about reuse and optimistic about
 nothing.
+
+## 30. mlock does not raise the ceiling; it removes the variance (2026-07-31)
+
+§16's cliff is a cache hit turning into a page fault, and §24 answered it
+from one side: make the slots *purgeable*, so the kernel discards instead of
+swapping. That worked at an over-large budget and cost 1.6x at the one that
+works, because volatile memory is memory you have given away. `mlock` is the
+opposite bargain — the kernel may not take a slot at all — and the obvious
+question is whether the opposite bargain is the better one. `WASTE_MLOCK=1`,
+off by default.
+
+**It is permitted.** `vm.user_wire_limit` is 56,349,970,923 bytes = 52.48 GiB,
+82% of this machine's 64. A probe wires 32 GiB in one call without complaint.
+(An earlier reading of this called it "exactly 7/8, the same fraction the
+budget resolver uses" — that was GB against GiB. It is 82%, and the
+coincidence is not there.)
+
+**At the budget that works it is worth having, for a reason that is not
+speed.** Default 46.25 GiB, cache 17.56 GiB, five runs each, alternated:
+
+| | median | min | max | spread |
+|---|---|---|---|---|
+| pageable | 0.42 tok/s | 0.32 | 0.48 | 38% |
+| **wired** | **0.51 tok/s** | **0.50** | **0.56** | **12%** |
+
+The best pageable run matches the wired ones. What changes is the floor: the
+pageable arm collapses to 0.32 on a machine that has been worked, and the
+wired arm does not. These runs were taken *after* the 52 and 58 GiB rows
+below, i.e. in exactly the state §16 says to treat as void — "macOS does not
+give back what it compressed and paged during the heavy rows, so anything
+measured after them is measured on a different computer." Wiring the cache is
+what makes that stop being true. **The gain is reproducibility, and the
+method note in §16 is what it buys back.**
+
+**At the cliff it halves the damage and does not remove it.** 4 tokens:
+
+| budget | cache | pageable | wired |
+|---|---|---|---|
+| 52 GiB | 23.32 GiB | 0.06 tok/s | **0.15 tok/s** |
+| 58 GiB | 29.32 GiB | 0.03 tok/s | **0.06 tok/s** |
+
+2 to 2.5x, and still three times worse than the default budget's 0.51. So
+wiring does not make a big cache viable, and the reason is the one §13 has
+been saying all along about which part of this engine is hot:
+
+**it pins the wrong thing.** The cache is the cold part — 19 to 30% hit — and
+the trunk is the hot part, 27.5 GiB read *in full every token*. Wiring the
+cache does not create memory; it decides who loses the fight for it, and it
+decides in favour of the part that is touched least. That is §24's finding
+arriving from the other direction: the memory was never there, and neither
+bargain conjures it.
+
+**And at 58 GiB the configuration is unreachable in principle**, which is the
+cleanest part of the answer. Wiring both would want 27.50 + 29.32 = 56.82 GiB
+against a 52.48 GiB limit. The OS refuses it outright. At 52 GiB both would
+fit — 50.82 GiB — with 1.66 GiB of headroom on a machine that also needs
+wired memory of its own, for a hit rate of 27% against the default's 19%.
+Not attempted: the upside is the wrong end of a curve §12 has already
+measured flat, and the downside is a laptop that stops responding.
+
+**Why it stays off by default.** On Linux `RLIMIT_MEMLOCK` is commonly 8 MB.
+Measured under that cap: 43,008 of 43,690 slots refused, one warning line,
+exit 0 — the fallback is not fatal, but wiring a real cache there is not
+possible without a raised limit. A default that fails for most Linux users
+and prints a warning about it is not a default.
+
+The method note is about the question rather than the answer. **"Why not
+mlock?" is the right question and it has three answers, not one**: it is
+allowed, it does not fix the cliff, and it fixes something else that was
+being lived with. The third only appeared because the measurement was run at
+the budget where nothing was supposed to be wrong.

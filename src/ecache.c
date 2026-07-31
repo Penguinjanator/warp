@@ -87,6 +87,23 @@ static void  ec_volatile(waste_ecache *c, int si) { (void)c; (void)si; }
 /* The slot the last get() handed out stays nonvolatile while its caller
  * uses it, and is released here on the next one — moe_layer and moe_chunk
  * both finish with a record before asking for the next. */
+/* Wiring the slots down. The opposite bargain to purgeable memory: that one
+ * tells the kernel it may take a slot cheaply, this one tells it that it may
+ * not take one at all. Whether that is an improvement depends entirely on
+ * whether the memory exists, which is what §16's cliff is really about.
+ *
+ * macOS caps wired memory at vm.user_wire_limit, 7/8 of RAM on this machine
+ * — the same fraction the budget resolver uses — so a cache that fits the
+ * budget fits the limit. A failure is reported and not fatal: an engine that
+ * refuses to open because it could not wire its cache would be worse than
+ * one that runs with a pageable one. */
+#ifndef _WIN32
+#include <sys/mman.h>
+static int ec_wire(void *p, size_t n) { return mlock(p, n) == 0; }
+#else
+static int ec_wire(void *p, size_t n) { return VirtualLock(p, n) != 0; }
+#endif
+
 static void ec_release_last(waste_ecache *c)
 {
     if (c->last_used < 0) return;
@@ -241,7 +258,13 @@ int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
     c->pf_gen = 1;
     c->last_used = -1;
     {   const char *e = getenv("WASTE_PURGEABLE");
-        c->purgeable = e && *e != '0'; }
+        c->purgeable = e && *e != '0';
+        e = getenv("WASTE_MLOCK");
+        c->wired = e && *e != '0';
+        /* One says the kernel may take a slot for free, the other that it
+         * may never take one. Asking for both is a contradiction, not a
+         * configuration. */
+        if (c->wired) c->purgeable = 0; }
     if (!rec_bytes || budget_bytes < rec_bytes) return 0;   /* no cache */
 
     c->n_slots = (int)(budget_bytes / rec_bytes);
@@ -272,7 +295,11 @@ int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
             continue;
         }
         if (!c->slot[i].data) { waste_ecache_free(c); return -1; }
+        if (c->wired && !ec_wire(c->slot[i].data, rec_bytes)) c->wire_failed++;
     }
+    if (c->wire_failed)
+        fprintf(stderr, "waste: could not wire %d of %d cache slots; "
+                        "those stay pageable\n", c->wire_failed, c->n_slots);
     return 0;
 }
 
