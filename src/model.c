@@ -2065,15 +2065,21 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     for (int j = 0; j < K; j++) w[j] *= c->routed_scale;
     if (routed) for (int j = 0; j < K; j++) routed[j] = idx[j];
 
-    /* WASTE_DUMP_ROUTE=path appends one line per (token, layer): the layer,
-     * then the renormalized weight of each of the top-K in selection order.
-     * What it is for is deciding whether the tail of the top-K carries
-     * enough mass to be worth reading at lower precision — docs/EFFICIENCY.md
-     * lever C, which is gated on this and nothing else. */
+    /* WASTE_DUMP_ROUTE=path appends one line per (token, layer):
+     *
+     *     L  id0..idK-1  w0..wK-1
+     *
+     * the layer, the top-K expert ids in selection order, then their
+     * renormalized weights. The weights gated lever C of
+     * docs/EFFICIENCY.md; the ids gate the cross-layer prefetcher whose
+     * next_layer_top field docs/FORMAT.md has reserved since the skeleton.
+     * Both questions are "is the signal there", and both are cheaper to
+     * answer from a trace than from a build. */
     if (dump_route) {
         FILE *df = fopen(dump_route, "a");
         if (df) {
             fprintf(df, "%d", L);
+            for (int j = 0; j < K; j++) fprintf(df, " %d", idx[j]);
             for (int j = 0; j < K; j++) fprintf(df, " %.6g", w[j]);
             fputc('\n', df);
             fclose(df);
@@ -2673,6 +2679,19 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
             for (int j = 0; j < K; j++) w[j] /= (s + 1e-20f);
         }
         for (int j = 0; j < K; j++) w[j] *= c->routed_scale;
+        /* Same trace as moe_layer's, from the path that routes a whole
+         * chunk at once — a prefill produces in one pass what decode would
+         * take hundreds of seconds to emit. */
+        if (dump_route) {
+            FILE *df = fopen(dump_route, "a");
+            if (df) {
+                fprintf(df, "%d", L);
+                for (int j = 0; j < K; j++) fprintf(df, " %d", idx[j]);
+                for (int j = 0; j < K; j++) fprintf(df, " %.6g", w[j]);
+                fputc('\n', df);
+                fclose(df);
+            }
+        }
     }
 
     const float *xin = in;

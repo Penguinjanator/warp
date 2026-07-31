@@ -297,6 +297,18 @@ So:
 Recorded here because it is the first thing anyone who reads that literature
 will try to build.
 
+### F. Cross-layer predictive prefetch — measured and refused
+
+Within a layer the prefetch is exact. Across a boundary it must guess, and
+the guess is not there: co-occurrence from layer L predicts layer L+1's
+top-16 at **29.0%** recall, against **29.5%** for simply reusing the
+previous token's set — which the cache already does for free, and 20.5% for
+the layer's static hot 16. Break-even needs ~60%, and a predictor fitted on
+the data it is scored against reaches only 49.7%, so even the unachievable
+ceiling loses. [LEARNED.md](LEARNED.md) §29 has the arithmetic and the
+`WASTE_IO_DEPTH` sweep that shows there is nothing left to overlap within a
+layer either.
+
 ### E. Where the bottleneck actually is
 
 This section used to argue from `max(0.85 I/O, 1.03 matmul)` that (A) and

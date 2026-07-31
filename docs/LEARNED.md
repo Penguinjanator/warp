@@ -1388,3 +1388,76 @@ failure named root; the traceback said only `EngineError not raised`. What
 identified it was running the same test as a different user in the same
 container — the cheapest possible A/B, and the one worth reaching for when
 a check is green on three machines and red on the fourth.
+
+## 29. The cross-layer prefetcher has nothing to predict from (2026-07-31)
+
+[FORMAT.md](FORMAT.md) has reserved `next_layer_top` in `usage.waste` since
+the skeleton, for "a pilot/COUPLE prefetcher" that would start reading layer
+L+1's experts while layer L computes. §22 built the *within-layer* prefetch,
+which needs no prediction at all — the top-16 ids come out of the router
+before the first read. Going across a layer boundary does need one, because
+L+1's router eats the output of L+1's attention, which does not exist yet.
+
+**First, the prerequisite: is there anything left to overlap?** No, not
+within a layer. `WASTE_IO_DEPTH` 2 against 8, alternated: 0.42/0.54 against
+0.43/0.52 tok/s — the spread between two runs of one setting is larger than
+the difference between settings. Two reads in flight already keep the disk
+as busy as it will get, so the only window a cross-layer prefetcher could
+fill is the boundary itself: kda 0.28 + mla 0.065 + lm_head 0.007 + the
+non-expert work inside MoE 0.19 = **~0.54 s per step** on a ~2.7 s step
+where the readers have nothing queued.
+
+**Then the signal.** `WASTE_DUMP_ROUTE` now writes the top-16 ids as well as
+their weights, and the chunked path writes them too, so one prefill yields
+what decode would take hundreds of seconds to emit. 214 tokens of mixed
+English, Italian, code and SQL; 91 layer transitions; recall@16 of layer
+L+1's actual set:
+
+| predictor | recall@16 |
+|---|---|
+| random 16 of 896 | 1.8% |
+| static hot 16 of the layer, held out | 20.5% |
+| **the previous token's set at L+1** | **29.5%** |
+| **co-occurrence from layer L, held out** | **29.0%** |
+| co-occurrence fitted on the evaluation data itself | 49.7% |
+
+**The cross-layer predictor does not beat the previous token**, and the
+previous token is what the expert cache already exploits for free. Knowing
+which experts layer L used tells you no more about layer L+1 than knowing
+what the last token did.
+
+**And the price is not symmetric.** On this machine bandwidth is the scarce
+resource, so a wrong prefetch is not a missed opportunity, it is a read that
+displaces a needed one. At accuracy p a layer reads `16 + 16(1−p)` records,
+and the disk's 1.35 s/step of real work becomes `1.35(2−p)`:
+
+| accuracy | wasted reads | window it can fill | net |
+|---|---|---|---|
+| 29.5% measured | 0.95 s | 0.54 s | **−0.41 s/step** |
+| 49.7% overfit ceiling | 0.68 s | 0.54 s | **−0.14 s/step** |
+| 60% | 0.54 s | 0.54 s | break-even |
+| 80% | 0.27 s | 0.54 s | +0.27 s |
+
+**Even the memorizing predictor loses.** The 49.7% row is a predictor fitted
+on the very tokens it is scored against — it cannot be achieved, and it is
+still under break-even. That is a one-sided bound, and it is what makes this
+a decision rather than an estimate: building it would make K3 slower.
+
+This is the third time the same asymmetry has decided something here. §4D
+refused batching and speculative decoding, §24 refused a bigger cache, and
+now this. The offloading literature — SP-MoE, MoE-SpeQ — assumes compute is
+free and the link is idle, which is true behind PCIe and false here.
+
+**A side effect worth keeping: this answers open question 1 of
+[K3.md](K3.md).** It asked whether K3's 896-expert latent routing
+concentrates differently from Kimi-Linear's 256 in full hidden space. Next-
+token reuse is **29.5%** against Kimi-Linear's 33.6% (§4) and OLMoE's 43.5%
+— the direction §4 predicted, now measured on the model this engine exists
+for. Reuse keeps falling as experts get finer, and every cache argument in
+this file rests on the level it has fallen to.
+
+One caveat on the trace: it is prefill routing over real text, not decode
+routing over the model's own output. The router is the same and the hidden
+states are real, but a self-generated continuation is more repetitive, so
+if anything these numbers are pessimistic about reuse and optimistic about
+nothing.
