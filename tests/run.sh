@@ -125,7 +125,15 @@ mkdir -p "$FT/srv" "$FT/dst"
 if stat --version >/dev/null 2>&1; then SM=gnu; else SM=bsd; fi
 python3 -c "open('$FT/srv/s.bin','wb').write(bytes(range(256))*4096)"
 
-if ! start_server; then
+# The worker the downloader generates is curl, so without curl these three
+# report the downloader broken when what is missing is a tool — which is the
+# one thing this suite says it must never do. Debian slim and a bare MinGW
+# both lack it.
+if ! command -v curl >/dev/null 2>&1; then
+    sk "a truncated shard resumes and verifies against Content-Length" "curl not installed"
+    sk "a completed shard is skipped without a request" "curl not installed"
+    NO_CURL=1
+elif ! start_server; then
     no "range server did not start (resume, state-file skip not run)"
 else
     head -c 400000 "$FT/srv/s.bin" > "$FT/dst/s.bin"
@@ -148,7 +156,9 @@ else
     kill $RSRV 2>/dev/null; wait $RSRV 2>/dev/null
 fi
 
-if ! start_server --no-range; then
+if [ -n "${NO_CURL:-}" ]; then
+    sk "a server without Range support restarts the shard instead of giving up" "curl not installed"
+elif ! start_server --no-range; then
     no "range server did not start (no-range fallback not run)"
 else
     rm -f "$FT/dst/s.bin" "$FT/dst/.st" "$FT/dst/log"
@@ -442,12 +452,24 @@ default_budget() {
     python3 - "$1" <<'PY'
 import json, os, subprocess, sys
 
+# subprocess does not go through the shell, so it does not inherit Git-Bash's
+# habit of resolving a bare name to the .exe next to it.
+WASTE = os.path.join(os.curdir, "waste" + (".exe" if os.name == "nt" else ""))
+
 def j(*a):
-    r = subprocess.run(["./waste", *a, "--json"], capture_output=True, text=True)
+    r = subprocess.run([WASTE, *a, "--json"], capture_output=True, text=True)
     return json.loads(r.stdout)
 
 plan, info = j("plan", sys.argv[1]), j("info", sys.argv[1])
-phys = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+# From the engine rather than os.sysconf, which does not exist in Windows
+# CPython at all. This is the same number the engine sized itself against,
+# so what the check still tests is the rule — floor + the largest whole
+# working set under 7/8 of RAM — and not the RAM reading, which has its
+# own platform code and no business being written twice.
+phys = plan["physical_ram_bytes"]
+if not phys:
+    print("physical RAM unknown on this host")
+    sys.exit(0)
 cap = phys - phys // 8
 # what the engine actually holds: the plan's mandatory parts plus the
 # cache it really allocated, which is what `info` reports
@@ -477,11 +499,11 @@ PY
 # fp16 scale per output row and the record's 4 KiB alignment.
 params_rule() {
     python3 - "$1" <<'PY'
-import json, subprocess, sys
+import json, os, subprocess, sys
 
 d = sys.argv[1]
 man = json.load(open(f"{d}/manifest.json"))
-r = subprocess.run(["./waste", "info", d, "--json"], capture_output=True, text=True)
+r = subprocess.run([os.path.join(os.curdir, "waste" + (".exe" if os.name == "nt" else "")), "info", d, "--json"], capture_output=True, text=True)
 info = json.loads(r.stdout)
 c, lay = man["config"], man["layers"]
 
@@ -628,11 +650,11 @@ head_ "parameter counts"
 # under `_outer`, and every trunk format the language model actually uses.
 info_rule() {
     python3 - "$1" <<'PY'
-import json, subprocess, sys
+import json, os, subprocess, sys
 
 d = sys.argv[1]
 man = json.load(open(f"{d}/manifest.json"))
-r = subprocess.run(["./waste", "info", d, "--json"], capture_output=True, text=True)
+r = subprocess.run([os.path.join(os.curdir, "waste" + (".exe" if os.name == "nt" else "")), "info", d, "--json"], capture_output=True, text=True)
 info = json.loads(r.stdout)
 c = man["config"]
 
@@ -812,8 +834,16 @@ head_ "serve (OpenAI-compatible server)"
 
 # The Python suite needs libwaste as a shared object; the CLI links the
 # archive, so a plain `make` before this change did not produce one.
-SOEXT=so
-[ "$(uname -s)" = "Darwin" ] && SOEXT=dylib
+# The Makefile picks this from the compiler's target triple; the suite has
+# to reach the same answer from the shell. `uname -s` under Git-Bash and
+# MSYS says MINGW64_NT-… , which the Darwin test missed and the fallback
+# then sent to libwaste.so — a target that does not exist on Windows, so
+# the check reported a build failure for a library that had built fine.
+case "$(uname -s)" in
+    Darwin)                SOEXT=dylib ;;
+    MINGW*|MSYS*|CYGWIN*)  SOEXT=dll ;;
+    *)                     SOEXT=so ;;
+esac
 
 if [ "${WASTE_SANITIZED:-0}" = 1 ]; then
     # ASan needs to be the first library loaded; a dlopen from a plain

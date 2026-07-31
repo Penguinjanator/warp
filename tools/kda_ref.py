@@ -86,7 +86,14 @@ def main():
         f.write(raw(beta))
         f.write(raw(S0))
 
-    exe = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "test_kda")
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    # MinGW's linker emits test_kda.exe. Git-Bash resolves the bare name to
+    # it and Windows-native Python does not, so the checker reported the KDA
+    # kernel as failing on the one platform where it had just been validated
+    # against the oracle to 4.5e-08.
+    exe = os.path.join(root, "test_kda")
+    if not os.path.exists(exe) and os.path.exists(exe + ".exe"):
+        exe += ".exe"
     if not os.path.exists(exe):
         print("build first:  cc -O2 -o test_kda tests/test_kda.c src/kda.c -lm")
         return 2

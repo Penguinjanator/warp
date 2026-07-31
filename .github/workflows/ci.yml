@@ -294,3 +294,64 @@ jobs:
             echo "missing SPDX header:"; echo "$missing"; exit 1
           fi
           echo "ok: all source files carry the header"
+
+  # The cross-build job proves the code compiles for Windows and the run job
+  # proves those binaries execute. Neither builds *on* Windows, so neither
+  # ever ran the Makefile's platform detection, the shell harness, or the
+  # Python checkers there — which is where all four defects in issue #3
+  # were, and why a contributor had to find them by hand. This job is the
+  # missing half: a native toolchain, the default compiler variable, and the
+  # whole suite.
+  windows-native:
+    name: windows-x86_64 (native build + suite)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      # MINGW64 rather than MSYS: its python is a native Windows build, so
+      # it has no os.sysconf and does not resolve `./waste` to waste.exe —
+      # the two things gaps 3 and 4 of #3 depend on. An MSYS python would
+      # paper over both and this job would pass while the bug survived.
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          path-type: inherit
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-make
+            mingw-w64-x86_64-python
+            make
+            curl
+            diffutils
+            file
+
+      - name: What this runner has
+        run: |
+          uname -s
+          gcc -dumpmachine
+          make --version | head -1
+          python3 --version
+          command -v cc >/dev/null && echo "cc: present" || echo "cc: absent (expected on MinGW)"
+
+      # No CC= on purpose. `cc` does not exist here, and the Makefile used to
+      # let that pass silently: -dumpmachine answered nothing, ARCH fell back
+      # to `uname -m`, and a build for Windows was configured as if for Linux.
+      - name: Build with the default compiler variable
+        run: make -j4
+
+      - name: Build the checkers
+        run: make test -j4
+
+      - name: It really is a Windows binary
+        run: |
+          file waste.exe libwaste.dll
+          file waste.exe | grep -q "PE32+ executable"
+
+      # The whole harness, not a hand-picked subset: SOEXT from `uname -s`,
+      # the .exe-suffixed checkers, and every Python block that shells out.
+      - name: Suite
+        run: bash tests/run.sh

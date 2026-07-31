@@ -20,7 +20,26 @@ LDLIBS  := -lm -lpthread
 # says arm64 and would put the NEON translation unit into an x86 binary
 # while leaving out the two SIMD ones the target actually dispatches to.
 TRIPLE  := $(shell $(CC) -dumpmachine 2>/dev/null)
-ARCH    := $(if $(TRIPLE),$(TRIPLE),$(shell uname -m))
+# Stock MinGW ships gcc.exe and no cc.exe, so the default CC does not exist
+# there and -dumpmachine answered nothing. The fallback below was `uname -m`,
+# which on MSYS says x86_64 and never contains "mingw" — so WINDOWS, EXE and
+# SOEXT stayed unset and make quietly built for the wrong platform, first
+# noticed when it tried to link an extensionless test_kda with a compiler
+# that is not installed. A missing compiler must not look like a Linux host.
+CC0     := $(CC)
+# A CC given on the command line wins over this assignment, by make's own
+# rules — so an explicitly named compiler that does not work is an error
+# rather than something quietly replaced.
+ifeq (,$(TRIPLE))
+CC      := gcc
+TRIPLE  := $(shell $(CC) -dumpmachine 2>/dev/null)
+endif
+ifeq (,$(TRIPLE))
+$(error no working C compiler: `$(CC0)` does not answer -dumpmachine$(if \
+$(filter-out $(CC0),$(CC)), and neither does `$(CC)`). Name one that does, \
+e.g. `make CC=gcc` on MinGW)
+endif
+ARCH    := $(TRIPLE)
 
 # Shared-library suffix: convert.py and serve/engine.py look for all three
 # through ctypes.
