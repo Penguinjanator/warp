@@ -113,6 +113,10 @@ start_server() {                       # $@ = extra server args; sets PORT, RSRV
         kill -0 "$RSRV" 2>/dev/null || break   # it died; stop waiting
         sleep 0.1
     done
+    # A server that never reported is still a process, and the caller below
+    # only kills the ones it was told about — CI reported exactly one
+    # orphaned Python the first time this path fired.
+    [ -n "$PORT" ] || { kill "$RSRV" 2>/dev/null; wait "$RSRV" 2>/dev/null; }
     [ -n "$PORT" ]
 }
 

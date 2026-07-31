@@ -21,7 +21,27 @@ taken". --port-file is how the caller learns which port it got.
 import http.server
 import os
 import re
+import socketserver
 import sys
+
+
+class Server(http.server.HTTPServer):
+    """HTTPServer without the reverse DNS lookup in its constructor.
+
+    HTTPServer.server_bind calls socket.getfqdn() on the address it just
+    bound, and TCPServer.__init__ runs it *between* bind() and the listen()
+    in server_activate. For 127.0.0.1 the answer is worth nothing — nothing
+    here reads server_name — but on a macOS CI runner it blocked for about
+    fifteen seconds, and until it returns the port is bound and not yet
+    listening, so a caller connecting in that window is refused rather than
+    queued. It also delayed the port file below past the caller's patience:
+    the first server of a run failed to report in time, the second was fast
+    because the resolver had cached the answer by then.
+    """
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 def make_handler(root, ranges):
@@ -75,7 +95,7 @@ def main():
         del argv[i:i + 2]
     ranges = "--no-range" not in argv
     root, port = [a for a in argv if not a.startswith("--")][:2]
-    srv = http.server.HTTPServer(("127.0.0.1", int(port)), make_handler(root, ranges))
+    srv = Server(("127.0.0.1", int(port)), make_handler(root, ranges))
 
     # Hand the real port back only after the constructor has bound and
     # listened, so a caller that sees this file can connect immediately —
