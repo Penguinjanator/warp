@@ -107,6 +107,14 @@ typedef struct {
 void *waste_dio_alloc(size_t n);
 void  waste_dio_free(void *p);
 
+/* Wiring, shared by the cache and the trunk so one switch cannot mean two
+ * things. WASTE_MLOCK: 0/unset off, `cache` (or 1, which is what §30 of
+ * LEARNED.md measured), `trunk`, `all`. */
+#define WASTE_WIRE_CACHE 1
+#define WASTE_WIRE_TRUNK 2
+int waste_mlock_mode(void);
+int waste_wire(void *p, size_t n);          /* 1 on success */
+
 /* budget_bytes 0 disables caching (every access reads). Returns 0 on ok. */
 int  waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
                        int policy);

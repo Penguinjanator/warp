@@ -204,6 +204,14 @@ works: five alternated runs give a median 0.51 against 0.42 and a spread of
 been worked and the wired one does not. That is §16's "sweep upward, never
 downward" bought back. [LEARNED.md](LEARNED.md) §30.
 
+**And §31 corrects which buffer to wire.** The cache was the one with a
+switch, not the one that mattered: wiring it alone is *worse than nothing*
+on a quiet machine (0.50 against 0.55), because it leaves the 27.5 GB trunk
+— read in full every token — as the pageable part. Wiring the trunk instead
+gives **0.56–0.58 tok/s in every run, quiet machine or worked**, which is
+the flattest number in this repository. `WASTE_MLOCK=1` wires both; still
+off by default, because Linux's 8 MB `RLIMIT_MEMLOCK` would refuse it.
+
 ### C. Stage-major records — measured and dropped
 
 Today a record is `[hdr][gate][up][down][scales]`, and within a matrix

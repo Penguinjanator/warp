@@ -99,10 +99,26 @@ static void  ec_volatile(waste_ecache *c, int si) { (void)c; (void)si; }
  * one that runs with a pageable one. */
 #ifndef _WIN32
 #include <sys/mman.h>
-static int ec_wire(void *p, size_t n) { return mlock(p, n) == 0; }
+int waste_wire(void *p, size_t n) { return mlock(p, n) == 0; }
 #else
-static int ec_wire(void *p, size_t n) { return VirtualLock(p, n) != 0; }
+int waste_wire(void *p, size_t n) { return VirtualLock(p, n) != 0; }
 #endif
+
+int waste_mlock_mode(void)
+{
+    const char *e = getenv("WASTE_MLOCK");
+    if (!e || !*e || *e == '0') return 0;
+    if (!strcmp(e, "trunk")) return WASTE_WIRE_TRUNK;
+    if (!strcmp(e, "cache")) return WASTE_WIRE_CACHE;
+    if (!strcmp(e, "all") || !strcmp(e, "both"))
+        return WASTE_WIRE_CACHE | WASTE_WIRE_TRUNK;
+    /* Bare 1 means "wire what you can". It meant cache-only when §30 was
+     * written, and §31 measured the trunk: wiring the cache alone is the
+     * one setting that is worse than doing nothing, because it leaves the
+     * hot part pageable. `cache` still names the old behaviour, for
+     * reproducing that section. */
+    return WASTE_WIRE_CACHE | WASTE_WIRE_TRUNK;
+}
 
 static void ec_release_last(waste_ecache *c)
 {
@@ -259,8 +275,7 @@ int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
     c->last_used = -1;
     {   const char *e = getenv("WASTE_PURGEABLE");
         c->purgeable = e && *e != '0';
-        e = getenv("WASTE_MLOCK");
-        c->wired = e && *e != '0';
+        c->wired = (waste_mlock_mode() & WASTE_WIRE_CACHE) != 0;
         /* One says the kernel may take a slot for free, the other that it
          * may never take one. Asking for both is a contradiction, not a
          * configuration. */
@@ -295,7 +310,7 @@ int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
             continue;
         }
         if (!c->slot[i].data) { waste_ecache_free(c); return -1; }
-        if (c->wired && !ec_wire(c->slot[i].data, rec_bytes)) c->wire_failed++;
+        if (c->wired && !waste_wire(c->slot[i].data, rec_bytes)) c->wire_failed++;
     }
     if (c->wire_failed)
         fprintf(stderr, "waste: could not wire %d of %d cache slots; "

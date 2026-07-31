@@ -33,7 +33,7 @@ import zlib
 MAGIC_EXPERT = 0x50584557        # 'WEXP'
 MAGIC_CODEBOOK = 0x4B424357      # 'WCBK'
 ALIGN = 4096
-FMT_F32, FMT_Q8G, FMT_VQ3R = 0, 2, 4
+FMT_F32, FMT_Q8G, FMT_Q4G, FMT_VQ3R = 0, 2, 3, 4
 VEC_DIM, CB_ENTRIES, STAGES, IDX_BLOCK = 8, 256, 3, 64
 GROUP = 128
 KINDS = ("gate", "up", "down")
@@ -93,7 +93,8 @@ def f16(vals):
 
 class Trunk:
     """Accumulates trunk.bin and its index, in the layout model.c reads:
-    F32 verbatim, Q8G as int8 rows followed by one fp16 scale per group."""
+    F32 verbatim, Q8G/Q4G as quantized rows followed by one fp16 scale per
+    group."""
 
     def __init__(self, rng):
         self.buf = bytearray()
@@ -109,20 +110,39 @@ class Trunk:
         self.index.append({"name": name, "fmt": FMT_F32, "off": off,
                            "shape": list(shape), "bytes": len(self.buf) - off})
 
-    def q8g(self, name, shape):
+    def quant(self, name, shape, bits=None):
+        """Quantized rows plus one fp16 scale per group.
+
+        The width mirrors tools/convert.py: 4 bits for the bulk, 8 at the
+        two ends of the network where error is least forgiving. Emitting
+        Q8G everywhere — which this did until a Q4G trunk turned out not to
+        load under WASTE_Q8=0 — leaves the 4-bit paths with no container CI
+        can reach, and a default conversion produces almost nothing else.
+        """
         rows, N = 1, shape[-1]
         for s in shape[:-1]:
             rows *= s
+        if bits is None:
+            bits = 8 if name.endswith(("embed_tokens.weight",
+                                       "lm_head.weight")) else 4
         ng = (N + GROUP - 1) // GROUP
-        off = len(self.buf)
-        # int8 payload is padded out to whole groups, as the converter does
-        self.buf += bytes((self.rng.randrange(-127, 128) & 0xFF)
-                          for _ in range(rows * ng * GROUP))
+        n = ng * GROUP          # payload is padded to whole groups, as the
+        off = len(self.buf)     # converter does
+        if bits == 8:
+            self.buf += bytes((self.rng.randrange(-127, 128) & 0xFF)
+                              for _ in range(rows * n))
+        else:
+            # two signed nibbles per byte, low one first, biased by +8 —
+            # the packing src/model.c's 4-bit decode assumes. n is a whole
+            # number of groups of 128, so the pairs never straddle a row.
+            v = [self.rng.randrange(-8, 8) for _ in range(rows * n)]
+            self.buf += bytes(((v[i] + 8) & 0x0F) | (((v[i + 1] + 8) & 0x0F) << 4)
+                              for i in range(0, len(v), 2))
         soff = len(self.buf)
         self.buf += f16([self.rng.uniform(0.002, 0.02)
                          for _ in range(rows * ng)])
-        self.index.append({"name": name, "fmt": FMT_Q8G, "off": off,
-                           "shape": list(shape), "group": GROUP,
+        self.index.append({"name": name, "fmt": FMT_Q8G if bits == 8 else FMT_Q4G,
+                           "off": off, "shape": list(shape), "group": GROUP,
                            "scale_off": soff, "bytes": len(self.buf) - off})
 
 
@@ -256,7 +276,7 @@ def main():
     kda = {l - 1 for l in cfg["linear_attn_config"]["kda_layers"]}
 
     t = Trunk(rng)
-    t.q8g("model.embed_tokens.weight", [cfg["vocab_size"], hid])
+    t.quant("model.embed_tokens.weight", [cfg["vocab_size"], hid])
     for L in range(cfg["num_hidden_layers"]):
         p = f"model.layers.{L}."
         t.f32(p + "input_layernorm.weight", [hid])
@@ -264,13 +284,13 @@ def main():
         if L in kda:
             a = p + "self_attn."
             for w in ("q_proj", "k_proj", "v_proj"):
-                t.q8g(a + w + ".weight", [C_KDA, hid])
-            t.q8g(a + "b_proj.weight", [H_KDA, hid])
-            t.q8g(a + "f_a_proj.weight", [D_KDA, hid])
-            t.q8g(a + "f_b_proj.weight", [C_KDA, D_KDA])
-            t.q8g(a + "g_a_proj.weight", [D_KDA, hid])
-            t.q8g(a + "g_b_proj.weight", [C_KDA, D_KDA])
-            t.q8g(a + "o_proj.weight", [hid, C_KDA])
+                t.quant(a + w + ".weight", [C_KDA, hid])
+            t.quant(a + "b_proj.weight", [H_KDA, hid])
+            t.quant(a + "f_a_proj.weight", [D_KDA, hid])
+            t.quant(a + "f_b_proj.weight", [C_KDA, D_KDA])
+            t.quant(a + "g_a_proj.weight", [D_KDA, hid])
+            t.quant(a + "g_b_proj.weight", [C_KDA, D_KDA])
+            t.quant(a + "o_proj.weight", [hid, C_KDA])
             for w in ("q_conv1d", "k_conv1d", "v_conv1d"):
                 t.f32(a + w + ".weight", [C_KDA, 1, 4])
             t.f32(a + "A_log", [1, 1, H_KDA, 1])
@@ -278,25 +298,25 @@ def main():
             t.f32(a + "o_norm.weight", [D_KDA])
         else:
             a = p + "self_attn."
-            t.q8g(a + "q_proj.weight", [nh * qd, hid])
-            t.q8g(a + "kv_a_proj_with_mqa.weight", [kvl + rope, hid])
+            t.quant(a + "q_proj.weight", [nh * qd, hid])
+            t.quant(a + "kv_a_proj_with_mqa.weight", [kvl + rope, hid])
             t.f32(a + "kv_a_layernorm.weight", [kvl])
-            t.q8g(a + "kv_b_proj.weight", [nh * (cfg["qk_nope_head_dim"] + vh), kvl])
-            t.q8g(a + "o_proj.weight", [hid, nh * vh])
+            t.quant(a + "kv_b_proj.weight", [nh * (cfg["qk_nope_head_dim"] + vh), kvl])
+            t.quant(a + "o_proj.weight", [hid, nh * vh])
         if L < cfg["first_k_dense_replace"]:
-            t.q8g(p + "mlp.gate_proj.weight", [dense, hid])
-            t.q8g(p + "mlp.up_proj.weight", [dense, hid])
-            t.q8g(p + "mlp.down_proj.weight", [hid, dense])
+            t.quant(p + "mlp.gate_proj.weight", [dense, hid])
+            t.quant(p + "mlp.up_proj.weight", [dense, hid])
+            t.quant(p + "mlp.down_proj.weight", [hid, dense])
         else:
             m = p + "block_sparse_moe."
-            t.q8g(m + "gate.weight", [cfg["num_experts"], hid])
+            t.quant(m + "gate.weight", [cfg["num_experts"], hid])
             t.f32(m + "gate.e_score_correction_bias", [cfg["num_experts"]])
             sh = moe * cfg["num_shared_experts"]
-            t.q8g(m + "shared_experts.gate_proj.weight", [sh, hid])
-            t.q8g(m + "shared_experts.up_proj.weight", [sh, hid])
-            t.q8g(m + "shared_experts.down_proj.weight", [hid, sh])
+            t.quant(m + "shared_experts.gate_proj.weight", [sh, hid])
+            t.quant(m + "shared_experts.up_proj.weight", [sh, hid])
+            t.quant(m + "shared_experts.down_proj.weight", [hid, sh])
     t.f32("model.norm.weight", [hid])
-    t.q8g("lm_head.weight", [cfg["vocab_size"], hid])
+    t.quant("lm_head.weight", [cfg["vocab_size"], hid])
     with open(os.path.join(args.out, "trunk.bin"), "wb") as f:
         f.write(t.buf)
 

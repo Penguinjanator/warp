@@ -328,8 +328,41 @@ PY
     else no "chunked prefill diverges"
     fi
 
-    WASTE_Q8=0 ./test_forward "$MODEL" "$IDS" "$TMP/f32.bin" 0 >/dev/null 2>&1
-    if python3 - "$TMP/seq.bin" "$TMP/f32.bin" <<'PY'
+    # WASTE_Q8=0 makes the entire trunk resident as f32 — 8x a 4-bit one, so
+    # K3's 26 GiB trunk asks for ~210 GB and no host runs this. Say so
+    # instead of reporting the refusal as a divergence.
+    q8_why=$(python3 - "$MODEL" <<'PY'
+import json, os, subprocess, sys
+WASTE = os.path.join(os.curdir, "waste" + (".exe" if os.name == "nt" else ""))
+try:
+    m = json.load(open(os.path.join(sys.argv[1], "manifest.json")))
+except Exception:
+    sys.exit(0)
+need = 0
+for t in m.get("trunk", []):
+    # the tower is never made resident by the text path, so it is not part
+    # of what this would allocate — src/model.c skips it at load
+    if t.get("name", "").startswith(("vision_tower.", "mm_projector.")):
+        continue
+    n = 1
+    for d in t.get("shape", []):
+        n *= d
+    need += n * 4
+r = subprocess.run([WASTE, "plan", sys.argv[1], "--json"],
+                   capture_output=True, text=True)
+try:
+    phys = json.loads(r.stdout)["physical_ram_bytes"]
+except Exception:
+    phys = 0
+if phys and need > phys // 2:
+    print(f"an f32 trunk is {need / 2**30:.0f} GB of {phys / 2**30:.0f} GB of RAM")
+PY
+)
+    if [ -n "$q8_why" ]; then
+        sk "quantized trunk storage == f32 weights" "$q8_why"
+    else
+        WASTE_Q8=0 ./test_forward "$MODEL" "$IDS" "$TMP/f32.bin" 0 >/dev/null 2>&1
+        if python3 - "$TMP/seq.bin" "$TMP/f32.bin" <<'PY'
 import struct, sys
 def L(p):
     b = open(p, "rb").read()
@@ -337,8 +370,9 @@ def L(p):
 a, b = L(sys.argv[1]), L(sys.argv[2])
 sys.exit(0 if max(abs(x - y) for x, y in zip(a, b)) < 1e-3 else 1)
 PY
-    then ok "int8 trunk storage == f32 weights"
-    else no "int8 storage changes results"
+        then ok "quantized trunk storage == f32 weights"
+        else no "quantized storage changes results"
+        fi
     fi
 
     WASTE_BACKEND=cpu ./test_forward "$MODEL" "$IDS" "$TMP/cpu.bin" 0 >/dev/null 2>&1

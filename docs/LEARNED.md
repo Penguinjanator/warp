@@ -1532,3 +1532,53 @@ mlock?" is the right question and it has three answers, not one**: it is
 allowed, it does not fix the cliff, and it fixes something else that was
 being lived with. The third only appeared because the measurement was run at
 the budget where nothing was supposed to be wrong.
+
+## 31. It was the trunk that wanted wiring, not the cache (2026-07-31)
+
+§30 measured `mlock` on the expert cache and concluded it bought
+reproducibility rather than speed. That was true and it was the wrong
+comparison: it compared a wired cache against nothing, both on a machine
+that had just been worked, and never asked whether wiring the *other* part
+was better. It is. All 27.28 GB of K3's trunk wires in one pass.
+
+Default budget, 8 tokens, four modes alternated, twice on a quiet machine
+and twice immediately after a 58 GiB row had driven it into paging:
+
+| wiring | quiet machine | right after a heavy row |
+|---|---|---|
+| none | 0.53–0.55 tok/s | **0.32** then 0.54 |
+| cache only | 0.50–0.51 | 0.51–0.52 |
+| **trunk only** | **0.57** | **0.56–0.57** |
+| both | 0.57–0.58 | 0.57 |
+
+Three things fall out, and the first two are the ones §30 could not see.
+
+**Wiring the cache alone is worse than doing nothing** on a quiet machine —
+0.50 against 0.55. This is the mechanism §30 hypothesized, now measured
+directly rather than argued: pinning 17.5 GB of a cache that hits 19% forces
+the 27.5 GB trunk, which is read *in full every token*, to be the pageable
+one. It pins the cold part at the hot part's expense.
+
+**Wiring the trunk is the best in every single run**, 0.56 to 0.58, quiet or
+worked. Nothing else in this file is that flat across machine states.
+
+**And wiring both adds nothing over the trunk alone.** Once the hot part
+cannot be taken, protecting the cold part buys no further throughput — which
+is the same statement as the first row, read from the other end.
+
+The `none` row is where §16's method note lives: 0.32 immediately after the
+heavy row, 0.54 once the machine had recovered. That spread is the whole
+reason "sweep upward, never downward" exists. Wiring the trunk removes it —
+the engine stops being a function of what the machine did an hour ago.
+
+So `WASTE_MLOCK=1` now wires both, which is what a bare 1 should mean;
+`cache` still names §30's behaviour, for reproducing that section. Still off
+by default, for §30's reason: Linux's `RLIMIT_MEMLOCK` is commonly 8 MB and
+a default that fails for most Linux users is not a default.
+
+**The method note is about the shape of the question.** §30 asked "does
+wiring help?" and answered it for the one buffer that had a wiring switch,
+because that is where the code already was. The buffer without a switch was
+the one that mattered, and it took a second experiment to notice that the
+first had never been a fair comparison. A measurement is only as good as the
+alternatives it was run against.

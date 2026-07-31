@@ -555,39 +555,41 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
             t->data = (float *)waste_dio_alloc(t->n * sizeof(float));
             if (!t->data) TRUNK_FAIL;
             if (pread_all(fd, t->data, t->n * sizeof(float), off)) TRUNK_FAIL;
-        } else if (!q8_off) {                             /* Q8G -> f32 */
+        } else if (!q8_off) {              /* Q8G/Q4G/Q3G -> f32 at load */
             const int N = t->shape[t->ndim - 1];
             const int64_t rows = (int64_t)(t->n / (size_t)N);
             const int ng = (N + g - 1) / g;
+            /* This branch had its own dequantizer, and it assumed one byte
+             * per weight while the condition catches every quantized
+             * format. A Q4G tensor therefore asked for twice the bytes it
+             * occupies: the load failed outright when the overrun hit EOF,
+             * and read the next tensor as int8 when it did not. Since
+             * convert.py's --trunk-bits defaults to 4, that is every
+             * container a default conversion produces — invisible here
+             * only because make_test_container.py emits Q8G/F32 alone.
+             * The private copy also predated waste_f16's subnormal fix and
+             * flushed any group scale below 6.1e-05 to zero. Both go away
+             * by decoding through waste_deq_row, the one place that knows
+             * all three widths. */
+            waste_tensor qt = { 0 };
+            qt.group = g;
+            qt.bits = (fmt == 3) ? 4 : (fmt == 7) ? 3 : 8;
+            /* 3-bit rows are a bitstream plus one guard byte */
+            qt.rowbytes = (qt.bits == 3)
+                        ? (size_t)((ng * g * 3 + 7) / 8 + 1)
+                        : (size_t)ng * g * qt.bits / 8;
             t->data = (float *)waste_dio_alloc(t->n * sizeof(float));
-            int8_t *qbuf = (int8_t *)malloc((size_t)rows * ng * g);
-            uint16_t *sbuf = (uint16_t *)malloc((size_t)rows * ng * sizeof(uint16_t));
-            if (!t->data || !qbuf || !sbuf ||
-                pread_all(fd, qbuf, (size_t)rows * ng * g, off) ||
-                pread_all(fd, sbuf, (size_t)rows * ng * sizeof(uint16_t), soff)) {
-                free(qbuf); free(sbuf); TRUNK_FAIL;
+            qt.q = (int8_t *)malloc((size_t)rows * qt.rowbytes);
+            qt.qs = (uint16_t *)malloc((size_t)rows * ng * sizeof(uint16_t));
+            if (!t->data || !qt.q || !qt.qs ||
+                pread_all(fd, qt.q, (size_t)rows * qt.rowbytes, off) ||
+                pread_all(fd, qt.qs, (size_t)rows * ng * sizeof(uint16_t), soff)) {
+                free(qt.q); free(qt.qs); TRUNK_FAIL;
             }
-            const int8_t *q = qbuf;
-            const uint16_t *sc = sbuf;
-            for (int64_t r = 0; r < rows; r++) {
-                for (int b = 0; b < ng; b++) {
-                    /* fp16 -> float without <arm_fp16.h> assumptions */
-                    const uint16_t h = sc[r * ng + b];
-                    const uint32_t sign = (uint32_t)(h >> 15) << 31;
-                    uint32_t exp = (h >> 10) & 0x1f, man = h & 0x3ff, bits;
-                    if (exp == 0) { bits = sign; }
-                    else { bits = sign | ((exp + 112u) << 23) | (man << 13); }
-                    float s;
-                    memcpy(&s, &bits, 4);
-                    for (int k = 0; k < g; k++) {
-                        const int col = b * g + k;
-                        if (col >= N) break;
-                        t->data[r * N + col] = (float)q[(r * ng + b) * g + k] * s;
-                    }
-                }
-            }
-            free(qbuf); free(sbuf);
-        } else {                             /* Q8G or Q4G, kept quantized */
+            for (int64_t r = 0; r < rows; r++)
+                waste_deq_row(&qt, (long)r, N, t->data + r * N);
+            free(qt.q); free(qt.qs);
+        } else {                       /* Q8G, Q4G or Q3G, kept quantized */
             const int N = t->shape[t->ndim - 1];
             const int64_t rows = (int64_t)(t->n / (size_t)N);
             const int ng = (N + g - 1) / g;
@@ -861,6 +863,42 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
 
 /* Defined below, next to record_check; the cache needs it at load. */
 static int bank_fetch(void *user, int layer, int expert, uint8_t *dst);
+
+/* Wire the resident trunk. The cache is the cold part of this engine —
+ * 19 to 30% hit — and this is the hot one: 27.5 GB on K3, read in full
+ * every token, so it is the eviction that costs most. LEARNED.md §30
+ * measured wiring the cache and found it bought reproducibility rather
+ * than speed; this is the other half of that experiment.
+ *
+ * Sizes are derived here rather than recorded at each malloc, because the
+ * trunk is allocated in four places in load_trunk and a fifth would be a
+ * place to forget. A tensor left on disk has nothing to wire. */
+static void wire_trunk(waste_model *m)
+{
+    size_t done = 0;
+    int failed = 0;
+    for (int i = 0; i < m->n_tensors; i++) {
+        const waste_tensor *t = &m->t[i];
+        if (t->on_disk || t->ndim < 1) continue;
+        if (t->data) {
+            const size_t n = t->n * sizeof(float);
+            if (waste_wire(t->data, n)) done += n; else failed++;
+        }
+        const int N = t->shape[t->ndim - 1];
+        if (!t->q || N <= 0 || t->group <= 0) continue;
+        const size_t rows = t->n / (size_t)N;
+        const size_t payload = rows * t->rowbytes;
+        if (waste_wire(t->q, payload)) done += payload; else failed++;
+        if (t->qs) {
+            const size_t sb = rows * (size_t)((N + t->group - 1) / t->group) *
+                              sizeof(uint16_t);
+            if (waste_wire(t->qs, sb)) done += sb; else failed++;
+        }
+    }
+    fprintf(stderr, "waste: wired %.2f GB of trunk%s\n",
+            (double)done / (double)(1u << 30),
+            failed ? " (some buffers were refused)" : "");
+}
 
 int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                      const waste_load_opts *opt)
@@ -1232,6 +1270,8 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         if (depth < nio) depth = nio;
         waste_ecache_io_start(&m->cache, bank_fetch, m, nio, depth);
     }
+    if (waste_mlock_mode() & WASTE_WIRE_TRUNK) wire_trunk(m);
+
     /* Every buffer the forward pass dereferences without asking, not the
      * five that used to be listed here — a NULL m->tmp or m->att is a
      * crash on the first token rather than a load failure. The per-layer
