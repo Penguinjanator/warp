@@ -353,6 +353,33 @@ PY
         no "expert cache changes results"
     fi
 
+    # Read-ahead is on by default, so the synchronous path — the fallback,
+    # and the thing every earlier measurement was made on — is the one no
+    # check would otherwise run. It shipped broken for exactly one build:
+    # a synchronous claim took a pin that never expired, the victim sampler
+    # ran out of slots, and the forward pass answered with the experts it
+    # had instead of failing.
+    WASTE_IO_THREADS=0 WASTE_CACHE_MB=512 ./test_forward "$MODEL" "$IDS" \
+        "$TMP/sync.bin" 0 >/dev/null 2>&1
+    if cmp -s "$TMP/cache.bin" "$TMP/sync.bin"; then
+        ok "read-ahead is bit-identical to synchronous reads"
+    else
+        no "read-ahead changes results"
+    fi
+
+    # A purged slot reads back as zeros, so the whole prototype rests on the
+    # engine noticing before it multiplies one. This does not create memory
+    # pressure — it checks that the volatile/nonvolatile traffic itself does
+    # not disturb a record. Vacuously true off macOS, where the flag is a
+    # no-op and says so.
+    WASTE_PURGEABLE=1 WASTE_CACHE_MB=512 ./test_forward "$MODEL" "$IDS" \
+        "$TMP/purge.bin" 0 >/dev/null 2>&1
+    if cmp -s "$TMP/cache.bin" "$TMP/purge.bin"; then
+        ok "purgeable slots are bit-identical to ordinary ones"
+    else
+        no "purgeable slots change results"
+    fi
+
     ORACLE="${WASTE_ORACLE:-tests/fixtures/oracle_kimilinear_16tok.bin}"
     if [ "$SYNTHETIC" = 1 ]; then
         sk "engine vs the PyTorch oracle" "synthetic container has no reference logits"

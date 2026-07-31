@@ -12,6 +12,7 @@
 #ifndef WASTE_MODEL_H
 #define WASTE_MODEL_H
 
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -135,6 +136,7 @@ typedef struct {
     float *cx, *cnorm, *cresid, *cq, *ckv, *clat, *cff, *cexp;
     float *cblockres, *cprefix;
     int   *croute;
+    int   *cused;                   /* chunk's distinct experts, ascending  */
     float *crw;
     int    chunk_cap;
 
@@ -162,6 +164,11 @@ typedef struct {
      * caught; `verify` adds the crc32 over the payload, which is the part
      * that costs, and it is off unless a caller asks — see waste.h. */
     int      read_error, bad_layer, bad_expert, verify;
+    /* bank_fetch runs on the cache's reader threads as well as the compute
+     * thread once read-ahead is on, and the two fields above plus the read
+     * counter are the only things it writes. Everything else it touches —
+     * the bank table, the expert shapes, `verify` — is fixed at load. */
+    pthread_mutex_t fetch_mu;
 } waste_model;
 
 /* Everything the load needs that is not in the container. These are

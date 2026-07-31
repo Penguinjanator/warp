@@ -201,7 +201,8 @@ So ~1.5 tok/s on the target machine at 3 bits — the higher bit-width from
 Gate 3 costs less than feared, because the better-measured hit rate pays
 part of it back.
 
-> **Superseded by measurement.** The engine does ~0.3 tok/s on K3. Two
+> **Superseded by measurement.** The engine does ~0.3 tok/s on K3 — 0.5
+> since read-ahead ([EFFICIENCY.md](EFFICIENCY.md)). Two
 > reasons, both in this table's assumptions. It gives a 64 GB machine
 > 52.9 GB of cache, where the real trunk is 27.28 GB resident and the
 > usable cache is 17 GB. And it counts disk time only, where expert I/O

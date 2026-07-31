@@ -319,7 +319,7 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
     sc += (uint64_t)2 * T * dense_inter * 4;
     sc += (uint64_t)3 * moe_inter * lat * 4;                /* one expert      */
     sc += (uint64_t)T * nb * hidden * 4 + (uint64_t)T * hidden * 4;
-    sc += (uint64_t)T * 64 * 8;
+    sc += (uint64_t)T * 64 * 12;    /* croute + crw + cused */
     out->scratch_bytes = sc;
 
     /* one layer's top-k experts, double buffered */

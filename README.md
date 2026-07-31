@@ -6,17 +6,17 @@
 $ waste run ~/models/k3.waste 'What is the capital of Italy?'
 waste: no --budget, using 46.24 GB of 64.00 GB (expert cache 17.56 GB)
 The capital of Italy is **Rome**.
-[16 tokens, 49.31 s, 0.32 tok/s | experts 3357 hit / 20195 miss = 14%]
+[16 tokens, 31.09 s, 0.51 tok/s | experts 3357 hit / 20195 miss = 14%]
 ```
 
 WASTE is an embeddable inference engine written in C, with no third-party runtime dependencies. It keeps the model trunk in memory, streams selected experts directly from disk, and uses the remaining RAM as a bounded expert cache.
 
-Its current proof point is the complete open-weights Kimi K3 model: 2.78 trillion parameters, converted into a 982 GiB container and running on a 64 GB MacBook Pro at 0.32–0.34 tokens per second. **This is not a distilled, pruned, or reduced variant**.
+Its current proof point is the complete open-weights Kimi K3 model: 2.78 trillion parameters, converted into a 982 GiB container and running on a 64 GB MacBook Pro at 0.49–0.54 tokens per second. **This is not a distilled, pruned, or reduced variant**.
 
 | Model               | Container | Minimum RAM | Tested speed    |
 | ------------------- | --------- | ----------- | --------------- |
-| **Kimi K3 2.78T**   | 982 GiB   | 29.05 GiB   | 0.32–0.34 tok/s |
-| **Kimi-Linear 48B** | 19 GiB    | 1.86 GiB    | 8.92 tok/s      |
+| **Kimi K3 2.78T**   | 982 GiB   | 29.05 GiB   | 0.49–0.54 tok/s |
+| **Kimi-Linear 48B** | 19 GiB    | 1.87 GiB    | 10.7 tok/s      |
 
 WASTE was written for that one model and that one constraint: **K3 does
 not fit in the RAM of current mainstream consumer systems.** It is 1.42 TB
@@ -31,8 +31,8 @@ needs, and spends every remaining byte of RAM on the part that repeats.
 
 The engine is correct: every layer is validated against a PyTorch
 reference, the final logits agree to 3.6e-06, and the vision tower matches
-its own oracle to 2.3e-06. It is also slow — a third of a token per
-second, fifty seconds for the sentence above.
+its own oracle to 2.3e-06. It is also slow — half a token per second,
+thirty seconds for the sentence above.
 
 Both of those matter, and the second one should not be read as a
 disclaimer. We are not aware of another published demonstration of a
@@ -44,9 +44,18 @@ bibliography and no comparison table, so read it as an invitation to send
 a counter-example, not as a result. The interesting part is not the
 speed, it is that the whole thing is in the reachable range on a single
 consumer machine — and that from here the question is engineering rather
-than feasibility. Half of a decode step is already disk I/O running near
-the drive's measured ceiling, so the levers are known: read fewer bytes
-per token, and keep more of them in RAM.
+than feasibility.
+
+Where the levers were is not where they are. Overlapping the expert reads
+with the arithmetic was worth ~1.6x and shipped; the two that looked bigger
+— reading fewer bytes per token, and keeping more of them in RAM — were both
+measured and both refused, one because this family's router has no tail to
+demote and one because a cache the machine will not leave resident cannot be
+bought at any price. Even with the reads overlapped they are still 55% of a
+decode step against the arithmetic's 27%, so what is left is a faster disk
+or a machine with more RAM, not another pass over the kernels.
+[docs/EFFICIENCY.md](docs/EFFICIENCY.md) is the account of how each of those
+was priced, including the two that were built before being measured.
 
 What that opens up, concretely: a frontier-scale model that answers with
 no network, no per-token invoice, and nothing leaving the machine — which
@@ -95,7 +104,7 @@ only.
 
 If a terabyte is not available, the same engine and the same format run
 `Kimi-Linear-48B-A3B-Instruct` from a **19 GB** container with a
-**1.86 GB** floor, at 8.92 tok/s. That is the good path for trying WASTE
+**1.87 GB** floor, at 10.7 tok/s. That is the good path for trying WASTE
 out before committing a disk to K3.
 
 ## What it is
@@ -184,6 +193,11 @@ re-run *after* the 52 and 58 GB rows have driven the machine into paging,
 counts identical to the digit. The engine is deterministic; the machine
 is not, and it does not fully recover between runs. Sweep upward.
 
+The decode column predates read-ahead and has not been re-swept: 46 GB now
+runs at 0.51 rather than 0.32. The shape is what the table is for, and
+read-ahead does not move it — it hides I/O behind arithmetic, which makes
+every row faster and none of them a different budget.
+
 Everything in the memory design exists to get above that line, which is
 why the engine works to free RAM rather than to save it.
 
@@ -246,10 +260,10 @@ measured on the commit it is published with.
 | minimum RAM | **29.05 GB** at 4K context |
 | | 30.54 GB at 32K, 35.63 GB at 128K, 83.21 GB at 1M |
 | resident trunk | 27.28 GB |
-| read per token | 17.0 GB at ~9.9 GB/s, near the SSD's measured ceiling |
+| read per token | 17.0 GB, read ahead on two threads so it overlaps the matmuls |
 | model load | 20 s |
-| prefill | 0.47 tok/s chunked, 0.29 sequential |
-| decode | 0.32–0.34 tok/s at the default budget, the best this machine gives |
+| prefill | 0.47 tok/s chunked, 0.29 sequential (before read-ahead) |
+| decode | 0.49–0.54 tok/s at the default budget, the best this machine gives |
 | vision tower | 15.7 s for a 1024-patch image, 27 layers |
 | image in a prompt | 256 positions for 896x896, 2.8 s each — as text |
 
@@ -269,8 +283,8 @@ grid halves the prompt.
 
 | | |
 |---|---|
-| minimum RAM | 1.86 GB |
-| decode | **8.92 tok/s** at an 8 GB budget, 78% cache hit |
+| minimum RAM | 1.87 GB |
+| decode | **10.7 tok/s** at an 8 GB budget, 78% cache hit |
 
 The same engine and the same format, on a model that fits comfortably.
 This is what WASTE looks like when it is not fighting.
@@ -465,6 +479,10 @@ The picture shows a simple, stylized landscape with:
 - A **green field** covering the lower part of the image.
 [78 tokens, 234.25 s, 0.33 tok/s | experts 15314 hit / 99502 miss = 13%]
 ```
+
+(That transcript predates read-ahead and its timing line is the old one —
+the picture it was run against is not in this repository, so it is left as
+recorded rather than re-timed. Same tokens, about 1.6x less waiting.)
 
 That is a 448×336 image, and every element of the description is in it —
 including the sky gradient, which is the kind of detail that separates a

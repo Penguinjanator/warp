@@ -960,3 +960,253 @@ reads unconditionally — embeddings, final norm, head — are now required
 at load. Checking *every* tensor the pass might want would mean a second
 copy of its naming rules, and a wrong entry there would refuse a
 container that works; these three cannot be wrong.
+
+## 22. The reads were serial, and half the step was waiting (2026-07-31)
+
+An outside article on running K3 through AirLLM — at ~5 minutes per token,
+against this engine's 3 seconds — turned out to have exactly one thing this
+project did not: it overlaps loading with compute. WASTE did not. `moe_layer`
+picked its top-16 and then read them one at a time, `pread` by blocking
+`pread`, with the arithmetic waiting on each.
+
+The ids were all known before the first read. They come out of the routing
+loop directly above, sixteen independent reads sitting in an array.
+
+**What it was worth.** Two reader threads, depth 2, alternating runs at the
+same budget so the paging state is shared:
+
+| | 16 tokens | tok/s |
+|---|---|---|
+| synchronous | 47.90 / 48.81 / 54.32 / 66.46 s | 0.24–0.33 |
+| **read-ahead** | **31.09 / 31.34 / 32.31 / 32.88 s** | **0.49–0.51** |
+
+**1.5–1.6x**, with `experts 3357 hit / 20195 miss` identical in every single
+run — the cache does exactly what it did before, the time is what changed.
+Chunked prefill gains less, ~1.35x, which is the same result read the other
+way: a chunk already spreads each expert over several tokens, so there is
+proportionally less I/O to hide.
+
+The second column is worth as much as the first. The synchronous runs spread
+39%; the read-ahead runs spread 6%. A blocking read inherits every hesitation
+the machine has, and a queue absorbs them.
+
+Three things this required, and two of them were mistakes first.
+
+**The pin that never expired.** A slot with a read in flight cannot be an
+eviction candidate, so slots carry a pin stamped with the current hint
+generation, and bumping the generation is what releases the previous layer's.
+The synchronous claim path took a pin too — and with read-ahead off the
+generation never advances, so every slot a synchronous read claimed stayed
+pinned forever. The victim sampler ran out of candidates within one cache-full
+of tokens and returned -1.
+
+**And -1 was silent.** `read_expert` returned NULL, `moe_layer` did what it
+has always done on an unreadable expert — `break`, and let `m->read_error`
+carry the reason out — except that nothing had set `read_error`, because
+`bank_fetch` was never reached. The engine answered, with the experts it
+happened to have: *"Italy's capital is Italy. Italy's capital is Italy."*,
+128 tokens of it, exit status 0. A wrong answer with no error is the failure
+this project spends the most effort not having, and it took a default-off
+code path one build to produce one. `REC_E_NOSLOT` exists now, and
+`read_expert` records it when the cache returns NULL without a cause.
+
+**The teardown order.** `waste_model_free` closes the bank fds before it
+frees the cache, which is where the reader threads get stopped — so a reader
+could have been mid-`pread` on a closed, possibly reused descriptor. The
+threads are stopped first now, before anything else is torn down.
+
+Method notes, both familiar:
+
+- **The default path is not the tested path.** The suite runs with read-ahead
+  on, so the synchronous fallback — the thing every measurement in this file
+  before today was made on — had no check at all. `WASTE_IO_THREADS=0`
+  against the default is now one, and it is the check that would have caught
+  the pin in seconds instead of in a K3 run.
+- **The disk was never the reason to do this.** The sweep says the internal
+  SSD gives 10.73 GB/s at queue depth 1 and 12.89 at depth 2 — a 20% band.
+  The other 1.3x came from not standing still, which is not a number a
+  bandwidth measurement can show.
+
+## 23. The router has no tail to demote (2026-07-31)
+
+[EFFICIENCY.md](EFFICIENCY.md) proposed reordering the expert record so its
+residual VQ stages are contiguous planes rather than interleaved bytes. That
+would make any prefix of the stages a single coalesced read, which in turn
+would allow reading two stages instead of three for the experts a token
+barely uses — the one lever that cuts I/O *and* arithmetic, since `vq_rows`
+does exactly `stages` gathers per row.
+
+It rests on one assumption: that the top-16 is top-heavy. `WASTE_DUMP_ROUTE`
+now writes the renormalized weights, and it is not.
+
+| rank | 1 | 2 | 4 | 8 | 12 | 16 |
+|---|---|---|---|---|---|---|
+| mean weight | 0.149 | 0.108 | 0.077 | 0.055 | 0.043 | 0.032 |
+
+1104 rows, 12 decode tokens over 92 MoE layers. First to sixteenth is a
+factor of **4.6**, and **ranks 9–16 carry 33.3% of the mass**. Per layer the
+tail runs 21.6% to 48.4%, so there is no subset of layers to apply it to
+either. Kimi-Linear says the same: 3.8x across its top-8, bottom half 32.0%.
+
+Priced with §20's own `err² = err3² + mass(S)·delta`, demoting ranks 9–16
+takes the expert error from 19.5% to **24.9%** for 16.7% of the reads; the
+gentlest version, ranks 13–16, gives 22.0% for 8.3%. A K3 expert costs 20.3%
+at 3 bits from MXFP4 and that is the measured safe point. Both rows are past
+it, and both sit on the straight line §20 already described — "the exchange
+rate is fixed and both ends of it are bad".
+
+So the format change was not made, for the price of an afternoon against a
+982 GB reconversion. This is Gate 6 again with a different assumption in the
+same place: §20 found the *experts* homogeneous in how hard they are to
+quantize, and this finds the *router* homogeneous in how much it leans on
+them. Two independent flatnesses, and between them they close per-expert bit
+allocation in both its static and its per-activation form.
+
+The instrument stays — four lines behind an env var — because it is the
+first thing to run against any new container, and it is the difference
+between believing a router is peaked and knowing it is not.
+
+## 24. Volatile memory is memory you have given away (2026-07-31)
+
+§16 is the worst number in this file: a 29.32 GB expert cache reaches a 37%
+hit rate and runs at **0.04 tok/s**, eight times slower than a 17.32 GB
+cache at 13%. The engine stays inside its budget, the machine does not, and
+a cache hit becomes a page fault instead of the `pread` the engine was
+managing.
+
+That reading blamed the OS for mishandling the engine's memory, and it
+suggested an answer: **purgeable memory**. Allocate each slot with
+`VM_FLAGS_PURGABLE`, mark it volatile while idle, and under pressure the
+kernel discards it outright rather than compressing and swapping it. A
+discarded slot is a miss, and a miss is a read. The cliff becomes a slope.
+
+Gated first, as the rule says: a volatile/nonvolatile round trip costs
+0.33 us — 0.5 ms over a K3 token's 1472 experts — `vm_allocate` returns
+16 KiB pages so O_DIRECT is unaffected, and the logits come out
+bit-identical. Cheap enough to build.
+
+**It works, and it is still not worth turning on.** 8 tokens, read-ahead on:
+
+| budget | cache | purgeable | hit | decode |
+|---|---|---|---|---|
+| 46.25 GB (default) | 17.56 GB | off | 19% | **0.49–0.52 tok/s** |
+| 46.25 GB (default) | 17.56 GB | on | **0–1%** | 0.29–0.33 tok/s |
+| 58 GB | 29.32 GB | off | 39% | **0.04 tok/s** |
+| 58 GB | 29.32 GB | on | 0–21% | **0.22–0.25 tok/s** |
+
+At an over-large budget it is **6x faster** and does exactly what it was
+built to do. At the budget that actually works it costs **1.6x**, because
+the hit rate falls to nothing: macOS reclaims volatile objects eagerly, not
+only under pressure, so a cache that would have stayed resident is taken
+anyway.
+
+One cause under both rows, and it is the correction to §16. **The memory was
+never the engine's.** Purgeable does not offer "keep more cache"; it offers
+"lose it cheaply or lose it expensively". The 37% hit rate in the third row
+is real, and every hit in it is a page fault, and no flag changes that — the
+pages are not there. A cache above what the machine will leave resident
+cannot be bought at any price, and the default budget resolver, which steps
+down a whole working set at a time and takes the largest that fits, was
+already picking the only size that works.
+
+So the projected ~2x from "fixing" the cliff does not exist. What is kept is
+the escape hatch: `WASTE_PURGEABLE=1` turns a badly-chosen `--budget` from a
+6x catastrophe into a 2x slowdown, which is worth having and is worth having
+off by default.
+
+Two method notes:
+
+- **The gate measured the wrong thing, and was still right to run.** It
+  asked whether the mechanism was affordable — 0.33 us, yes — and that
+  question was worth an hour. It could not have asked whether the kernel
+  would leave the pages alone, because that only appears against a 29 GB
+  cache on a busy machine. A cheap gate is not a substitute for the
+  measurement, it is what makes the measurement worth setting up.
+- **A result that reverses between two configurations is the useful kind.**
+  Had it only been measured at 58 GB it would have shipped on by default as
+  a 6x win, and every ordinary run would have got 1.6x slower.
+
+And one defect this found, unrelated to memory but caught by the same work:
+`waste_ecache_get` releases one more read into the pipe *before* it returns,
+and nothing stopped the victim sampler choosing the slot whose bytes the
+caller was about to multiply. The hint path pinned it as a side effect; the
+synchronous fallback inside `get` did not. `ec_pinned` covers `last_used`
+now. Read-ahead had been green on 37 checks and against the oracle for a day
+by then — the window is one layer wide and needs the sampler to land on one
+slot out of 1483.
+
+## 25. The gather loop was not the bottleneck (2026-07-31)
+
+§22 hid the expert reads behind the arithmetic and §24 closed the memory
+levers, and [EFFICIENCY.md](EFFICIENCY.md) concluded from the model
+`max(1.17 I/O, 1.03 matmul)` that the engine was now arithmetic-bound, with
+`vq_rows` the thing left to fix. So `vq_rows` was fixed.
+
+**The profile says it was not the thing to fix.** Six decode steps of K3
+with read-ahead on:
+
+| stage | s | share |
+|---|---|---|
+| expert I/O | 9.95 | **54.8%** |
+| expert matmul | 4.94 | 27.2% |
+| — of which LUT apply | 4.34 | 23.9% |
+| kda | 1.69 | 9.3% |
+| LUT build | 0.48 | 2.7% |
+
+The reads are still **twice** the arithmetic. The projection had
+overestimated the matmul and underestimated the wait, and nothing checked it
+against a profile before it became a plan.
+
+**The optimization is real and small.** Three table lookups per row are the
+algorithm; the three index bytes read one at a time are not. Eight rows are
+24 consecutive bytes, so six word loads replace 24 byte loads — 64 memory
+operations per eight rows down to 46, eight gather chains instead of four,
+bit-identical output.
+
+| | `waste bench` | `waste run`, 32 tokens | K3, LUT apply at 6 threads |
+|---|---|---|---|
+| before | 8.45 tok/s | 10.53 tok/s | 3.09 s |
+| after | **8.73–8.78** (+3.6%) | **10.88–10.93** (+3.5%) | **3.00 s** (+3%) |
+
+Kept: it is free, and Kimi-Linear is the model whose container fits in RAM,
+where this bucket is most of a step. On K3, 3% of 22% is 0.7% and does not
+clear the noise of a streaming decode.
+
+**That table said +6.6% before it was measured properly.** The baseline came
+from an hour earlier in the same session; run back to back against the
+previous commit's `model.c` it is 3.5%, and three harnesses then agree on
+3–3.6%. §16 established that a row taken after the machine has been worked
+is measured on a different computer. It says nothing about which direction
+the drift goes, and here it flattered the change — the harder case to
+notice, because the number was the one being hoped for.
+
+**Two refutations, and the first is §7 arriving from the other side.**
+
+*Accumulators in registers.* Turn the loops inside out for an eight-row
+sub-tile and the running sums live in registers, deleting all the `acc`
+load/store traffic: 30 memory operations per eight rows instead of 46, and
+still bit-exact, because each row sums over `v` ascending either way. It is
+**17% slower** — 8.93 against 11.08 tok/s. Consecutive `v` sit 192 bytes
+apart, so a sub-tile re-walks the block's whole index span and touches about
+five cache lines for each one it uses. §7 found a layout that was 1.44x in
+isolation and nothing in place; this is a change that is 35% fewer memory
+operations on paper and a loss in place. **Counting operations does not
+predict this loop. Counting cache lines does.**
+
+*`VQ_SUPER`.* Swept 1, 2, 4, 8 on both models: 11.12–11.20 tok/s on
+Kimi-Linear, 4.33–4.35 s on K3. Flat. §7's table-bandwidth theory stays
+refuted even with a third of the index loads removed.
+
+**One finding worth keeping.** The apply saturates at **six threads**, which
+is exactly this machine's performance-core count: 2 → 6 threads is
+7.31 → 2.99 s, and 6 → 18 is 2.99 → 2.89. The twelve efficiency cores are
+worth 3% between them. §10 noted that a single-threaded run lands on an
+E-core; this is the same asymmetry seen from the top.
+
+The method note is about the order, not the code. **A projection that names
+the next bottleneck should be checked against a profile before it becomes a
+plan.** The profile cost one command and would have said, before any of this
+was written, that the arithmetic was 27% and the reads were 55%. The work
+was not wasted — it is bit-exact and it made the model that fits in RAM
+3.5% faster — but it was chosen by arithmetic on an estimate rather than by
+measurement, which is the thing this file exists to stop.
