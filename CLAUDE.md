@@ -49,8 +49,8 @@ tests/run.sh /nonexistent             # forces the synthetic container (what CI 
 
 With no container it builds a few-MB synthetic one via
 `tools/make_test_container.py` and reports SKIP — loudly — for anything
-needing real weights. A fresh clone is 27 pass / 10 skip; with both K3 and
-Kimi-Linear containers on disk it is 39 checks.
+needing real weights. A fresh clone is 28 pass / 10 skip; with both K3 and
+Kimi-Linear containers on disk it is 40 checks.
 
 The download-script checks start `tests/range_server.py` on an ephemeral
 port and read the number back through `--port-file`. Keep it that way — a

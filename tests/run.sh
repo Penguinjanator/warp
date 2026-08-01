@@ -340,9 +340,13 @@ except Exception:
     sys.exit(0)
 need = 0
 for t in m.get("trunk", []):
-    # the tower is never made resident by the text path, so it is not part
-    # of what this would allocate — src/model.c skips it at load
-    if t.get("name", "").startswith(("vision_tower.", "mm_projector.")):
+    # what src/model.c leaves out of the resident set at load, in both
+    # modes, is not part of what this would allocate: the tower, which the
+    # text path never touches, and embed_tokens, whose rows are pread one
+    # per token — 1.41 GiB of a 7.50 GiB f32 Kimi-Linear trunk
+    name = t.get("name", "")
+    if name.startswith(("vision_tower.", "mm_projector.")) or \
+       name.endswith("embed_tokens.weight"):
         continue
     n = 1
     for d in t.get("shape", []):
@@ -534,6 +538,11 @@ PY
     warm_m=${warm##*/ }; warm_m=${warm_m% miss}
     if [ -z "$cold" ] || [ -z "$warm" ]; then
         no "hotlist check read no cache line from the run"
+    elif [ "$cold_m" -eq 0 ] && [ "$warm_m" -eq 0 ]; then
+        # The cold run had nothing to teach, so neither outcome is
+        # demonstrated. PASS here would be passing by luck, and this suite
+        # does not treat an absent prerequisite as one.
+        sk "learned hotlist" "the cold run already missed nothing"
     elif [ "$warm_m" -lt "$cold_m" ]; then
         ok "learned hotlist warms the cache ($cold_m -> $warm_m misses)"
     else

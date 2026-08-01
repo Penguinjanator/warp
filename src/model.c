@@ -563,41 +563,7 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
             t->data = (float *)waste_dio_alloc(t->n * sizeof(float));
             if (!t->data) TRUNK_FAIL;
             if (pread_all(fd, t->data, t->n * sizeof(float), off)) TRUNK_FAIL;
-        } else if (!q8_off) {              /* Q8G/Q4G/Q3G -> f32 at load */
-            const int N = t->shape[t->ndim - 1];
-            const int64_t rows = (int64_t)(t->n / (size_t)N);
-            const int ng = (N + g - 1) / g;
-            /* This branch had its own dequantizer, and it assumed one byte
-             * per weight while the condition catches every quantized
-             * format. A Q4G tensor therefore asked for twice the bytes it
-             * occupies: the load failed outright when the overrun hit EOF,
-             * and read the next tensor as int8 when it did not. Since
-             * convert.py's --trunk-bits defaults to 4, that is every
-             * container a default conversion produces — invisible here
-             * only because make_test_container.py emits Q8G/F32 alone.
-             * The private copy also predated waste_f16's subnormal fix and
-             * flushed any group scale below 6.1e-05 to zero. Both go away
-             * by decoding through waste_deq_row, the one place that knows
-             * all three widths. */
-            waste_tensor qt = { 0 };
-            qt.group = g;
-            qt.bits = (fmt == 3) ? 4 : (fmt == 7) ? 3 : 8;
-            /* 3-bit rows are a bitstream plus one guard byte */
-            qt.rowbytes = (qt.bits == 3)
-                        ? (size_t)((ng * g * 3 + 7) / 8 + 1)
-                        : (size_t)ng * g * qt.bits / 8;
-            t->data = (float *)waste_dio_alloc(t->n * sizeof(float));
-            qt.q = (int8_t *)malloc((size_t)rows * qt.rowbytes);
-            qt.qs = (uint16_t *)malloc((size_t)rows * ng * sizeof(uint16_t));
-            if (!t->data || !qt.q || !qt.qs ||
-                pread_all(fd, qt.q, (size_t)rows * qt.rowbytes, off) ||
-                pread_all(fd, qt.qs, (size_t)rows * ng * sizeof(uint16_t), soff)) {
-                free(qt.q); free(qt.qs); TRUNK_FAIL;
-            }
-            for (int64_t r = 0; r < rows; r++)
-                waste_deq_row(&qt, (long)r, N, t->data + r * N);
-            free(qt.q); free(qt.qs);
-        } else {                       /* Q8G, Q4G or Q3G, kept quantized */
+        } else {                              /* Q8G, Q4G or Q3G */
             const int N = t->shape[t->ndim - 1];
             const int64_t rows = (int64_t)(t->n / (size_t)N);
             const int ng = (N + g - 1) / g;
@@ -624,6 +590,42 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
             if (pread_all(fd, t->q, payload, off) ||
                 pread_all(fd, t->qs, (size_t)rows * ng * sizeof(uint16_t), soff))
                 TRUNK_FAIL;
+
+            /* WASTE_Q8=0 dequantizes the trunk once here instead of at every
+             * use, and it runs *after* the quantized load so it can hand the
+             * rows to waste_deq_row — the same unpacker the compute path
+             * calls. A width this code does not itself know cannot be
+             * mis-read at load while working everywhere else.
+             *
+             * It used to be a branch of its own, ahead of this one, with a
+             * private copy of the Q8 unpacking that read `rows * ng * g`
+             * bytes: one byte per weight, true of Q8G alone, while the
+             * branch caught every non-F32 format. A Q4G trunk — what
+             * --trunk-bits 4, the default, produces — asked for twice the
+             * bytes it occupies and failed to load. Only the synthetic
+             * container, Q8G/F32 throughout, took the shape it handled,
+             * which is why CI never saw it.
+             *
+             * embed_tokens stays on disk above either way. Its rows go
+             * through this same unpacker when read, so the logits are
+             * identical, 1.41 GiB stays out of the resident set, and the
+             * f32-equivalence check differs from the default path in the
+             * storage width alone — which is what it claims to compare. */
+            if (!q8_off) {
+                float *f32 = (float *)waste_dio_alloc(t->n * sizeof(float));
+                if (!f32) TRUNK_FAIL;
+                for (int64_t r = 0; r < rows; r++)
+                    waste_deq_row(t, (long)r, N, f32 + (size_t)r * (size_t)N);
+                waste_dio_free(t->q);  t->q  = NULL;
+                waste_dio_free(t->qs); t->qs = NULL;
+                /* Indistinguishable from a tensor that was F32 on disk:
+                 * the kernels branch on bits without consulting q, and
+                 * m->t is calloc'd, so a real F32 tensor carries zeroes in
+                 * all three. wire_trunk reads data and q independently and
+                 * skips the quantized half on group <= 0. */
+                t->bits = 0; t->rowbytes = 0; t->group = 0;
+                t->data = f32;
+            }
         }
     }
     m->trunk_fd = fd;   /* on-disk tensors read through it */
