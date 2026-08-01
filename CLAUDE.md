@@ -49,19 +49,24 @@ tests/run.sh /nonexistent             # forces the synthetic container (what CI 
 
 With no container it builds a few-MB synthetic one via
 `tools/make_test_container.py` and reports SKIP — loudly — for anything
-needing real weights. A fresh clone is 23 pass / 11 skip; with both K3 and
-Kimi-Linear containers on disk it is 36 checks.
+needing real weights. A fresh clone is 27 pass / 10 skip; with both K3 and
+Kimi-Linear containers on disk it is 39 checks.
 
 The download-script checks start `tests/range_server.py` on an ephemeral
 port and read the number back through `--port-file`. Keep it that way — a
 hardcoded port fails on a machine already using it, and it fails as
 "resume" rather than as "that port is taken".
 
-Env it reads: `WASTE_REF_MODEL` (container), `WASTE_REF_SRC` (source
-safetensors, for the round-trip), `WASTE_ORACLE` (logits from
-`tools/kimi_ref.py` — **must be the same token ids run.sh uses**, or a
-mismatched dump looks exactly like an engine bug), `K3_DIR` (the K3 release
-directory, for the XTML differential).
+Env it reads: `WASTE_REF_MODEL` (container — **point it at a default
+`convert.py` conversion**, i.e. a 4-bit trunk; a `--trunk8` container is a
+shape nobody ships, and running the suite on one is how the Q4G load path
+stayed broken through green runs), `WASTE_REF_SRC` (source safetensors, for
+the round-trip), `WASTE_ORACLE` (logits from `tools/kimi_ref.py` — **must be
+the same token ids run.sh uses**, or a mismatched dump looks exactly like an
+engine bug; setting it also turns off both generating an oracle from the
+container and the provenance check on the shipped fixture, so it is the one
+way to compare against weights that are not the ones under test), `K3_DIR`
+(the K3 release directory, for the XTML differential).
 
 Individual checkers, after `make test` (all binaries land at the repo root):
 

@@ -182,21 +182,31 @@ not low — it is zero. Above it the curve bends sharply.
 
 | budget | expert cache | hit rate | decode |
 |---|---|---|---|
-| 32 GB | 3.32 GB | 0% | 0.31 tok/s |
-| 46 GB | 17.32 GB | 13% | **0.32 tok/s** |
-| 52 GB | 23.32 GB | 27% | 0.11–0.14 tok/s |
-| 58 GB | 29.32 GB | 37% | 0.04 tok/s |
+| 32 GB | 3.32 GB | 0% | 0.50 tok/s |
+| 46 GB | 17.32 GB | 17% | **0.54 tok/s** |
+| 52 GB | 23.32 GB | 31% | 0.04 tok/s |
+| 58 GB | 29.32 GB | 39% | 0.02 tok/s |
 
 Measured in that order, on an otherwise idle machine. Order matters:
 re-run *after* the 52 and 58 GB rows have driven the machine into paging,
-46 GB gives 0.22–0.25 rather than 0.32 — while reporting hit and miss
+46 GB collapses — 0.02 tok/s in one such run — while reporting hit and miss
 counts identical to the digit. The engine is deterministic; the machine
 is not, and it does not fully recover between runs. Sweep upward.
 
-The decode column predates read-ahead and has not been re-swept: 46 GB now
-runs at 0.51 rather than 0.32. The shape is what the table is for, and
-read-ahead does not move it — it hides I/O behind arithmetic, which makes
-every row faster and none of them a different budget.
+Read-ahead made the good rows faster and left the bad ones where they were,
+so the step is now larger than when this was first measured: 46 GB went
+0.32 to 0.54 and 52 GB stayed under 0.1. The cliff is not a slope seen at
+low resolution.
+
+Wiring the resident trunk with `WASTE_MLOCK=trunk` does not move it either.
+32 and 46 GB are unchanged (0.50 and 0.56, within the noise of the rows
+above). 58 GB stays hopeless. And 52 GB stops having a value at all —
+three runs gave **0.46, 0.19 and 0.03 tok/s with cache statistics identical
+to the digit**, because that budget sits exactly where the outcome is
+decided by what else the machine happens to be holding rather than by
+anything the engine does. A budget whose throughput spans 15x across
+identical runs is the clearest argument there is for the one below it.
+[docs/LEARNED.md](docs/LEARNED.md) §30–33.
 
 Everything in the memory design exists to get above that line, which is
 why the engine works to free RAM rather than to save it.

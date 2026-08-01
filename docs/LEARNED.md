@@ -1720,3 +1720,60 @@ Three notes:
   oracle prompt ids are Kimi-Linear's and mean nothing against K3's
   vocabulary. Both now skip with the arithmetic or the reason, rather than
   reporting a refusal as a divergence.
+
+## 33. The 52 GiB row does not have a value (2026-08-01)
+
+§32 re-swept the budgets wired and reported 0.19 tok/s at 52 GiB against
+0.04 unwired — "three times better in the transition zone". Re-run on a
+machine that started quiet, the same configuration gave **0.46**. Run again
+after that, **0.03**.
+
+| 52 GiB, `WASTE_MLOCK=trunk` | wall | tok/s |
+|---|---|---|
+| clean sweep | 17.55 s | **0.46** |
+| §32's measurement | 42.95 s | 0.19 |
+| immediately after | 239.17 s | **0.03** |
+
+**3652 hit / 8124 miss = 31% in all three.** The engine did identical work
+each time and the clock spanned 15x.
+
+So §32's "three times better" was not a measurement of anything, and neither
+is 0.46 or 0.03. **At 52 GiB the outcome is not a property of the
+configuration.** The budget sits exactly where 27.5 GiB of wired trunk plus
+23.3 GiB of cache either does or does not fit alongside whatever else the
+machine is holding, and which side of that it lands on is decided before the
+process starts.
+
+That is the third reading of this row and the first useful one. §16 called
+it 0.11–0.14, §32 called it 0.19, the clean sweep says 0.46 and the run
+after it says 0.03. Every one of those was reported as a number. **The
+number was the wrong output; the variance was the result.**
+
+The clean unwired sweep, upward from a quiet machine, is what the README now
+carries:
+
+| budget | cache | hit | decode |
+|---|---|---|---|
+| 32 GiB | 3.32 GiB | 0% | 0.50 tok/s |
+| 46 GiB | 17.32 GiB | 17% | **0.54** |
+| 52 GiB | 23.32 GiB | 31% | 0.04 |
+| 58 GiB | 29.32 GiB | 39% | 0.02 |
+
+Wiring changes none of it: 32 and 46 measure 0.50 and 0.56, inside the noise
+of the rows above; 58 stays hopeless; 52 has no value to change. **§31's
+finding stands and §32's does not** — wiring the trunk is worth having for
+reproducibility at a budget that fits, and it buys nothing at a budget that
+does not.
+
+Two method notes, and the second is the one that cost the afternoon.
+
+- **A row that varies 15x is not a slow row, it is a row with no value.**
+  Reporting its mean would have been worse than reporting nothing, because
+  a mean invites comparison and there is nothing here to compare.
+- **Each row of this sweep changes the machine the next one runs on, and
+  wiring perturbs it more than working it does.** §32 already said the
+  alternating design was wrong; running the arms separately did not fix it,
+  because a 462-second 58 GiB row poisons the first row of whatever comes
+  next — which is why §32's wired 32 GiB row read 0.21 and reads 0.50 when
+  measured on its own. The only design that works here is one budget per
+  quiet machine, and that is four times the wall clock of a sweep.
