@@ -2042,3 +2042,62 @@ column instead of two, which read as a broken reconstruction rather than a
 stale binary. §17 recorded exactly this ("once to a stale test binary") and
 the fix is the same as it was then: `make test`, or `make check`, which
 rebuilds first.
+
+## 38. One load, many arms, one machine (2026-08-01)
+
+The second half of the iteration problem. §37 removed the engine from
+questions that never needed it; this removes the *process* from questions
+that do.
+
+`tests/sweep.c` loads a container once and runs the arms back to back,
+interleaved, resetting the session and clearing the expert cache between
+each — because leaving the cache warm would hand the second configuration
+the first one's work and measure the order rather than the setting.
+`waste_model_reset` and `waste_ecache_clear` exist for it; the first was
+already in `waste.c` reaching into the model's fields and is now in one
+place.
+
+```
+$ WASTE_CACHE_MB=1024 ./sweep kimi-linear.waste 1008,6013,318,28288,17189 16 lookahead=0,6 3
+lookahead    rep     tok/s       hit   GB read
+       0      1    9.573     37.9%      6.7
+       6      1   10.713     72.2%      7.4
+       0      2    9.820     37.3%      6.8
+       6      2   10.686     72.5%      7.4
+       0      3    9.790     37.5%      6.8
+       6      3   10.743     72.6%      7.3
+```
+
+**Two arms, three repeats, spreads of 2.6% and 0.5%.** Nine paired runs of
+the same comparison across processes (§35) spanned 0.79x to 1.79x. That is
+the whole point: the variance was never the feature, it was the harness.
+
+On K3 it is honest about what it cannot fix:
+
+| lookahead | median tok/s | spread | hit | GB read |
+|---|---|---|---|---|
+| 0 | 0.506 | 7% | 7.2–7.7% | 204–205 |
+| 6 | 0.541 | 23% | 38.0–38.2% | **191** |
+
+The deterministic columns are exact to a tenth of a point. The clock is not:
+K3 still drifts inside a single process, because the drift is the machine's
+memory system and not the process's. **What the harness buys on K3 is that
+the noise is now visible as noise** rather than as a difference between two
+runs an hour apart.
+
+And it turned up something the cross-process measurements had wrong. §35
+reported the lookahead as reading the same bytes; measured with the cache
+cleared identically for both arms, it reads **6.6% fewer** — 191 GB against
+204. The speculative fill arrives before the demand, so the record is
+inserted early and its later hit raises its LFRU count, and records that
+were being evicted and re-read now are not. That effect was invisible when
+each arm started from whatever the previous process had left in the cache.
+
+**What it cannot sweep is the budget**, which sizes the cache at open. Those
+still need one process each and a quiet machine each, which §33 already
+established is the only design that works there.
+
+The method note: **a harness is part of the measurement.** Every conclusion
+in §30 through §36 was drawn through a harness that added more variance than
+the effects being measured, and two of them came out wrong. Building the
+harness first would have been cheaper than any of the re-runs.

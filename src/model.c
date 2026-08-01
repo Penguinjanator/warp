@@ -2370,6 +2370,36 @@ static void state_fill(const waste_model *m, waste_state_hdr *h, int pos)
     h->pos = pos; h->n_blockres = m->n_blockres;
 }
 
+/* Every buffer a session accumulates into, back to the state of a fresh
+ * open. Lived in waste.c reaching into the model's fields; it is here so
+ * there is one copy, and so a measurement harness that drives the model
+ * directly can start each arm from the same place the last one did. */
+void waste_model_reset(waste_model *m)
+{
+    const waste_config *c = &m->cfg;
+    for (int L = 0; L < c->n_layers; L++) {
+        if (m->S[L])
+            memset(m->S[L], 0, (size_t)c->kda_heads * c->kda_dim * c->kda_dim * sizeof(float));
+        if (m->conv[L])
+            memset(m->conv[L], 0,
+                   (size_t)3 * c->kda_heads * c->kda_dim * (c->conv_k - 1) * sizeof(float));
+        m->n_kv[L] = 0;
+    }
+    m->n_blockres = 0;
+    if (m->x) memset(m->x, 0, (size_t)c->hidden * sizeof(float));
+    if (m->blockres && c->attn_res_block) {
+        const int nb = c->n_layers / c->attn_res_block + 2;
+        memset(m->blockres, 0, (size_t)nb * c->hidden * sizeof(float));
+    }
+}
+
+/* The one tuning knob a sweep varies between arms in a single process.
+ * WASTE_LOOKAHEAD still sets the default; this changes it after load, which
+ * is the whole point — a new process costs 48 seconds of model load on K3
+ * and, worse, a different machine state. */
+void waste_model_set_lookahead(int n) { lookahead_n = n < 0 ? 0 : n; }
+int  waste_model_get_lookahead(void)  { return lookahead_n; }
+
 int waste_model_state_save(const waste_model *m, const char *path, int pos)
 {
     const waste_config *c = &m->cfg;
