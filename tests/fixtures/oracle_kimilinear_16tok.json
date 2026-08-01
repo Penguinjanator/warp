@@ -1,0 +1,13 @@
+{
+  "_": "Provenance of oracle_kimilinear_16tok.bin. tools/kimi_ref.py computes its logits FROM a WASTE container, so this fixture is only comparable against a container quantized the way this one was. tests/run.sh reads `trunk` below and skips, with the reason, when the container under test does not match — a cross-width diff looks exactly like an engine bug and is not one.",
+  "source": "moonshotai/Kimi-Linear-48B-A3B-Instruct",
+  "convert_flags": [],
+  "trunk": "Q4G/Q8G/F32",
+  "expert_quant": "VQ3R, 3 stages, 256 entries, vec_dim 8",
+  "converted_on": "macOS arm64, --device mps (the default where MPS is available)",
+  "generated": "2026-07-31",
+  "prompt_ids": "1008,10484,318,15383,387,11,316,276,10484,318,19509,387,31082,13,646,10484",
+  "logits": "the last position after prefill, f32, vocab 163840",
+  "command": "uv run --no-project --with torch --with fla-core --with einops python tools/kimi_ref.py --container MODEL --prompt-ids IDS --tokens 0 --dump tests/fixtures/oracle_kimilinear_16tok.bin",
+  "history": "The previous fixture came from a --trunk8 container and nothing recorded it, so anyone converting with today's defaults saw a 3.28 max diff and no way to tell engine from fixture (issue #7). It was not an engine error: a fresh oracle diverged from that fixture by exactly the amount the engine did."
+}

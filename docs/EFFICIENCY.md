@@ -212,6 +212,13 @@ gives **0.56–0.58 tok/s in every run, quiet machine or worked**, which is
 the flattest number in this repository. `WASTE_MLOCK=1` wires both; still
 off by default, because Linux's 8 MB `RLIMIT_MEMLOCK` would refuse it.
 
+**It does not move the knee** (§32). Re-sweeping the budgets wired: 3x at
+52 GiB, where the OS was choosing wrongly and pinning the hot part fixes it;
+nothing below the knee, where nothing was being paged; and nothing above it,
+where 58 GiB puts 35.6 GB into swap and 8 tokens do not finish in eleven
+minutes. The knee is set by how much memory exists. Policy only decides
+which part of the engine is destroyed when there is not enough.
+
 ### C. Stage-major records — measured and dropped
 
 Today a record is `[hdr][gate][up][down][scales]`, and within a matrix

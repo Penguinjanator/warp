@@ -427,11 +427,57 @@ PY
         no "purgeable slots change results"
     fi
 
+    # kimi_ref.py computes its logits *from* a WASTE container, so an oracle
+    # is only comparable against the container that produced it — and not
+    # merely against its trunk width. The expert codebooks are k-means, and
+    # the same seed on a different --device trains different books: splicing
+    # one layer of cpu-trained books into an mps container moved the logits
+    # by 1.24 max against this 1e-3 threshold. No shipped fixture can be
+    # portable across conversions, so generate one from the container under
+    # test — 16.9 s on Kimi-Linear, and it needs the container, not the
+    # 92 GB of source shards. The fixture stays for hosts without uv, where
+    # its provenance has to be checked instead (see the sidecar): a
+    # cross-conversion diff reads as an engine bug and is not one.
     ORACLE="${WASTE_ORACLE:-tests/fixtures/oracle_kimilinear_16tok.bin}"
+    oracle_arch=$(./waste info "$MODEL" --json 2>/dev/null | python3 -c \
+        "import json,sys; print(json.load(sys.stdin).get('arch',''))" 2>/dev/null || true)
     if [ "$SYNTHETIC" = 1 ]; then
         sk "engine vs the PyTorch oracle" "synthetic container has no reference logits"
-    elif [ -f "$ORACLE" ]; then
-        if python3 - "$TMP/seq.bin" "$ORACLE" <<'PY'
+    elif [ -n "$oracle_arch" ] && [ "$oracle_arch" != "kimi-linear" ]; then
+        # the ids above and the fixture's vocabulary are Kimi-Linear's
+        sk "engine vs the PyTorch oracle" \
+           "the oracle prompt is Kimi-Linear's, this container is $oracle_arch"
+    else
+        GEN=""
+        if [ -z "${WASTE_ORACLE:-}" ] && command -v uv >/dev/null 2>&1; then
+            uv run --no-project --with torch --with fla-core --with einops \
+                python tools/kimi_ref.py --container "$MODEL" --prompt-ids "$IDS" \
+                --tokens 0 --dump "$TMP/oracle.bin" >/dev/null 2>&1 || true
+            [ -s "$TMP/oracle.bin" ] && GEN="$TMP/oracle.bin"
+        fi
+        oracle_why=""
+        if [ -z "$GEN" ] && [ -z "${WASTE_ORACLE:-}" ] && [ -f "${ORACLE%.bin}.json" ]; then
+            oracle_why=$(python3 - "$MODEL" "${ORACLE%.bin}.json" <<'PY'
+import json, os, subprocess, sys
+WASTE = os.path.join(os.curdir, "waste" + (".exe" if os.name == "nt" else ""))
+meta = json.load(open(sys.argv[2]))
+want = meta.get("trunk")
+r = subprocess.run([WASTE, "info", sys.argv[1], "--json"],
+                   capture_output=True, text=True)
+try:
+    got = json.loads(r.stdout)["quantization"].split("trunk ", 1)[1]
+except Exception:
+    sys.exit(0)                       # let the diff speak if info cannot
+if want and got != want:
+    print(f"no uv to generate one, and the fixture is from a {want} trunk "
+          f"against this container's {got} — see {os.path.basename(sys.argv[2])}")
+PY
+)
+        fi
+        if [ -n "$oracle_why" ]; then
+            sk "engine vs the PyTorch oracle" "$oracle_why"
+        elif [ -n "$GEN" ] || [ -f "$ORACLE" ]; then
+            if python3 - "$TMP/seq.bin" "${GEN:-$ORACLE}" <<'PY'
 import struct, sys
 def L(p):
     b = open(p, "rb").read()
@@ -439,11 +485,16 @@ def L(p):
 a, b = L(sys.argv[1]), L(sys.argv[2])
 sys.exit(0 if max(abs(x - y) for x, y in zip(a, b)) < 1e-3 else 1)
 PY
-        then ok "engine matches the PyTorch oracle"
-        else no "engine diverges from the oracle"
+            then
+                if [ -n "$GEN" ]
+                then ok "engine matches a PyTorch oracle built from this container"
+                else ok "engine matches the shipped PyTorch oracle"
+                fi
+            else no "engine diverges from the oracle"
+            fi
+        else
+            sk "oracle diff" "no fixture; regenerate with tools/kimi_ref.py --dump"
         fi
-    else
-        sk "oracle diff" "no fixture; regenerate with tools/kimi_ref.py --dump"
     fi
 
     if ./test_state "$MODEL" 2>/dev/null | grep -q "^STATE OK"; then
@@ -457,15 +508,25 @@ PY
         sk "learned hotlist" "synthetic container carries no tokenizer"
     else
     rm -f "$MODEL/usage.waste"
+    # Read hits and misses together. Counting misses alone cannot tell a
+    # perfect warm run from a run that never happened, and both come out 0:
+    # a 4-bit trunk leaves enough of the 5G budget for the whole working
+    # set, the hotlist lands 100%, and demanding "misses > 0" failed the
+    # best result the check can produce. The empty line is the real
+    # "nothing ran" signal.
     cold=$(./waste run "$MODEL" "The capital of France is" -n 12 --budget 5G --learn 2>&1 \
-           | grep -oE "[0-9]+ miss" | grep -oE "[0-9]+" || echo 0)
+           | grep -oE "[0-9]+ hit / [0-9]+ miss" || true)
     warm=$(./waste run "$MODEL" "The capital of France is" -n 12 --budget 5G 2>&1 \
-           | grep -oE "[0-9]+ miss" | grep -oE "[0-9]+" || echo 0)
+           | grep -oE "[0-9]+ hit / [0-9]+ miss" || true)
     rm -f "$MODEL/usage.waste"
-    if [ "${warm:-0}" -gt 0 ] && [ "${warm:-0}" -lt "${cold:-0}" ]; then
-        ok "learned hotlist warms the cache ($cold -> $warm misses)"
+    cold_m=${cold##*/ }; cold_m=${cold_m% miss}
+    warm_m=${warm##*/ }; warm_m=${warm_m% miss}
+    if [ -z "$cold" ] || [ -z "$warm" ]; then
+        no "hotlist check read no cache line from the run"
+    elif [ "$warm_m" -lt "$cold_m" ]; then
+        ok "learned hotlist warms the cache ($cold_m -> $warm_m misses)"
     else
-        no "hotlist did not reduce misses ($cold -> $warm)"
+        no "hotlist did not reduce misses ($cold_m -> $warm_m)"
     fi
     fi
 else

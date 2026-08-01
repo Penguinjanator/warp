@@ -1582,3 +1582,60 @@ because that is where the code already was. The buffer without a switch was
 the one that mattered, and it took a second experiment to notice that the
 first had never been a fair comparison. A measurement is only as good as the
 alternatives it was run against.
+
+## 32. Wiring does not move the knee (2026-08-01)
+
+§31 found the trunk was the buffer worth wiring and left an obvious
+question: §16's budget sweep found a cliff between 46 and 52 GiB, and if
+wiring stops the OS taking the hot part, does the cliff move? Re-measured
+with `WASTE_MLOCK=trunk`.
+
+| budget | cache | hit | unwired | wired |
+|---|---|---|---|---|
+| 32 GiB | 3.3 GiB | 0% | 0.50 tok/s | 0.45 |
+| 46 GiB | 17.3 GiB | 17% | 0.53–0.55 | 0.50 |
+| 52 GiB | 23.3 GiB | 31% | 0.06 | **0.19** |
+| 58 GiB | 29.3 GiB | 37% | 0.03 | **< 0.012** |
+
+**No. The knee is in the same place.** Wiring is worth 3x in the transition
+zone at 52 GiB, where the OS was making the wrong choice and pinning the hot
+part corrects it. It is worth nothing below the knee, where nothing was
+going to be paged anyway. And above it, nothing helps: at 58 GiB the run did
+not finish 8 tokens in eleven minutes, with **35.6 GB of the machine's 36.8
+GB swap file in use** and 62 MB of RAM free.
+
+That last row is the mechanism in the clearest form this project has
+managed to photograph. Wiring the trunk means the trunk cannot be swapped,
+so the *cache* is what goes — all 29.3 GiB of it, pages the engine believes
+are resident, so every hit it counts is a swap read it does not. The engine
+reported the same hit rate it always does. **The knee is set by how much
+memory exists, and page-replacement policy only decides which part of the
+engine is destroyed when there is not enough.**
+
+**The experiment design was wrong and it is worth saying how.** The sweep
+alternated wired and unwired at each budget, wired second, on the theory
+that the handicap would fall on the configuration being argued for. It falls
+the other way: a run that wires 27.5 GB and releases it leaves the memory
+system in a state that punishes whatever runs next, and what ran next was
+always the unwired arm. The 46 GiB unwired row of that sweep came out at
+**0.02 tok/s — 348 s for 8 tokens** — against 0.53–0.55 for the same
+configuration on a quiet machine in §31. That number is an artefact of the
+run before it and is not in the table above; the unwired column is taken
+from §30 and §31, where the ordering was clean.
+
+Which leaves the absolute values at 32 and 46 GiB not worth arguing about
+either — 0.45 and 0.50 wired here against 0.57 in §31, on a machine that had
+been hammered all afternoon. **What survives is the shape**, and the shape is
+what the question was about: three times better at 52, unchanged everywhere
+else, and the cliff exactly where it was.
+
+Two notes:
+
+- **A sweep is not a set of independent measurements** when each row changes
+  the machine the next one runs on. §16 knew this and wrote "sweep upward,
+  never downward"; that rule is not sufficient once one arm wires memory,
+  because wiring perturbs more than working the machine does.
+- **The 58 GiB row was stopped rather than finished**, at eleven minutes and
+  35.6 GB of swap. A more precise number was available and not worth a
+  laptop that stops responding for it. `< 0.012 tok/s` is enough to answer
+  the question that was asked.
