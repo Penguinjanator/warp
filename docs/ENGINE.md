@@ -132,6 +132,13 @@ is refusing to open a model that does technically fit.
 Everything above the floor is expert cache, and that is the only knob
 that buys speed.
 
+> **Superseded in part (2026-08-01).** That was true of a cache which only
+> fills on demand. The router lookahead fetches a layer ahead, so a record
+> has to survive one attention rather than one token, and a 3.32 GB cache
+> now measures 29.1% hit against 0.0% without it — within 10% of a 17.32 GB
+> one on throughput. The floor is still exactly where §4 put it; it is no
+> longer what limits the engine. [LEARNED.md](LEARNED.md) §39.
+
 ### Estimated for a K3-shaped config (60L, H=7168, 896 experts, top_k=16,
 ### experts @2.12 bit, trunk @4.25 bit, ctx 32k — `tools/memplan.py`)
 

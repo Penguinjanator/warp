@@ -16,12 +16,19 @@
  * varying between two adjacent measurements is the setting and roughly
  * nothing else.
  *
- * What it cannot vary is the RAM budget, which sizes the cache at open. A
- * budget sweep still needs one process per budget, and still needs a quiet
- * machine for each.
+ * The one thing it still cannot vary is the context length, which sizes the
+ * KV and KDA state at load.
  *
  *   sweep CONTAINER ids,.. n_gen lookahead=0,6 [repeat]
  *   sweep CONTAINER ids,.. n_gen iodepth=2,4,8 [repeat]
+ *   sweep CONTAINER ids,.. n_gen cache=3400,17736,23879 [repeat]
+ *
+ * `cache` is in MB and re-makes the expert cache in place. The trunk is what
+ * a load costs, not the cache, so a budget sweep no longer needs a process
+ * per budget — which is what made §32 and §33 come out wrong, each process
+ * meeting a machine the one before it had changed. The footprint at each arm
+ * is what that budget would have made it: the same trunk plus the cache
+ * being asked for.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,7 +52,7 @@ int main(int argc, char **argv)
     if (argc < 5) {
         fprintf(stderr,
                 "usage: %s CONTAINER ids,.. n_gen KEY=v1,v2,.. [repeat]\n"
-                "  KEY is lookahead or iodepth\n", argv[0]);
+                "  KEY is lookahead, iodepth or cache (MB)\n", argv[0]);
         return 2;
     }
     int ids[MAX_IDS], n = 0;
@@ -64,7 +71,11 @@ int main(int argc, char **argv)
 
     const int is_look = !strcmp(key, "lookahead");
     const int is_depth = !strcmp(key, "iodepth");
-    if (!is_look && !is_depth) { fprintf(stderr, "unknown key %s\n", key); return 2; }
+    const int is_cache = !strcmp(key, "cache");
+    if (!is_look && !is_depth && !is_cache) {
+        fprintf(stderr, "unknown key %s\n", key);
+        return 2;
+    }
 
     waste_model m;
     waste_load_opts lo;
@@ -84,11 +95,18 @@ int main(int argc, char **argv)
     /* Interleaved rather than grouped: if the machine drifts over the run —
      * and it does — a grouped sweep charges the drift to the last arm and
      * an interleaved one spreads it across all of them. */
-    printf("%8s %6s %9s %9s %9s\n", key, "rep", "tok/s", "hit", "GB read");
+    printf("%8s %6s %7s %9s %9s %9s\n", key, "rep", "slots", "tok/s", "hit",
+           "GB read");
     for (int r = 0; r < repeat; r++) {
         for (int a = 0; a < n_arms; a++) {
-            if (is_look) waste_model_set_lookahead(arm[a]);
-            else m.cache.depth = arm[a] < 1 ? 1 : arm[a];
+            if (is_look) {
+                waste_model_set_lookahead(arm[a]);
+            } else if (is_depth) {
+                m.cache.depth = arm[a] < 1 ? 1 : arm[a];
+            } else if (waste_model_resize_cache(&m, (size_t)arm[a] << 20)) {
+                fprintf(stderr, "resize to %d MB failed\n", arm[a]);
+                return 1;
+            }
 
             waste_model_reset(&m);
             waste_ecache_clear(&m.cache);
@@ -108,8 +126,9 @@ int main(int argc, char **argv)
             }
             const double dt = now() - s;
             const unsigned long long h = m.cache.hits, mi = m.cache.misses;
-            printf("%8d %6d %8.3f %8.1f%% %8.1f\n", arm[a], r + 1,
-                   n_gen / dt, 100.0 * (double)h / (double)(h + mi ? h + mi : 1),
+            printf("%8d %6d %7d %8.3f %8.1f%% %8.1f\n", arm[a], r + 1,
+                   m.cache.n_slots, n_gen / dt,
+                   100.0 * (double)h / (double)(h + mi ? h + mi : 1),
                    (double)m.cache.bytes_read / 1073741824.0);
             fflush(stdout);
         }

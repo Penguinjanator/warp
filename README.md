@@ -63,8 +63,24 @@ internal SSD:
 
 For K3, 64 GB is the practical minimum. A 32 GB machine can open the model but
 will page heavily. The default memory budget on the test machine is 46.24 GB,
-including a 17.56 GB expert cache. Giving the process more memory is not always
-faster: once macOS starts paging the cache, performance collapses.
+including a 17.56 GB expert cache.
+
+Most of that requirement is the 29.05 GB resident trunk rather than the cache.
+Shrinking the expert cache from 17.32 GB to 3.32 GB costs about 10% of
+throughput; enlarging it past the default costs everything. Measured across
+four cache sizes in one process:
+
+| expert cache | hit rate | decode |
+|---:|---:|---:|
+| 3.32 GB | 29.1% | 0.56–0.58 tok/s |
+| 17.32 GB | 36.2% | **0.63 tok/s** |
+| 23.32 GB | 38.4% | 0.07–0.09 tok/s |
+| 29.32 GB | 41.3% | 0.07–0.08 tok/s |
+
+The last two rows are the failure mode worth knowing about: the hit rate keeps
+climbing and the bytes read keep falling while throughput drops eightfold. The
+engine is inside its budget and the machine is not, so a cache hit becomes a
+page fault. Giving the process more memory is not always faster.
 
 Storage is the main constraint. A cold K3 token reads about 17 GB of experts.
 The internal SSD sustains 12.78 GB/s; a tested USB enclosure managed 0.94 GB/s.

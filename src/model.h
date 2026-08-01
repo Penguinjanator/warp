@@ -202,6 +202,7 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed);
  * is static; `layer` and `expert` name the record. Sticky, so a caller
  * checks it once per call rather than per expert. */
 void        waste_model_reset(waste_model *m);
+int         waste_model_resize_cache(waste_model *m, size_t cache_bytes);
 void        waste_model_set_lookahead(int n);
 int         waste_model_get_lookahead(void);
 const char *waste_model_read_error(const waste_model *m, int *layer, int *expert);

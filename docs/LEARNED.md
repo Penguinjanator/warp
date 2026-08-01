@@ -2101,3 +2101,64 @@ The method note: **a harness is part of the measurement.** Every conclusion
 in §30 through §36 was drawn through a harness that added more variance than
 the effects being measured, and two of them came out wrong. Building the
 harness first would have been cheaper than any of the re-runs.
+
+## 39. The cache floor was a property of a demand-only cache (2026-08-01)
+
+§4 is the oldest load-bearing measurement in this file, and §16 and the
+budget resolver are both built on it: **the cache floor is one token's
+working set**, 17.0 GB for K3, and below it the hit rate is not low, it is
+zero. Re-measured with `tests/sweep.c` — one process, four cache sizes
+interleaved, two repeats — it is still exactly true, and it no longer binds.
+
+The control first, at 287 slots, a fifth of the way to a token's 1472
+records:
+
+| 287 slots | hit | tok/s | GB read |
+|---|---|---|---|
+| lookahead off | **0.0%** | 0.507 | 153.1 |
+| lookahead on | **29.1%** | 0.585 | 165.2 |
+
+§4's zero is exactly reproduced. What breaks it is that **the lookahead does
+not need a record to survive from one token to the next, only from one layer
+to the next.** It fetches what layer L+1 wants while layer L is finishing, so
+the record is consumed a few milliseconds later instead of three seconds. A
+cache far too small to hold a token's working set is ample to hold six
+experts for the length of one attention.
+
+The whole sweep, with the lookahead on, which is the default:
+
+| budget | cache | slots | hit | decode |
+|---|---|---|---|---|
+| 32 GB | 3.32 GB | 287 | 29.1% | 0.56–0.58 |
+| 46 GB | 17.32 GB | 1498 | 36.2% | **0.63** |
+| 52 GB | 23.32 GB | 2018 | 38.4% | 0.07–0.09 |
+| 58 GB | 29.32 GB | 2537 | 41.3% | 0.07–0.08 |
+
+Hit rate and bytes read are **identical to the digit across both repeats** —
+29.1/29.1, 36.2/36.2, 38.4/38.4, 41.3/41.3 — which is what one process buys
+and what §33 could not get from four.
+
+**The useful window opens far lower than it did.** A 3.32 GB cache is within
+10% of a 17.32 GB one. The RAM above the resident trunk has stopped being
+the lever it was in §12 and §16; the trunk is now nearly the whole
+requirement.
+
+**The cliff is exactly where it was**, and the rows either side of it are
+the clearest statement of what it is: between 46 and 52 GB throughput falls
+eightfold while the hit rate *rises* and the bytes read *fall*, 137 GB to
+126. The engine does less work and takes ten times as long. Nothing about
+caching touches that — it is 27.3 GB of trunk plus 23.3 GB of cache on a
+64 GB machine, and §24 and §32 already established that no allocation policy
+conjures the difference.
+
+One more thing worth keeping, because it is not what §35 reported. **The
+lookahead's byte economics depend on the cache size.** At 287 slots it reads
+8% *more* — 165 GB against 153 — because speculative records are evicted
+before use often enough to be re-read. At 1498 slots it reads 6.6% *fewer*.
+It is a prefetch at small caches and a scheduling change at large ones, and
+§35 measured only the large end.
+
+The method note is short. **§4 was right and stopped being the constraint,
+and nothing about §4 was wrong.** A measurement can be perfectly reproduced
+and still stop describing the system, when what changes is not the number
+but which mechanism the number was about.
