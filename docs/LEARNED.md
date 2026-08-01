@@ -1945,3 +1945,47 @@ The note worth keeping is about what §35's own measurement could not see.
 also "the path does not want one".** One observation, two explanations, and
 the cheap one was assumed. The distinguishing measurement — total bytes —
 took one command and was not run until the second version had been built.
+
+## 37. The bug the instruction set decided the meaning of (2026-08-01)
+
+[#10](https://github.com/sqliteai/waste/issues/10), from a Windows/MinGW
+build: `waste info` and `waste run` died instantly on K3 with
+`STATUS_INTEGER_DIVIDE_BY_ZERO`. `waste plan` worked, because it does not
+load.
+
+The tensors the loader declines to load — the vision tower, and anything
+outside `cfg.prefix` — set `on_disk` and `continue` before the quantized
+branch assigns `group`, and `m->t` is `calloc`'d, so `group` stays 0. The
+row-scratch sizing then divided by it.
+
+**What that division means is the architecture's choice.** arm64's `sdiv`
+answers 0 and the program carries on; x86's `idiv` raises `#DE` and the
+process is gone. Same source, same container, same undefined behaviour, and
+one machine reports a working engine while the other cannot open the
+project's flagship model. Every measurement this project has published was
+made on the machine that cannot see it.
+
+The lesson is not "test on x86" — it is that **a suite green on one ISA says
+nothing about another for undefined behaviour, and the sanitizer is what
+carries the result across.** UBSan reproduces it on the hardware that hides
+it: building with `-fsanitize=undefined` on this arm64 laptop gives
+`src/model.c:1218:67: runtime error: division by zero` on a container the
+normal binary opens without complaint. `make asan` is therefore not only a
+memory-safety gate; for this class it is the only portable oracle we have.
+
+Two things worth writing down beyond the fix:
+
+- **The trigger was the prefix, not the vision tower**, and the issue title
+  says otherwise for a good reason — on K3 they coincide. The skip needs
+  `cfg.prefix[0]` non-empty, so a `vision_tower.*` tensor in a prefix-less
+  Kimi-Linear container does *not* reproduce: it falls through and gets a
+  group like everything else. The first attempt at a repro here failed for
+  exactly that reason, which is the only way the distinction was noticed.
+  `make_test_container.py` grew `--prefix`, not `--vision`.
+- **It never needed K3.** The repro is an ~800 KB synthetic container, so
+  this was always within reach of CI — §33's shape a third time, and the
+  third different way of missing the same thing: after a trunk width nobody
+  ships and an oracle from a conversion nobody makes, a container layout
+  nobody generates. The check now exists, and its comment states where it
+  is load-bearing: on x86 in any build, on arm64 only under the sanitizer.
+  A check that passes by construction on half the machines has to say so.
