@@ -1777,3 +1777,67 @@ Two method notes, and the second is the one that cost the afternoon.
   next — which is why §32's wired 32 GiB row read 0.21 and reads 0.50 when
   measured on its own. The only design that works here is one budget per
   quiet machine, and that is four times the wall clock of a sweep.
+
+## 34. §29 refuted the wrong predictor (2026-08-01)
+
+[deltafin](https://github.com/gavamedia/deltafin) is a parallel project with
+the same goal — K3 on one machine — in Python, MIT, streaming both spine and
+experts. Its `OPTIMIZATIONS.md` lists a **router lookahead**: take layer N's
+pre-MoE hidden state, run *layer N+1's router weights* on it, and start
+fetching what that says. The real router stays authoritative; the prediction
+only starts I/O early, so it is exact by construction.
+
+§29 measured cross-layer predictability and refused it at 29.0% recall,
+against a 60% break-even. **That measured a different predictor.** §29 asked
+what layer L's *expert ids* say about layer L+1's, i.e. a statistic over the
+router's past answers. This asks the router.
+
+Measured the same way, 12 decode tokens, 1092 layer transitions:
+
+| predictor | recall@16 |
+|---|---|
+| same-layer expert ids | 1.7% |
+| co-occurrence, held out (§29) | 29.0% |
+| previous token's set (§29) | 29.5% |
+| **next layer's router on this layer's hidden state** | **59.0%** |
+
+Twice §29's number, and sitting exactly on the break-even it computed. On
+its own that would be a coin flip. What decides it is that the prediction is
+**steeply ranked**, which §29 never had reason to check:
+
+| rank | 1 | 4 | 7 | 10 | 13 | 16 |
+|---|---|---|---|---|---|---|
+| precision | 92.2% | 80.2% | 64.3% | 53.3% | 39.4% | 27.9% |
+
+So the policy is not "prefetch 16 and waste 41% of them". Prefetching the
+top **6** — which is what the ~5.9 ms layer boundary holds at 0.92 ms a read
+— gives **4.9 useful and 1.1 wasted** per layer. Blocking reads fall 16 →
+11.1, the expert-I/O share of a step falls 0.548 → 0.380, and the step
+should land near **0.65 tok/s from 0.54, about 1.2x**.
+
+That is a projection, and §25 is the standing reminder about what happens to
+projections here — but the input to it is measured, and the mechanism is not
+in doubt: this is idle disk time being filled with reads that are right four
+times in five.
+
+**What §29 got right and what it got wrong.** The arithmetic was right: the
+break-even, the asymmetry that a wrong prefetch displaces a needed read, the
+observation that the window is only the layer boundary. What was wrong was
+treating one predictor's failure as the question's answer. The `next_layer_top`
+field the format reserves is a co-occurrence table, so the co-occurrence
+predictor is what got tested — **the shape of the reserved data decided the
+shape of the experiment**, and the better predictor needs no stored data at
+all, only a matvec against weights already resident.
+
+Two notes:
+
+- **A parallel project is a source of hypotheses, not of numbers.** Nothing
+  of deltafin's was adopted on its say-so; the recall and the rank profile
+  were measured here, on this container, with `WASTE_DUMP_ROUTE`. Their
+  design differs in a way that matters for the rest of their list: they
+  stream the spine and WASTE keeps the trunk resident, which is why their
+  speculative decoding pays and [EFFICIENCY.md](EFFICIENCY.md) §4D still
+  refuses ours — theirs amortizes a per-token spine read we do not have.
+- **The lookahead costs a second router matvec per layer**, 896x7168 against
+  weights already in RAM. Under 1% of a step, and it is the reason this can
+  be tried without touching the container format.

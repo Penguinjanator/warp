@@ -2116,11 +2116,44 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
      * Both questions are "is the signal there", and both are cheaper to
      * answer from a trace than from a build. */
     if (dump_route) {
+        /* Third group on the line: what the *next* layer's router says about
+         * *this* layer's hidden state. That is the predictor deltafin calls
+         * "router lookahead", and it is a different and much stronger one
+         * than the co-occurrence over expert ids that LEARNED §29 refuted —
+         * it asks the real router rather than a statistic about its past
+         * answers. Whether the hidden state has moved too far between here
+         * and there is exactly what wants measuring. -1 when there is no
+         * next MoE layer to ask. */
+        int look[64];
+        int nlook = 0;
+        if (L + 1 < c->n_layers) {
+            const waste_tensor *g1 = waste_find(m, tname(
+                "%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L + 1));
+            if (g1) {
+                float *s1 = m->att + WASTE_ATT_ROUTER_OFF, *p1 = s1 + E;
+                matvec_t(m, s1, g1, in, E, hid);
+                const float *b1 = T(m, "%smodel.layers.%d.block_sparse_moe.gate.e_score_correction_bias",
+                                    c->prefix, L + 1);
+                for (int e = 0; e < E; e++)
+                    p1[e] = 1.0f / (1.0f + expf(-s1[e])) + (b1 ? b1[e] : 0.0f);
+                for (int j = 0; j < K; j++) {
+                    int best = -1; float bv = -1e30f;
+                    for (int e = 0; e < E; e++) {
+                        int taken = 0;
+                        for (int q = 0; q < j; q++) if (look[q] == e) { taken = 1; break; }
+                        if (!taken && p1[e] > bv) { bv = p1[e]; best = e; }
+                    }
+                    look[j] = best;
+                }
+                nlook = K;
+            }
+        }
         FILE *df = fopen(dump_route, "a");
         if (df) {
             fprintf(df, "%d", L);
             for (int j = 0; j < K; j++) fprintf(df, " %d", idx[j]);
             for (int j = 0; j < K; j++) fprintf(df, " %.6g", w[j]);
+            for (int j = 0; j < K; j++) fprintf(df, " %d", j < nlook ? look[j] : -1);
             fputc('\n', df);
             fclose(df);
         }
