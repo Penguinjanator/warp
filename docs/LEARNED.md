@@ -2139,7 +2139,12 @@ Hit rate and bytes read are **identical to the digit across both repeats** —
 and what §33 could not get from four.
 
 **The useful window opens far lower than it did.** A 3.32 GB cache is within
-10% of a 17.32 GB one. The RAM above the resident trunk has stopped being
+10% of a 17.32 GB one — which is a size the default budget resolver cannot
+choose, since it steps in whole multiples of a 16.2 GB working set and there
+is nothing on K3 between the floor and `floor + 1x`. Whether that rule's
+quantum should change is [GATES.md](GATES.md) Gate 7, open and not run: four
+generated tokens is exactly the length that flatters a small cache, and
+cross-token reuse is what a large one buys. The RAM above the resident trunk has stopped being
 the lever it was in §12 and §16; the trunk is now nearly the whole
 requirement.
 
