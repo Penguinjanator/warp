@@ -164,6 +164,11 @@ static int q8_off = 1;     /* 1 = keep the trunk stored as int8          */
 static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
 static int i8mm_on = 0;    /* SMMLA batched matmul; costs activation int8 */
 static const char *dump_route = NULL;  /* WASTE_DUMP_ROUTE, see moe_layer */
+/* Absolute position of the first token of the pass being routed. The dump
+ * names each row by the token it belongs to rather than leaving a reader
+ * to infer it from where the layer index wraps — which is a heuristic
+ * that has to be rewritten correctly in every script that reads one. */
+static int dump_pos0 = 0;
 static int lookahead_n = 0;            /* WASTE_LOOKAHEAD, see moe_layer  */
 static pthread_once_t model_opts_once = PTHREAD_ONCE_INIT;
 
@@ -2192,7 +2197,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
         const int nlook = predict_next_moe(m, L, in, look, K);
         FILE *df = fopen(dump_route, "a");
         if (df) {
-            fprintf(df, "%d", L);
+            fprintf(df, "%d %d", dump_pos0, L);
             for (int j = 0; j < K; j++) fprintf(df, " %d", idx[j]);
             for (int j = 0; j < K; j++) fprintf(df, " %.6g", w[j]);
             for (int j = 0; j < K; j++) fprintf(df, " %d", j < nlook ? look[j] : -1);
@@ -2810,9 +2815,12 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
         if (dump_route) {
             FILE *df = fopen(dump_route, "a");
             if (df) {
-                fprintf(df, "%d", L);
+                fprintf(df, "%d %d", dump_pos0 + t, L);
                 for (int j = 0; j < K; j++) fprintf(df, " %d", idx[j]);
                 for (int j = 0; j < K; j++) fprintf(df, " %.6g", w[j]);
+                /* No lookahead on this path (LEARNED §36), but the column
+                 * stays so every row of a trace has one shape. */
+                for (int j = 0; j < K; j++) fprintf(df, " -1");
                 fputc('\n', df);
                 fclose(df);
             }
@@ -2960,6 +2968,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     const int hid = c->hidden;
     if (n <= 0) return m->logits;
     if (n == 1) return waste_model_step(m, tokens[0], pos0, NULL);
+    dump_pos0 = pos0;
     if (n > WASTE_CHUNK_MAX) n = WASTE_CHUNK_MAX;
     /* mla_layer writes one latent per position with no bound of its own,
      * so the bound is here. The public API refuses an over-long prompt
@@ -3099,6 +3108,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
 
 const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
 {
+    dump_pos0 = pos;
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
     {   /* see waste_model_prefill */

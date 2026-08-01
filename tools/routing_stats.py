@@ -73,8 +73,19 @@ def _cfg(d, *keys, default=None):
 
 
 def load_config(data_dir):
-    with open(os.path.join(data_dir, "config.json")) as f:
-        cfg = json.load(f)
+    """Accepts a release directory or a .waste container.
+
+    The converter copies the release's own config into the manifest
+    verbatim, so a container answers every shape question a downloaded
+    config does — and it is the thing already on disk when someone has a
+    trace to analyse."""
+    manifest = os.path.join(data_dir, "manifest.json")
+    if os.path.exists(manifest):
+        with open(manifest) as f:
+            cfg = json.load(f).get("config", {})
+    else:
+        with open(os.path.join(data_dir, "config.json")) as f:
+            cfg = json.load(f)
     # unwrap nested text_config style wrappers if present
     if "num_hidden_layers" not in cfg:
         for v in cfg.values():
@@ -149,21 +160,74 @@ def cmd_math(args):
 
 # ------------------------------------------------------------- simulate ----
 
+
+def read_trace(path):
+    """A routing trace as a list of set((layer, expert)), one per token.
+
+    Two formats, told apart by the first non-blank byte:
+
+    JSONL   {"tok": n, "layers": [[e0, ...], ...]}   — what an external hook
+            on transformers or vLLM emits, and what Gate 2 was run against.
+
+    native  pos layer id0..idK-1 w0..wK-1 look0..lookK-1  — what the engine
+            writes under WASTE_DUMP_ROUTE. One row per (token, layer); the
+            leading field is the token's absolute position, which is why this
+            reader does not have to guess where a pass begins. It used to:
+            every script that read one of these re-derived token boundaries
+            from where the layer index wrapped, which is a heuristic that is
+            wrong on the chunked path and had to be written correctly three
+            times before it went into the engine instead.
+
+    The native form carries weights and the lookahead prediction too; this
+    reader keeps only the ids, which is all a cache simulation needs.
+    """
+    with open(path) as f:
+        head = f.read(1)
+        f.seek(0)
+        if head == "{":
+            return [{(li, e) for li, layer in enumerate(json.loads(l)["layers"])
+                     for e in layer}
+                    for l in f if l.strip()]
+        by_pos = {}
+        for line in f:
+            p = line.split()
+            if len(p) < 3:
+                continue
+            pos, layer = int(p[0]), int(p[1])
+            k = (len(p) - 2) // 3          # ids, weights, lookahead
+            by_pos.setdefault(pos, set()).update(
+                (layer, int(x)) for x in p[2:2 + k])
+        return [by_pos[k] for k in sorted(by_pos)]
+
+
+def container_rec_bytes(data_dir):
+    """The record size the engine will actually pread, when --data is a
+    container. Derived from bits it is close; read from the manifest it is
+    the same number, and the slot count then matches the engine's exactly
+    instead of by a percent."""
+    manifest = os.path.join(data_dir, "manifest.json")
+    if not os.path.exists(manifest):
+        return None
+    with open(manifest) as f:
+        layers = json.load(f).get("layers") or {}
+    vals = layers.values() if isinstance(layers, dict) else layers
+    best = 0
+    for L in vals:
+        if L.get("experts"):
+            best = max(best, L["bytes"] // L["experts"])
+    return best or None
+
+
 def cmd_simulate(args):
     s = model_shape(load_config(args.data))
     bits = float(args.bits)
-    rec_gb = 3 * s["hidden"] * s["moe_inter"] * bits / 8 / 2**30
+    rec = container_rec_bytes(args.data)
+    rec_gb = (rec / 2**30 if rec
+              else 3 * s["hidden"] * s["moe_inter"] * bits / 8 / 2**30)
 
-    tokens = []           # list of set((layer, expert)) per token
-    freq = Counter()
-    with open(args.trace) as f:
-        for line in f:
-            if not line.strip():
-                continue
-            t = json.loads(line)
-            acts = {(li, e) for li, layer in enumerate(t["layers"]) for e in layer}
-            tokens.append(acts)
-            freq.update(acts)
+    tokens, freq = read_trace(args.trace), Counter()
+    for t in tokens:
+        freq.update(t)
     n = len(tokens)
     if n < 2:
         print("need >= 2 tokens in trace", file=sys.stderr)
@@ -187,9 +251,14 @@ def cmd_simulate(args):
         print(f"top {k} expert-slots ({k*rec_gb:.0f} GB) cover {cov:.0%} of activations")
 
     # LRU vs LFRU hit-rate at various cache budgets.
-    # LFRU uses sampled eviction (min freq over 32 sampled keys, recency
-    # tiebreak) — same approximation a real C engine would use; exact
-    # min-scan is O(n^2) and pointless precision for a feasibility read.
+    #
+    # This mirrors src/ecache.c rather than approximating it, because a
+    # simulator that models a different cache is worse than none: this one
+    # read 36.6% where the engine measured 30.4%, by keeping a frequency
+    # count across evictions that the engine resets and by sampling 32
+    # victims where the engine samples 16. Both are copied now — EC_SAMPLE
+    # and the `slot->hits = 1` in ec_claim — and the two agree to 1.6 points
+    # over a 0 to 30% range. Change ecache.c's policy and change this.
     import random
     rng = random.Random(0)
     print(f"\n{'cache GB':>8} {'slots':>7} {'LRU hit':>8} {'LFRU hit':>9} "
@@ -202,12 +271,12 @@ def cmd_simulate(args):
             cache = OrderedDict()      # key -> last-access clock
             f2, hits, total_acc, clock = Counter(), 0, 0, 0
             for t in tokens:
-                for key in t:
+                for key in sorted(t):
                     total_acc += 1
                     clock += 1
-                    f2[key] += 1
                     if key in cache:
                         hits += 1
+                        f2[key] += 1
                         cache.move_to_end(key)
                         cache[key] = clock
                     elif slots > 0:
@@ -216,12 +285,14 @@ def cmd_simulate(args):
                                 cache.popitem(last=False)
                             else:
                                 keys = list(cache)
-                                sample = (keys if len(keys) <= 32 else
-                                          rng.sample(keys, 32))
+                                sample = (keys if len(keys) <= 16 else
+                                          rng.sample(keys, 16))
                                 victim = min(sample,
                                              key=lambda k: (f2[k], cache[k]))
                                 cache.pop(victim)
+                                del f2[victim]
                         cache[key] = clock
+                        f2[key] = 1        # ec_claim resets the hit count
             hr = hits / total_acc
             row += f" {hr:>7.1%}" if policy == "lru" else f" {hr:>8.1%}"
             miss_gb = (1 - hr) * uniq * rec_gb

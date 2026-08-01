@@ -1989,3 +1989,56 @@ Two things worth writing down beyond the fix:
   nobody generates. The check now exists, and its comment states where it
   is load-bearing: on x86 in any build, on arm64 only under the sanitizer.
   A check that passes by construction on half the machines has to say so.
+
+## 37. The simulator was modelling a different cache (2026-08-01)
+
+Most of what this project asks is not a throughput question. "Does the tail
+of the top-16 carry enough mass to demote" (§23), "how predictable is the
+next layer" (§29, §34), "what hit rate does this budget give" (§4) — none of
+those need the engine to run, and all of them were answered on K3 anyway, at
+**~50 seconds a measurement of which ~48 are model load and prefill**. The
+same loop on Kimi-Linear is 2.9 seconds end to end.
+
+`tools/routing_stats.py simulate` existed for exactly this and had not been
+used since Gate 2, because the engine writes traces in one format and the
+tool reads another. Connected now, and connecting it turned up three things.
+
+**The tool models a different cache than the engine.** It kept a frequency
+count across evictions that `ec_claim` resets, and sampled 32 victims where
+`EC_SAMPLE` is 16. Against the same trace it read **36.6% where the engine
+measured 30.4%** — optimistic, plausible, and wrong. Both are copied from
+`ecache.c` now:
+
+| slots | engine | simulator |
+|---|---|---|
+| 25 | 0.0% | 0.0% |
+| 100 | 0.0% | 0.0% |
+| 201 | 8.1% | 6.6% |
+| 402 | 30.4% | 29.6% |
+
+Within 1.5 points over a 0–30% range, with the access counts identical
+(4992 both). `tests/run.sh` asserts the agreement rather than remembering
+it, because a simulator that drifts quietly is how a policy question gets
+the wrong answer for a week.
+
+**The trace had to name its tokens.** Every script that read one of these —
+three of them, in this session alone — re-derived token boundaries from
+where the layer index wraps, which is a heuristic that is simply wrong on
+the chunked path, where rows are grouped by layer and not by token. The dump
+now writes the absolute position of the token each row belongs to, and the
+reader has no reconstruction in it at all.
+
+**And `--data` takes a container.** The record size read from the manifest
+is the number the engine preads; derived from `bits` it was close enough to
+put the slot counts a percent out. The converter copies the release config
+into the manifest verbatim, so a container answers every shape question the
+downloaded config does and is the thing already on disk.
+
+The method note is one this file already has and this session ignored
+twice. **`make -j8` builds the engine and not the checkers**, so the first
+validation run compared a fresh library against a `test_forward` compiled
+before the trace format changed — and the trace came out with one leading
+column instead of two, which read as a broken reconstruction rather than a
+stale binary. §17 recorded exactly this ("once to a stale test binary") and
+the fix is the same as it was then: `make test`, or `make check`, which
+rebuilds first.

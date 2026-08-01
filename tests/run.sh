@@ -438,6 +438,31 @@ PY
         no "read-ahead changes results"
     fi
 
+    # A trace-driven simulator is only worth having if it models *this*
+    # cache. Before this check it did not: it kept a frequency count across
+    # evictions that ec_claim resets and sampled 32 victims where EC_SAMPLE
+    # is 16, and read 36.6% where the engine measured 30.4%. A simulator
+    # that disagrees quietly is how a policy question gets the wrong answer
+    # for a week, so the agreement is asserted rather than remembered.
+    if [ "$SYNTHETIC" != 1 ] && command -v python3 >/dev/null 2>&1; then
+        TR="$TMP/sim.trace"
+        rm -f "$TR"
+        eng=$(WASTE_LOOKAHEAD=0 WASTE_DUMP_ROUTE="$TR" WASTE_CACHE_MB=1024 \
+              ./test_forward "$MODEL" "$(echo "$IDS" | tr ' ' ',')" /dev/null 8 2>&1 \
+              | sed -n 's/.*= \([0-9.]*\)% hit.*/\1/p')
+        sim=$(python3 tools/routing_stats.py simulate "$TR" --data "$MODEL" \
+              --cache-gb 1.0 2>/dev/null |
+              awk '/%/ && NF == 5 { v = $4 } END { gsub("%", "", v); print v }')
+        if [ -n "$eng" ] && [ -n "$sim" ] && python3 -c "
+import sys; sys.exit(0 if abs($eng - $sim) <= 5 else 1)" 2>/dev/null; then
+            ok "trace simulator agrees with the engine's cache (${eng}% vs ${sim}%)"
+        else
+            no "trace simulator disagrees with the engine (${eng:-?}% vs ${sim:-?}%)"
+        fi
+    else
+        sk "trace simulator vs the engine" "needs a real container and python3"
+    fi
+
     # The router lookahead starts reads on a guess. The guess must never
     # reach the arithmetic: the real router stays authoritative and the
     # prefetch only decides when bytes move, so the logits cannot shift.
