@@ -203,6 +203,13 @@ parser that reads replies back into reasoning / content / `tool_calls`;
   index-layout blocking, per-expert bit allocation). Read it before
   proposing an optimization — several obvious ones are already measured and
   dead. Do not quietly correct an old number; append the new one.
+- **`CHANGELOG.md` is updated with every new tag, in the same commit that
+  bumps `WASTE_VERSION_*` in `src/waste.h`.** A release whose changelog
+  lands later is a release nobody can read from the outside — LEARNED.md
+  carries the reasoning, but it is dated by experiment, not by version, and
+  a user asking "what changed in 0.6.2" cannot reconstruct it from there.
+  Record what was measured and *not* adopted too: the measurement is the
+  useful part even when the feature is gone.
 - Every number in `README.md` and the docs was measured on the commit it
   ships with. Don't add a figure you haven't run, and don't restate one
   under a change that would move it.
