@@ -1902,3 +1902,46 @@ Two notes:
   five *and* the reads still fit before the demand for them arrives; both
   halves of that are properties of this disk and this model, not numbers to
   carry to another machine.
+
+## 36. The same lookahead in the prefill path costs 7% of the reads (2026-08-01)
+
+§35 shipped the router lookahead on the decode path and noted the obvious
+next step: `moe_chunk` has no hook, so `waste bench` — mostly prefill —
+showed nothing while `waste run` showed the gain. Built it. It loses.
+
+A chunk routes nT tokens at once, so the prediction is the *union* of the
+next layer's tops over every token in the chunk: one token wanting an expert
+is enough to force the read. Implemented, capped at 384 ids, bit-identical
+as before.
+
+| | reads | demand hit | tok/s |
+|---|---|---|---|
+| decode hook only | 193.9 GB | 7% | **0.108** |
+| plus the chunk hook | **207.2 GB** | 33% | 0.085 |
+
+**The hit rate triples and the bytes go up 6.9%**, which is the signature of
+a prefetch that is thrown away and fetched again. On a 64-token prefill the
+wall clock does not move at all: 132.6 / 137.0 s without, 130.6 / 138.3 s
+with.
+
+The mechanism is the one §35's decode numbers hid. A decode layer claims 16
+slots, so the six speculative records for the next layer survive easily. **A
+chunk layer claims about 550** — the distinct experts of 64 tokens — and the
+speculative records are unpinned, freshly inserted, and therefore exactly
+what LFRU evicts first. They are read, evicted, and read again.
+
+Pinning them would fix the eviction and not the problem underneath, which is
+that **there is no idle window in the chunk path to fill.** A decode layer's
+boundary is a real fraction of the layer, ~5.9 ms of attention against
+16 reads. A chunk layer needs 550 reads against attention over 64 tokens: the
+disk is busy continuously, and a prefetch there does not move a read into
+idle time, it moves it in front of another read and pays an eviction for the
+privilege.
+
+So the hook is removed rather than defaulted off. Decode keeps it.
+
+The note worth keeping is about what §35's own measurement could not see.
+**`waste bench` showing nothing was read as "the hook is missing", and it was
+also "the path does not want one".** One observation, two explanations, and
+the cheap one was assumed. The distinguishing measurement — total bytes —
+took one command and was not run until the second version had been built.
