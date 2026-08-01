@@ -6,16 +6,16 @@
 $ waste run ~/models/k3.waste 'What is the capital of Italy?'
 waste: no --budget, using 46.24 GB of 64.00 GB (expert cache 17.56 GB)
 The capital of Italy is **Rome**.
-[16 tokens, 31.09 s, 0.51 tok/s | experts 3357 hit / 20195 miss = 14%]
+[16 tokens, 25.78 s, 0.62 tok/s | experts 9038 hit / 14514 miss = 38%]
 ```
 
 WASTE is an embeddable inference engine written in C, with no third-party runtime dependencies. It keeps the model trunk in memory, streams selected experts directly from disk, and uses the remaining RAM as a bounded expert cache.
 
-Its current proof point is the complete open-weights Kimi K3 model: 2.78 trillion parameters, converted into a 982 GiB container and running on a 64 GB MacBook Pro at 0.49–0.54 tokens per second. **This is not a distilled, pruned, or reduced variant**.
+Its current proof point is the complete open-weights Kimi K3 model: 2.78 trillion parameters, converted into a 982 GiB container and running on a 64 GB MacBook Pro at 0.45–0.62 tokens per second. **This is not a distilled, pruned, or reduced variant**.
 
 | Model               | Container | Minimum RAM | Tested speed    |
 | ------------------- | --------- | ----------- | --------------- |
-| **Kimi K3 2.78T**   | 982 GiB   | 29.05 GiB   | 0.49–0.54 tok/s |
+| **Kimi K3 2.78T**   | 982 GiB   | 29.05 GiB   | 0.45–0.62 tok/s |
 | **Kimi-Linear 48B** | 19 GiB    | 1.87 GiB    | 10.7 tok/s      |
 
 WASTE was written for that one model and that one constraint: **K3 does
@@ -32,7 +32,7 @@ needs, and spends every remaining byte of RAM on the part that repeats.
 The engine is correct: every layer is validated against a PyTorch
 reference, the final logits agree to 3.6e-06, and the vision tower matches
 its own oracle to 2.3e-06. It is also slow — half a token per second,
-thirty seconds for the sentence above.
+twenty-six seconds for the sentence above.
 
 Both of those matter, and the second one should not be read as a
 disclaimer. We are not aware of another published demonstration of a
@@ -46,16 +46,20 @@ speed, it is that the whole thing is in the reachable range on a single
 consumer machine — and that from here the question is engineering rather
 than feasibility.
 
-Where the levers were is not where they are. Overlapping the expert reads
-with the arithmetic was worth ~1.6x and shipped; the two that looked bigger
-— reading fewer bytes per token, and keeping more of them in RAM — were both
-measured and both refused, one because this family's router has no tail to
-demote and one because a cache the machine will not leave resident cannot be
-bought at any price. Even with the reads overlapped they are still 55% of a
-decode step against the arithmetic's 27%, so what is left is a faster disk
-or a machine with more RAM, not another pass over the kernels.
-[docs/EFFICIENCY.md](docs/EFFICIENCY.md) is the account of how each of those
-was priced, including the two that were built before being measured.
+Where the levers were is not where they are. The two that looked biggest —
+reading fewer bytes per token, and keeping more of them in RAM — were both
+measured and both refused: this family's router has no tail to demote, and a
+cache the machine will not leave resident cannot be bought at any price. What
+paid instead was never about *which* bytes to read but *when*. Overlapping
+the expert reads with the arithmetic is worth ~1.6x; starting the next
+layer's reads on its own router's guess, one residual early, takes the hit
+rate from 14% to 38% at no extra bytes at all.
+
+Both of those are exact — the cache statistics and the logits are unchanged
+— which is the property that makes them shippable rather than tuning.
+[docs/EFFICIENCY.md](docs/EFFICIENCY.md) is the account of how each lever was
+priced, including the three that were built before being measured and the two
+that were then taken back out.
 
 What that opens up, concretely: a frontier-scale model that answers with
 no network, no per-token invoice, and nothing leaving the machine — which
@@ -160,6 +164,32 @@ off by default: it is a pass over every record on every cache miss, about
 downloaded and have not read since; not worth it on every token of one
 you converted yourself. See [docs/FORMAT.md](docs/FORMAT.md).
 
+### Reading ahead, and reading before the router has spoken
+
+A layer knows all sixteen of its expert ids the moment its router runs, so
+the reads go out on their own threads and the arithmetic consumes them as
+they land instead of blocking on each. That is worth ~1.6x on K3, and the
+cache statistics are identical to the digit with it on and off — the engine
+does the same work, it just stops waiting for it.
+
+The next layer's ids are not known: its router eats a hidden state that does
+not exist yet. But the *router* does exist, and it is resident. So at the end
+of each layer, once its own reads are consumed and the disk is about to go
+idle through the next layer's attention, the engine runs **layer L+1's router
+on layer L's hidden state** and starts fetching the six experts it names. One
+residual early, that guess is right 92% of the time at rank 1 and 81% over
+the first six.
+
+It is exact by construction: the real router still decides, and the guess
+only decides when bytes move. The demand hit rate goes from 14% to 38% and
+**the total bytes read do not change** — those records were going to be read
+anyway. `WASTE_LOOKAHEAD=0` turns it off.
+
+The same trick in the prefill path was built and removed. A decode layer
+claims 16 cache slots so the speculative records survive; a chunk layer
+claims about 550, evicts them before use, and reads them twice — 6.9% more
+bytes for no time saved. [docs/LEARNED.md](docs/LEARNED.md) §34–36.
+
 ### Three bits per expert weight
 
 Experts are stored as residual vector quantization — three stages of
@@ -193,6 +223,11 @@ the engine stops fitting in the machine.
 | 46 GB | 17.32 GB | 17% | **0.53–0.55 tok/s** |
 | 52 GB | 23.32 GB | 31% | 0.04–0.15 — **not reproducible** |
 | 58 GB | 29.32 GB | 39% | 0.02–0.03 tok/s |
+
+The hit-rate column predates the router lookahead, which roughly doubles it
+at every budget — 14% to 38% at 46 GB. It does not move the decode column's
+shape, because what collapses the 52 and 58 GB rows is the machine running
+out of memory and not the cache missing.
 
 **Ranges, not measurements**, and the width is the finding. Every run behind
 a row reports cache statistics identical to the digit — the engine does the
@@ -288,10 +323,10 @@ measured on the commit it is published with.
 | minimum RAM | **29.05 GB** at 4K context |
 | | 30.54 GB at 32K, 35.63 GB at 128K, 83.21 GB at 1M |
 | resident trunk | 27.28 GB |
-| read per token | 17.0 GB, read ahead on two threads so it overlaps the matmuls |
+| read per token | 17.0 GB cold, 10.5 GB at the 38% hit rate the lookahead gives |
 | model load | 20 s |
 | prefill | 0.47 tok/s chunked, 0.29 sequential (before read-ahead) |
-| decode | 0.49–0.54 tok/s at the default budget, the best this machine gives |
+| decode | 0.45–0.62 tok/s at the default budget; 0.62 is a first run on a quiet machine |
 | vision tower | 15.7 s for a 1024-patch image, 27 layers |
 | image in a prompt | 256 positions for 896x896, 2.8 s each — as text |
 
@@ -331,16 +366,20 @@ which is the state a fresh prompt starts in:
 | MLA layers | 2.8% |
 | lm_head | 0.2% |
 
-Reproduce with `WASTE_PROFILE=1 WASTE_CACHE_MB=17735 ./test_forward
-MODEL 1008,10484,318,15383,387 out.bin 5`. The I/O share falls as the
-cache warms, so a long session sits lower than this; the ranking does
-not change.
+Reproduce with `WASTE_PROFILE=1 WASTE_LOOKAHEAD=0 WASTE_CACHE_MB=17735
+./test_forward MODEL 1008,10484,318,15383,387 out.bin 5`. The lookahead is
+off there on purpose: this is the cold-cache shape, and with it on the hit
+rate is 38% and the I/O share correspondingly lower. The I/O share also
+falls as the cache warms, so a long session sits under this either way; the
+ranking does not change.
 
 The I/O already runs near the hardware limit — 17.0 GB per token at
 ~9.9 GB/s against the SSD's measured 12.78 — so it only gets cheaper by
-happening less often, which means cache, which means RAM. That is the
-whole optimization story so far, and the reason the next steps are about
-memory rather than arithmetic.
+happening less often. For a long time that read as *which means cache,
+which means RAM*, and it was half right: the other half is **when** it
+happens. Overlapping the reads with the arithmetic and starting the next
+layer's on its own router's guess between them cost no RAM at all. What
+follows is the memory half of that story.
 
 ## Getting started
 
