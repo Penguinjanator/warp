@@ -164,6 +164,7 @@ static int q8_off = 1;     /* 1 = keep the trunk stored as int8          */
 static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
 static int i8mm_on = 0;    /* SMMLA batched matmul; costs activation int8 */
 static const char *dump_route = NULL;  /* WASTE_DUMP_ROUTE, see moe_layer */
+static int lookahead_n = 0;            /* WASTE_LOOKAHEAD, see moe_layer  */
 static pthread_once_t model_opts_once = PTHREAD_ONCE_INIT;
 
 static void model_opts_init(void)
@@ -184,6 +185,13 @@ static void model_opts_init(void)
     /* Read once rather than per layer per token: moe_layer runs 92
      * times a token and getenv is not free. */
     dump_route = getenv("WASTE_DUMP_ROUTE");
+    /* How many of the next layer's experts to fetch on the router's guess.
+     * The layer boundary holds about six reads and the prediction's
+     * precision falls off past there, so that is the default. 0 is off. */
+    { const char *e2 = getenv("WASTE_LOOKAHEAD");
+      lookahead_n = e2 ? atoi(e2) : 6;
+      if (lookahead_n < 0) lookahead_n = 0;
+      if (lookahead_n > 64) lookahead_n = 64; }
 }
 
 /* One weight from a 3-bit stream: values sit LSB-first at bit offset 3*i,
@@ -2069,6 +2077,51 @@ static void ffn(waste_model *m, const waste_tensor *W1, const waste_tensor *W3,
     if (accum) for (int i = 0; i < hid; i++) out[i] += w * dst[i];
 }
 
+/* What layer L+1's router says about layer L's hidden state.
+ *
+ * The router of L+1 will really see the state after L's MoE and L+1's
+ * attention; this asks it early, one residual short. Measured at 59.0%
+ * recall over the true top-16 and steeply ranked — 92.2% at rank 1, 27.9%
+ * at rank 16 — which is what makes a narrow prefetch pay and a wide one
+ * not. LEARNED.md §34.
+ *
+ * Writes at most `n` ids and returns how many. 0 when L+1 is not a MoE
+ * layer, which is also what happens on the last one. Scratch is the router
+ * area of m->att, dead by the time this is called.
+ */
+static int predict_next_moe(waste_model *m, int L, const float *in, int *out, int n)
+{
+    const waste_config *c = &m->cfg;
+    const int E = c->n_experts, hid = c->hidden;
+    if (n <= 0 || E <= 0 || L + 1 >= c->n_layers) return 0;
+    const waste_tensor *g = waste_find(m, tname(
+        "%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L + 1));
+    if (!g) return 0;
+    if (n > E) n = E;
+
+    float *sc = m->att + WASTE_ATT_ROUTER_OFF, *p = sc + E;
+    matvec_t(m, sc, g, in, E, hid);
+    const float *bias = T(m, "%smodel.layers.%d.block_sparse_moe.gate.e_score_correction_bias",
+                          c->prefix, L + 1);
+    /* Selection order only, so the sigmoid is monotone and could be skipped
+     * — kept because the bias is added in probability space, as the real
+     * router does it, and a different order here would be a different
+     * prediction rather than a faster one. */
+    for (int e = 0; e < E; e++)
+        p[e] = 1.0f / (1.0f + expf(-sc[e])) + (bias ? bias[e] : 0.0f);
+    for (int j = 0; j < n; j++) {
+        int best = -1;
+        float bv = -1e30f;
+        for (int e = 0; e < E; e++) {
+            int taken = 0;
+            for (int q = 0; q < j; q++) if (out[q] == e) { taken = 1; break; }
+            if (!taken && p[e] > bv) { bv = p[e]; best = e; }
+        }
+        out[j] = best;
+    }
+    return n;
+}
+
 static void moe_layer(waste_model *m, int L, const float *in, float *out, int *routed)
 {
     const waste_config *c = &m->cfg;
@@ -2125,29 +2178,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
          * and there is exactly what wants measuring. -1 when there is no
          * next MoE layer to ask. */
         int look[64];
-        int nlook = 0;
-        if (L + 1 < c->n_layers) {
-            const waste_tensor *g1 = waste_find(m, tname(
-                "%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L + 1));
-            if (g1) {
-                float *s1 = m->att + WASTE_ATT_ROUTER_OFF, *p1 = s1 + E;
-                matvec_t(m, s1, g1, in, E, hid);
-                const float *b1 = T(m, "%smodel.layers.%d.block_sparse_moe.gate.e_score_correction_bias",
-                                    c->prefix, L + 1);
-                for (int e = 0; e < E; e++)
-                    p1[e] = 1.0f / (1.0f + expf(-s1[e])) + (b1 ? b1[e] : 0.0f);
-                for (int j = 0; j < K; j++) {
-                    int best = -1; float bv = -1e30f;
-                    for (int e = 0; e < E; e++) {
-                        int taken = 0;
-                        for (int q = 0; q < j; q++) if (look[q] == e) { taken = 1; break; }
-                        if (!taken && p1[e] > bv) { bv = p1[e]; best = e; }
-                    }
-                    look[j] = best;
-                }
-                nlook = K;
-            }
-        }
+        const int nlook = predict_next_moe(m, L, in, look, K);
         FILE *df = fopen(dump_route, "a");
         if (df) {
             fprintf(df, "%d", L);
@@ -2221,6 +2252,16 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
         matvec_t(m, out, waste_find(m, tname(
                      "%smodel.layers.%d.block_sparse_moe.routed_expert_up_proj.weight",
                      c->prefix, L)), ysum, hid, lat);
+    }
+
+    /* The guess goes out last, when this layer's sixteen reads have all
+     * been consumed and the disk is about to go idle through the next
+     * layer's attention. Issuing it earlier would put speculative reads in
+     * front of demand ones on a queue that is the bottleneck. */
+    if (lookahead_n) {
+        int nxt[64];
+        const int nn = predict_next_moe(m, L, in, nxt, lookahead_n);
+        if (nn) waste_ecache_prefetch(&m->cache, L + 1, nxt, nn);
     }
 
     /* shared expert — on the original hidden state, not the latent */

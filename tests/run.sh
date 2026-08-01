@@ -414,6 +414,17 @@ PY
         no "read-ahead changes results"
     fi
 
+    # The router lookahead starts reads on a guess. The guess must never
+    # reach the arithmetic: the real router stays authoritative and the
+    # prefetch only decides when bytes move, so the logits cannot shift.
+    WASTE_LOOKAHEAD=6 WASTE_CACHE_MB=512 ./test_forward "$MODEL" "$IDS" \
+        "$TMP/look.bin" 0 >/dev/null 2>&1
+    if cmp -s "$TMP/cache.bin" "$TMP/look.bin"; then
+        ok "router lookahead is bit-identical to no lookahead"
+    else
+        no "router lookahead changes results"
+    fi
+
     # A purged slot reads back as zeros, so the whole prototype rests on the
     # engine noticing before it multiplies one. This does not create memory
     # pressure — it checks that the volatile/nonvolatile traffic itself does

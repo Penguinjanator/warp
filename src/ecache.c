@@ -415,6 +415,32 @@ static int ec_victim(waste_ecache *c)
  * the process, the victim sampler ran out of candidates, and the forward
  * pass quietly continued with the experts it had. EC_INFLIGHT alone already
  * protects a slot whose buffer is being written. */
+/* `fresh` marks a record this layer's hint pulled in, and it is also the pin;
+ * `spec` marks one the lookahead guessed at.
+ *
+ * The accounting differs on purpose. hits/misses describe the *demand*
+ * stream — of the experts a token actually asked for, how many were already
+ * there — and every number in LEARNED.md means that. A speculative read is
+ * not a demand access, so it must not become a miss, or a prefetcher that
+ * guessed wrong would look like a cache that performed badly. It is real
+ * I/O, so its bytes are counted; if the guess lands, the token that asks for
+ * it finds it resident and scores an ordinary hit. */
+static void ec_claim_spec(waste_ecache *c, int vi, int32_t key)
+{
+    ec_nonvolatile(c, vi);
+    const int had = c->slot[vi].key >= 0;
+    c->slot[vi].key = key;
+    c->slot[vi].state = EC_INFLIGHT;
+    c->slot[vi].fresh = 0;              /* a demand hit on it is a real hit */
+    c->slot[vi].pin = 0;                /* belongs to no hint generation    */
+    c->slot[vi].hits = 1;
+    c->slot[vi].last = c->clock;
+    if (had) { c->evictions++; ec_rehash(c); }
+    else ec_insert(c, key, vi);
+    c->spec_issued++;
+    c->bytes_read += c->rec_bytes;
+}
+
 static void ec_claim(waste_ecache *c, int vi, int32_t key, int fresh)
 {
     /* Whoever fills this slot is about to write into it, so it has to stop
@@ -471,6 +497,27 @@ static void ec_issue_next(waste_ecache *c)
         }
         return;
     }
+}
+
+void waste_ecache_prefetch(waste_ecache *c, int layer, const int *ids, int n)
+{
+    if (!c->io || c->n_slots <= 0 || n <= 0) return;
+    ec_lock(c);
+    for (int i = 0; i < n; i++) {
+        if (ids[i] < 0) continue;
+        const int32_t key = ec_key(layer, ids[i]);
+        if (ec_lookup(c, key) >= 0) continue;   /* already here, or coming */
+        const int vi = ec_victim(c);
+        if (vi < 0) break;                      /* everything pinned; skip */
+        ec_claim_spec(c, vi, key);
+        if (eio_push(c->io, vi, layer, ids[i]) != 0) {
+            c->spec_issued--;
+            c->bytes_read -= c->rec_bytes;
+            ec_drop(c, vi);
+            break;                              /* queue full: stop asking */
+        }
+    }
+    ec_unlock(c);
 }
 
 void waste_ecache_hint(waste_ecache *c, int layer, const int *ids, int n)

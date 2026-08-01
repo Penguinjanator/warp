@@ -1841,3 +1841,64 @@ Two notes:
 - **The lookahead costs a second router matvec per layer**, 896x7168 against
   weights already in RAM. Under 1% of a step, and it is the reason this can
   be tried without touching the container format.
+
+## 35. The router lookahead, built (2026-08-01)
+
+§34 measured the predictor and priced it. Built: at the end of `moe_layer`,
+once this layer's sixteen reads have all been consumed and the disk is about
+to go idle through the next layer's attention, run layer L+1's router on
+layer L's hidden state and issue speculative reads for its top **6**.
+
+Six because that is what the ~5.9 ms boundary holds at 0.92 ms a read, and
+because the prediction's precision falls off past it — 92.2% at rank 1,
+81.4% cumulative at 6, 59.0% at 16. `WASTE_LOOKAHEAD=0` disables it.
+
+**Two things it does are deterministic**, and they are the ones worth
+trusting:
+
+| | without | with |
+|---|---|---|
+| demand hit rate | 14–19% | **38–40%** |
+| total bytes read | 254.2 GB | 254.5 GB |
+
+The hit rate more than doubles and **the bytes do not move**. That is the
+whole mechanism: the prefetched records were going to be read anyway, and
+the lookahead only changes *when*. Past n=6 it stops being free — n=10
+reads 264.2 GB, and the extra is waste.
+
+**The throughput gain is real and this machine cannot pin it down.** Nine
+paired runs, alternated, three prompt lengths:
+
+    n=6 faster in 8 of 9 pairs
+    ratio: median 1.17x, min 0.79, max 1.79
+    median 0.46 -> 0.53 tok/s
+
+A median of 1.17x against a projection of 1.20x is agreement, and a range
+from 0.79 to 1.79 is what a day of sweeps has done to this laptop — §33
+already established that a row measured after a heavy row is measured on a
+different computer, and by now every row is after a heavy row.
+
+**The accounting had to be designed, not inherited.** A speculative read is
+not a demand access, so counting it as a miss would make a prefetcher that
+guessed wrong look like a cache that performed badly, and every hit-rate
+number in this file would stop meaning what it meant. So `ec_claim_spec`
+counts `spec_issued` and the bytes, never `misses`; a token that later asks
+for the record finds it resident and scores an ordinary hit. The 38% above
+is the demand stream, comparable with every earlier figure.
+
+**Exact by construction**, which is the property that makes it shippable:
+the real router still decides, the prediction only starts I/O. `tests/run.sh`
+checks the logits are bit-identical with it on and off.
+
+Two notes:
+
+- **It is on the decode path only.** `moe_chunk` routes a whole chunk at
+  once and does not have the hook, which is why `waste bench` — mostly
+  prefill — shows almost nothing while `waste run` shows the gain. That is
+  the next thing to build, not a defect in the measurement.
+- **The width is not a tuning constant, it is a window.** n=3 and n=4
+  measured worse than n=6 (0.45–0.55 and 0.51–0.52 against 0.59–0.61) and
+  n=10 worse again. Six is where the prediction is still right four times in
+  five *and* the reads still fit before the demand for them arrives; both
+  halves of that are properties of this disk and this model, not numbers to
+  carry to another machine.

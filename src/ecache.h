@@ -68,6 +68,7 @@ typedef struct {
     size_t rec_bytes, budget_bytes;
     uint64_t clock, hits, misses, bytes_read, evictions;
     uint64_t prefetched; /* misses whose read was started before it blocked */
+    uint64_t spec_issued;/* records the lookahead fetched on a guess         */
     unsigned rng;
     int policy;          /* 0 = LFRU, 1 = LRU                               */
 
@@ -146,6 +147,11 @@ void waste_ecache_io_stop(waste_ecache *c);
  * each waste_ecache_get releases one more into the pipe. Calling it with a
  * synchronous cache is a no-op, so call sites need no conditional. */
 void waste_ecache_hint(waste_ecache *c, int layer, const int *ids, int n);
+
+/* Speculative fill for a layer that has not routed yet. Unlike a hint these
+ * are not pinned and are not counted as misses: they are a guess, and the
+ * demand stream's hit rate has to keep meaning what it meant before. */
+void waste_ecache_prefetch(waste_ecache *c, int layer, const int *ids, int n);
 
 /* Persist / restore which experts this workload actually uses. Gate 5
  * measured a 0% hit rate until the cache exceeds one token's working set;
