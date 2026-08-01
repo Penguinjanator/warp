@@ -96,10 +96,11 @@ class Trunk:
     F32 verbatim, Q8G/Q4G as quantized rows followed by one fp16 scale per
     group."""
 
-    def __init__(self, rng):
+    def __init__(self, rng, prefix=""):
         self.buf = bytearray()
         self.index = []
         self.rng = rng
+        self.prefix = prefix
 
     def f32(self, name, shape):
         n = 1
@@ -107,10 +108,11 @@ class Trunk:
             n *= s
         off = len(self.buf)
         self.buf += f32([self.rng.uniform(-0.5, 0.5) for _ in range(n)])
-        self.index.append({"name": name, "fmt": FMT_F32, "off": off,
-                           "shape": list(shape), "bytes": len(self.buf) - off})
+        self.index.append({"name": self.prefix + name, "fmt": FMT_F32,
+                           "off": off, "shape": list(shape),
+                           "bytes": len(self.buf) - off})
 
-    def quant(self, name, shape, bits=None):
+    def quant(self, name, shape, bits=None, prefixed=True):
         """Quantized rows plus one fp16 scale per group.
 
         The width mirrors tools/convert.py: 4 bits for the bulk, 8 at the
@@ -141,7 +143,8 @@ class Trunk:
         soff = len(self.buf)
         self.buf += f16([self.rng.uniform(0.002, 0.02)
                          for _ in range(rows * ng)])
-        self.index.append({"name": name, "fmt": FMT_Q8G if bits == 8 else FMT_Q4G,
+        self.index.append({"name": (self.prefix if prefixed else "") + name,
+                           "fmt": FMT_Q8G if bits == 8 else FMT_Q4G,
                            "off": off, "shape": list(shape), "group": GROUP,
                            "scale_off": soff, "bytes": len(self.buf) - off})
 
@@ -255,6 +258,10 @@ def main():
                     help="also write a small tiktoken-style vocabulary with "
                          "K3's XTML specials, so the container can be driven "
                          "with text instead of raw ids")
+    ap.add_argument("--prefix", default="", metavar="PFX",
+                    help="put the text tensors under a tensor_prefix, e.g. "
+                         "language_model., and add one tensor outside it — "
+                         "K3's shape, and the one the loader skips")
     args = ap.parse_args()
     rng = random.Random(args.seed)
     os.makedirs(args.out, exist_ok=True)
@@ -275,7 +282,7 @@ def main():
     moe, dense = cfg["moe_intermediate_size"], cfg["intermediate_size"]
     kda = {l - 1 for l in cfg["linear_attn_config"]["kda_layers"]}
 
-    t = Trunk(rng)
+    t = Trunk(rng, args.prefix)
     t.quant("model.embed_tokens.weight", [cfg["vocab_size"], hid])
     for L in range(cfg["num_hidden_layers"]):
         p = f"model.layers.{L}."
@@ -317,6 +324,17 @@ def main():
             t.quant(m + "shared_experts.down_proj.weight", [hid, sh])
     t.f32("model.norm.weight", [hid])
     t.quant("lm_head.weight", [cfg["vocab_size"], hid])
+    if args.prefix:
+        # One tensor outside the prefix, which is what the loader declines
+        # to load: it sets on_disk and continues before `group` is
+        # assigned, and the row-scratch sizing then divided by that zero.
+        # arm64's sdiv answers 0 and x86's idiv raises #DE, so K3 was an
+        # instant SIGFPE on every x86 build while this suite stayed green
+        # — a prefix-less container has no tensor that takes the skip.
+        # Naming it vision_tower is K3's case; any name outside the prefix
+        # reproduces it. issue #10.
+        t.quant("vision_tower.encoder.layers.0.fc0.weight", [128, hid],
+                prefixed=False)
     with open(os.path.join(args.out, "trunk.bin"), "wb") as f:
         f.write(t.buf)
 
@@ -346,7 +364,7 @@ def main():
     manifest = {
         "format_version": 0,
         "arch": cfg["model_type"],
-        "tensor_prefix": "",
+        "tensor_prefix": args.prefix,
         "config": cfg,
         "expert_quant": {"fmt": "VQ3R", "stages": STAGES, "vec_dim": VEC_DIM,
                          "entries": CB_ENTRIES, "index_block": IDX_BLOCK,

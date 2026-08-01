@@ -300,6 +300,26 @@ else
     sk "expert record verification" "cannot build a synthetic container"
 fi
 
+# A container with a tensor_prefix carries tensors the loader declines to
+# load, and that skip used to leave `group` at zero for them while the
+# row-scratch sizing divided by it. The architecture decided what that
+# meant: arm64's sdiv answers 0, x86's idiv raises #DE — so `waste info` on
+# K3 was an instant SIGFPE on every x86 build, Linux included, while this
+# suite stayed green on a container that has no prefix and therefore no
+# tensor that takes the skip (issue #10). This check is load-bearing on x86
+# in any build, since the process dies; on arm64 it needs `make asan`,
+# whose UBSan reports the division whatever the hardware does with it.
+if python3 tools/make_test_container.py "$TMP/pfx.waste" \
+        --prefix language_model. >/dev/null 2>&1; then
+    if ./waste info "$TMP/pfx.waste" >/dev/null 2>&1; then
+        ok "a container whose tensors are not all under its prefix loads"
+    else
+        no "a prefixed container does not load"
+    fi
+else
+    sk "prefixed container" "cannot build a synthetic container"
+fi
+
 # ----------------------------------------------------------------- e2e ----
 head_ "engine"
 

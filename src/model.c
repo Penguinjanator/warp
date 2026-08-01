@@ -1214,7 +1214,16 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         size_t rb = 0, sb = 0;
         for (int i = 0; i < m->n_tensors; i++) {
             const waste_tensor *t = &m->t[i];
-            if (!t->on_disk) continue;
+            /* group is 0 on the tensors the loader skipped — the vision
+             * tower, and anything outside cfg.prefix — because that skip
+             * sets on_disk and continues before the quantized branch
+             * assigns it. Dividing by it is undefined, and the architecture
+             * decides what that means: arm64's sdiv quietly yields 0, x86's
+             * idiv raises #DE, so `waste info` on K3 was an instant SIGFPE
+             * on every x86 build while every check here stayed green.
+             * Skipping is also what those tensors want — rowbytes 0 and no
+             * scale rows, so no row scratch to size. issue #10. */
+            if (!t->on_disk || !t->group) continue;
             const int ng = (t->shape[t->ndim - 1] + t->group - 1) / t->group;
             if (t->rowbytes > rb) rb = t->rowbytes;
             if ((size_t)ng > sb) sb = (size_t)ng;
