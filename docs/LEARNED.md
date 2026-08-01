@@ -1639,3 +1639,84 @@ Two notes:
   35.6 GB of swap. A more precise number was available and not worth a
   laptop that stops responding for it. `< 0.012 tok/s` is enough to answer
   the question that was asked.
+
+## 33. An oracle fixture cannot be portable, and k-means is why (2026-08-01)
+
+Two reports from outside ([#6](https://github.com/sqliteai/waste/issues/6),
+[#7](https://github.com/sqliteai/waste/issues/7)) landed on the same blind
+spot from opposite ends: **neither the container CI builds nor the container
+this laptop keeps is the container a default conversion produces.**
+The trunk's bulk has been 4-bit by default since before §13 refuted 3, while
+`make_test_container.py` emitted only Q8G/F32 and the local Kimi-Linear was
+built with `--trunk8`. Every check involving trunk width had been running on
+the one shape that is not shipped.
+
+**#7 first, because it is the one with a number worth keeping.** The engine
+diverged from the shipped oracle fixture by 2.4 max on a default-conversion
+container, and it was not an engine error:
+
+| comparison | max \|diff\| | mean | correlation |
+|---|---|---|---|
+| engine vs a **fresh** oracle | **4.77e-05** | 7.52e-06 | 1.000000 |
+| engine vs the shipped fixture | 2.425 | 0.461 | 0.979884 |
+| **fresh oracle** vs the shipped fixture | **2.425** | **0.461** | **0.979884** |
+
+`kimi_ref.py` shares no code with `model.c`, so a divergence that reproduces
+identically in both comes from the weights they both read, not from either.
+The reporter got the same three-row shape on Linux/x86 with his own
+container (3.28 / 0.548 / 0.964251).
+
+The obvious repair is to regenerate the fixture for the default conversion,
+and **it is not enough.** One expert layer converted with `--device cpu`,
+against the same layer converted on `mps`:
+
+- the **trunk is bit-identical** — quantization is deterministic arithmetic;
+- the **expert bank is not**. `train_codebooks` seeds its generator, but
+  k-means on a different device converges to different books;
+- splicing that one layer of 26 into an otherwise-`mps` container moved the
+  final logits by **1.24 max / 0.19 mean**, against this suite's 1e-3
+  threshold.
+
+So a fixture is valid only for the exact container that produced it, and no
+recorded provenance can fix that — a contributor on Linux would get the
+right trunk width and fail on the codebooks instead, with a smaller diff and
+the same ambiguity. **A pinned oracle is a second implementation's output
+frozen against one build of the first. What survives a re-conversion is the
+method, not the bytes.**
+
+The number that made the alternative obvious was sitting in the tool the
+whole time: `kimi_ref.py` reads the **container**, not the 92 GB of source
+shards, so generating an oracle for the container under test costs **16.9 s**
+here — against 2.67 s for the same 16-token prefill in the engine. `run.sh`
+now generates, and keeps the fixture as the fallback for hosts without `uv`,
+where it checks the recorded trunk against the container's and skips with
+that reason.
+
+**#6 is the same blind spot as a live bug.** `WASTE_Q8=0` claimed to
+dequantize the trunk to f32 and read one byte per weight, which is true only
+of Q8G, while its condition caught every quantized format. On Q4G it asked
+for twice the bytes: a load failure when the overrun hit EOF, silently
+decoding the next tensor as int8 when it did not. Routed through
+`waste_deq_row` it now matches the default path to **1.9e-06**; restoring
+the old assumption on the same container answers argmax 177 instead of 164.
+
+Three notes:
+
+- **This is the third instance of §28's shape.** A check that passed in CI
+  and could not pass on a real container is a check that cannot fail
+  correctly. The fix that matters is not in `model.c` — it is that
+  `make_test_container.py` now mirrors `convert.py`'s widths, 4 bits for the
+  bulk and 8 at both ends, so the synthetic container reports
+  `trunk Q4G/Q8G/F32` and CI can reach the path at all.
+- **A private copy of a shared routine is a fix that does not propagate.**
+  That same branch carried its own fp16 conversion, flushing subnormals to
+  zero — the bug `waste_f16` had been corrected for three days earlier, at a
+  measured 27% error on one row of the vision tower's `fc0`. It survived
+  because it was a copy. `docs/K3.md` records the identical
+  knows-only-F32-and-Q8G bug being fixed in the *Python* oracle, and nothing
+  connected the two.
+- **Not every check can be run everywhere, and the suite should say which.**
+  `WASTE_Q8=0` on K3 wants **211 GB of f32 trunk on a 64 GB machine**; the
+  oracle prompt ids are Kimi-Linear's and mean nothing against K3's
+  vocabulary. Both now skip with the arithmetic or the reason, rather than
+  reporting a refusal as a divergence.
