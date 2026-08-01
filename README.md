@@ -178,43 +178,60 @@ cache prediction held, the throughput did not, and the output collapsed.
 The most predictive number in this project. K3 touches 16 experts in each
 of 92 layers per token: **17.0 GB**. Below that, an expert cached for one
 token is evicted before the next token asks for it, and the hit rate is
-not low — it is zero. Above it the curve bends sharply.
+not low — it is zero.
 
-| budget | expert cache | hit rate | decode |
+What crossing it buys has changed, though, and the table below is the first
+one to show it. Going from a 0% hit rate to 17% is worth about 8% of
+throughput now — 0.50 to 0.54 — because read-ahead already hides most of
+the I/O the cache would have saved. **The sharp bend in this curve is no
+longer the climb above the floor; it is the collapse above 46 GB**, where
+the engine stops fitting in the machine.
+
+| budget | expert cache | hit rate | decode, observed |
 |---|---|---|---|
 | 32 GB | 3.32 GB | 0% | 0.50 tok/s |
-| 46 GB | 17.32 GB | 17% | **0.54 tok/s** |
-| 52 GB | 23.32 GB | 31% | 0.04 tok/s |
-| 58 GB | 29.32 GB | 39% | 0.02 tok/s |
+| 46 GB | 17.32 GB | 17% | **0.53–0.55 tok/s** |
+| 52 GB | 23.32 GB | 31% | 0.04–0.15 — **not reproducible** |
+| 58 GB | 29.32 GB | 39% | 0.02–0.03 tok/s |
 
-Measured in that order, on an otherwise idle machine. Order matters:
-re-run *after* the 52 and 58 GB rows have driven the machine into paging,
-46 GB collapses — 0.02 tok/s in one such run — while reporting hit and miss
-counts identical to the digit. The engine is deterministic; the machine
-is not, and it does not fully recover between runs. Sweep upward.
+**Ranges, not measurements**, and the width is the finding. Every run behind
+a row reports cache statistics identical to the digit — the engine does the
+same work each time — so what varies is the machine, not the engine.
 
-Read-ahead made the good rows faster and left the bad ones where they were,
-so the step is now larger than when this was first measured: 46 GB went
-0.32 to 0.54 and 52 GB stayed under 0.1. The cliff is not a slope seen at
-low resolution.
+The two rows that fit are tight. 32 and 46 GB reproduce to within a few
+percent, because the engine's whole footprint fits with room to spare and
+nothing has to be taken from anything.
 
-Wiring the resident trunk with `WASTE_MLOCK=trunk` does not move it either.
-32 and 46 GB are unchanged (0.50 and 0.56, within the noise of the rows
-above). 58 GB stays hopeless. And 52 GB stops having a value at all —
-three runs gave **0.46, 0.19 and 0.03 tok/s with cache statistics identical
-to the digit**, because that budget sits exactly where the outcome is
-decided by what else the machine happens to be holding rather than by
-anything the engine does. A budget whose throughput spans 15x across
-identical runs is the clearest argument there is for the one below it.
-[docs/LEARNED.md](docs/LEARNED.md) §30–33.
+**52 GB has no value.** Two runs of the default configuration gave 0.04 and
+0.15; three more with the trunk wired gave 0.46, 0.19 and 0.03 — seven-fold
+in the column above and fifteen-fold across both configurations,
+against `3652 hit / 8124 miss` every single time. That budget sits exactly
+where the engine's footprint either does or does not fit beside whatever
+else the machine is holding, and which side it lands on is decided before
+the process starts. A row that spans 15x is not a slow row; it is a row
+whose mean would invite a comparison there is nothing to compare.
+
+58 GB is uniformly bad and reproducibly so.
+
+Order still matters, and more than the table shows. Re-run *after* the 52
+and 58 GB rows have driven the machine into paging, 46 GB collapses — 0.02
+tok/s in one such run — while again reporting identical counts. Sweep
+upward, one budget per quiet machine, and treat anything measured after a
+paging row as void.
+
+Read-ahead made the rows that fit faster and left the others where they
+were, so the step is larger than when this was first measured: 46 GB went
+0.32 to 0.54. Wiring the resident trunk with `WASTE_MLOCK=trunk` does not
+move it either — 32 and 46 GB are unchanged, 58 GB stays hopeless, and 52 GB
+has no value to change. [docs/LEARNED.md](docs/LEARNED.md) §30–33.
 
 Everything in the memory design exists to get above that line, which is
 why the engine works to free RAM rather than to save it.
 
 **And there is a ceiling on the other side, closer than it looks.** Read
 that table twice: the hit rate climbs all the way down. At 58 GB on a
-64 GB machine the cache serves 37% of experts from RAM and the engine is
-*eight times slower* than at 46 GB, where it serves 13%. The engine is
+64 GB machine the cache serves 39% of experts from RAM and the engine is
+*twenty times slower* than at 46 GB, where it serves 17%. The engine is
 inside its budget; the *machine* is not, so the OS pages out the expert
 cache, and a "hit" becomes a page fault instead of the disk read the
 engine was managing.
@@ -224,7 +241,8 @@ finally clears one token's working set, and it has already closed by 52 —
 on an otherwise idle machine, with 49 GB free before the run. It is also
 sharp enough to move under a change that looks unrelated: taking 1.11 GB
 of embedding table off the resident set fed straight into the cache at a
-fixed budget, and that was enough to push 58 GB from 0.32 tok/s to 0.04.
+fixed budget, and on the build of the day that was enough to push 58 GB
+from 0.32 tok/s to 0.04.
 
 **So the default does not fill the machine.** Expert cache is only worth
 anything in whole multiples of that working set, and the remainder above a
