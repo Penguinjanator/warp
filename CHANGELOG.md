@@ -8,6 +8,41 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
+## 0.6.7 — 2026-08-10
+
+The container format, arithmetic, routing, and default open behavior are
+unchanged. A host can now ask cooperating WASTE processes for exclusive
+ownership of one container before model-sized allocation begins. This is a
+host-policy mechanism for a workstation daemon, not RAM accounting or a data
+lock: containers remain read-only, concurrent opens remain the default, and an
+unsupported advisory lock does not make a readable model unavailable.
+
+**Callers must recompile against this header.** `exclusive_open` was appended
+to `waste_cfg`, and `WASTE_E_BUSY` was added to `waste_status`. The library is
+still pre-1.0 and does not promise a stable ABI; `serve/engine.py`'s ctypes
+mirror moved with the C header.
+
+### Added
+
+- **Opt-in single-process container ownership**
+  ([#29](https://github.com/sqliteai/waste/pull/29)). On POSIX hosts,
+  `waste_cfg.exclusive_open`, or `--exclusive-open` in the CLI and server,
+  takes a non-blocking advisory `flock` on the container directory. Multiple
+  contexts in one process share a device/inode-keyed reference; a cooperating
+  process that also requests exclusivity receives `WASTE_E_BUSY`. The last
+  close and every planning, budget, and partial-load failure release ownership;
+  descriptors are close-on-exec, and a forked child discards the copied
+  registry. Windows keeps its existing lifecycle behavior.
+
+### Fixed
+
+- **Advisory locking fails open when ownership cannot be established.** Only
+  actual `EWOULDBLOCK`/`EAGAIN` contention returns `WASTE_E_BUSY`. A directory
+  that is search-only, a filesystem without `flock`, or another non-contention
+  locking failure continues through the ordinary model-open path. This keeps
+  external FUSE, SMB, and NFS containers usable and leaves their real read
+  errors to the existing loader diagnostics.
+
 ## 0.6.6 — 2026-08-05
 
 The engine decodes exactly as 0.6.5 did and no container format moved. Two

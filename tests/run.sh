@@ -53,6 +53,21 @@ else
     exit 1
 fi
 
+head_ "model-container ownership"
+# This intentionally opens two contexts at once. Always give it a tiny
+# dedicated container rather than duplicating a caller-supplied K3 load.
+LOCK_MODEL="$TMP/lock-test.waste"
+if ! python3 tools/make_test_container.py "$LOCK_MODEL" \
+        >"$TMP/lock-container.log" 2>&1; then
+    sk "model-container ownership lock" \
+       "could not build its synthetic container"
+elif ./test_lock "$LOCK_MODEL" "$TMP" >"$TMP/lock.log" 2>&1; then
+    ok "opt-in process exclusion, references, fail-open and cleanup"
+else
+    no "model-container ownership lock"
+    head -20 "$TMP/lock.log"
+fi
+
 # ---------------------------------------------------------------- unit ----
 head_ "kernels vs the reference implementations"
 

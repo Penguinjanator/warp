@@ -48,8 +48,8 @@ extern "C" {
  */
 #define WASTE_VERSION_MAJOR  0
 #define WASTE_VERSION_MINOR  6
-#define WASTE_VERSION_PATCH  6
-#define WASTE_VERSION_STRING "0.6.6"
+#define WASTE_VERSION_PATCH  7
+#define WASTE_VERSION_STRING "0.6.7"
 #define WASTE_VERSION_NUMBER (WASTE_VERSION_MAJOR * 10000 + \
                               WASTE_VERSION_MINOR * 100 + \
                               WASTE_VERSION_PATCH)
@@ -70,6 +70,7 @@ typedef enum {
     WASTE_E_ARG = -5,
     WASTE_E_UNSUPPORTED = -6,  /* arch/quant combination not built in      */
     WASTE_E_CANCELLED = -7,    /* callback asked to stop                   */
+    WASTE_E_BUSY = -8,         /* another process owns this container      */
 } waste_status;
 
 /* Human-readable, static storage; never NULL. A coarse answer by design:
@@ -222,6 +223,14 @@ typedef struct {
      * expert this container does not have are skipped, because it is one
      * of the few files the engine reads that nobody asked it to. */
     const char *usage_path;
+
+    /* Ask for single-process ownership of this container on POSIX hosts.
+     * Multiple contexts in that process share the ownership; a cooperating
+     * competing process that also requests exclusivity receives WASTE_E_BUSY
+     * before model-sized allocations begin. Off by default: containers are
+     * read-only, and whether concurrent loads are acceptable is host policy.
+     * Unsupported locks fail open, and non-POSIX hosts ignore this setting. */
+    int exclusive_open;
 } waste_cfg;
 
 /* Removed in 0.6.0, having never done anything: `io_threads` (there is no
