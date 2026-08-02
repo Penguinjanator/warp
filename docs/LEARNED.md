@@ -2217,11 +2217,34 @@ should trim the multiplier rather than the ceiling is
 [#14](https://github.com/sqliteai/waste/issues/14), still open, and the
 proposal that opened it is what found this bug.
 
-The method note is the uncomfortable one. **Nothing here was measured.**
-The cgroup reader is covered by synthetic-file tests, `test_memory` runs
-in milliseconds on every host, and the two cases worth having — a leaf at
-`max` under a finite parent, and `docker run` without a private cgroup
-namespace, where `/proc/self/cgroup` names a path that does not exist
-under the mount — are exactly the two a real host cannot be put into on
-demand. The fix is an arithmetic change to a number that was provably the
-wrong one; it is not a throughput row and must not be quoted as one.
+Measured in the only place it can be, which is a container. `docker run
+--memory=6g` on a host reporting 8,319,213,568 bytes of RAM:
+`waste plan --json` gives `physical_ram_bytes` 8,319,213,568 and
+`usable_ram_bytes` **6,442,450,944** — the limit exactly. The suite's own
+budget check, run inside that cgroup, reports `usable 6.00 GB`, which is
+the resolver consuming it rather than the reader merely reading it.
+24 passed, 0 failed, 16 skipped on Linux there.
+
+Both cgroup namespace modes were exercised, and they fail differently,
+which is why the walk has to end *on* the mounted root:
+
+| mode | `/proc/self/cgroup` | where the limit is | usable |
+|---|---|---|---|
+| private (default) | `0::/` | the mounted root itself | 5–6 GiB, exact |
+| `--cgroupns=host` | `0::/docker/<id>` | that path, on the host hierarchy | 5 GiB, exact |
+
+Under `--cgroupns=host` the composed path does exist, and
+`/sys/fs/cgroup/memory.max` does **not** — confirming the assumption the
+fallback rests on, that a real unified root carries no limit and an
+unconfined host therefore still reads 0.
+
+The choice changes, not just the reading. On the synthetic container
+(floor 8,844,904, recommended 9,139,816) a 12 MiB cgroup holds
+`floor + 3x` and opens silently; a 9 MiB one puts the ceiling under the
+floor, so the engine runs at the floor and says so. Before this commit
+both read 8.32 GB and saw nothing to say.
+
+What is *not* here is a throughput row. This is arithmetic on a number
+that was provably the wrong one, and the K3-in-a-cgroup case that motivates
+it — 80.64 GB asked of a 32 GiB allowance — is derived from the resolver's
+own rule, not run.
