@@ -135,14 +135,18 @@ uint64_t waste_cgroup_limit(const char *self_cgroup_path, const char *cgroup_roo
      * trusting the leaf.
      *
      * The walk ends *on* the mounted root, and that last read is not a
-     * formality — it is what covers `docker run` without a private cgroup
-     * namespace, where /proc/self/cgroup reports the host path
-     * (0::/system.slice/docker-<id>.scope) while /sys/fs/cgroup is mounted
-     * as the container's own root. Every composed directory along the way
-     * is then missing, and the limit that actually applies is sitting in
-     * the root itself. Stopping one level short would read nothing and
-     * report "unconfined" for the one deployment this exists for. An
-     * unconfined host is still 0: a real unified root has no memory.max. */
+     * formality: it is the only one that fires under a private cgroup
+     * namespace, which is what `docker run` gives by default —
+     * /proc/self/cgroup says 0::/ and the container's limit is in the root
+     * itself. Measured both ways, because they are not the same shape.
+     * With --cgroupns=host the process reads 0::/docker/<id>, that path
+     * *does* exist because the host hierarchy is mounted, and the root has
+     * no memory.max at all; a runtime that mounts only the leaf gives the
+     * mirror image. Reading every level from the composed path up to and
+     * including the root is what covers all three without having to know
+     * which one this is. An unconfined host is still 0: a real unified
+     * root carries no memory.max, which is the same fact that makes the
+     * --cgroupns=host root read nothing. */
     uint64_t cap = 0;
     for (;;) {
         cap = smaller_nonzero(cap, limits_at(dir));

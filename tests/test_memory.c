@@ -99,12 +99,13 @@ static int hierarchy_cases(const char *tmp)
     CHECK(waste_cgroup_limit(SELF, R) == 2 * GiB);
     CHECK(!rm(CHILD, "memory.high"));
 
-    /* `docker run` without a private cgroup namespace: /proc/self/cgroup
-     * reports the host path while the mount is the container's own root.
-     * Nothing along the composed path exists; the limit is in the root.
-     * Reading it is the whole point — this is the deployment the change
-     * is for, and the version that stopped one level short reported
-     * "unconfined" here. */
+    /* /proc/self/cgroup names a path that is not under this mount, which
+     * is what a runtime mounting only the container's own leaf produces:
+     * nothing along the composed path exists and the limit is in the root.
+     * Reading the root is the whole point — a walk that stopped one level
+     * short would report "unconfined" here. (The `docker run` default is
+     * the easier shape, 0::/ with the limit in the root; --cgroupns=host
+     * is the third, where the composed path does exist. Same walk.) */
     CHECK(!rm(CHILD, "memory.max") && !rm(PARENT, "memory.max"));
     CHECK(!put(R, "memory.max", "34359738368\n"));              /* 32 GiB */
     CHECK(!self_says("0::/system.slice/docker-0123456789ab.scope\n"));
