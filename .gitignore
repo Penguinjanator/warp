@@ -8,6 +8,9 @@ model.waste/
 # clang writes these beside the object when a build is interrupted
 *.o.tmp
 /test_*
+# the measurement harness builds beside the checkers but does not match
+# their prefix, so it needs saying separately — it was committed once
+/sweep
 waste
 libwaste.a
 *.a

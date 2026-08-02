@@ -614,6 +614,29 @@ const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
     return dst;
 }
 
+/* Back to a freshly-opened cache: no records, no counters. A sweep needs it
+ * between arms — leaving the cache warm would hand the second configuration
+ * the first one's work and measure the order instead of the setting. */
+void waste_ecache_clear(waste_ecache *c)
+{
+    ec_lock(c);
+    for (int i = 0; i < c->n_slots; i++) {
+        if (c->slot[i].state == EC_READY) ec_volatile(c, i);
+        c->slot[i].key = -1;
+        c->slot[i].state = EC_EMPTY;
+        c->slot[i].fresh = 0;
+        c->slot[i].pin = 0;
+        c->slot[i].hits = 0;
+        c->slot[i].last = 0;
+    }
+    if (c->hash) memset(c->hash, 0xff, ((size_t)c->hash_mask + 1) * sizeof *c->hash);
+    c->clock = c->hits = c->misses = c->bytes_read = 0;
+    c->evictions = c->prefetched = c->spec_issued = 0;
+    c->pf_n = c->pf_issued = 0;
+    c->last_used = -1;
+    ec_unlock(c);
+}
+
 /* ---- learned hotlist ---------------------------------------------------- */
 
 int waste_ecache_save_usage(const waste_ecache *c, const char *path,
