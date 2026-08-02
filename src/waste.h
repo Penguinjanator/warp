@@ -48,8 +48,8 @@ extern "C" {
  */
 #define WASTE_VERSION_MAJOR  0
 #define WASTE_VERSION_MINOR  6
-#define WASTE_VERSION_PATCH  2
-#define WASTE_VERSION_STRING "0.6.2"
+#define WASTE_VERSION_PATCH  3
+#define WASTE_VERSION_STRING "0.6.3"
 #define WASTE_VERSION_NUMBER (WASTE_VERSION_MAJOR * 10000 + \
                               WASTE_VERSION_MINOR * 100 + \
                               WASTE_VERSION_PATCH)
@@ -117,7 +117,7 @@ typedef struct {
      * only useful in whole multiples of one token's working set, so it
      * starts from waste_memplan.recommended_bytes (floor + 3x that set)
      * and steps down a whole multiple at a time until the total fits
-     * under 7/8 of physical RAM. It does not spend the remainder up to
+     * under 7/8 of waste_usable_ram(). It does not spend the remainder up to
      * that ceiling: the last fraction buys a little hit rate and risks
      * the OS paging the cache out, which costs far more than it gains.
      * When not even floor + 1x fits, it runs at floor_bytes.
@@ -393,6 +393,18 @@ waste_status waste_get_stats(const waste_ctx *ctx, waste_stats *out);
  * near this number is counterproductive: the OS pages out the engine's own
  * expert cache, and a hit then costs a page fault. */
 uint64_t waste_physical_ram(void);
+
+/* How much of it this process may actually use: physical RAM, or a smaller
+ * cgroup-v2 limit when one applies. This is what a budget of 0 sizes
+ * against, and it is the number a host should size its own ceiling from.
+ *
+ * The two differ only on Linux, and there they can differ by everything:
+ * sysconf(_SC_PHYS_PAGES) reports the host's RAM from inside a container,
+ * so a confined process that trusts it asks for memory the kernel will not
+ * give. That failure is a kill, not a slowdown — unlike the paging cliff
+ * waste_physical_ram warns about, no cache policy softens it. 0 when
+ * neither figure can be determined. */
+uint64_t waste_usable_ram(void);
 
 #ifdef __cplusplus
 }

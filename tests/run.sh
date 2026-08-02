@@ -56,6 +56,17 @@ fi
 # ---------------------------------------------------------------- unit ----
 head_ "kernels vs the reference implementations"
 
+# Not a kernel, but it decides the default budget on every containerized
+# host and runs in milliseconds against synthetic files, so it runs early
+# and unconditionally. All of it runs everywhere: the reader takes its
+# paths as parameters, so the cases that only fire on Linux are still
+# compiled and checked on the platforms we actually develop on.
+if ./test_memory "$TMP" 2>/dev/null | grep -q "^PASS"; then
+    ok "cgroup-v2 limits vs the automatic budget's ceiling"
+else
+    no "cgroup-v2 limits"
+fi
+
 if command -v uv >/dev/null 2>&1; then
     ./test_k3parts "$TMP/k3parts.bin" >/dev/null 2>&1
     if uv run --quiet --with torch --no-project python tools/k3parts_ref.py \
@@ -375,7 +386,9 @@ for t in m.get("trunk", []):
 r = subprocess.run([WASTE, "plan", sys.argv[1], "--json"],
                    capture_output=True, text=True)
 try:
-    phys = json.loads(r.stdout)["physical_ram_bytes"]
+    # usable, not physical: this decides whether the host can hold an f32
+    # trunk, and in a container the host's RAM is not what it can hold
+    phys = json.loads(r.stdout)["usable_ram_bytes"]
 except Exception:
     phys = 0
 if phys and need > phys // 2:
@@ -607,10 +620,10 @@ head_ "RAM budget"
 # the machine — K3 asks for 80.63 GB — and a swap storm. So assert the
 # rule, not a number, and it holds on any host: the engine steps down a
 # whole token working set at a time and takes the largest of
-# floor + 3x, 2x, 1x that fits under 7/8 of physical RAM, or the floor
-# when not even one multiple does, less at most one expert record of slot
-# rounding. Filling the cap instead is what put a 27 GB cache on a 64 GB
-# machine and cost 8x throughput — docs/LEARNED.md §16.
+# floor + 3x, 2x, 1x that fits under 7/8 of the RAM this process may use,
+# or the floor when not even one multiple does, less at most one expert
+# record of slot rounding. Filling the cap instead is what put a 27 GB
+# cache on a 64 GB machine and cost 8x throughput — docs/LEARNED.md §16.
 default_budget() {
     python3 - "$1" <<'PY'
 import json, os, subprocess, sys
@@ -625,13 +638,17 @@ def j(*a):
 
 plan, info = j("plan", sys.argv[1]), j("info", sys.argv[1])
 # From the engine rather than os.sysconf, which does not exist in Windows
-# CPython at all. This is the same number the engine sized itself against,
-# so what the check still tests is the rule — floor + the largest whole
-# working set under 7/8 of RAM — and not the RAM reading, which has its
-# own platform code and no business being written twice.
-phys = plan["physical_ram_bytes"]
+# CPython at all and would read the host's RAM inside a container anyway.
+# This is the same number the engine sized itself against, so what the
+# check still tests is the rule — floor + the largest whole working set
+# under 7/8 of it — and not the RAM reading, which has its own platform
+# code and no business being written twice. It is a capacity and not a
+# pressure reading, so it is the same in this process and in the `info`
+# one below; a ceiling that moved between the two would make this check
+# fail as an engine bug on any busy machine.
+phys = plan["usable_ram_bytes"]
 if not phys:
-    print("physical RAM unknown on this host")
+    print("usable RAM unknown on this host")
     sys.exit(0)
 cap = phys - phys // 8
 # what the engine actually holds: the plan's mandatory parts plus the
@@ -646,7 +663,7 @@ for k in (3, 2, 1):
         break
 rec = plan["min_expert_cache"] // (2 * info["top_k"]) if info["top_k"] else 0
 G = 1 << 30
-print(f"{held/G:.2f} GB held, ceiling {want/G:.2f} GB, machine {phys/G:.2f} GB")
+print(f"{held/G:.2f} GB held, ceiling {want/G:.2f} GB, usable {phys/G:.2f} GB")
 sys.exit(0 if want - rec - 1 <= held <= want else 1)
 PY
 }

@@ -105,6 +105,14 @@ class TestLibrary(EngineTestCase):
         ram = E.physical_ram()
         self.assertTrue(ram == 0 or ram > (1 << 28), ram)
 
+    def test_usable_ram(self):
+        # Never above physical, and only below it inside a cgroup — which
+        # this may well be running in, so both are allowed.
+        usable, ram = E.usable_ram(), E.physical_ram()
+        self.assertTrue(usable == 0 or usable > (1 << 24), usable)
+        if usable and ram:
+            self.assertLessEqual(usable, ram)
+
     def test_plan_memory_without_loading(self):
         plan = E.plan_memory(str(self.model), 512)
         self.assertGreater(plan.floor_bytes, 0)

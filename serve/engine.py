@@ -271,6 +271,8 @@ def _bind(lib) -> None:
     lib.waste_get_stats.argtypes = [C.c_void_p, C.POINTER(Stats)]
     lib.waste_physical_ram.restype = C.c_uint64
     lib.waste_physical_ram.argtypes = []
+    lib.waste_usable_ram.restype = C.c_uint64
+    lib.waste_usable_ram.argtypes = []
 
 
 def version() -> str:
@@ -283,6 +285,12 @@ def build_info() -> str:
 
 def physical_ram() -> int:
     return int(_lib().waste_physical_ram())
+
+
+def usable_ram() -> int:
+    """Physical RAM, or a smaller cgroup-v2 limit. What a 0 budget sizes
+    against — in a container it is the only one of the two that is true."""
+    return int(_lib().waste_usable_ram())
 
 
 def _bounded_int(name: str, value: int, lo: int, hi: int) -> int:
