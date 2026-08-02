@@ -13,6 +13,15 @@ knee — and the shares move because the cache moves, not because one of
 them is wrong. When two figures disagree, take the one with the later
 date, and take the end-to-end numbers from the README.
 
+**Two numbers were used twice.** There are two §33s and two §37s, all four
+dated 2026-08-01, from sections that landed the same day. They are not
+renumbered because both members of each pair are already cited from outside
+this file — `CHANGELOG.md` cites the first of each (the oracle fixture, the
+divide-by-zero), `GATES.md` and `tests/sweep.c` the second (the 52 GiB row,
+the simulator) — and renumbering would silently redirect a released
+changelog. **Cite these four by title, not by number**, and read a bare §33
+or §37 as pointing at whichever one the surrounding sentence is about.
+
 ---
 
 ## 1. The model (see [K3.md](K3.md) for the full read)

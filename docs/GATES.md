@@ -141,6 +141,15 @@ useful hit rates start at 2-3x that. For K3 that floor is ~960 experts x
 32 GB machine would not, and that is now a measured statement rather than a
 guess.
 
+> **Still exactly true, and no longer binding (2026-08-01).** Re-measured on
+> K3 in one process at 287 slots — a fifth of a token's 1472 records —
+> [LEARNED.md](LEARNED.md) §39 reproduces the zero: **0.0% hit** with the
+> router lookahead off. With it on the same 287 slots measure **29.1%**,
+> because a prefetched record has to survive from one layer to the next
+> rather than from one token to the next. The floor is a property of a
+> demand-only cache, which was the only kind that existed when this gate
+> ran. Whether the budget resolver's quantum should follow is Gate 7.
+
 Correctness: cache on vs cache off is **bit-identical**, and both match the
 oracle at rel 1.50e-06. Placement decides speed, never precision.
 

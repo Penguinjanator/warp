@@ -212,7 +212,7 @@ make serve-check                                  # everything
 K3_DIR=/Volumes/WasteDisk/k3 make serve-check     # plus the differential
 ```
 
-Four suites, in order of what they prove:
+Five suites, in order of what they prove:
 
 | file | what it checks | needs |
 |---|---|---|
