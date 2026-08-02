@@ -133,6 +133,26 @@ Kimi-Linear, is unaffected. When even the floor is above the cap the
 engine runs at the floor and says so on stderr, because the alternative
 is refusing to open a model that does technically fit.
 
+**"The machine" is `waste_usable_ram()`, not physical RAM.** They are the
+same number everywhere except a Linux cgroup, and there they differ by
+the whole ratio between the host and the limit: `sysconf(_SC_PHYS_PAGES)`
+reads the host's `MemTotal` from inside a container. A 32 GiB cgroup on a
+256 GiB host therefore saw a 224 GiB ceiling, resolved K3 at `floor + 3x`,
+and asked for 80.64 GB — 75 GiB — of a 32 GiB allowance. That failure is not the
+paging cliff above — nothing degrades, the kernel kills the process — so
+no cache policy softens it and the only fix is to see the limit. With the
+limit visible the same machine lands on the floor and runs.
+`src/memory.c` takes the smallest finite `memory.max` or
+`memory.high` over this cgroup and its ancestors, since the limit is
+hierarchical and a leaf saying `max` does not cancel a finite parent.
+
+Only *capacity* enters that reading. `MemAvailable` and `memory.current`
+are pressure, they move between the read and the allocation, and a budget
+resolved once at open cannot track them — bounding a run that lasts hours
+by an instantaneous reading makes the same command on the same machine
+two different runs. Whether current pressure should trim the multiplier
+is [issue #14](https://github.com/sqliteai/waste/issues/14), open.
+
 ### What the floor is made of
 
 | part | scales with | can it shrink? |
@@ -316,7 +336,7 @@ print:
 | `eval` | `waste_eval`, `waste_detokenize` |
 | `tokenize` / `detokenize` | `waste_tokenize`, `waste_detokenize` |
 | `bench` | `waste_get_stats` |
-| `plan` | `waste_plan_memory`, `waste_physical_ram` |
+| `plan` | `waste_plan_memory`, `waste_physical_ram`, `waste_usable_ram` |
 | `info` | `waste_model_get_info`, `waste_memory_used` |
 
 Images add four more, reachable from `run`, `chat` and `eval` via

@@ -23,6 +23,7 @@
 #include <time.h>
 
 #include "json.h"
+#include "memory.h"
 #include "model.h"
 #include "platform.h"
 #include "tokenizer.h"
@@ -149,6 +150,18 @@ uint64_t waste_physical_ram(void)
 #else
     return 0;
 #endif
+}
+
+/* What the budget is allowed to size against. Physical RAM is how big the
+ * machine is; this is how much of it this process may have, and on Linux
+ * the two differ by the whole ratio between a host and a container limit —
+ * sysconf reads host MemTotal from inside a cgroup. See src/memory.c. */
+uint64_t waste_usable_ram(void)
+{
+    const uint64_t phys = waste_physical_ram();
+    const uint64_t cg = waste_cgroup_limit("/proc/self/cgroup", "/sys/fs/cgroup");
+    if (!cg) return phys;
+    return (!phys || cg < phys) ? cg : phys;
 }
 
 waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
@@ -394,8 +407,12 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
      * that fits. On 64 GB K3 gets floor + 1x = 46 GB, the measured
      * optimum; on 128 GB it still gets the full floor + 3x; a model whose
      * recommendation already fits, like Kimi-Linear, is unaffected. When
-     * not even one multiple fits, run at the floor and say so below. */
-    const uint64_t phys = waste_physical_ram();
+     * not even one multiple fits, run at the floor and say so below.
+     *
+     * What "the machine" means is waste_usable_ram, not physical RAM: in a
+     * cgroup those differ by the ratio between the host and the limit, and
+     * sizing against the host there is not a slow run but a killed one. */
+    const uint64_t phys = waste_usable_ram();
     const uint64_t cap = phys ? phys - phys / 8 : 0;   /* 12% left to the OS */
     uint64_t budget = cfg.ram_budget_bytes;
 
@@ -421,8 +438,8 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
      * this machine — worth saying out loud before it crawls. */
     if (cap && budget > cap)
         fprintf(stderr,
-                "waste: budget %.1f GB leaves under 12%% of this machine's "
-                "%.1f GB free\n       the OS will page out the expert cache "
+                "waste: budget %.1f GB leaves under 12%% of the %.1f GB this "
+                "process may use\n       the OS will page out the expert cache "
                 "and throughput collapses\n",
                 budget / 1073741824.0, phys / 1073741824.0);
 

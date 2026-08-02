@@ -8,6 +8,35 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
+## 0.6.3 — 2026-08-02
+
+### Fixed
+
+- **The automatic budget sized against the host's RAM inside a container**
+  ([#14](https://github.com/sqliteai/waste/issues/14)). `waste_physical_ram()`
+  is `sysconf(_SC_PHYS_PAGES)` on Linux, which reports the host's `MemTotal`
+  from inside a cgroup that is allowed a fraction of it, so a `--budget`-less
+  open resolved `floor + 3x` against memory the kernel would never hand over:
+  K3 in a 32 GiB cgroup on a large host asks for ~80 GB and is killed. Unlike
+  the paging cliff of [LEARNED.md](docs/LEARNED.md) §16 this has no gradual
+  form and no cache policy softens it. The ceiling is now
+  `min(physical, cgroup limit)` — the smallest finite `memory.max` or
+  `memory.high` across the cgroup and its ancestors, since the limit is
+  hierarchical — and the rest of the resolver is unchanged. See §40.
+
+  Current pressure (`MemAvailable`, `memory.current`) was considered and
+  deliberately left out: a budget is resolved once and held for a whole run,
+  so bounding it by an instantaneous sample would make the same command on
+  the same machine two different runs. Whether it should trim the working-set
+  multiplier instead is #14, still open.
+
+### Added
+
+- `waste_usable_ram()`: physical RAM, or a smaller cgroup-v2 limit when one
+  applies — what a budget of 0 sizes against, and what an embedding host
+  should size its own ceiling from. `waste plan --json` reports it beside
+  `physical_ram_bytes`, which stays what it always was.
+
 ## 0.6.2 — 2026-08-01
 
 ### Fixed

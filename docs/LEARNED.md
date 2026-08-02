@@ -2176,3 +2176,75 @@ The method note is short. **§4 was right and stopped being the constraint,
 and nothing about §4 was wrong.** A measurement can be perfectly reproduced
 and still stop describing the system, when what changes is not the number
 but which mechanism the number was about.
+
+## 40. The machine the resolver was sizing against was not ours (2026-08-02)
+
+The default budget has one machine number in it, and until now that number
+was `waste_physical_ram()`. On Linux it is `sysconf(_SC_PHYS_PAGES) *
+sysconf(_SC_PAGESIZE)`, which reads the host's `MemTotal` — and reads
+exactly the same thing from inside a cgroup that is allowed a fraction of
+it. Every containerized run has therefore been sizing against RAM it was
+never going to be given: K3 in a 32 GiB cgroup on a 256 GiB host resolves
+`floor + 3x`, asks for about 80 GB, and is killed.
+
+**This is not §16 and it does not behave like §16.** The cliff there is a
+performance failure with a shape — the hit rate climbs, the bytes read
+fall, throughput drops eightfold, and it is visible in a sweep. A cgroup
+limit is a kill. Nothing degrades first, no allocation policy softens it,
+and the sweep that found §16 could never have found this one, because the
+machine it was swept on was not in a cgroup. It is the same class of bug
+as §27: a platform path that every green run had avoided rather than
+exercised.
+
+So the ceiling is now `min(physical, cgroup limit)`, and everything
+downstream — the 7/8 reserve, the whole-working-set stepping, the floor
+refusal — is untouched. The reader takes the smallest finite `memory.max`
+or `memory.high` across this cgroup and its ancestors: the limit is
+hierarchical, so a leaf saying `max` does not cancel a finite parent, and
+`memory.high` belongs there because a group the kernel reclaims from is a
+group whose expert cache it takes back, which is §16's mechanism arriving
+by another road.
+
+**What deliberately did not go in is current pressure.** `MemAvailable`
+and `memory.current` are the obvious next reading and they are a different
+kind of number: capacity is fixed for the life of the process, pressure
+moves between the read and the allocation. A budget is resolved once at
+`waste_open` and then held for the length of a run, so bounding it by an
+instantaneous sample makes the same command on the same machine two
+different runs — and the reason to want it, a host that is busy *now*,
+says nothing about a host that will be busy in ten minutes. Whether it
+should trim the multiplier rather than the ceiling is
+[#14](https://github.com/sqliteai/waste/issues/14), still open, and the
+proposal that opened it is what found this bug.
+
+Measured in the only place it can be, which is a container. `docker run
+--memory=6g` on a host reporting 8,319,213,568 bytes of RAM:
+`waste plan --json` gives `physical_ram_bytes` 8,319,213,568 and
+`usable_ram_bytes` **6,442,450,944** — the limit exactly. The suite's own
+budget check, run inside that cgroup, reports `usable 6.00 GB`, which is
+the resolver consuming it rather than the reader merely reading it.
+24 passed, 0 failed, 16 skipped on Linux there.
+
+Both cgroup namespace modes were exercised, and they fail differently,
+which is why the walk has to end *on* the mounted root:
+
+| mode | `/proc/self/cgroup` | where the limit is | usable |
+|---|---|---|---|
+| private (default) | `0::/` | the mounted root itself | 5–6 GiB, exact |
+| `--cgroupns=host` | `0::/docker/<id>` | that path, on the host hierarchy | 5 GiB, exact |
+
+Under `--cgroupns=host` the composed path does exist, and
+`/sys/fs/cgroup/memory.max` does **not** — confirming the assumption the
+fallback rests on, that a real unified root carries no limit and an
+unconfined host therefore still reads 0.
+
+The choice changes, not just the reading. On the synthetic container
+(floor 8,844,904, recommended 9,139,816) a 12 MiB cgroup holds
+`floor + 3x` and opens silently; a 9 MiB one puts the ceiling under the
+floor, so the engine runs at the floor and says so. Before this commit
+both read 8.32 GB and saw nothing to say.
+
+What is *not* here is a throughput row. This is arithmetic on a number
+that was provably the wrong one, and the K3-in-a-cgroup case that motivates
+it — 80.64 GB asked of a 32 GiB allowance — is derived from the resolver's
+own rule, not run.

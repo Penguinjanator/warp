@@ -483,9 +483,15 @@ static int cmd_plan(int argc, char **argv)
          * so anything reading this had to work out physical RAM for itself
          * — which on Windows means neither sysconf nor /proc exists and the
          * caller reimplements GlobalMemoryStatusEx. The engine already
-         * knows; 0 when it cannot tell. */
-        printf(",\"physical_ram_bytes\":%llu",
-               (unsigned long long)waste_physical_ram());
+         * knows; 0 when it cannot tell.
+         *
+         * Both figures, because in a container they differ and only the
+         * second is the one the budget was sized against. A reader given
+         * only physical_ram_bytes there would compute a ceiling the engine
+         * never used, and conclude the engine had ignored its own rule. */
+        printf(",\"physical_ram_bytes\":%llu,\"usable_ram_bytes\":%llu",
+               (unsigned long long)waste_physical_ram(),
+               (unsigned long long)waste_usable_ram());
         if (p.vision_bytes)
             printf(",\"vision_bytes\":%llu", (unsigned long long)p.vision_bytes);
         if (o.budget)
@@ -765,7 +771,10 @@ static void show_chosen_budget(waste_ctx *c, const opts *o)
      * this is what is held, not what was allowed. */
     const uint64_t used = u.trunk_bytes + u.state_bytes + u.scratch_bytes +
                           u.min_expert_cache;
-    const uint64_t phys = waste_physical_ram();
+    /* Usable, not physical: inside a cgroup "using 20 GB of 256 GB" names a
+     * machine this process does not have, and the number that explains the
+     * choice is the one the choice was made from. */
+    const uint64_t phys = waste_usable_ram();
     char ub[32], cb[32], pb[32];
     human(used, ub, 32);
     human(u.min_expert_cache, cb, 32);
