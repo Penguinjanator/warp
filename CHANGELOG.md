@@ -8,7 +8,7 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
-## 0.6.3 — 2026-08-02
+## 0.6.3 — 2026-08-03
 
 ### Fixed
 
@@ -30,12 +30,90 @@ changed. Each entry names the section to read for the numbers behind it.
   the same machine two different runs. Whether it should trim the working-set
   multiplier instead is #14, still open.
 
+- **`tools/convert.py` spawned `--jobs` × cores threads**
+  ([#13](https://github.com/sqliteai/waste/pull/13), contributed by
+  @andrewwhitecdw). torch sizes its intra-op pool from `os.cpu_count()`, and
+  the native VQ encoder reads `nthreads=0` as "every core" (capped at 64), so
+  N worker processes meant N×cpus threads competing for the machine: on a
+  224-core box `--jobs 8` spawned ~1792 threads and the codebook phase ran
+  ~20x slower than the measured baseline. Each worker is now capped at its
+  fair share, `cpu_count // jobs`, for both pools — set in the parent before
+  the workers spawn, since that is the only point torch reads it, and with
+  `setdefault`, so an explicit `OMP_NUM_THREADS` stays the caller's.
+
+- **The trace simulator modelled a different cache than the engine.**
+  `tools/routing_stats.py simulate` kept a frequency count across evictions
+  that `ec_claim` resets and sampled 32 victims where `EC_SAMPLE` is 16:
+  against the same trace it read **36.6% where the engine measured 30.4%** —
+  optimistic, plausible and wrong. Both constants now come from `ecache.c`,
+  which brings it within 1.5 points across a 0–30% range, and `tests/run.sh`
+  asserts the agreement rather than remembering it. Two smaller things went
+  with it: the route dump writes the absolute position of the token each row
+  belongs to, so readers stop re-deriving token boundaries from where the
+  layer index wraps (a heuristic that is simply wrong on the chunked path,
+  where rows group by layer), and `simulate --data` takes a container, whose
+  manifest states the record size the engine actually `pread`s. See §37,
+  *The simulator was modelling a different cache*.
+
 ### Added
 
 - `waste_usable_ram()`: physical RAM, or a smaller cgroup-v2 limit when one
   applies — what a budget of 0 sizes against, and what an embedding host
   should size its own ceiling from. `waste plan --json` reports it beside
   `physical_ram_bytes`, which stays what it always was.
+
+- **`tests/sweep.c`, a one-process measurement harness.** It loads a
+  container once and runs the arms back to back, interleaved, resetting the
+  session and clearing the expert cache between each — a warm cache would
+  hand the second arm the first one's work and measure the order instead of
+  the setting. Kimi-Linear, two arms, three repeats: spreads of 2.6% and
+  0.5%, where nine paired runs of the same comparison across processes
+  spanned 0.79x to 1.79x. The variance was the harness, not the feature. On
+  K3 the deterministic columns come out exact and the clock still drifts,
+  which is the machine's memory system rather than the process — what the
+  harness buys there is that the noise is visible as noise. §38.
+
+- **`docs/TECHNICAL.md` and `examples/`.** The measurement tables move out of
+  `README.md` into TECHNICAL.md, and `examples/` carries three compilable
+  programs against the public header — `api_plan.c` (budget arithmetic
+  without loading), `api_text.c`, `api_vision.c` — with a README that walks
+  through them.
+
+### Changed
+
+- **§4's cache floor still reproduces exactly, and has stopped binding.**
+  The oldest load-bearing measurement here — below one token's working set
+  the hit rate is zero, not low — was re-measured across four cache sizes in
+  one process, two repeats, hit rate and bytes read identical to the digit
+  across both:
+
+  | budget | expert cache | slots | hit | decode |
+  |---|---|---|---|---|
+  | 32 GB | 3.32 GB | 287 | 29.1% | 0.56–0.58 tok/s |
+  | 46 GB | 17.32 GB | 1498 | 36.2% | **0.63 tok/s** |
+  | 52 GB | 23.32 GB | 2018 | 38.4% | 0.07–0.09 tok/s |
+  | 58 GB | 29.32 GB | 2537 | 41.3% | 0.07–0.08 tok/s |
+
+  The 29.1% at 287 slots is not a refutation of §4: with the lookahead off
+  the same 287 slots give **0.0%**, exactly §4's zero. What breaks it is that
+  a speculative record has to survive one attention rather than one token, so
+  a cache far too small for a token's working set is ample to hold six
+  experts. A 3.32 GB cache is now within 10% of a 17.32 GB one, which means
+  the premise the default resolver is built on — that cache is only worth
+  buying in whole multiples of a working set — no longer holds. **The
+  resolver is unchanged**: that is a decision, not a measurement, and it is
+  [GATES.md](docs/GATES.md) Gate 7, open. The cliff is exactly where it was,
+  and the last two rows say what it is — throughput falls eightfold while the
+  hit rate rises and the bytes read fall, because the engine is inside its
+  budget and the machine is not. §39.
+
+- **0.6.2's "total bytes read unchanged" for the router lookahead was the
+  harness.** Measured with both arms starting from an identically cleared
+  cache, the byte economics depend on the cache size: **6.6% fewer** bytes at
+  1498 slots, **8% more** at 287, where speculative records are evicted
+  before use often enough to be re-read. It is a prefetch at small caches and
+  a scheduling change at large ones, and 0.6.2 measured only the large end.
+  The feature and its default are unchanged. §38, §39.
 
 ## 0.6.2 — 2026-08-01
 
