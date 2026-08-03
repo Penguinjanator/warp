@@ -76,6 +76,17 @@ LDLIBS  += $(STATIC)
 SHLDFLAGS := -Wl,--export-all-symbols
 else ifeq ($(shell uname -s),Darwin)
 SOEXT   := dylib
+# Same rule as the Windows branch above, from the other direction: the
+# archiver has to match the target, and here PATH is what gets it wrong.
+# Apple's ld requires every 64-bit Mach-O member of an archive to begin on
+# an 8-byte boundary, which Apple's ar arranges by padding the member's
+# name field (`#1/20` for a 10-character name). GNU ar writes the short
+# name form instead, putting the first member at offset 68, and the build
+# then gets all the way to the link before failing with "64-bit mach-o
+# member 'kda_neon.o' not 8-byte aligned in 'libwaste.a'" — issue #16, on a
+# machine with Homebrew's binutils ahead of /usr/bin. Name the system
+# archiver rather than trusting PATH. A command-line AR= still overrides.
+AR      := $(if $(wildcard /usr/bin/ar),/usr/bin/ar,ar)
 else
 SOEXT   := so
 endif
