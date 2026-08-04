@@ -8,6 +8,79 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
+## 0.6.5 — 2026-08-04
+
+Nothing in the engine changed: a binary built from this tag decodes exactly
+as 0.6.4 did, and no container format moved. What changed is on either side
+of it — converting K3 on the disk you actually have, and how long a reply
+the server gives a client that never asked for a length.
+
+### Added
+
+- **`tools/convert.py --reclaim {off,dry,on}`** — deletes each source shard
+  once its last consumer has published, so peak staging is the container
+  plus the shards still owed rather than the container plus all of them. On
+  K3 that is the difference between 1.42 TB of staging beside a 982 GiB
+  container — two disks — and one. It is safe because every tensor has
+  exactly one consumer, so a shard whose last consumer has finished is never
+  opened again. `--reclaim` also runs the trunk pass first: it consumes
+  every non-expert tensor, and while it ran last almost no shard was ever
+  spent. The reordering is neutral — `off`, `dry` and `on` produce
+  byte-identical containers.
+
+  **Off by default, and not reversible.** A reclaimed shard has to be
+  downloaded again, and `verify_container.py` loses the comparison against
+  source for good — which is why `pipeline.sh` now converts one probe layer
+  and round-trips *that* while the checkpoint is still whole, before
+  converting the rest. Stages renumber to six; stage 4 passes `--skip-trunk`
+  because stage 2 built it, a K3 trunk being hours to do twice.
+
+  It refuses **before** deleting rather than during: `--experts`, a
+  container inside the checkpoint or the reverse, a shard that is neither on
+  disk nor already reclaimed, and a bank that is not a whole bank —
+  `bank_is_sound` walks the records by their own block counts for 48 bytes
+  each, which catches a bank truncated by a kill, a full disk, or a torn
+  rename. Releases are recorded in `<src>/.reclaimed`, fsynced ahead of the
+  unlink, because a name recorded but not deleted costs nothing while the
+  reverse is indistinguishable from an unfinished download.
+  [K3.md](docs/K3.md) has the refusals and the ledger discipline.
+
+  Proven on a copy of a real Kimi-Linear checkpoint rather than on stubs:
+  `--layers 1,2 --reclaim on` deleted exactly the one shard the dry pass
+  named (4.7 GiB, 92 -> 87 GB), left the other 19 unchanged, and wrote a
+  container that reads back 256 records with 0 problems. The second run over
+  the now-incomplete source refuses — pointing at `--skip-trunk` — and
+  deletes nothing while refusing.
+
+### Changed
+
+- **The server's default `--max-tokens` is 4096, was 512.** Clients mostly
+  do not send the field; Open-WebUI does not unless you set it in the
+  model's advanced parameters, so the server default was every reply's
+  length, and a reply that ends at the cap is indistinguishable from a model
+  that stopped on its own. `--ctx` never lifted it and could not: the limit
+  is clamped to the room left after the prompt, so raising the context only
+  ever lowers the cap. **This is a behaviour change, not a fix** — a
+  deployment that relied on 512 to bound per-request cost should now pass
+  `--max-tokens` explicitly. `Engine.generate`'s own default is untouched:
+  the server always passes the value, so the two never meet.
+
+- **[SERVE.md](docs/SERVE.md) documents Open-WebUI** — the base URL, why no
+  compatibility mode is needed, `--host 0.0.0.0` for a client in a
+  container, the background title and tag requests that queue behind the
+  reply on the lock every generation takes, and `reasoning_content`, which a
+  client that does not know the field renders as a server that has stopped.
+
+### Fixed
+
+- **A resumed `--reclaim` run believed the download ledger over the disk.**
+  `ST.have()` reads `fetch_weights.sh`'s `.download-state`, so a shard that
+  the run had itself consumed still read as present and both refusals were
+  skipped. Absence is now asked of the filesystem, and `have()` only asked
+  whether a shard that is there finished downloading. The pipeline test
+  found it; the file-backed test stub could not have, and now mirrors
+  `mxfp4.ST`, trap included.
+
 ## 0.6.4 — 2026-08-04
 
 A container format addition and the measurements that price it. **Nothing
