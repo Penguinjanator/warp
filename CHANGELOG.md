@@ -8,6 +8,82 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
+## 0.6.4 — 2026-08-04
+
+A container format addition and the measurements that price it. **Nothing
+changes by default and this is not a speedup release**: no shipped container
+uses the new format, the new switches are off, and an engine built from this
+tag behaves exactly as 0.6.3 did unless it is asked otherwise. The reason to
+tag it is that `fmt 8` is now allocated and public, and a format code that
+lives only in a working tree is one somebody else reassigns.
+
+### Added
+
+- **`WQ_VQ4P`, fmt 8** — 4 residual VQ stages of 64 entries with 6-bit
+  indices packed four into three bytes. Same 3.00 bits/weight as VQ3R, same
+  record size, same blocked index layout; what changes is that a 64-entry
+  stage table is 64 bytes, which is one NEON `vqtbl4q`, where VQ3R's
+  256-entry table is sixteen vector registers on a machine that has
+  thirty-two and cannot be held at all. That is why the VQ3R gather is
+  scalar. [FORMAT.md](docs/FORMAT.md) specifies the packing;
+  [LEARNED.md](docs/LEARNED.md) §41 has the derivation.
+
+  It is a distinct fmt rather than a manifest flag because a VQ4P payload is
+  byte-for-byte the size of a VQ3R one, so a reader taking the three bytes
+  for three one-byte indices would decode silently and wrongly. The engine
+  additionally refuses a record whose fmt byte disagrees with the manifest's
+  `index_bits`, which is the only read-path behaviour that changed.
+
+- **`tools/convert.py`: `--entries`, `--index-bits`, `--stages 4|6`.**
+  Default output is unchanged VQ3R. The parameters travel in the job tuple
+  rather than a module global: the worker pool uses `spawn`, so a global
+  would have written every layer at 256 entries without saying so.
+
+- **`WASTE_XPAR`** — one task per routed expert instead of one per row
+  range, **off by default**. `WASTE_XPAR_BATCH` bounds how many experts are
+  held at once, `WASTE_P6_CHUNK` sizes the VQ4P apply, and
+  `-DWASTE_P6_SCALAR` builds the kernel's portable path, which is
+  bit-identical to the NEON one rather than merely close — §43 explains why
+  an int8 lookup table raises that bar.
+
+- **`tools/lutbw.c`, `tools/lutmt.c`** — the two benches the sections below
+  rest on: kernel throughput against a working set from 4 MB to 1 GB, and
+  the same kernels driven through the engine's own `waste_parallel_for`.
+
+### Measured
+
+Numbers on this commit, medians of repeated runs, each container on the same
+storage as the baseline it is compared against.
+
+- **The kernel is 3.88x** and that survives a gigabyte of index stream, so it
+  is not a cache artefact (§46).
+- **In the engine it is 1.24x** on Kimi-Linear best-configuration against
+  best-configuration, and **1.74x** against what the engine does untouched;
+  **1.09x** on K3 (§46, §47).
+- **Quality costs +2.7% perplexity** on Kimi-Linear (10.937 -> 11.237), all
+  of it from the smaller codebook. Quantizing the runtime lookup table to
+  int8 — which is what makes a byte shuffle possible at all — measured free,
+  because the scale is per 32 vector positions rather than global (§41).
+
+The gap between 3.88x on a bench and 1.17x in place is the useful part, and
+§47 is the answer: 3.88x is a single-thread ratio, this machine is 6
+performance cores and 12 efficiency cores with the pool taking all 18, and
+the fast kernel is the one an E-core straggler hurts. **On K3 the same
+settings invert** — six threads are 34% worse than eighteen there. No
+default was changed because every one of them is right on one model and
+wrong on the other.
+
+### Not adopted
+
+- **6x16 codebooks** (FAISS FastScan's shape) are a third faster than 4x64
+  and cost 18% more reconstruction error against 4x64's 7.5%. Speed was not
+  the binding constraint (§41).
+- **Expert-parallel MoE as a default.** Worth 1.24x on Kimi-Linear, a
+  regression on K3: the batch that gives it parallelism is the batch that
+  barriers the read-ahead, and no batch size wins both (§44).
+- **Capping the thread pool at the performance cores.** A 25% win on
+  Kimi-Linear and a 34% loss on K3 (§47).
+
 ## 0.6.3 — 2026-08-03
 
 ### Fixed
