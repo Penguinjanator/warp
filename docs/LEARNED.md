@@ -2656,3 +2656,89 @@ What would deserve building, if this comes back: a pool that knows which
 cores are performance cores and sizes SIMD-heavy work to them while leaving
 the latency-bound kernels the whole machine. That is a real change to
 `threads.h` and it is not justified by one kernel on one laptop.
+
+## 48. Gate 1 answered, on hardware this repo does not have (2026-08-04)
+
+**Third-party measurement. Not reproduced here, and it cannot be** — there
+is no x86 server and no NVIDIA card on this machine, which is the reason
+issue #11 was written as a set of gates for someone else to run rather than
+as a plan.
+
+`ssarthak15` ran gate 1 on one Oracle bare-metal DenseIO node, dual EPYC
+7J13 (Zen 3, 32 cores, two-socket NUMA interleave), K3 with direct expert
+I/O from NVMe. `lm_head` medians over 33 measured decodes after 16 warm
+ones, in each of three fresh processes, against a matched host scan on the
+same cores, affinity mask and NUMA policy over 32 GiB — 64x the node's
+512 MiB aggregate LLC:
+
+| | `lm_head` | effective | matched host | ratio |
+|---|---|---|---|---|
+| 1 | 7.100 ms | 168.0 GB/s | 170.2 GB/s | **98.7%** |
+| 2 | 8.827 | 135.1 | 171.7 | 78.7% |
+| 3 | 8.688 | 137.3 | 164.9 | 83.2% |
+
+Threshold declared before the run was 70%. **The x86 path is bandwidth-bound
+too.**
+
+**Why it is trustworthy without being reproducible.** The byte accounting
+is what would give away a number that had not been measured, and it
+reconciles exactly with this repo's own format. 1,174,405,120 payload bytes
+against 18,350,080 bytes of fp16 scales is 128 elements per scale, which is
+`quantize_q8g(W, group=128)`; the payload is 163840 x 7168, K3's vocab by
+its hidden, so it is that tensor and not a stand-in; and `lm_head` does
+keep 8 bits in a default conversion while the trunk goes to 4, so it is
+also the same width `docs/BACKENDS.md` measured Metal against. Every
+derived figure divides back out, including 1/1947 ms against the pooled
+0.5139 tok/s.
+
+**The AVX2/AVX-512 gap is smaller than it looks.** Gate 1 asked about
+AVX-512 and this is AVX2. A wider ISA moves the same bytes with fewer
+instructions, so a kernel already at 79-99% of achievable bandwidth has
+nowhere to go but 100% — the answer's *direction* does not depend on the
+ISA, only its exact value does. Zen 3 has no AVX-512 at all, so it was not
+measurable on that node regardless.
+
+**Against the Metal row it replaces**, same tensor, same width, same one
+dispatch per token:
+
+| | `lm_head` | effective |
+|---|---|---|
+| Apple silicon, NEON (2026-07-28) | 6 ms | 195 GB/s |
+| dual EPYC 7J13, AVX2 | 7.10 ms | 168 GB/s |
+
+The laptop beats the 16-channel dual-socket server on this kernel. Both are
+at their machine's bandwidth, which is the finding.
+
+**What it settles.** The clause in `docs/BACKENDS.md` — "the CPU path is
+already running at the machine's memory bandwidth, and this is a
+bandwidth-bound matvec" — was an Apple-silicon observation being asked to
+carry an argument about accelerators in general. It now has an x86 leg. So
+filling the `waste_backend` slots with CUDA kernels reproduces the Metal
+result on different hardware, and issue #11's gate 1 branch where the host
+had headroom to reclaim is closed.
+
+**What it does not settle.** Nothing about the "different engine" — one
+dispatch per layer, residual resident in VRAM, which is where a discrete
+card's bandwidth advantage would actually live. That is gate 2, the
+end-to-end cost of one dependent matvec over PCIe against this 7.10 ms, and
+it remains unmeasured.
+
+**And gate 3's premise has moved since the issue was written.** It bounded
+an accelerator at roughly 2x by Amdahl on "~53% of a K3 decode step is
+expert reads". §46 measured the disk at the engine's real access pattern
+and found K3 decode compute-bound by about 1.8x at a 17.7 GB cache. Gate 3
+is more open than it was posed, not less.
+
+**One decode number worth keeping**, from the same run and the same
+caveats — K3, 99 tokens in 192.645 s, one serial stream, 32 threads, greedy,
+automatic budget:
+
+| | |
+|---|---|
+| pooled | 0.514 tok/s |
+| median forward | 1947 ms/token |
+| suite range | 0.47-0.55 tok/s |
+
+It stays here and not in `README.md`. Every number there was measured on
+the commit it ships with, and dual EPYC is a class of machine this repo
+cannot verify on.
