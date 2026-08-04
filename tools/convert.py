@@ -24,6 +24,21 @@ member of the family (Kimi-Linear) by pointing --src elsewhere.
 
 Resumable: a layer whose bank file already exists is skipped. Never holds
 more than one layer of experts in memory.
+
+Peak *disk*, though, was the source plus the container — 1.42 TB of K3
+staging alongside a 982 GiB container, which is two disks. --reclaim
+removes that: every tensor here has exactly one consumer (the expert layer
+it belongs to, or the single trunk pass), so a shard whose last consumer
+has finished will never be opened again and is deleted while the run
+continues. Peak staging becomes the container plus the shards still owed.
+
+  ... --reclaim dry     # say which shards it would delete, delete nothing
+  ... --reclaim on      # delete them
+
+It is off by default and it is not reversible: a reclaimed shard has to be
+downloaded again, and tools/verify_container.py can no longer check the
+container against its source. Prove a recipe with that first, reclaim on
+the runs after.
 """
 
 import argparse
@@ -379,6 +394,186 @@ def write_expert_record(f, layer, eid, cb_base, payloads, scales, shapes,
     return blocks
 
 
+def bank_is_sound(path, layer, n_exp):
+    """True if `path` is a whole bank: n_exp well-formed records for `layer`,
+    tiling the file exactly, each one naming the expert the index will ask
+    for at that offset.
+
+    Costs 48 bytes per record — it walks the file by each record's own block
+    count — and catches the failure that makes --reclaim dangerous: a bank
+    truncated by a kill, a full disk, or a rename that landed torn. It says
+    nothing about the *numbers* in the payloads; that is
+    tools/verify_container.py's job, and it needs the source weights that
+    reclaiming deletes. Which is the order to work in: prove a recipe with
+    verify_container.py once, reclaim on the runs after.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False
+    hdr_size, seen, off = 48, 0, 0
+    with open(path, "rb") as f:
+        while off < size:
+            f.seek(off)
+            raw = f.read(hdr_size)
+            if len(raw) < hdr_size:
+                return False
+            (magic, L, eid, _fmt, _flags, _cb, lowrank, _r0, blocks,
+             g_off, u_off, d_off, corr_off, _crc, _r1, _r2) = struct.unpack(
+                 "<IHHBBHHHIIIIIIII", raw)
+            total = blocks * ALIGN
+            if (magic != MAGIC_EXPERT or L != layer or eid != seen
+                    or lowrank != 0 or blocks < 1 or off + total > size
+                    or not hdr_size <= g_off < u_off < d_off < corr_off <= total):
+                return False
+            off += total
+            seen += 1
+    return seen == n_exp and off == size
+
+
+class ShardDebt:
+    """Which source shards some part of this conversion still has to read.
+
+    Peak staging is otherwise the source *plus* the container — 1.42 TB and
+    982 GiB for K3, which is two disks. But a shard holds whole tensors, and
+    every tensor here has exactly one consumer: the expert layer it belongs
+    to, or the single trunk pass. Once the last consumer of a shard has
+    published its output, nothing in this script will open that shard again,
+    so it can go while the conversion is still running.
+
+    This class only tracks and reports. Deleting is `release`, and main()
+    calls it only under --reclaim.
+    """
+
+    TRUNK = ("trunk",)
+
+    @staticmethod
+    def name(who):
+        return f"layer {who[1]}" if who[0] == "layer" else " ".join(map(str, who))
+
+    @staticmethod
+    def ledger(src):
+        """Shards an earlier run already reclaimed from this checkpoint.
+
+        Without it a resumed conversion cannot tell a shard it consumed
+        itself from one that never downloaded, and has to refuse both. It
+        lives beside fetch_weights.sh's .download-state because it describes
+        the same thing: what is, and is no longer, in the staging area.
+        """
+        path = os.path.join(src, ".reclaimed")
+        try:
+            with io.open(path, encoding="utf-8") as f:
+                return set(f.read().split())
+        except OSError:
+            return set()
+
+    def __init__(self, weight_map, src):
+        self.src = src
+        self.ledger_path = os.path.join(src, ".reclaimed")
+        self.owed = {}            # shard -> consumers that have not finished
+        self.held_by = {}         # consumer -> the shards it is holding up
+        for name, shard in weight_map.items():
+            # A shard an earlier run already reclaimed is not staging this
+            # one can give back, and counting it would report a saving twice.
+            if not os.path.exists(os.path.join(src, shard)):
+                continue
+            who = self.consumer(name)
+            self.owed.setdefault(shard, set()).add(who)
+            self.held_by.setdefault(who, set()).add(shard)
+        self.freed = 0
+        self.released = []
+
+    @staticmethod
+    def consumer(name):
+        """The one part of this script that reads `name`.
+
+        The trunk pass takes everything that is not an expert. mxfp4 stores a
+        tensor as a _packed/_scale pair and ST rejoins them, so both halves
+        belong wherever the tensor they encode does.
+        """
+        base = name
+        for suffix in ("_packed", "_scale"):
+            if base.endswith(suffix):
+                base = base[:-len(suffix)]
+        if ".experts." not in base:
+            return ShardDebt.TRUNK
+        parts = base.split(".")
+        try:
+            return ("layer", int(parts[parts.index("layers") + 1]))
+        except (ValueError, IndexError):
+            # An expert whose layer cannot be read is an expert nobody can
+            # prove is spent. Hold its shards forever rather than guess.
+            return ("unreadable", base)
+
+    def release(self, who, delete):
+        """Mark a consumer finished. Returns the (shard, bytes) it freed,
+        having deleted them when `delete`, or merely counted them when not."""
+        freed = []
+        for shard in sorted(self.held_by.get(who, ())):
+            pending = self.owed.get(shard)
+            if pending is None:
+                continue              # already released by another consumer
+            pending.discard(who)
+            if pending:
+                continue
+            path = os.path.join(self.src, shard)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                del self.owed[shard]
+                continue
+            if delete:
+                # Ledger first: a shard recorded but not yet deleted costs a
+                # resumed run nothing, while one deleted but not recorded is
+                # indistinguishable from a download that never finished.
+                try:
+                    with io.open(self.ledger_path, "a", encoding="utf-8") as f:
+                        f.write(shard + "\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.remove(path)
+                except OSError as e:
+                    print(f"  reclaim: cannot remove {shard}: {e}",
+                          file=sys.stderr)
+                    continue
+            del self.owed[shard]
+            self.freed += size
+            self.released.append(shard)
+            freed.append((shard, size))
+        return freed
+
+    def still_owed(self):
+        """Shards no consumer has released, and the bytes they hold."""
+        total = 0
+        for shard in self.owed:
+            try:
+                total += os.path.getsize(os.path.join(self.src, shard))
+            except OSError:
+                pass
+        return len(self.owed), total
+
+
+def human(n):
+    """Sizes here run from a test fixture to 1.4 TB; print both legibly."""
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if n < 1024 or unit == "GiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def reclaim(debt, mode, who, what):
+    """Release `who`'s shards and say what that did, or would do."""
+    if debt is None:
+        return
+    freed = debt.release(who, mode == "on")
+    if not freed:
+        return
+    verb = "freed" if mode == "on" else "would free"
+    print(f"  reclaim: {what} {verb} {len(freed)} shard(s), "
+          f"{human(sum(s for _, s in freed))} "
+          f"({human(debt.freed)} total)", flush=True)
+
+
 def bank_codebook_base(path):
     """The codebook base a finished bank was written with, or -1.
 
@@ -466,6 +661,80 @@ def convert_layer(job):
 
 
 
+def build_trunk(args, sr, st, existing, manifest_path):
+    """Write trunk.bin.tmp and return its index, or None if the run must stop.
+
+    A function rather than a stretch of main() because --reclaim has to run
+    it *before* the expert layers instead of after: the trunk pass is the
+    consumer of every tensor that is not an expert, so until it has run
+    almost no shard is fully spent and there is nothing to delete.
+    """
+    trunk_path = os.path.join(args.out, "trunk.bin")
+    trunk_tmp = trunk_path + ".tmp"
+    tindex = []
+    if args.skip_trunk:
+        # "The trunk is unchanged between runs" — so carry its published
+        # index forward and still publish. Returning here instead left the
+        # banks this run had just converted unreferenced by any manifest,
+        # and the codebooks.bin the merge had already replaced described by
+        # an old one: a container that reports itself as fine and whose
+        # layer bases point into records that are no longer there.
+        tindex = (existing or {}).get("trunk")
+        if not isinstance(tindex, list) or not tindex:
+            print(f"--skip-trunk keeps the trunk {manifest_path} describes, "
+                  "and it describes none — convert once without it",
+                  file=sys.stderr)
+            return None
+        if not os.path.exists(trunk_path):
+            print(f"--skip-trunk needs {trunk_path}, which is not there",
+                  file=sys.stderr)
+            return None
+        print(f"skipping trunk: keeping the published {len(tindex)} tensors")
+    else:
+        # Keep the currently published trunk intact for the entire
+        # conversion. A K3 trunk takes hours to rebuild; opening the final
+        # path with "wb" destroyed a working container at the start of that
+        # interval.
+        with open(trunk_tmp, "wb") as tf:
+            for name in sorted(sr.names()):
+                if ".experts." in name or name.endswith(("_packed", "_scale")):
+                    continue
+                if not st.have(name):
+                    continue                  # shard not downloaded yet
+                t = st.tensor(name)
+                off = tf.tell()
+                if t.dim() == 1 or t.numel() < 1 << 16:
+                    tf.write(raw_bytes(t.float()))
+                    tindex.append({"name": name, "fmt": FMT_F32, "off": off,
+                                   "shape": list(t.shape),
+                                   "bytes": tf.tell() - off})
+                else:
+                    # 4 bits for the bulk; the embedding table and the output
+                    # head keep 8, they are small and sit at both ends of the
+                    # network where error is least forgiving
+                    big = not (name.endswith("embed_tokens.weight")
+                               or name.endswith("lm_head.weight"))
+                    bits = 8 if (args.trunk8 or not big) else args.trunk_bits
+                    if bits == 3:
+                        q, sc, shape = quantize_q3g(t); fmt = FMT_Q3G
+                    elif bits == 4:
+                        q, sc, shape = quantize_q4g(t); fmt = FMT_Q4G
+                    else:
+                        q, sc, shape = quantize_q8g(t); fmt = FMT_Q8G
+                    tf.write(raw_bytes(q))
+                    sc_off = tf.tell()
+                    tf.write(raw_bytes(sc))
+                    tindex.append({"name": name, "fmt": fmt,
+                                   "off": off, "shape": shape, "group": 128,
+                                   "scale_off": sc_off,
+                                   "bytes": tf.tell() - off})
+            tf.flush()
+            os.fsync(tf.fileno())
+        print(f"trunk: {os.path.getsize(trunk_tmp)/2**20:.0f} MB, "
+              f"{len(tindex)} tensors")
+    return tindex
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True,
@@ -505,11 +774,23 @@ def main():
                          "using every core")
     ap.add_argument("--cb-sample", type=int, default=12,
                     help="experts sampled per layer to fit the codebooks")
+    ap.add_argument("--reclaim", choices=("off", "dry", "on"), default="off",
+                    help="delete each source shard as soon as no part of "
+                         "this conversion will read it again, so peak "
+                         "staging is the container plus the shards still "
+                         "owed rather than the container plus the whole "
+                         "checkpoint; 'dry' only says what it would delete")
     args = ap.parse_args()
     if args.jobs < 1:
         ap.error("--jobs must be at least 1")
     if args.cb_sample < 1:
         ap.error("--cb-sample must be at least 1")
+    if args.reclaim != "off" and args.experts:
+        # A layer converted with --experts N never read the tensors of the
+        # other experts, so its shards are not spent and deleting them would
+        # take weights this container does not contain.
+        ap.error("--reclaim and --experts are exclusive: a layer converted "
+                 "with an expert subset has not consumed its shards")
     # The packing is 4x6 into 3 bytes and nothing else; a 6-bit field cannot
     # hold an index into more than 64 entries, and the engine's unpack is
     # written for exactly four stages.
@@ -536,6 +817,69 @@ def main():
     st = ST(args.src)
     sr = ShardReader(args.src)
     dev = torch.device(args.device)
+
+    # ---- staging reclaim: refuse before anything is deleted, not during --
+    debt = None
+    if args.reclaim != "off":
+        src_real, out_real = os.path.realpath(args.src), os.path.realpath(args.out)
+        if (src_real == out_real
+                or out_real.startswith(src_real + os.sep)
+                or src_real.startswith(out_real + os.sep)):
+            print("--reclaim refuses to delete shards that live inside the "
+                  "container's own directory, or a container inside the "
+                  "checkpoint: keep the two apart (docs/GATES.md, Gate H)",
+                  file=sys.stderr)
+            return 1
+        # A shard that is absent is either one an earlier reclaim consumed —
+        # fine, and the ledger says so — or one the download never finished.
+        # The second is what must not proceed: build_trunk silently skips a
+        # tensor whose shard is not there, so a partial checkpoint yields a
+        # short trunk, and reclaiming would then delete the shards that fed
+        # the parts that *were* right.
+        #
+        # Absence is asked of the filesystem, not of ST.have(): that reads
+        # fetch_weights.sh's .download-state, which still lists a shard this
+        # tool deleted and would report it present. have() is asked the other
+        # question — whether a shard that IS there finished downloading.
+        spent = ShardDebt.ledger(args.src)
+        probe = {}                          # shard -> one tensor inside it
+        for name, fn in st.wm.items():
+            probe.setdefault(fn, name)
+        gone, absent, unverified = set(), [], []
+        for fn, one in sorted(probe.items()):
+            if not os.path.exists(os.path.join(args.src, fn)):
+                gone.add(fn)
+                if fn not in spent:
+                    absent.append(fn)
+            elif not st.have(one):
+                unverified.append(fn)
+        if absent or unverified:
+            why = (f"{len(absent)} missing (first {absent[0]})" if absent
+                   else f"{len(unverified)} unverified (first {unverified[0]})")
+            print(f"--reclaim needs every shard either on disk and verified "
+                  f"or already reclaimed: {why}. Finish the download first.",
+                  file=sys.stderr)
+            return 1
+        # The trunk cannot be rebuilt from a checkpoint whose non-expert
+        # shards are already gone. Say which flag makes that a run rather
+        # than a truncated container.
+        if gone and not args.skip_trunk and any(
+                ShardDebt.consumer(name) == ShardDebt.TRUNK
+                and fn in gone for name, fn in st.wm.items()):
+            print(f"--reclaim already consumed the shards the trunk is built "
+                  f"from; rerun with --skip-trunk to keep the trunk "
+                  f"{os.path.join(args.out, 'manifest.json')} publishes",
+                  file=sys.stderr)
+            return 1
+        debt = ShardDebt(st.wm, args.src)
+        n_shards, held = debt.still_owed()
+        print(f"reclaim={args.reclaim}: {n_shards} shards, "
+              f"{human(held)} of staging to give back"
+              + ("" if args.reclaim == "on" else " (nothing is deleted)"))
+        if args.reclaim == "on":
+            print("  a reclaimed shard is gone: tools/verify_container.py "
+                  "cannot check this container against its source afterwards, "
+                  "so prove the recipe on a smaller model first.")
     print(f"device={dev}  stages={args.stages}  entries={args.entries}  "
           f"index_bits={args.index_bits} "
           f"({args.stages * args.index_bits / VEC_DIM:.2f} b/w)")
@@ -623,6 +967,41 @@ def main():
                      args.entries, args.index_bits, str(dev), args.cb_sample,
                      base, cached_ok))
 
+    tindex = None
+    if debt is not None:
+        # The trunk pass consumes every tensor that is not an expert, so
+        # until it has run almost no shard is fully spent. Run it first. It
+        # writes trunk.bin.tmp either way and the published trunk.bin is
+        # still only replaced together with the manifest, so nothing about
+        # what this run can survive changes — only the order.
+        tindex = build_trunk(args, sr, st, existing, manifest_path)
+        if tindex is None:
+            return 1
+        reclaim(debt, args.reclaim, ShardDebt.TRUNK, "trunk")
+
+        # A resumed conversion is holding the shards of every layer an
+        # earlier run already finished. Give those back too, on the same
+        # evidence the engine would use: the manifest names the bank, and
+        # the bank is a whole bank.
+        for L in sorted(set(range(first_dense, n_layers)) - set(layers)):
+            meta = manifest_layers.get(str(L), {})
+            bank = os.path.join(args.out, f"experts-L{L}.bin")
+            if (meta.get("experts") == n_exp and os.path.exists(bank)
+                    and meta.get("bytes") == os.path.getsize(bank)
+                    and bank_is_sound(bank, L, n_exp)):
+                reclaim(debt, args.reclaim, ("layer", L), f"layer {L} (earlier run)")
+
+    def reclaim_layer(L, size):
+        """Give back layer L's shards, once its bank proves it is finished."""
+        if debt is None or not size:
+            return
+        bank = os.path.join(args.out, f"experts-L{L}.bin")
+        if not bank_is_sound(bank, L, n_exp):
+            print(f"  reclaim: keeping layer {L}'s shards — experts-L{L}.bin "
+                  f"is not a complete bank of {n_exp} records", file=sys.stderr)
+            return
+        reclaim(debt, args.reclaim, ("layer", L), f"layer {L}")
+
     if args.jobs > 1:
         import multiprocessing as mp
         ctx = mp.get_context("spawn")     # torch/MPS is not fork-safe
@@ -634,12 +1013,14 @@ def main():
                 Lr, sz, base, how = res
                 print(f"  layer {Lr}: {sz/2**20:.0f} MB, cb base {base} [{how}] "
                       f"({len(results)}/{len(jobs)})", flush=True)
+                reclaim_layer(Lr, sz)
     else:
         results = []
         for j in jobs:
             res = convert_layer(j)
             results.append(res)
             print(f"  layer {res[0]}: {res[1]/2**20:.0f} MB [{res[3]}]", flush=True)
+            reclaim_layer(res[0], res[1])
 
     for L, sz, base, how in sorted(results):
         if sz:
@@ -825,69 +1206,14 @@ def main():
               f"max_patches {vj['max_patches']}")
 
     # ---- trunk ----------------------------------------------------------
+    # --reclaim has already run this, before the experts, so that the shards
+    # holding non-expert tensors become deletable at all.
+    if tindex is None:
+        tindex = build_trunk(args, sr, st, existing, manifest_path)
+        if tindex is None:
+            return 1
     trunk_path = os.path.join(args.out, "trunk.bin")
     trunk_tmp = trunk_path + ".tmp"
-    tindex = []
-    if args.skip_trunk:
-        # "The trunk is unchanged between runs" — so carry its published
-        # index forward and still publish. Returning here instead left the
-        # banks this run had just converted unreferenced by any manifest,
-        # and the codebooks.bin the merge had already replaced described by
-        # an old one: a container that reports itself as fine and whose
-        # layer bases point into records that are no longer there.
-        tindex = (existing or {}).get("trunk")
-        if not isinstance(tindex, list) or not tindex:
-            print(f"--skip-trunk keeps the trunk {manifest_path} describes, "
-                  "and it describes none — convert once without it",
-                  file=sys.stderr)
-            return 1
-        if not os.path.exists(trunk_path):
-            print(f"--skip-trunk needs {trunk_path}, which is not there",
-                  file=sys.stderr)
-            return 1
-        print(f"skipping trunk: keeping the published {len(tindex)} tensors")
-    else:
-        # Keep the currently published trunk intact for the entire
-        # conversion. A K3 trunk takes hours to rebuild; opening the final
-        # path with "wb" destroyed a working container at the start of that
-        # interval.
-        with open(trunk_tmp, "wb") as tf:
-            for name in sorted(sr.names()):
-                if ".experts." in name or name.endswith(("_packed", "_scale")):
-                    continue
-                if not st.have(name):
-                    continue                  # shard not downloaded yet
-                t = st.tensor(name)
-                off = tf.tell()
-                if t.dim() == 1 or t.numel() < 1 << 16:
-                    tf.write(raw_bytes(t.float()))
-                    tindex.append({"name": name, "fmt": FMT_F32, "off": off,
-                                   "shape": list(t.shape),
-                                   "bytes": tf.tell() - off})
-                else:
-                    # 4 bits for the bulk; the embedding table and the output
-                    # head keep 8, they are small and sit at both ends of the
-                    # network where error is least forgiving
-                    big = not (name.endswith("embed_tokens.weight")
-                               or name.endswith("lm_head.weight"))
-                    bits = 8 if (args.trunk8 or not big) else args.trunk_bits
-                    if bits == 3:
-                        q, sc, shape = quantize_q3g(t); fmt = FMT_Q3G
-                    elif bits == 4:
-                        q, sc, shape = quantize_q4g(t); fmt = FMT_Q4G
-                    else:
-                        q, sc, shape = quantize_q8g(t); fmt = FMT_Q8G
-                    tf.write(raw_bytes(q))
-                    sc_off = tf.tell()
-                    tf.write(raw_bytes(sc))
-                    tindex.append({"name": name, "fmt": fmt,
-                                   "off": off, "shape": shape, "group": 128,
-                                   "scale_off": sc_off,
-                                   "bytes": tf.tell() - off})
-            tf.flush()
-            os.fsync(tf.fileno())
-        print(f"trunk: {os.path.getsize(trunk_tmp)/2**20:.0f} MB, "
-              f"{len(tindex)} tensors")
 
     # `arch` is descriptive only — the engine derives its own from
     # config._outer.architectures, because the *inner* architectures says
@@ -942,6 +1268,19 @@ def main():
         os.replace(trunk_tmp, trunk_path)
     os.replace(manifest_tmp, manifest_path)
     print(f"wrote {args.out}/manifest.json")
+    if debt is not None:
+        n_shards, held = debt.still_owed()
+        verb = "reclaimed" if args.reclaim == "on" else "reclaimable"
+        print(f"reclaim: {human(debt.freed)} {verb} from "
+              f"{len(debt.released)} shard(s); {n_shards} shard(s) "
+              f"({human(held)}) still held")
+        if n_shards:
+            # Almost always the layers this invocation did not convert. Say
+            # which, because "still held" with no reason reads like a bug.
+            waiting = sorted({who for s in debt.owed for who in debt.owed[s]})
+            print(f"  waiting on: "
+                  f"{', '.join(ShardDebt.name(w) for w in waiting[:8])}"
+                  f"{' ...' if len(waiting) > 8 else ''}")
     return 0
 
 
