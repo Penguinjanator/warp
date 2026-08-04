@@ -104,8 +104,12 @@ Kimi-Linear and a regression on K3, because the batch that gives it
 parallelism is the same batch that barriers the read-ahead, LEARNED §44),
 `WASTE_XPAR_BATCH=N` (experts held at a time, default 4),
 `WASTE_P6_CHUNK=N` (rows per chunk in the VQ4P apply, in index blocks,
-default 16 — the kernel is fast enough that the pool wants fewer, bigger
-chunks). Building with `-DWASTE_P6_SCALAR` drops the VQ4P kernel to its
+default 16). **These three and `WASTE_THREADS` interact, and the best
+setting inverts between models** — on Kimi-Linear `WASTE_XPAR=1` is worth
+1.24x and six threads beat eighteen; on K3 six threads are 34% *worse* than
+the default because its applies are large enough to use the E-cores too.
+LEARNED §47 has the table; do not carry a setting from one model to the
+other. Building with `-DWASTE_P6_SCALAR` drops the VQ4P kernel to its
 portable path; the two are meant to be **bit-identical**, not merely close,
 and that is checkable rather than asserted — see LEARNED §43 for why an
 int8 lookup table raises the bar that far.

@@ -2548,7 +2548,8 @@ buckets to throughput over the ~17.4 GB of index a token touches:
 VQ4P in the engine runs at its single-thread rate. It is not the chunk
 size — `WASTE_P6_CHUNK` was swept 1..16 on K3 and every value landed inside
 the run-to-run noise — and 25 GB/s is far too low to be a memory ceiling on
-this machine. Recorded as an open question rather than a guess.
+this machine. Recorded as an open question rather than a guess; §47
+answers it.
 
 **So the standing recommendation is unchanged, for a new reason.** VQ4P is
 worth having where the apply is dispatch-bound and small (Kimi-Linear,
@@ -2565,3 +2566,93 @@ against `diskbench` whenever it is leaned on, rather than inherited.
 **The rule.** Before claiming anything is disk-bound, run `diskbench` and
 divide. The stall bucket says how much I/O failed to overlap; that is a
 different question and it does not answer this one.
+
+## 47. The fast kernel is the one the E-cores hurt (2026-08-04)
+
+§46 left a hole: the VQ4P kernel is 3.88x standalone and 1.17x in the
+engine, it is not cache residency and it is not memory bandwidth, and the
+throughputs said it runs at its single-thread rate however many threads the
+pool has. Three things, and the third inverts between models.
+
+The instrument is `tools/lutmt.c` — the same two kernels driven through the
+engine's own `waste_parallel_for`, with thread count and chunk from argv,
+so the dispatch under test is the real one and the engine's noise is not.
+
+**One: 3.88x is a single-thread ratio, and the slow kernel parallelizes
+better.** K3's gate shape, index buffers rotated so no pass re-reads the
+last one's bytes:
+
+| threads | VQ3R | VQ4P | ratio |
+|---|---|---|---|
+| 1 | 6.6 GB/s | 26.1 | **3.94x** |
+| 4 | 20.0 | 74.5 | 3.72x |
+| 6 | 27.9 | **91.3** | 3.28x |
+| 8 | 28.7 | 88.4 | 3.08x |
+| 10 | 29.8 | 73.2 | 2.45x |
+
+So the ceiling in a threaded engine was never 3.9x. It is ~3.3x, and only
+at one thread count.
+
+**Two: this machine is 6 P-cores and 12 E-cores, and the pool takes all
+18.** VQ4P peaks exactly on the P-cores and *degrades* past them — 91.3 down
+to 73.2. VQ3R does not: it keeps improving to 8-10. The asymmetry is that
+VQ3R is latency-bound, so a slow core costs it proportionally little, while
+VQ4P is wide and fast and an E-core running the same chunk is a straggler
+the barrier waits for. `waste_parallel_for` cuts work into `ceil(n/nthreads)`
+— one task per thread, nothing left to steal — so the straggler is
+structural rather than unlucky. Oversubscribing helps (12 tasks on 10
+threads: 73.1 GB/s against 56.3 at 48 tasks and 66.7 at 4) and does not
+recover the 6-thread peak.
+
+Not bandwidth: a 788 MB working set, cold, measures 91.3 GB/s at 6 threads
+against 90.5 warm. Not cache residency either — that was already dead in
+§46.
+
+**Three: an apply can be too small to pay for a fork-join.** At
+Kimi-Linear's shapes one task is ~9 us of arithmetic against tens of us of
+dispatch. `WASTE_P6_CHUNK=16` was worse than useless there in a way worth
+naming: `min_chunk` of 1024 against M=1024 hits
+`if (n <= min_chunk) { fn(0, n, arg); return; }`, so **the apply ran
+serially**, and it won its own sweep because with 18 threads every
+alternative was worse. A default chosen that way is a default chosen by a
+bug in the setup.
+
+**What is actually achievable**, Kimi-Linear, three runs each, stable to the
+last digit:
+
+| | accounted |
+|---|---|
+| VQ3R, engine default today | 1.84 |
+| VQ3R, best (`WASTE_XPAR=1`) | **1.31** |
+| VQ4P, row-parallel, 6 threads, chunk 1 | 1.30 |
+| VQ4P, best (`WASTE_XPAR=1`) | **1.06** |
+
+Best against best is **1.24x**, and against what the engine does untouched,
+**1.74x**. Both are better than the 1.18x §41 recorded, and the difference
+is entirely configuration.
+
+**And then K3 inverts it.**
+
+| K3, VQ3R | s/token |
+|---|---|
+| default (18 threads) | **1.68** |
+| 6 threads | 2.25 |
+| 8 threads | 2.35 |
+| `WASTE_XPAR=1`, 6 threads | 1.89 |
+
+Fewer threads is 34% *worse* on K3. Its applies are 4.7x larger, so they
+amortize the dispatch and genuinely use every core the machine has,
+E-cores included. "Cap the pool at the P-cores" is a 25% win on one model
+and a 34% loss on the other.
+
+**So no default changes.** `WASTE_P6_CHUNK=16` is wrong at 6 threads and
+right at 18; `WASTE_XPAR` is right on Kimi-Linear and wrong on K3; the
+thread count that is best on one is worst on the other. Any default picked
+here is tuned for one model against the other, which is why these are
+switches and why the tuning table above is the deliverable rather than a
+commit that moves a constant.
+
+What would deserve building, if this comes back: a pool that knows which
+cores are performance cores and sizes SIMD-heavy work to them while leaving
+the latency-bound kernels the whole machine. That is a real change to
+`threads.h` and it is not justified by one kernel on one laptop.
