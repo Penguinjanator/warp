@@ -237,6 +237,14 @@ parser that reads replies back into reasoning / content / `tool_calls`;
   `tools/*.{py,sh}` — CI fails the build without it.
 - Python (`tools/`) converts and validates models. It never runs alongside
   the engine, and torch is never a dependency of the inference path.
+- **`convert.py --reclaim on` deletes source shards as it consumes them**,
+  which is what lets K3 convert on one disk instead of two (1.42 TB of
+  staging beside a 982 GB container). It is safe because every tensor has
+  exactly one consumer, it refuses before deleting rather than during, and
+  it is **not reversible** — a reclaimed shard has to be downloaded again
+  and `verify_container.py` can no longer check the container against its
+  source. Prove a recipe with `--reclaim dry` first; docs/K3.md has the
+  refusals and the ledger discipline.
 - Comments here explain *why*, usually with the failure that motivated
   them. Match that: a comment that only restates the code is noise, but the
   Makefile's and CI's explanations of past breakage are load-bearing.
