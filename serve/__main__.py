@@ -117,8 +117,11 @@ examples:
 
     s = ap.add_argument_group("serving")
     s.add_argument("--max-tokens", type=bounded_int(1, (1 << 32) - 1),
-                   default=512,
-                   help="default cap when a request does not set one")
+                   default=4096,
+                   help="default cap when a request does not set one "
+                        "(default 4096). Most clients never set one, and a "
+                        "reply that stops at the cap is indistinguishable "
+                        "from a model that stopped on its own")
     s.add_argument("--no-thinking", action="store_true",
                    help="answer without the think channel unless a request "
                         "asks for it. K3's reasoning can be most of a reply, "
