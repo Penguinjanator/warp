@@ -82,8 +82,8 @@ converted = []           # layers the fake quantizer actually ran on
 
 
 def fake_convert_layer(job):
-    (L, src, out, prefix, n_exp, stages, device, cb_sample, cb_base,
-     cached_ok) = job
+    (L, src, out, prefix, n_exp, stages, entries, index_bits, device,
+     cb_sample, cb_base, cached_ok) = job
     bank = os.path.join(out, f"experts-L{L}.bin")
     if cached_ok and os.path.exists(bank):
         return (L, os.path.getsize(bank), cb_base, "cached")
@@ -186,7 +186,7 @@ def main():
         # Emulate a crash: layers 1,2,3 finished (bank + unmerged part),
         # nothing merged, no manifest — exactly what is on disk mid-run.
         for i, L in enumerate(MOE_LAYERS[:3]):
-            fake_convert_layer((L, src, out, "", N_EXPERTS, STAGES, "cpu", 1,
+            fake_convert_layer((L, src, out, "", N_EXPERTS, STAGES, CONV.CB_ENTRIES, 8, "cpu", 1,
                                 i * PER_LAYER, False))
         ck(not os.path.exists(os.path.join(out, "manifest.json")),
            "no manifest exists, as after a real crash")
@@ -202,7 +202,7 @@ def main():
         out = os.path.join(tmp, "gap.waste")
         os.makedirs(out)
         for L in (1, 2, 3, 5):                 # layer 4 never finished
-            fake_convert_layer((L, src, out, "", N_EXPERTS, STAGES, "cpu", 1,
+            fake_convert_layer((L, src, out, "", N_EXPERTS, STAGES, CONV.CB_ENTRIES, 8, "cpu", 1,
                                 (L - FIRST_DENSE) * PER_LAYER, False))
         did = run(out, src)
         ck(did == [4], f"re-converts only the hole {did}")
@@ -221,7 +221,7 @@ def main():
         out = os.path.join(tmp, "subset.waste")
         os.makedirs(out)
         for L in (1, 2, 3):
-            fake_convert_layer((L, src, out, "", N_EXPERTS, STAGES, "cpu", 1,
+            fake_convert_layer((L, src, out, "", N_EXPERTS, STAGES, CONV.CB_ENTRIES, 8, "cpu", 1,
                                 (L - FIRST_DENSE) * PER_LAYER, False))
         did = run(out, src, layers=[3])
         ck(did == [], f"layer 3 is recognised as already done {did}")
@@ -262,7 +262,7 @@ def main():
         print("a bank whose codebook part was lost cannot be trusted")
         out = os.path.join(tmp, "lostpart.waste")
         os.makedirs(out)
-        fake_convert_layer((1, src, out, "", N_EXPERTS, STAGES, "cpu", 1,
+        fake_convert_layer((1, src, out, "", N_EXPERTS, STAGES, CONV.CB_ENTRIES, 8, "cpu", 1,
                             0, False))
         os.remove(os.path.join(out, "codebooks-L1.bin"))
         did = run(out, src, layers=[1])

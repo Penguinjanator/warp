@@ -105,6 +105,7 @@ MAGIC_CODEBOOK = 0x4B424357      # 'WCBK'
 ALIGN = 4096
 FMT_F32, FMT_F16, FMT_Q8G, FMT_Q4G, FMT_VQ3R, FMT_VQ2R = 0, 1, 2, 3, 4, 5
 FMT_Q3G = 7
+FMT_VQ4P = 8
 VEC_DIM = 8
 CB_ENTRIES = 256
 TRAIN_VECTORS = 300000       # vectors k-means sees per (layer, matrix kind)
@@ -148,17 +149,19 @@ class ShardReader:
 
 # ------------------------------------------------------------ quantizers --
 
-def train_codebooks(X, n_stages, dev, iters=10, sample=300000, seed=0):
+def train_codebooks(X, n_stages, dev, iters=10, sample=300000, seed=0,
+                    entries=None):
     """Residual k-means: one codebook per stage, fitted on the running
     residual. X is [n, VEC_DIM] on `dev`."""
+    entries = entries or CB_ENTRIES
     g = torch.Generator(device="cpu").manual_seed(seed)
     books = []
     resid = X[torch.randperm(X.shape[0], generator=g)[:sample]].to(dev)
     for _ in range(n_stages):
-        C = resid[torch.randperm(resid.shape[0], generator=g)[:CB_ENTRIES]].clone()
+        C = resid[torch.randperm(resid.shape[0], generator=g)[:entries]].clone()
         for _ in range(iters):
             idx = assign(resid, C)
-            for j in range(CB_ENTRIES):
+            for j in range(entries):
                 m = idx == j
                 if m.any():
                     C[j] = resid[m].mean(0)
@@ -196,8 +199,35 @@ def block_indices(idx, M, N, stages):
     return t.contiguous()
 
 
-def quantize_vq(W, books, dev):
+def block_indices_packed(idx, M, N, stages):
+    """block_indices, then four 6-bit fields squeezed into three bytes.
+
+    Same [M/B][v][row_in_block][...] blocking; only the trailing per-row run
+    changes, from four whole bytes to three packed ones. That keeps VQ4P at
+    3.00 bits/weight — the same record size as VQ3R — while giving each
+    stage a 64-byte table that a single NEON vqtbl4q can address.
+
+    Little-endian bit order, LSB of stage 0 at bit 0, because the unpack in
+    the engine is a byte shift and mask per stage and any other order costs
+    it a shuffle:
+
+        byte0 = s0 | s1<<6      byte1 = s1>>2 | s2<<4     byte2 = s2>>4 | s3<<2
+    """
+    t = block_indices(idx, M, N, stages)          # [nb, nvr, B, stages] u8
+    if stages != 4:
+        raise ValueError(f"packed indices need 4 stages, got {stages}")
+    if int(t.max()) > 63:
+        raise ValueError("packed indices need entries <= 64")
+    s = [t[..., i].to(torch.int32) for i in range(4)]
+    b0 = (s[0] | (s[1] << 6)) & 0xFF
+    b1 = ((s[1] >> 2) | (s[2] << 4)) & 0xFF
+    b2 = ((s[2] >> 4) | (s[3] << 2)) & 0xFF
+    return torch.stack([b0, b1, b2], dim=-1).to(torch.uint8).contiguous()
+
+
+def quantize_vq(W, books, dev, entries=None):
     """W [out, in] -> (indices uint8 [stages, nvec], per-channel fp16 scale)."""
+    entries = entries or CB_ENTRIES
     M, N = W.shape
     scale = W.abs().amax(-1, keepdim=True).clamp(min=1e-8)
 
@@ -215,7 +245,7 @@ def quantize_vq(W, books, dev):
         nthreads = int(os.environ.get("OMP_NUM_THREADS") or 0)
         lib.waste_vq_encode(
             ctypes.cast(X.data_ptr(), fp), n,
-            ctypes.cast(B.data_ptr(), fp), st, CB_ENTRIES, VEC_DIM,
+            ctypes.cast(B.data_ptr(), fp), st, entries, VEC_DIM,
             ctypes.cast(out.data_ptr(), ctypes.POINTER(ctypes.c_uint8)), nthreads)
         return out.view(n, st).T.contiguous(), scale.half().flatten().cpu()
 
@@ -311,17 +341,19 @@ def raw_bytes(t):
     buf.view(t.dtype)[:t.numel()] = t.flatten()
     return bytes(memoryview(buf.numpy() if False else bytearray(buf.tolist())))
 
-def write_expert_record(f, layer, eid, cb_base, payloads, scales, shapes):
+def write_expert_record(f, layer, eid, cb_base, payloads, scales, shapes,
+                        packed=False):
     """One 4 KiB-aligned WEXP record: header, then gate|up|down indices,
     then the per-channel scales for all three."""
     hdr_size = 48
     off = hdr_size
     offsets = []
     body = bytearray()
+    blk = block_indices_packed if packed else block_indices
     for i, p in enumerate(payloads):          # [stages, nvec] uint8
         offsets.append(off)
         M, N = shapes[i]
-        b = raw_bytes(block_indices(p, M, N, p.shape[0]))
+        b = raw_bytes(blk(p, M, N, p.shape[0]))
         body += b
         off += len(b)
     corr_off = off
@@ -336,7 +368,8 @@ def write_expert_record(f, layer, eid, cb_base, payloads, scales, shapes):
     crc = zlib.crc32(bytes(body)) & 0xFFFFFFFF
 
     hdr = struct.pack("<IHHBBHHHIIIIIIII",
-                      MAGIC_EXPERT, layer, eid, FMT_VQ3R, 0, cb_base, 0, 0,
+                      MAGIC_EXPERT, layer, eid,
+                      FMT_VQ4P if packed else FMT_VQ3R, 0, cb_base, 0, 0,
                       blocks, offsets[0], offsets[1], offsets[2], corr_off,
                       crc, 0, 0)
     assert len(hdr) == hdr_size, len(hdr)
@@ -371,8 +404,8 @@ def convert_layer(job):
     file and separate codebook file. The parent decides the base — from the
     published manifest, from an existing bank's own records, or new after
     the published record count — and never renumbers a bank that exists."""
-    (L, src, out, prefix, n_exp, stages, device, cb_sample, cb_base,
-     cached_ok) = job
+    (L, src, out, prefix, n_exp, stages, entries, index_bits, device,
+     cb_sample, cb_base, cached_ok) = job
     import time as _t
     bank = os.path.join(out, f"experts-L{L}.bin")
     cbf = os.path.join(out, f"codebooks-L{L}.bin")
@@ -408,12 +441,13 @@ def convert_layer(job):
                 chunks.append(V[torch.randperm(V.shape[0], generator=g)[:per]])
                 del W, V
             X = torch.cat(chunks); del chunks
-            books[kind] = train_codebooks(X, stages, dev, sample=TRAIN_VECTORS)
+            books[kind] = train_codebooks(X, stages, dev, sample=TRAIN_VECTORS,
+                                          entries=entries)
             del X
             for si, C in enumerate(books[kind]):
                 cid = cb_base + ki * stages + si
                 cf.write(struct.pack("<IHBBII", MAGIC_CODEBOOK, cid & 0xFFFF,
-                                     FMT_VQ3R, VEC_DIM, CB_ENTRIES, 0))
+                                     FMT_VQ3R, VEC_DIM, entries, 0))
                 cf.write(raw_bytes(C.cpu().half()))
     os.replace(cbf + ".tmp", cbf)
 
@@ -422,10 +456,11 @@ def convert_layer(job):
             payloads, scales = [], []
             for kind, tag in KINDS:
                 W = st.tensor(ename(e, tag))
-                idx, sc = quantize_vq(W, books[kind], dev)
+                idx, sc = quantize_vq(W, books[kind], dev, entries=entries)
                 payloads.append(idx); scales.append(sc)
                 del W
-            write_expert_record(f, L, e, cb_base, payloads, scales, shapes)
+            write_expert_record(f, L, e, cb_base, payloads, scales, shapes,
+                                packed=(index_bits == 6))
     os.replace(bank + ".tmp", bank)
     return (L, os.path.getsize(bank), cb_base, f"{_t.time()-t0:.0f}s")
 
@@ -437,8 +472,22 @@ def main():
                     help="HF checkpoint directory, as published")
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", default="", help="comma list; default = all MoE layers")
-    ap.add_argument("--stages", type=int, choices=(2, 3), default=3,
-                    help="3 = VQ3R, 2 = VQ2R")
+    ap.add_argument("--stages", type=int, choices=(2, 3, 4, 6), default=3,
+                    help="3 = VQ3R, 2 = VQ2R; 4 and 6 exist to pair with "
+                         "--entries below the byte")
+    # bits/weight is stages * log2(entries) / 8 per 8-dim vector, so 3x256,
+    # 4x64 and 6x16 all encode 24 bits per vector. They differ in whether the
+    # per-stage table fits a SIMD register: 256 entries does not, which is
+    # why the gather is scalar. The engine reads `entries` from the manifest
+    # and indexes with a whole byte, so a container written below 256 is
+    # correct but not yet smaller — the 6-bit/4-bit index packing is a
+    # separate change. Written for that experiment; 256 remains the default.
+    ap.add_argument("--entries", type=int, default=CB_ENTRIES,
+                    choices=(16, 32, 64, 128, 256),
+                    help="codebook entries per stage (default 256)")
+    ap.add_argument("--index-bits", type=int, default=8, choices=(6, 8),
+                    help="6 packs four 6-bit indices into three bytes "
+                         "(WQ_VQ4P, 3.00 b/w); needs --stages 4 --entries 64")
     ap.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu")
     ap.add_argument("--experts", type=int, default=0, help="limit experts (debug)")
     ap.add_argument("--trunk-bits", type=int, default=4, choices=(3, 4, 8),
@@ -461,6 +510,11 @@ def main():
         ap.error("--jobs must be at least 1")
     if args.cb_sample < 1:
         ap.error("--cb-sample must be at least 1")
+    # The packing is 4x6 into 3 bytes and nothing else; a 6-bit field cannot
+    # hold an index into more than 64 entries, and the engine's unpack is
+    # written for exactly four stages.
+    if args.index_bits == 6 and (args.stages != 4 or args.entries != 64):
+        ap.error("--index-bits 6 requires --stages 4 --entries 64")
 
     # torch sizes its intra-op pool from os.cpu_count() by default, so N
     # worker processes would otherwise spawn N*cpus threads and thrash each
@@ -482,7 +536,9 @@ def main():
     st = ST(args.src)
     sr = ShardReader(args.src)
     dev = torch.device(args.device)
-    print(f"device={dev}  stages={args.stages}")
+    print(f"device={dev}  stages={args.stages}  entries={args.entries}  "
+          f"index_bits={args.index_bits} "
+          f"({args.stages * args.index_bits / VEC_DIM:.2f} b/w)")
 
     n_layers = cfg["num_hidden_layers"]
     n_exp = cfg.get("num_experts") or cfg.get("n_routed_experts")
@@ -502,7 +558,7 @@ def main():
         except (OSError, ValueError):
             existing = None
 
-    cb_record_bytes = struct.calcsize("<IHBBII") + CB_ENTRIES * VEC_DIM * 2
+    cb_record_bytes = struct.calcsize("<IHBBII") + args.entries * VEC_DIM * 2
     merged = os.path.join(args.out, "codebooks.bin")
     old_books = 0
     old_quant = existing.get("expert_quant", {}) if existing else {}
@@ -510,7 +566,8 @@ def main():
         existing and os.path.exists(merged) and
         old_quant.get("stages") == args.stages and
         old_quant.get("vec_dim") == VEC_DIM and
-        old_quant.get("entries") == CB_ENTRIES and
+        old_quant.get("entries") == args.entries and
+        old_quant.get("index_bits", 8) == args.index_bits and
         os.path.getsize(merged) % cb_record_bytes == 0)
     if compatible:
         old_books = os.path.getsize(merged) // cb_record_bytes
@@ -563,7 +620,8 @@ def main():
         elif base + n_cb_per_layer > next_base:
             next_base = base + n_cb_per_layer
         jobs.append((L, args.src, args.out, prefix, n_exp, args.stages,
-                     str(dev), args.cb_sample, base, cached_ok))
+                     args.entries, args.index_bits, str(dev), args.cb_sample,
+                     base, cached_ok))
 
     if args.jobs > 1:
         import multiprocessing as mp
@@ -848,10 +906,19 @@ def main():
         "arch": arch,
         "tensor_prefix": prefix,
         "config": cfg,
-        "expert_quant": {"fmt": "VQ3R" if args.stages == 3 else "VQ2R",
+        # The record's fmt byte is FMT_VQ3R for every stage count but 2 — the
+        # engine takes the stage and entry counts from here, not from the
+        # byte, and only refuses a fmt that is neither VQ3R nor VQ2R.
+        # bits_per_weight is `stages` because the index is still a whole byte
+        # per stage; --entries below 256 buys quality headroom, not bytes,
+        # until the packed index lands.
+        "expert_quant": {"fmt": ("VQ4P" if args.index_bits == 6 else
+                                 "VQ2R" if args.stages == 2 else "VQ3R"),
                          "stages": args.stages, "vec_dim": VEC_DIM,
-                         "entries": CB_ENTRIES, "index_block": IDX_BLOCK,
-                         "bits_per_weight": args.stages},
+                         "entries": args.entries, "index_block": IDX_BLOCK,
+                         "index_bits": args.index_bits,
+                         "bits_per_weight":
+                             args.stages * args.index_bits / VEC_DIM},
         "layers": manifest_layers,
         "trunk": tindex,
     }

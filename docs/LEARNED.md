@@ -2248,3 +2248,320 @@ What is *not* here is a throughput row. This is arithmetic on a number
 that was provably the wrong one, and the K3-in-a-cgroup case that motivates
 it — 80.64 GB asked of a 32 GiB allowance — is derived from the resolver's
 own rule, not run.
+
+## 41. The 256-entry table was the reason the gather was scalar (2026-08-03)
+
+§25 established that the VQ3R gather is a `load -> address -> load`
+dependency and unrolled it eight ways. What it did not ask is why the
+lookup had to touch memory at all. NEON has `tbl`: 16 lookups in one
+instruction, from a table held in registers. The reason VQ3R cannot use it
+is arithmetic, not effort — a 256-entry stage table is 256 bytes, sixteen
+vector registers, on a machine with thirty-two. It does not fit, and no
+amount of blocking makes it fit.
+
+This is the same constraint the vector-search literature hit and solved:
+[Quick ADC](https://arxiv.org/pdf/1704.07355) and FAISS FastScan both
+force 4-bit sub-quantizers precisely so the table lives in a register, and
+[T-MAC](https://arxiv.org/abs/2407.00088) reports 4.7x on ARM at 3 bits
+doing the same thing for LLM weights. `vq_apply` is an ADC scan — a sum of
+per-sub-quantizer table lookups over a database of codes — so the mapping
+is exact rather than analogical.
+
+**Bits per weight is `stages * log2(entries) / vec_dim`, and three shapes
+hit 3.00.** 3x256, 4x64 and 6x16 all spend 24 bits per 8-weight vector, so
+all three are the same record size. They differ only in whether a stage
+table is addressable in registers. Swept single-threaded on K3's gate
+shape (M=3072, nv=448), medians of seven runs:
+
+| kernel | ms | vs current |
+|---|---|---|
+| scalar 3x256 fp32 (VQ3R) | 0.504 | 1.00x |
+| `vqtbl4q` split-table 3x256 int8 | 0.407 | 1.24x |
+| `vqtbl4q` 4x64 int8 | 0.152 | **3.32x** |
+| `vqtbl1q` 6x16 int8 | 0.118 | 4.27x |
+
+The split-table variant is the one that needs no format change — 256
+entries as four 64-byte tables, four `vqtbl4q` and three `orr` — and it
+buys 1.24x, because sixteen table registers still have to be reloaded per
+stage. It is not worth a kernel.
+
+**4x64 rather than 6x16, and the reason is quality, not speed.** Residual
+k-means fitted the way `convert.py` fits it, against real weights taken
+from the Q8G trunk of `kimi-linear-q8.waste` (the expert banks are already
+VQ3R and would hand 3x256 a target it can hit exactly):
+
+| shape | mean relative error | vs 3x256 |
+|---|---|---|
+| 3x256 | 19.97% | 1.000x |
+| 4x64 | 21.47% | 1.075x |
+| 6x16 | 23.60% | 1.182x |
+
+On a real routed expert the same comparison reads 19.29% -> 20.85%
+(+8.1%), so the trunk proxy was sound. 6x16 is a third faster and more
+than twice the quality cost; 4x64 is the shape.
+
+**End to end on Kimi-Linear, 1023 tokens of two different texts:**
+
+| container | perplexity |
+|---|---|
+| VQ3R 3x256 | 10.937 |
+| 4x64, byte indices, fp32 LUT | 11.248 |
+| VQ4P, 6-bit packed, int8 LUT | **11.237** |
+
+**The int8 table is free.** All of the +2.7% is the codebook shape;
+quantizing the table — which is what makes a byte shuffle possible at all
+— costs nothing measurable, and the packed container is marginally the
+better of the two. One scale per 32 vector positions is why: a LUT entry
+is `dot(x_v, centroid)` and its magnitude tracks `||x_v||`, which varies by
+orders of magnitude across a hidden state, so a single global scale would
+round the quiet positions to zero.
+
+The container is the same size to the byte: 18 GB on Kimi-Linear, 982 GB
+on K3, 3.00 b/w both.
+
+## 42. A table built once and quantized sixteen times (2026-08-03)
+
+The kernel above wants an int8 table. The first implementation quantized
+it inside `vq_apply`, on the argument that a pass over `stages*entries`
+against an apply that does `M` times as much is about 2%.
+
+**It was about 140%.** `LUT apply` went from 0.85s to 1.48s — with the
+kernel that had just measured 3.3x faster in isolation.
+
+Two mistakes, and the estimate hid both. Gate and up are built *once per
+token* and applied *once per routed expert*, so the pass ran top_k times
+over a table that had not changed. And it ran serially, next to an apply
+that was threaded, so its share of wall-clock was its share of one thread's
+work — not one core's worth of a parallel region.
+
+Moving it into `vq_build_lut` fixed the redundancy and left `LUT build` at
+0.51s against VQ3R's 0.28s. Vectorizing the pass with NEON changed nothing
+(0.52 -> 0.52), which is the measurement that identified what it actually
+was: **not arithmetic, dispatch.** 260 builds a token, each 4 to 9 scale
+blocks, ~79us of fork-join for ~7us of work.
+
+Serial and vectorized, `LUT build` is 0.28s — parity with VQ3R while doing
+the extra pass. `vq_quant_lut` is therefore deliberately not threaded, and
+that is the note that keeps someone from "fixing" it.
+
+**The general form:** a pass that is 2% of a kernel's *work* is not 2% of
+its *time* if it runs once per caller instead of once per input, or on one
+thread instead of the pool. Both were visible in the profile within a
+minute of looking, and neither was visible in the estimate.
+
+## 43. An int8 table makes the engine discontinuous (2026-08-03)
+
+Weighting each expert inside its own task (`part[i] = w[j] * acc[i]`) and
+summing afterwards, instead of `ysum[i] += w[j] * acc[i]` in the caller,
+moved a VQ3R logit by 5.7e-06 and a **VQ4P logit by 0.68**.
+
+Both paths were correct. Per layer they agreed to 1.9e-06 — *identically*
+for the two formats. The asymmetry is downstream: `vq_quant_lut` takes its
+scale from `max|lut|`, so the int8 table is a step function of its input. A
+perturbation of 1e-8 moves the scale, and every entry sitting near a
+rounding boundary moves by one LSB. VQ4P amplifies float noise about five
+orders of magnitude harder than VQ3R does.
+
+The perturbation itself was FMA contraction: `ysum[i] += w[j] * acc[i]`
+fuses into a single rounding, and rounding the product first does not. The
+fix is to leave `acc` unweighted and let the caller apply `w[j]` in the
+same expression the serial loop uses, so the compiler contracts it the
+same way.
+
+**For VQ4P, "numerically equivalent" is not a good enough standard for two
+code paths — they have to be bit-identical**, and that is now checked:
+row-parallel against expert-parallel, one thread against eight, NEON
+against `-DWASTE_P6_SCALAR`, all `cmp`-clean. The int8 table is what
+raises the bar, and it will raise it for any future path that touches
+these kernels.
+
+## 44. A batch is both the parallelism and the barrier (2026-08-03)
+
+At Kimi-Linear's expert shapes one `vq_apply` is a few microseconds of
+arithmetic against a fork-join that costs tens, and a token spends ~900
+dispatches. Giving each routed expert its own task instead — one dispatch a
+layer, 26 a token — is worth 1.15x on VQ3R and 1.18x on VQ4P, and it
+removes the thread-count cliff: row-parallel was *worst* at the default
+thread count and needed `WASTE_THREADS=6` to look good, expert-parallel is
+best at the default.
+
+**On K3 it is a regression, and no batch size fixes it.** Holding a
+layer's records before computing is a barrier against the read-ahead; the
+hint has already queued all sixteen reads, and waiting for the last one
+before starting the first expert stops them overlapping the multiplies they
+were issued to hide behind. Batching the holds bounds the barrier — but the
+batch is also how many experts can run at once. 15 steps, K3, VQ3R,
+internal disk:
+
+| mode | expert I/O | expert mm | accounted | s/token |
+|---|---|---|---|---|
+| row-parallel | 3.71 | 12.78 | **37.24** | **1.61** |
+| expert, batch 1 | 0.78 | 51.44 | 81.80 | 4.00 |
+| expert, batch 2 | 1.11 | 27.20 | 49.01 | 2.46 |
+| expert, batch 4 | 4.10 | 15.62 | 42.16 | 1.87 |
+| expert, batch 8 | 9.66 | 10.68 | 46.25 | 2.03 |
+| expert, batch 16 | 15.69 | **6.15** | 56.33 | 1.87 |
+
+Read the two interior columns against each other: batch 1 overlaps the I/O
+perfectly and leaves one thread working, batch 16 does the arithmetic
+2.1x better than row-parallel and pays 15.7s of stall for it. Row-parallel
+declines the trade — it pipelines one expert at a time while putting every
+thread on that expert's rows.
+
+**So `WASTE_XPAR` is off by default.** The two strategies suit opposite
+regimes and the regime is set by which of dispatch and disk is the budget,
+which is a property of the model and the machine, not something the engine
+can read off the container.
+
+What would get both is a task granularity of (expert, row range) with a
+small expert batch, staged so the gate/up applies, the down LUT builds and
+the down applies are three dispatches per batch instead of one. That
+decouples the parallelism width from the barrier width. It is not written,
+and it is the obvious next thing here.
+
+## 45. The disk contaminates the buckets that do not touch it (2026-08-03)
+
+The K3 VQ4P container went to the external disk because the internal one
+had 691 GB free against a 982 GB container. The reasoning for accepting
+that was: `WASTE_PROFILE` separates expert I/O from arithmetic, so
+`LUT apply` and `expert mm` stay comparable even at 0.94 GB/s instead of
+12.78. **That reasoning is wrong, and `kda` is the control that shows it.**
+
+10 decode steps, row-parallel, same prompt, same step count:
+
+| container | LUT build | LUT apply | kda | mla | expert I/O | expert mm | accounted |
+|---|---|---|---|---|---|---|---|
+| VQ3R, internal | 1.03 | 7.55 | 9.14 | 1.61 | 2.47 | 8.79 | 28.66 |
+| VQ4P, external | 1.37 | 8.77 | **15.60** | 2.96 | 131.38 | 10.36 | 171.63 |
+
+`kda` reads no expert record at all — it is trunk arithmetic — and it is
+71% slower. A profile taken while the disk is saturated is not a profile of
+the arithmetic with one column swapped out; the whole run is slower and
+every bucket carries some of it.
+
+**"71% slower than one other run" is not the evidence, though, and saying
+so was sloppy.** Five repetitions of the same internal baseline put `kda`
+between 8.65s and 14.52s over 15 steps — a 68% spread on identical work,
+this being a desktop with a window server on it. A single pair of readings
+cannot clear that band. What clears it is the rate: 0.58–0.97 s/step across
+six internal runs against **1.56 s/step external**, 61% above the highest
+internal observation rather than 71% above one of them. The conclusion
+stands; the argument for it needed a noise band, and the first version
+would have gone in the file as a fact that the next five runs contradicted.
+
+The rest of that spread is worth knowing on its own: `s/token` is stable to
+±1.5% (1.62–1.67) while `accounted` swings 38% and `kda` 68%. **Compare
+decode s/token; treat a single bucket reading as an estimate** unless it is
+a median of several.
+
+**So there is still no clean number for the VQ4P kernel on K3.** The
+normalized estimate (LUT apply relative to `kda`: 0.826 -> 0.562, about
+1.47x) is arithmetic on two contaminated readings and is recorded here as
+the reason not to quote it. Getting the real one means the container on the
+same class of storage as its baseline, which on this machine means deleting
+the 982 GB VQ3R container first — and §46 is why that is now worth doing.
+
+**The rule.** Before measuring a container on different storage than the
+one it is compared against: don't. Copy it, free space, or measure
+something else. If it cannot be avoided, put a bucket in the profile that
+touches no expert bytes and read that one first — that check costs one
+column and would have saved this run.
+
+## 46. The stall bucket is not the disk floor (2026-08-03)
+
+**Do not derive the disk floor from the `expert I/O` bucket.** That was
+tried twice in one afternoon, in two different ways, and both were wrong in
+opposite directions.
+
+The first read §10's 9.9 GB/s — a throughput *observed during a run*, not
+the device's capability — and concluded the floor was ~1.43s against a
+1.87s step, so any compute win was capped near 1.3x.
+
+The second reasoned that if reads pipeline behind arithmetic then the stall
+is exactly the excess, so `disk = compute + stall`. On the K3 row-parallel
+run (34.64s accounted, 3.11s stall) that gives disk 34.64s against compute
+31.53s, i.e. the disk already binding and *any* arithmetic win worth
+nothing. It is a tidy derivation and it inverts the moment the pipelining
+is imperfect, which is the case it was invented to reason about.
+
+**Measured instead, with `tools/diskbench.c`, at the pattern the engine
+actually uses** — 12 MB records, random, cache-bypassed, 8 reader threads,
+on the internal SSD:
+
+| | |
+|---|---|
+| seq write / seq read | 11.10 / 10.55 GB/s |
+| random, 1 thread | 10.82 GB/s |
+| random, 8 threads | **12.87 GB/s** |
+
+That settles it. The same run reads 223.86 GB over 15 steps, so the disk
+owes 17.4s against 31.5s of arithmetic: **K3 decode at a 17.7 GB cache is
+compute-bound, by about 1.8x.** The 3.11s of stall is not the disk running
+out of headroom, it is reads that failed to hide behind arithmetic there
+was plenty of.
+
+Per token that is a 1.16s floor under a 1.61s step — **1.39x of headroom**,
+and §41's kernel takes `LUT apply` from ~0.51s to ~0.15s, which would land
+at ~1.28x. That prediction was worth the measurement it cost, because it
+was also wrong.
+
+**Measured: 1.09x.** The VQ4P container was copied onto the internal disk
+(the VQ3R baseline moved out to make room, measured first and restored
+after), so both sides sit on the same storage with the same build. Medians,
+13 VQ4P runs against 5 VQ3R:
+
+| | VQ3R | VQ4P | |
+|---|---|---|---|
+| **s/token** | **1.65** | **1.52** | **1.086x** |
+| LUT apply | 11.21 | ~9.6 | 1.17x |
+| expert I/O | 3.15 | 3.69 | slightly more exposed |
+| `kda` (control) | 10.35 | 10.52 | unchanged |
+
+`kda` unchanged is what says the two are comparable this time, which is the
+check §45 was written about.
+
+**The kernel is not the problem, and neither is cache residency.** The
+obvious suspicion was that §41's 3.32x lived in a 3.94 MB index buffer hot
+in L2 while the engine streams ~17 GB of index per token. Sized up, one
+pass, no repetition:
+
+| index working set | VQ3R | VQ4P | speedup |
+|---|---|---|---|
+| 3.9 MB | 1.268 ms | 0.290 ms | 4.37x |
+| 63 MB | 9.882 | 2.478 | 3.99x |
+| 252 MB | 37.178 | 9.630 | 3.86x |
+| 1008 MB | 151.029 | 38.880 | **3.88x** |
+
+It holds at 3.88x against a gigabyte. So that hypothesis is dead too — the
+third of the day, and the reason this section says what is measured and
+stops. The instrument is `tools/lutbw.c`, which exists so the next person
+to suspect a cache artefact can settle it in a minute instead of a day.
+
+**What is left is a scaling failure nobody has explained.** Converting the
+buckets to throughput over the ~17.4 GB of index a token touches:
+
+| | one thread | in-engine, ~10 threads | scaling |
+|---|---|---|---|
+| VQ3R | 6.5 GB/s | 23.3 GB/s | 3.6x |
+| VQ4P | 25.3 GB/s | 27.2 GB/s | **1.07x** |
+
+VQ4P in the engine runs at its single-thread rate. It is not the chunk
+size — `WASTE_P6_CHUNK` was swept 1..16 on K3 and every value landed inside
+the run-to-run noise — and 25 GB/s is far too low to be a memory ceiling on
+this machine. Recorded as an open question rather than a guess.
+
+**So the standing recommendation is unchanged, for a new reason.** VQ4P is
+worth having where the apply is dispatch-bound and small (Kimi-Linear,
+1.18x) and is worth 1.09x on K3 — real, but not a reason to reconvert
+982 GB, and nowhere near what the kernel does in isolation. The gap between
+3.88x on a bench and 1.17x in place is the whole finding.
+
+**This also dents the standing model.** "Disk I/O is the budget" and "~53%
+of a K3 decode step is expert reads" were true when they were written and
+are not true here: §35's lookahead, the reader pool and a 17.7 GB cache
+have moved K3 to the other side of the line. The claim is worth re-checking
+against `diskbench` whenever it is leaned on, rather than inherited.
+
+**The rule.** Before claiming anything is disk-bound, run `diskbench` and
+divide. The stall bucket says how much I/O failed to overlap; that is a
+different question and it does not answer this one.

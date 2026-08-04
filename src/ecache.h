@@ -94,6 +94,12 @@ typedef struct {
     int wire_failed;                 /* how many mlock calls were refused  */
     size_t slot_bytes;               /* what was handed to vm_allocate     */
     int last_used;                   /* held nonvolatile until the next get */
+    /* The same claim last_used makes, for more than one record at a time.
+     * A layer that hands each of its top-k experts to a different thread
+     * holds all k at once, so "the one the caller is using" stops being a
+     * single slot. Released together by waste_ecache_release. */
+    int held[WASTE_PF_MAX];
+    int n_held;
     uint64_t purged;                 /* slots the kernel reclaimed         */
 } waste_ecache;
 
@@ -127,6 +133,20 @@ void waste_ecache_clear(waste_ecache *c);
  * NULL on failure. */
 const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
                                 waste_fetch_fn fetch, void *user);
+
+/* waste_ecache_get, except the record stays claimed after the next one is
+ * asked for. A caller that hands k records to k threads needs every one of
+ * them to outlive the loop that collected them; get() alone releases each
+ * as the next arrives, and on macOS a released slot is volatile — the
+ * kernel may drop it and the reader would see zeros rather than weights.
+ *
+ * Holds at most WASTE_PF_MAX; returns NULL if the set is full or the read
+ * failed. Every hold must be matched by one waste_ecache_release, which
+ * releases the whole set. Not for concurrent use: collect on one thread,
+ * then read the pointers from many. */
+const uint8_t *waste_ecache_hold(waste_ecache *c, int layer, int expert,
+                                 waste_fetch_fn fetch, void *user);
+void waste_ecache_release(waste_ecache *c);
 
 /* ---- read-ahead ---------------------------------------------------------
  *

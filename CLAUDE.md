@@ -58,9 +58,11 @@ hardcoded port fails on a machine already using it, and it fails as
 "resume" rather than as "that port is taken".
 
 Env it reads: `WASTE_REF_MODEL` (container — **point it at a default
-`convert.py` conversion**, i.e. a 4-bit trunk; a `--trunk8` container is a
-shape nobody ships, and running the suite on one is how the Q4G load path
-stayed broken through green runs), `WASTE_REF_SRC` (source safetensors, for
+`convert.py` conversion**, i.e. a 4-bit trunk *and* VQ3R experts; a
+`--trunk8` container is a shape nobody ships, and running the suite on one
+is how the Q4G load path stayed broken through green runs — the same
+applies to `--index-bits 6`, which exercises a different kernel and a
+different record fmt), `WASTE_REF_SRC` (source safetensors, for
 the round-trip), `WASTE_ORACLE` (logits from `tools/kimi_ref.py` — **must be
 the same token ids run.sh uses**, or a mismatched dump looks exactly like an
 engine bug; setting it also turns off both generating an oracle from the
@@ -96,6 +98,18 @@ read path), `WASTE_THREADS`, `WASTE_DIRECT=0` (keep the page cache),
 on a 4-bit trunk, so it is out of reach on K3), `WASTE_I8MM=1`,
 `WASTE_TOK_PLAIN=1`, `WASTE_VIS_STAGE`, `WASTE_DUMP_LATENT/HIDDEN`.
 
+MoE scheduling and the VQ4P kernel: `WASTE_XPAR=1` (one task per routed
+expert instead of one per row range — **off by default**: worth ~1.18x on
+Kimi-Linear and a regression on K3, because the batch that gives it
+parallelism is the same batch that barriers the read-ahead, LEARNED §44),
+`WASTE_XPAR_BATCH=N` (experts held at a time, default 4),
+`WASTE_P6_CHUNK=N` (rows per chunk in the VQ4P apply, in index blocks,
+default 16 — the kernel is fast enough that the pool wants fewer, bigger
+chunks). Building with `-DWASTE_P6_SCALAR` drops the VQ4P kernel to its
+portable path; the two are meant to be **bit-identical**, not merely close,
+and that is checkable rather than asserted — see LEARNED §43 for why an
+int8 lookup table raises the bar that far.
+
 Profiling a decode step:
 `WASTE_PROFILE=1 WASTE_CACHE_MB=17735 ./test_forward MODEL ids out.bin 5`.
 
@@ -119,7 +133,7 @@ logging, signal handling and config files belong to the host, not the API.
 | `model.c` | container load + forward pass; one token per call (prefill is repeated steps, so decode is the only path) |
 | `ecache.c` | bounded LFRU expert cache over the per-layer banks |
 | `kda.c`, `kda_neon.c` | Kimi Delta Attention recurrence |
-| `vq.c` | 3-stage residual VQ decode; also built standalone as `libwastevq` for `convert.py` |
+| `vq.c` | residual VQ decode; also built standalone as `libwastevq` for `convert.py` |
 | `vision.c`, `image.c` | the 27-layer ViT + projector, and file → patch tensor |
 | `tokenizer.c` | tiktoken BPE in C, Unicode classes coded directly (no regex engine) |
 | `backend.c`, `simd_*.c`, `metal.m` | kernel dispatch |

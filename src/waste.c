@@ -326,6 +326,24 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
                              (uint64_t)stages * (uint64_t)entries;
         sc += ((uint64_t)(2 * T + 1) * lut + 64) * 4;       /* m->cq  */
         sc += 3 * lut * 4;                                  /* m->lut */
+        /* The int8 shadows of both, m->lut8 and m->cq8, allocated only for
+         * VQ4P and counted for every container anyway: a quarter of tables
+         * already counted above, against a cache measured in tens of
+         * gigabytes. A plan that under-counts what a load then allocates is
+         * the failure this arithmetic exists to prevent. */
+        const uint64_t nsc = lut / ((uint64_t)stages * entries)
+                             / WASTE_VQ_LUT_BLK + 2;
+        sc += 3 * lut + 3 * nsc * 4;                        /* m->lut8 */
+        sc += (uint64_t)(2 * T + 1) * (lut + nsc * 4) + 64; /* m->cq8  */
+        /* Per-expert scratch for the expert-parallel MoE path: one gate,
+         * up, accumulator and down LUT per routed expert, because k threads
+         * each run a whole expert. Read here rather than at the bottom of
+         * this function, where top_k is fetched for the cache floor. */
+        const uint64_t k = (uint64_t)js_int(&d, js_get(&d, cfg,
+                                            "num_experts_per_token"), 8);
+        sc += k * ((uint64_t)2 * moe_inter + lat) * 4;      /* xga/xub/xacc */
+        sc += k * lut * 4;                                  /* m->xlut  */
+        sc += k * (lut + nsc * 4);                          /* xlut8/xqs */
     }
     sc += ((uint64_t)T * (2 * moe_inter * n_shared_eff + hidden) + 64) * 4;
     sc += (uint64_t)T * (2 * lat + 2 * hidden) * 4;

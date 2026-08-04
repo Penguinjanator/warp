@@ -273,6 +273,7 @@ int waste_ecache_init(waste_ecache *c, size_t budget_bytes, size_t rec_bytes,
      * hinted" rather than "pinned by the current batch". */
     c->pf_gen = 1;
     c->last_used = -1;
+    c->n_held = 0;
     {   const char *e = getenv("WASTE_PURGEABLE");
         c->purgeable = e && *e != '0';
         c->wired = (waste_mlock_mode() & WASTE_WIRE_CACHE) != 0;
@@ -363,6 +364,13 @@ static void ec_rehash(waste_ecache *c)
 /* A slot is untouchable while a reader owns its buffer, and while the hint
  * that reserved it is still being consumed — otherwise a deep pipeline
  * evicts the record it just read, one layer before it is used. */
+static int ec_is_held(const waste_ecache *c, int i)
+{
+    for (int k = 0; k < c->n_held; k++)
+        if (c->held[k] == i) return 1;
+    return 0;
+}
+
 static int ec_pinned(const waste_ecache *c, int i)
 {
     /* last_used is the record the caller is holding a pointer to right now.
@@ -372,7 +380,7 @@ static int ec_pinned(const waste_ecache *c, int i)
      * the synchronous fallback inside get() does not, and that is the hole
      * this closes. */
     return c->slot[i].state == EC_INFLIGHT || c->slot[i].pin == c->pf_gen ||
-           i == c->last_used;
+           i == c->last_used || ec_is_held(c, i);
 }
 
 static int ec_victim(waste_ecache *c)
@@ -614,6 +622,39 @@ const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
     return dst;
 }
 
+const uint8_t *waste_ecache_hold(waste_ecache *c, int layer, int expert,
+                                 waste_fetch_fn fetch, void *user)
+{
+    if (c->n_slots <= 0 || c->n_held >= WASTE_PF_MAX) return NULL;
+    const uint8_t *r = waste_ecache_get(c, layer, expert, fetch, user);
+    if (!r) return NULL;
+    /* get() parked it in last_used, which the *next* get would release.
+     * Move it into the held set instead, so the claim outlives the loop
+     * that is collecting these. */
+    ec_lock(c);
+    if (c->last_used >= 0) {
+        if (!ec_is_held(c, c->last_used)) c->held[c->n_held++] = c->last_used;
+        c->last_used = -1;
+    }
+    ec_unlock(c);
+    return r;
+}
+
+void waste_ecache_release(waste_ecache *c)
+{
+    ec_lock(c);
+    for (int k = 0; k < c->n_held; k++) {
+        const int si = c->held[k];
+        /* Same test as ec_release_last: a slot reclaimed for another
+         * expert may have a reader writing into it, and a volatile object
+         * under an in-flight write is how a purged page becomes a silently
+         * zeroed weight. */
+        if (c->slot[si].state == EC_READY) ec_volatile(c, si);
+    }
+    c->n_held = 0;
+    ec_unlock(c);
+}
+
 /* Back to a freshly-opened cache: no records, no counters. A sweep needs it
  * between arms — leaving the cache warm would hand the second configuration
  * the first one's work and measure the order instead of the setting. */
@@ -634,6 +675,7 @@ void waste_ecache_clear(waste_ecache *c)
     c->evictions = c->prefetched = c->spec_issued = 0;
     c->pf_n = c->pf_issued = 0;
     c->last_used = -1;
+    c->n_held = 0;
     ec_unlock(c);
 }
 
