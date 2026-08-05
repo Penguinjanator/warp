@@ -12,8 +12,15 @@
  * Every row says whether the bypass was actually obtained, because on a
  * filesystem that refuses it these are RAM numbers wearing a disk's label.
  *
+ * The last argument turns GB/s into tok/s for a model that reads that many
+ * GB per token cold. It has no default: the column used to assume K3's 12.5
+ * unconditionally, which is ~8x off on a 48B model (1.61 GB/token measured)
+ * and says so nowhere. `waste bench` prints the real figure for a container
+ * as "disk N GB total, M GB/token"; pass M here, or leave it out and read
+ * the GB/s.
+ *
  * Build: cc -O2 -o diskbench tools/diskbench.c
- * Usage: ./diskbench /Volumes/WasteDisk/k3/.bench [file_gb] [rec_mb] [threads]
+ * Usage: ./diskbench /Volumes/WasteDisk/k3/.bench [file_gb] [rec_mb] [threads] [gb_per_token]
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -142,11 +149,21 @@ static void *rand_reader(void *p) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: %s PATH [file_gb] [rec_mb] [threads]\n", argv[0]); return 1; }
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s PATH [file_gb] [rec_mb] [threads] [gb_per_token]\n"
+                        "  gb_per_token: from `waste bench` on the container you are\n"
+                        "  sizing for; omitted, the tok/s column is omitted with it\n", argv[0]);
+        return 1;
+    }
     g_path = argv[1];
     double file_gb = argc > 2 ? atof(argv[2]) : 8.0;
     double rec_mb  = argc > 3 ? atof(argv[3]) : 12.0;
     int maxthreads = argc > 4 ? atoi(argv[4]) : 8;
+    /* No default, deliberately. This was K3's 12.5 hardcoded into the format
+     * string, so every run printed a K3 answer whatever the container being
+     * sized — off by ~8x on a 48B model, and silent about it. A column that
+     * cannot be derived from what was measured does not get printed. */
+    double gb_tok = argc > 5 ? atof(argv[5]) : 0.0;
     g_file = (size_t)(file_gb * (1u << 30));
     g_rec  = (size_t)(rec_mb * (1u << 20)) & ~4095UL;
     /* A record under one page rounds to zero and divides by it two screens
@@ -196,8 +213,11 @@ int main(int argc, char **argv) {
         for (int i = 0; i < nt; i++) { pthread_join(th[i], NULL); tot += ta[i].bytes; }
         dt = now() - t0;
         double gbs = tot / dt / (1u << 30);
-        printf("rand %2d thr : %6.2f GB/s  -> %.2f tok/s at 12.5 GB/token cold  (%s)\n",
-               nt, gbs, gbs / 12.5, bypass_note());
+        if (gb_tok > 0)
+            printf("rand %2d thr : %6.2f GB/s  -> %.2f tok/s at %.4g GB/token cold  (%s)\n",
+                   nt, gbs, gbs / gb_tok, gb_tok, bypass_note());
+        else
+            printf("rand %2d thr : %6.2f GB/s  (%s)\n", nt, gbs, bypass_note());
     }
 
     if (!g_direct) {
