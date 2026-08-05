@@ -8,6 +8,37 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
+## Unreleased
+
+### Added
+
+- **`--cpus LIST`** on the CLI and the server, `waste_cfg.cpu_list` in the
+  API, `WASTE_CPUS` in the environment — a Linux-style cpu list (`0-5`,
+  `0-2,6-8`) that the compute pool binds to. Linux and Windows; macOS has
+  no call that binds a thread to a core, so a list there is refused with
+  `WASTE_E_UNSUPPORTED` rather than ignored.
+
+  It exists because on a machine whose cores are not interchangeable,
+  placement is worth more than the thread count.
+  [Issue #23](https://github.com/sqliteai/waste/issues/23) measured
+  Kimi-Linear-48B on a Ryzen 9 9900X — two 6-core CCDs, separate 32 MB L3 —
+  and found six threads on one CCD 16-25% faster than the same six split
+  across both, at identical `bytes_read` and identical hit counts. Handing
+  those six threads all 24 CPUs to migrate between costs a further ~10%.
+  Not reproduced here: this repo has no multi-CCD machine, and the numbers
+  above are the reporter's. What *is* checked here is the mechanism —
+  `tests/test_cpus.c` reads back every participant's affinity mask.
+
+  **No default changed.** The engine still names no CPUs and leaves
+  placement to the OS. `docs/LEARNED.md` §47 measured the tempting default
+  — cap the pool at the fast cores — as a 25% gain on Kimi-Linear and a 34%
+  loss on K3, so it stays a switch. `--threads 0` with a cpu list means one
+  thread per CPU listed; an explicit `--threads` still wins. The thread
+  that calls into the engine is bound too, on its first parallel region,
+  because it is one of the workers; the expert cache's reader threads are
+  not, because they are blocked in `pread` rather than competing for a
+  core. `docs/ENGINE.md`, "Thread placement", has the rest.
+
 ## 0.6.5 — 2026-08-04
 
 Nothing in the engine changed: a binary built from this tag decodes exactly

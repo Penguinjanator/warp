@@ -151,7 +151,12 @@ int main(int argc, char **argv)
     for (size_t i=0;i<(size_t)NV*4*64;i++) lut8[i]=(int8_t)((random()%127)-63);
     for (int i=0;i<M_ROWS;i++) sc[i]=0.01f;
 
-    waste_pool_init(nthr);
+    {   /* honours WASTE_CPUS, so a placement measured here is the
+           placement the engine would use */
+        waste_cpumask cpus;
+        const int cr = waste_cpus_resolve(NULL, &cpus);
+        waste_pool_init(nthr, cr == WASTE_CPUS_OK ? &cpus : NULL);
+    }
     static volatile double sink;
     arg_t a = { y, NULL, lutf, lut8, sc, 1.0f/127.0f };
     const int REP = 40;

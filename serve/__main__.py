@@ -4,7 +4,7 @@
 __main__.py — `python3 -m serve MODEL`.
 
 Flags mirror the CLI's where they mean the same thing (--budget, --ctx,
---threads, --vision), because a person who has run `waste run` should not
+--threads, --cpus, --vision), because a person who has run `waste run` should not
 have to learn a second vocabulary to serve the same container.
 """
 
@@ -23,6 +23,7 @@ if __package__ in (None, ""):                    # python3 serve/__main__.py
 
 from . import api                                            # noqa: E402
 from .engine import (CACHE_LFRU, CACHE_LRU,                  # noqa: E402
+                     WASTE_E_ARG, WASTE_E_UNSUPPORTED,
                      Engine, EngineError, build_info, physical_ram,
                      plan_memory)
 from .server import serve                                    # noqa: E402
@@ -101,6 +102,12 @@ examples:
     g.add_argument("--threads", type=bounded_int(0, (1 << 31) - 1),
                    default=0, metavar="N",
                    help="compute threads (0 = one per core)")
+    g.add_argument("--cpus", default=None, metavar="LIST",
+                   help="restrict the compute pool to a cpu list, e.g. 0-5 "
+                        "or 0-2,6-8; --threads 0 then means one per CPU "
+                        "listed. Linux and Windows. Worth it where cores "
+                        "differ: on a two-die Ryzen, six threads on one die "
+                        "measured 16-25%% faster than six split across both")
     g.add_argument("--cache", choices=sorted(POLICIES), default="lfru")
     g.add_argument("--no-direct-io", action="store_true",
                    help="keep the page cache in the way. The bypass is on "
@@ -165,6 +172,7 @@ examples:
             ram_budget_bytes=args.budget,
             ctx_tokens=args.ctx,
             n_threads=args.threads,
+            cpu_list=args.cpus,
             cache_policy=POLICIES[args.cache],
             direct_io=not args.no_direct_io,
             vision=args.vision,
@@ -172,6 +180,13 @@ examples:
             usage_path=args.usage)
     except EngineError as e:
         print(f"{e}", file=sys.stderr)
+        # Two statuses that say nothing useful on their own when --cpus is
+        # what produced them, and here it usually is.
+        if args.cpus and e.status == WASTE_E_ARG:
+            print(f"--cpus: not a cpu list: {args.cpus}", file=sys.stderr)
+        elif args.cpus and e.status == WASTE_E_UNSUPPORTED:
+            print("--cpus: this platform does not bind threads to CPUs "
+                  "(Linux and Windows only)", file=sys.stderr)
         return 1
 
     try:

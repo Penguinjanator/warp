@@ -228,7 +228,7 @@ waste$(EXE): cli/main.o libwaste.a
 # the two failures tests/run.sh was written to catch, so a binary that
 # `test` builds and `clean` forgets defeats the check meant to notice it.
 TESTNAMES := test_kda test_container test_forward test_tokenizer test_k3parts \
-             test_state test_vision test_image test_memory sweep
+             test_state test_vision test_image test_memory test_cpus sweep
 TESTBINS  := $(addsuffix $(EXE),$(TESTNAMES))
 
 test: $(TESTBINS)
@@ -267,6 +267,11 @@ test_state$(EXE): tests/test_state.o libwaste.a
 # being parameters is that the policy is checkable in milliseconds against
 # synthetic files, with no container and no /proc on the host to depend on.
 test_memory$(EXE): tests/test_memory.o src/memory.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+# The pool is a header, so this links no engine at all — which is the point:
+# it can check placement without a container, and the parse half of it runs
+# on the platforms that cannot bind a thread.
+test_cpus$(EXE): tests/test_cpus.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 %.o: %.c

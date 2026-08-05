@@ -284,6 +284,9 @@ python3 -m serve MODEL [options]
   --budget SIZE      hard RAM ceiling, e.g. 48G (0 = the engine chooses)
   --ctx N            context tokens
   --threads N        compute threads (0 = one per core)
+  --cpus LIST        restrict them to a cpu list, e.g. 0-5 or 0-2,6-8;
+                     --threads 0 then means one per CPU listed. Linux and
+                     Windows — see docs/ENGINE.md, "Thread placement"
   --cache {lfru,lru} expert-cache eviction policy
   --no-direct-io     keep the page cache in the way (the bypass is on)
   --vision           load the vision tower

@@ -389,6 +389,20 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
     else waste_cfg_init(&cfg);
     if (!cfg.ctx_tokens) cfg.ctx_tokens = 4096;
 
+    /* Before anything is allocated, and refused rather than ignored: a
+     * cpuset the engine cannot honour has to be an error, because a run
+     * that silently did not pin looks exactly like pinning that did not
+     * help. The loader resolves the same string again, through the same
+     * function, and by then it can only succeed. */
+    {
+        waste_cpumask cpus;
+        switch (waste_cpus_resolve(cfg.cpu_list, &cpus)) {
+        case WASTE_CPUS_BAD:         return WASTE_E_ARG;
+        case WASTE_CPUS_UNSUPPORTED: return WASTE_E_UNSUPPORTED;
+        default: break;
+        }
+    }
+
     waste_ctx *c = (waste_ctx *)calloc(1, sizeof *c);
     if (!c) return WASTE_E_OOM;
     c->cfg = cfg;
@@ -471,6 +485,7 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
         opt.cache_bytes = (size_t)cache_bytes;
         opt.want_vision = cfg.vision;
         opt.n_threads = cfg.n_threads;
+        opt.cpus = cfg.cpu_list;
         opt.policy = (int)cfg.cache_policy;
         opt.direct_io = cfg.use_direct_io;
         const int rc = waste_model_load(&c->m, model_path, (int)cfg.ctx_tokens,

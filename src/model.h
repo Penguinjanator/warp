@@ -207,7 +207,11 @@ typedef struct {
  *
  *   cache_bytes  hard ceiling for the expert cache; 0 = no cache
  *   want_vision  load the vision tower (434 MB of weights)
- *   n_threads    compute pool size; 0 = WASTE_THREADS, else hardware
+ *   n_threads    compute pool size; 0 = WASTE_THREADS, else the CPUs the
+ *                pool may use
+ *   cpus         cpu list the pool binds to ("0-5"); NULL = WASTE_CPUS,
+ *                else the OS decides. Validated by waste_open — a loader
+ *                called directly ignores one it cannot parse or honour.
  *   policy       waste_cache_policy: 0 = LFRU, 1 = LRU
  *   direct_io    ask for the page-cache bypass on the expert banks
  */
@@ -215,6 +219,7 @@ typedef struct {
     size_t cache_bytes;
     int    want_vision;
     int    n_threads;
+    const char *cpus;
     int    policy;
     int    direct_io;
 } waste_load_opts;

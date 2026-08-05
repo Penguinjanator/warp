@@ -949,7 +949,10 @@ static void wire_trunk(waste_model *m)
 int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                      const waste_load_opts *opt)
 {
-    static const waste_load_opts defaults = { 0, 0, 0, 0, 1 };
+    /* Named rather than positional: this used to be `{ 0, 0, 0, 0, 1 }`,
+     * and a field added in the middle of the struct silently moved the 1
+     * from direct_io onto cache_policy. */
+    static const waste_load_opts defaults = { .direct_io = 1 };
     if (!opt) opt = &defaults;
     const size_t cache_bytes = opt->cache_bytes;
     memset(m, 0, sizeof *m);
@@ -969,8 +972,16 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
          * initialises once — the first model in wins, which is why the
          * header says so. */
         const char *e = getenv("WASTE_THREADS");
+        /* Same rule for the cpuset, and the same escape hatch. waste_open
+         * already refused a list that is malformed or that this platform
+         * cannot bind, so anything but OK here means the caller came in
+         * through waste_model_load directly: leave placement to the OS
+         * rather than guess at what half of a bad list meant. */
+        waste_cpumask cpus;
+        const int cr = waste_cpus_resolve(opt->cpus, &cpus);
         waste_pool_init(opt->n_threads > 0 ? opt->n_threads
-                                           : (e ? atoi(e) : 0));
+                                           : (e ? atoi(e) : 0),
+                        cr == WASTE_CPUS_OK ? &cpus : NULL);
     }
 
     char path[MAXP];

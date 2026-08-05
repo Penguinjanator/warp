@@ -82,6 +82,7 @@ class Cfg(C.Structure):
     _fields_ = [("ram_budget_bytes", C.c_uint64),
                 ("ctx_tokens", C.c_uint32),
                 ("n_threads", C.c_int),
+                ("cpu_list", C.c_char_p),
                 ("cache_policy", C.c_int),
                 ("use_direct_io", C.c_int),
                 ("vision", C.c_int),
@@ -368,6 +369,7 @@ class Engine:
                  ram_budget_bytes: int = 0,
                  ctx_tokens: int = 0,
                  n_threads: int = 0,
+                 cpu_list: Optional[str] = None,
                  cache_policy: int = CACHE_LFRU,
                  # waste_cfg_init's default, and the one the engine's own
                  # hit-rate numbers are measured under. Defaulting to
@@ -392,6 +394,12 @@ class Engine:
         cfg.ram_budget_bytes = ram_budget_bytes
         cfg.ctx_tokens = ctx_tokens
         cfg.n_threads = n_threads
+        # Kept alive for the same reason usage_path is, below. waste_open
+        # refuses a list it cannot parse or cannot honour, so a bad one
+        # surfaces here as EngineError rather than as a run that quietly
+        # did not pin anything.
+        self._cpus = cpu_list.encode() if cpu_list else None
+        cfg.cpu_list = self._cpus
         cfg.cache_policy = cache_policy
         cfg.use_direct_io = 1 if direct_io else 0
         cfg.vision = 1 if vision else 0

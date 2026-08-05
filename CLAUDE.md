@@ -49,8 +49,9 @@ tests/run.sh /nonexistent             # forces the synthetic container (what CI 
 
 With no container it builds a few-MB synthetic one via
 `tools/make_test_container.py` and reports SKIP — loudly — for anything
-needing real weights. A fresh clone is 29 pass / 10 skip; with both K3 and
-Kimi-Linear containers on disk it is 42 checks.
+needing real weights. A fresh clone on macOS is 30 pass / 13 skip; with
+both K3 and Kimi-Linear containers on disk it is 45 checks, 43 of which
+pass. Linux skips more, having no `uv` in `Dockerfile.test`: 26 / 16.
 
 The download-script checks start `tests/range_server.py` on an ephemeral
 port and read the number back through `--port-file`. Keep it that way — a
@@ -93,7 +94,10 @@ torch is never a repo dependency and never in the inference path.
 `WASTE_PROFILE=1` (phase timings), `WASTE_CACHE_MB=N` (expert cache size in
 the test harness), `WASTE_BACKEND=cpu` (disable SIMD/accelerator dispatch,
 for bisecting numeric diffs), `WASTE_VERIFY=1` (crc32 every record on the
-read path), `WASTE_THREADS`, `WASTE_DIRECT=0` (keep the page cache),
+read path), `WASTE_THREADS`, `WASTE_CPUS` (cpu list the pool binds to —
+`--cpus` on the CLI and the server, Linux and Windows; refused rather than
+ignored elsewhere, see docs/ENGINE.md "Thread placement"),
+`WASTE_DIRECT=0` (keep the page cache),
 `WASTE_Q8=0` (dequantize the trunk to f32 at load, any width — 8x the RAM
 on a 4-bit trunk, so it is out of reach on K3), `WASTE_I8MM=1`,
 `WASTE_TOK_PLAIN=1`, `WASTE_VIS_STAGE`, `WASTE_DUMP_LATENT/HIDDEN`.

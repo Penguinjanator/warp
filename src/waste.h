@@ -141,6 +141,43 @@ typedef struct {
      * results do not depend on the count either way. */
     int      n_threads;
 
+    /* Which CPUs the compute pool may run on: a Linux-style cpu list,
+     * "0-5" or "0-2,6-8" or "3". NULL = wherever the OS puts them, which
+     * is the default and stays the default. WASTE_CPUS fills in a NULL but
+     * does not override a value set here.
+     *
+     * Worth setting when the machine's cores are not interchangeable. On a
+     * two-CCD Ryzen 9 (two 6-core dies, separate 32 MB L3), six threads on
+     * one die measured 16-25% faster than the same six split across both
+     * at byte-identical work, because the far die's L3 is an Infinity
+     * Fabric hop away and every barrier waits for whoever is slowest —
+     * third-party measurement, issue #23. docs/LEARNED.md §47 is the same
+     * effect between P-cores and E-cores. There is no good default here:
+     * §47 measured capping the pool as a 25% gain on one model and a 34%
+     * loss on another, so the engine picks nothing and this is how a host
+     * that knows its machine says so.
+     *
+     * Two consequences worth knowing before setting it:
+     *
+     *   - n_threads 0 then means one thread per CPU in the list, not one
+     *     per CPU in the machine.
+     *   - the thread that calls into the engine is a worker, so it is
+     *     bound too, the first time it runs a kernel — and it stays bound
+     *     afterwards. A host that also uses that thread for something else
+     *     is restricting that too.
+     *
+     * The expert cache's reader threads are deliberately left out: they
+     * spend their lives blocked in pread, and putting them on the same
+     * CPUs as the kernels they feed is contention for nothing.
+     *
+     * A list that is malformed, or that names no CPU, fails waste_open
+     * with WASTE_E_ARG. A well-formed list on a platform that cannot bind
+     * threads — macOS, which has no such call — fails with
+     * WASTE_E_UNSUPPORTED rather than being ignored: silently not pinning
+     * is indistinguishable from pinning that did not help, and that is the
+     * one answer this option must never give. */
+    const char *cpu_list;
+
     waste_cache_policy cache_policy;
 
     /* Read expert banks with the page cache out of the way: F_NOCACHE on
