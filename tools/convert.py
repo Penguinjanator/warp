@@ -145,6 +145,38 @@ MOE_LAYOUTS = (
 KIND_ORDER = ("gate", "up", "down")
 KINDS = tuple(zip(KIND_ORDER, MOE_LAYOUTS[0][2]))   # default: Mixtral naming
 
+# The two families disagree on MoE *config* keys as well as on tensor names,
+# and this half is the more dangerous one: the engine reads `num_experts` and
+# a DeepSeek config only spells it `n_routed_experts`, so it loads 0 experts
+# and refuses the container with no diagnostic — after the conversion has
+# already run. `num_experts_per_tok` vs `..._per_token` is one letter and
+# would leave top_k at 0.
+#
+# The manifest is WASTE's format, not HF's, so it is normalised here for the
+# same reason the tensor names are: one spelling reaches the engine. Written
+# only when absent, so a config that already uses the canonical key wins.
+CONFIG_ALIASES = (
+    ("num_experts",           "n_routed_experts"),
+    ("num_experts_per_token", "num_experts_per_tok"),
+    ("num_shared_experts",    "n_shared_experts"),
+)
+# `moe_renormalize` is keyed on the field being PRESENT, not on its value, so
+# a plain alias of DeepSeek's `norm_topk_prob` would silently turn
+# renormalisation on for a checkpoint that sets it false. Emit only when true.
+CONFIG_FLAG_ALIASES = (("moe_renormalize", "norm_topk_prob"),)
+
+
+def normalise_cfg(cfg):
+    """A copy of the HF config with MoE keys under the names the engine reads."""
+    out = dict(cfg)
+    for canon, hf in CONFIG_ALIASES:
+        if canon not in out and hf in out:
+            out[canon] = out[hf]
+    for canon, hf in CONFIG_FLAG_ALIASES:
+        if canon not in out and out.get(hf):
+            out[canon] = True
+    return out
+
 
 def moe_layout(st, prefix, layer):
     """Which of MOE_LAYOUTS this checkpoint uses, from what is actually on disk."""
@@ -1316,7 +1348,7 @@ def main():
         "format_version": 0,
         "arch": arch,
         "tensor_prefix": prefix,
-        "config": cfg,
+        "config": normalise_cfg(cfg),
         # The record's fmt byte is FMT_VQ3R for every stage count but 2 — the
         # engine takes the stage and entry counts from here, not from the
         # byte, and only refuses a fmt that is neither VQ3R nor VQ2R.
