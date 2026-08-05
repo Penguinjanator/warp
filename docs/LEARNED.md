@@ -2820,3 +2820,281 @@ probe-refused paths, and confirming the write probe restores the file byte
 for byte — which is the same limitation §14 recorded for the engine, for
 the same reason. The three-column table above is the reporter's. **The
 platform still has not been measured from here.**
+
+## 50. Gate 2 measured: the GPU wins the matvec and loses the transfer (2026-08-05)
+
+**Third-party measurement, second contributor, and again not reproduced
+here.** `fab2s` ran gates 1, 2 and 3 on a consumer desktop — Ryzen 9 9900X
+(Zen 5, AVX-512, two 6-core CCDs with separate 32 MB L3) and an RTX 5060 Ti
+(sm_120, 36 SMs, 15.5 GB usable, 448 GB/s theoretical, PCIe Gen5 x8
+confirmed under load), on Kimi-Linear-48B with a default VQ3R container.
+§48 could not cover AVX-512 (Zen 3 has none), could not cover a second
+model, and — the part that changes its conclusion — measured one isolated
+kernel rather than the aggregate step.
+
+### Gate 1, re-answered with levers: the *step* is not bandwidth-bound
+
+Instead of a ratio against a STREAM ceiling, one resource varied at a time
+over byte-identical work — same container, same pinning, same `-n`, with
+`bench --json` reporting identical `bytes_read` and hit/miss counts, and
+clocks sampled *during* the load over the pinned cpuset:
+
+| lever | change applied | throughput | Amdahl f |
+|---|---|---|---|
+| core clock, max-freq cap, 3629 → 5327 MHz in-load | +46.8% | 11.73 → 15.99 (+36.4%) | **0.84** (0.79-0.84) |
+| DRAM, JEDEC 4800 → EXPO 6000 | +25.9% bandwidth | 14.90 → 15.63 (+4.9%) | **0.23** (0.21-0.26) |
+
+Solving `1/(1+y) = (1-f) + f/(1+x)` on each side. The two fractions come
+from independent levers on different boots and approximately partition the
+step. Samples were medians of 3-5 with cooldowns and the first run
+discarded; the DRAM sides are non-overlapping with under 0.6% spread each,
+and the measured bandwidth change matches the nominal DIMM change (63.4 →
+79.8 GB/s).
+
+Four corroborations, none of which rely on a cross-session absolute:
+
+- **Throughput does not scale with parallelism** past one CCD's physical
+  cores: 6 threads 15.94 tok/s, 12 threads 15.54, 24 threads 12.67.
+- **One core cannot saturate DRAM** — the same DIMM change moves STREAM read
+  +1.8% at 1 thread and +25.9% at 6, so the aggregate is not bounded by a
+  single core's outstanding-miss capacity.
+- **The fractions are complementary**, 0.84 + 0.23, from two levers measured
+  on separate boots.
+- **The ratio against the streaming ceiling gets *worse* as bandwidth
+  improves.** Per-token traffic is ~1.61 GB (1.04 GB of trunk re-read every
+  token, plus 214 expert records at 2.54 MiB, measured at `-n 256` with
+  prefill and read-ahead included against a nominal 26 x top-8 = 208):
+  24.0 GB/s of 63.4 (38%) at 4800, 25.2 of 79.8 (32%) at 6000. If bandwidth
+  were binding, raising it would pull the workload *toward* the ceiling.
+
+The 84% is not SIMD arithmetic. It is the LUT path's dependent
+load → address → load gather chains — cache-hit latency counted in core
+cycles, the same mechanism §7 and §41 kept arriving at from the ARM side.
+That is work a wider vector unit does not touch.
+
+**And the isolated kernel reproduces §48 exactly.** `lm_head.weight` here is
+383,385,600 B (Q8G group 128, `[163840, 2304]`, 0.321x K3's tensor and
+matching hidden 2304/7168): **6.600 ms/call, 58.1 GB/s, 73-76% of ceiling**,
+identical across three repeats, clearing the 70% bar §48 declared in
+advance — now on AVX-512.
+
+**So §48's kernel number stands and its generalization does not.** "The x86
+path is bandwidth-bound too" was inferred from a kernel the profiler puts at
+4.9% of decode at `-n 5`, 7.3% at `-n 45`, and `docs/TECHNICAL.md` puts at
+0.2% on K3. Both hold at once: **the kernel is bandwidth-bound, and it is
+0.2-7.3% of the budget.** The other 93-99% is core-clock-scaled. Read §48 as
+answering the question about `lm_head` and this as answering it about the
+step.
+
+That cuts both ways, and it is worth being explicit because issue #11
+predicted otherwise. #11 said a host that is *not* bandwidth-bound has
+headroom to reclaim, which weakens the accelerator case. But the host cannot
+reclaim it: threads stop scaling at one CCD, and the bound is gather latency,
+not width. Abundant thread-level parallelism is exactly what a GPU has. The
+gate-1 branch that closes is "fill the `waste_backend` slots" — the same
+branch §48 closed, for a different reason.
+
+### Gate 2 — the first end-to-end PCIe measurement this project has
+
+Correctness checked against a CPU reference at rel L2 1.02e-07 before any
+timing. Empty-kernel dispatch floor: **4.39 us** launch+sync, 1.30 us
+launch-only.
+
+| | `lm_head` 383 MB | one expert matrix [1024x2304], 2.4 MB |
+|---|---|---|
+| kernel only | 0.9940 ms → 385.7 GB/s | 0.0059 ms → 405.3 GB/s |
+| full round trip | 1.0561 ms | 0.0194 ms |
+| dependent chain | 1.0011 ms | 0.0114 ms |
+| queued chain | 0.9962 ms | 0.0059 ms |
+| dependency cost | (noise floor) | 5.5 us |
+
+85-90% of theoretical VRAM bandwidth, and against the CPU's 6.600 ms the
+**full GPU round trip is 6.25x faster**. The clause carried over from Metal —
+that the round-trip eats the win — does **not** transfer to a discrete card.
+Dispatch is not the obstacle for a restructured engine either: 27
+dispatches/token is 0.1 ms. It only binds the backend-shim shape, at 624
+dispatches x 11.4 us = 7.13 ms/token.
+
+**The deciding term is the expert stream:**
+
+| | |
+|---|---|
+| H2D pinned, 544 MiB = one token's routed experts | **19.807 ms → 28.8 GB/s** |
+| H2D pageable | 20.812 ms → 27.4 GB/s |
+| share of a measured 62.7 ms CPU token | **31.6%** |
+| expert set vs usable VRAM | 16.5 GiB vs 15.5 GiB — does not fit |
+
+28.8 GB/s is 90% of Gen5 x8, so the link is behaving. **It is also slower
+than this CPU's own RAM at 63-80 GB/s.** The card is structurally on a worse
+path to the same bytes: read experts into host RAM, then push them across a
+link at half the speed the host already had them at.
+
+**The expert matmul was implemented and measured, not substituted.** Taking
+the term from `matvec_q8g` would have been wrong — experts are residual VQ,
+not int8, and 16.53 GiB of 3-bit experts is ~88 GB at f16, so they must be
+decoded every token. One expert's gate+up+down, indices and codebooks
+straight out of the container, checked against a CPU reference at 3e-07:
+
+| per token, 26 layers x top-8, kernels only | decode-then-matvec | LUT, as the engine amortizes it |
+|---|---|---|
+| **VQ3R** (stages=3) | **13.86 ms** | 15.85 ms |
+| VQ2R (stages=2) | 12.48 ms | **9.70 ms** |
+
+`vq_apply` scales with stages (0.0428 → 0.0712 ms per expert, +66% for +50%
+lookups); reconstructing the weights and doing an ordinary matvec is nearly
+flat (0.0600 → 0.0666, +11%) because its M x N MAC term does not depend on
+stages. **The two cross between 2 and 3 stages, and the GPU picks the
+opposite algorithm from the CPU.** The reason is §41's, seen from the other
+side: the LUT exists to save FLOPs, its table is 864 KB at three stages and
+cannot leave L2, while the codebook is 24 KiB and sits in shared memory. On
+a GPU the FLOPs are free and the gathers are not.
+
+**Scope, and it matters: that is a 256-entry result, and `WQ_VQ4P` likely
+inverts it.** VQ4P's table is 288 KB fp32 and **72 KB int8** against VQ3R's
+864 KB, and 72 KB fits shared memory — which is the only reason
+reconstruction won here. The crossover is a property of the codebook shape,
+not of the device. Measuring it needs a 64-entry path in the benchmark, a
+fresh conversion and 0.6.4. Not run.
+
+Against the CPU's expert-matmul time — the profiler's share (48.7% VQ3R,
+52.9% VQ2R) applied to the 62.7 / 67.9 ms bench medians, approximate because
+profile and bench ran different read-ahead settings — that is **2.2x and
+3.7x**. Real, and far from the 6.25x the contiguous `lm_head` matvec gets.
+
+**Which corrects the projection.** With the expert term measured at 13.9 ms
+instead of the 3.7 ms an int8 stand-in implied:
+
+| term | ms/token |
+|---|---|
+| expert H2D | **19.8** |
+| trunk read at 379 GB/s | 2.7 |
+| expert decode + matvec, measured | **13.9** (was 3.7) |
+| dispatch, 27 x 4.39 us | 0.1 |
+| `lm_head` | 1.0 |
+| total | **~37.5 ms/token, ~27 tok/s** |
+
+**~1.7x** over the measured 62.7 ms / ~16 tok/s, not the ~2.3x the stand-in
+implied, with transfer falling from 73% to 53% of the budget because the
+compute term grew. Still a projection — there is no CUDA backend to measure
+— and it ignores KDA and MLA, a further 24% of CPU time that would need
+kernels of their own.
+
+### Gate 3 — no, and it would not have helped
+
+`gdscheck -p`, GDS 1.16.1.26, reports compat mode on all transports:
+disk → host RAM → `cudaMemcpy`. The hop is not avoided. Three reasons that
+is settled rather than pending:
+
+1. **Not silicon.** The card reports `supports GDS`, BAR1 at the full
+   16384 MiB, platform verification passes. `nvidia_fs` (min 2.12) is simply
+   absent.
+2. **Hostile to obtain.** `nvidia-fs-dkms` pulls a driver DKMS package at a
+   different version than the prebuilt driver in use; prebuilt
+   `linux-modules-nvidia-fs-*` target `-nvidia` kernel flavours rather than
+   `-generic`; and GDS is not guaranteed with `iommu=on/pt`, which that
+   machine needs.
+3. **Amdahl-bounded anyway.** 98.1% of expert reads are served from the RAM
+   cache, so GDS could touch ~2%, and on a miss the disk is the slow link
+   (3.4 GB/s there), not the bounce buffer.
+
+Note this is the opposite regime from the one §48 flagged: "~53% of a K3
+decode step is expert reads" is cold-cache and K3-scale, which is also the
+scale a 16 GB card cannot serve at all. The two do not overlap.
+
+### The configuration that would invert gate 2, built and killed
+
+The expert set misses VRAM by 1 GB. If it fit, the PCIe hop would become a
+one-time load and the per-token transfer term would vanish. So a VQ2R
+container was built with `convert.py --stages 2`, everything else default.
+
+**It fits, with room to spare:**
+
+| | VQ3R | VQ2R |
+|---|---|---|
+| expert bank | 16.53 GiB | **11.04 GiB** |
+| per-expert record | 2.543 MiB | 1.699 MiB |
+| resident (trunk + state + scratch) | 1.24 GiB | 1.21 GiB |
+| total on device | 17.77 GiB | **12.25 GiB** |
+| fits 15.5 GiB usable | no, by 2.27 GiB | **yes, by 3.25 GiB** |
+
+The bank ratio is 0.6682 against a bits-per-weight ratio of 0.6667; the
+difference is per-row f16 scales and index-block padding, which do not scale
+with stages.
+
+**On the CPU it is slower, by 7.7%**, medians of 3, 6 threads pinned to one
+CCD, `-n 512`, 96.5% hit rate in every case:
+
+| container | budget | median tok/s |
+|---|---|---|
+| VQ3R | 22G | **15.9601** |
+| VQ2R | 22G | 14.7337 |
+| VQ2R | record-scaled 15.78G | 14.6873 |
+
+The scaled budget holds cache capacity constant in *records* — without it
+the smaller container simply gets a bigger cache and the comparison measures
+hit rate instead of format. Both VQ2R runs agree to 0.3%, so it is intrinsic.
+`WASTE_PROFILE=1` says where it goes: expert I/O falls 22% as expected
+(0.69 → 0.54 s, 15.1% → 11.5%) and expert mm rises 11% (2.22 → 2.47 s,
+48.7% → 52.9%) and cancels it. That was an implementation artifact on 0.6.3
+— `vq_rows` had an `if (st == 3)` fast path and `st == 2` fell through to the
+generic one-row loop, so VQ2R issued 33% fewer lookups and still lost. §41
+has since reworked that path around a 64-entry table, so treat it as context
+for the numbers above rather than a standing gap.
+
+**Quality is what actually closes the loophole, and it reproduces
+`docs/GATES.md` Gate 3 independently.** Reconstruction error against source
+weights, 312 tensors each: VQ3R median **19.51%** (19.39-22.08), VQ2R median
+**33.19%** (33.05-37.63) — against the 19.4% at 3 bits and "2-bit VQ stays
+unsafe at 33%" recorded there, on different hardware and a different model.
+`verify_container.py` FAILs the VQ2R container at its 0.30 threshold, which
+is that same operating point; the parse itself is clean. The logit proxy
+agrees the damage is real without being dramatic at one step: top-1 agrees,
+KL 0.0179 nats, but top-10 overlap is 7/10, logit rel L2 is 9.42%, and greedy
+continuations diverge at the third token.
+
+**So gate 2's answer holds for every configuration that meets this project's
+own quality bar.** The only shape whose expert bank fits 15.5 GiB is the one
+Gate 3 rules out; the shape that passes Gate 3 misses VRAM by 2.27 GiB. The
+two do not overlap — the same structure as the gate 3 answer above.
+
+### Method notes worth keeping, independent of CUDA
+
+- **On `amd_pstate` in active mode the governor is not a clock lever.** Under
+  sustained load powersave boosts to 5332 MHz against performance's 5327 —
+  identical. A governor toggle compares idle-clock labels on same-speed runs.
+  A clock lever must be a max-frequency cap, verified in-load, on both sides.
+- **Pin threads within one CCD.** Splitting 6 threads across both CCDs costs
+  **16-25%** at identical thread count and identical work. That is `--cpus` /
+  `WASTE_CPUS` measured from the outside by someone who did not know it was
+  landing, and it is the strongest argument yet that the flag is not
+  optional tuning.
+- **Hold `-n` fixed** when sweeping — `--threads` also sizes the reader pool,
+  so at low token counts the ranking between thread counts inverts.
+- **Use `-n 1024`+.** Misses are unique-expert first touches, a fixed cost,
+  so hit rate rises with length: 94.0 / 96.5 / 98.1% at 256 / 512 / 1024.
+- **Check `bytes_read` matches** before comparing throughput at all.
+- Over a long back-to-back campaign (32 runs, ~30 min) that machine produced
+  occasional ~30% low outliers on byte-identical work — not thermal, not
+  competing processes, not huge-page fallback, not fragmentation, cause
+  unidentified. Short series showed none. Anything measured over a long
+  campaign needs medians and within-round ratios.
+- Gate 2 needs no host CUDA install if a CUDA >= 12.8 image is available
+  (12.8 added sm_120).
+
+### What it settles
+
+A discrete consumer card is answered, and for a **different reason than
+Metal was**. Metal died on the round trip; here the round trip is 6.25x
+favourable and the kernels hit 85-90% of VRAM bandwidth. What kills it is
+expert-transfer bandwidth plus VRAM capacity: PCIe is slower than the host's
+own RAM, and the experts do not fit.
+
+That names the condition under which it flips, which is the useful part.
+**VQ3R's 17.77 GiB fits a 24 GB part comfortably** — and then the H2D term
+becomes a one-time load rather than 19.8 ms every token, which is the whole
+deciding row. The GPU VQ-decode throughput measured above applies unchanged
+to that case.
+
+Not measured: bandwidth against DRAM latency separately, GDS in GDS mode,
+KDA and MLA on a GPU, the VQ4P 64-entry crossover, VQ2R quality on a real
+eval, gate 4, contexts beyond 4096, prefill as distinct from decode.
