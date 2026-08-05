@@ -8,7 +8,22 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
-## Unreleased
+## 0.6.6 — 2026-08-05
+
+The engine decodes exactly as 0.6.5 did and no container format moved. Two
+things make it a tag. A host can now say which CPUs the compute pool runs
+on, which is the first answer this project has to a machine whose cores are
+not interchangeable. And `tools/diskbench` — the tool whose entire job is to
+certify the storage a container will be streamed from — was measuring the
+page cache on Linux, so it had been answering that question wrong for
+everyone who is not on macOS.
+
+**Callers must recompile against this header.** `cpu_list` was added to
+`waste_cfg` between `n_threads` and `cache_policy`, so a caller built
+against 0.6.5's struct reads `cache_policy` and every field after it from
+the wrong offset. `serve/engine.py`'s mirror moved with it; an out-of-tree
+ctypes or FFI binding has to move too. The library is 0.6.x and promises no
+stable ABI yet, but a silent misread is worth the sentence.
 
 ### Added
 
@@ -38,6 +53,64 @@ changed. Each entry names the section to read for the numbers behind it.
   because it is one of the workers; the expert cache's reader threads are
   not, because they are blocked in `pread` rather than competing for a
   core. `docs/ENGINE.md`, "Thread placement", has the rest.
+
+- **The converted K3 container over BitTorrent**, in `README.md` ahead of
+  the conversion recipe. The default conversion is deterministic, so the
+  982 GB directory is byte-identical for everyone who produces it, and
+  nearly all of what the recipe costs — a 1.42 TB source download, 4.7
+  hours, and staging storage that has to exist before it can be freed — is
+  paid to reproduce a fixed artifact. The torrent's own piece hashes verify
+  it as it arrives. Converting from the published weights stays documented,
+  for anyone who would rather not trust a third-party copy.
+
+### Fixed
+
+- **`tools/diskbench` measured the page cache on Linux, not the disk**
+  ([#22](https://github.com/sqliteai/waste/pull/22), `docs/LEARNED.md`
+  §49). It documented itself as reading with the cache bypassed, and did
+  neither: `nocache()` had an `#ifdef __APPLE__` body and nothing else in
+  it, and `O_DIRECT` appeared nowhere in the file. Against a Samsung 970
+  PRO on Gen3 x4 it reported 44.67 GB/s sequential and 65.72 GB/s random
+  over a 3.94 GB/s link — 11x and 17x the ceiling. Bypassed: 3.15 and 3.33
+  GB/s, saturating at two threads, which is what that drive should do.
+
+  This is LEARNED §14 in the one place §14 did not reach. The engine's own
+  bypass was written blind and fixed on 2026-07-28; the tool that exists to
+  characterise the engine's I/O kept reading RAM, which means §46's standing
+  rule — run `diskbench` and divide before claiming anything is disk-bound —
+  returned a fiction on Linux for that whole window. **No published number
+  moves**: every `diskbench` figure in `docs/GATES.md`, `docs/EFFICIENCY.md`
+  and LEARNED §44/§46 was measured on macOS, where `F_NOCACHE` did work.
+
+  The flag alone is not enough, for the reason `bank_open` already knows:
+  `O_DIRECT` is accepted at open and refused at transfer (tmpfs does this),
+  so a bare flag turns a refusing filesystem into a table of zeroes with no
+  cause given. It follows `bank_open` instead — probe with one aligned
+  transfer, fall back to a plain open plus `POSIX_FADV_RANDOM`, and label
+  every row, because a bench that quietly measures something else is worse
+  than one that says it could not. The write is bypassed too, and that is
+  not symmetry for its own sake: `F_NOCACHE` stops new pages being cached
+  but does not evict resident ones, so a buffered write leaves the file in
+  the UBC and every read row below it reports RAM — 8.07 GB/s sequential
+  with the write bypassed against 26.04 GB/s with it buffered, 1 GB file on
+  an M5 Pro. Also fixed alongside: a sub-page record rounded to zero and was
+  divided by, and a failed sequential read ended the loop and silently
+  shortened the row.
+
+  Reported, diagnosed and fixed by fab2s. Verified here on macOS as
+  unchanged within noise; the Linux figures are the reporter's, on hardware
+  this repo does not have.
+
+- **`diskbench`'s tok/s column answered for K3 whatever was being sized.**
+  The derived column carried 12.5 GB/token in its format string — K3's
+  figure — so on a 48B model at a measured 1.61 GB/token it was ~8x off,
+  and silent about the assumption, which is what made it a trap rather than
+  an approximation. It is now the fifth positional argument with no default:
+  without it the column is not printed. A tool cannot derive bytes-per-token
+  from a scratch file — that number belongs to a container, and `waste
+  bench` already reports it. `docs/GATES.md`'s Gate H table keeps its
+  "tok/s @12.5 GB/token" header: that was a K3 decision, and the figure is
+  stated in the header rather than hidden in a format string.
 
 ## 0.6.5 — 2026-08-04
 
