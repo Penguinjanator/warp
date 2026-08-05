@@ -2742,3 +2742,81 @@ automatic budget:
 It stays here and not in `README.md`. Every number there was measured on
 the commit it ships with, and dual EPYC is a class of machine this repo
 cannot verify on.
+
+## 49. The bench that certified the disk was reading RAM (2026-08-05)
+
+§14 found `O_DIRECT` in a comment and nowhere in the code, and fixed the
+engine. It did not look at `tools/diskbench.c`, which carries the same
+sentence in its own header — "with the page cache bypassed (F_NOCACHE /
+O_DIRECT)" — and had the same hole: `nocache()`'s body was `#ifdef
+__APPLE__` with nothing else in it, and all three opens were unqualified.
+
+Reported by `fab2s` as PR #22, **on hardware this repo does not have** —
+Samsung 970 PRO, PCIe Gen3 x4, Ubuntu 26.04, 16 GB file, 3 MB records:
+
+| | before | after | link ceiling |
+|---|---|---|---|
+| seq read | 44.67 GB/s | 3.15 GB/s | 3.94 GB/s |
+| random, 1 thread | 36.75 | 2.91 | |
+| random, saturated | 65.72 | 3.33 | |
+
+11x and 17x over the link. The tell was there in every run and nobody
+divided: a Gen3 x4 drive cannot deliver 65 GB/s whatever the benchmark
+says, and after the fix it saturates at two threads and 85% of the
+ceiling, which is what that drive should do.
+
+**What it cost.** §46 ends with a rule — before claiming anything is
+disk-bound, run `diskbench` and divide. On Linux that rule returned a
+fiction from 2026-07-28 until now. No published number moves: every
+`diskbench` figure in `docs/GATES.md`, `docs/EFFICIENCY.md` and §44/§46
+was measured here, on macOS, where `F_NOCACHE` did work. But the rule had
+no force on the platform most users are on, and Gate H is exactly the
+class of decision — 1.5 TB onto the wrong device — it exists to protect.
+
+**The general form: the engine's rules bind the tools that measure the
+engine.** `bank_open` bounds its bypass, probes it with a real transfer
+and reports when it did not get it. `diskbench` asserted one in a header
+comment. That is now three instances of one bug class in this repo —
+issue #4 (an alignment test that was false for every container that
+exists), §14 (the flag that lived only in a comment), and now the tool the
+disk-bound claim rests on.
+
+**`F_NOCACHE` does not evict, and that is not a detail.** Reviewing the
+fix, the write looked like it should stay buffered: row 1 stands for the
+download and the conversion landing, and those write through the page
+cache like everything else. On Linux that holds — a subsequent `O_DIRECT`
+read writes back and invalidates the range first, so the leftovers cannot
+flatter the read rows (reasoned, not measured; no Linux here). On macOS it
+is wrong, and measurably so. `F_NOCACHE` stops *new* pages being cached; it
+does not evict resident ones. A buffered write leaves the whole file in
+the UBC and every read row below then measures RAM. Same binary, 1 GB
+working file, 4 MB records, internal SSD, differing only in whether the
+write fd got the bypass:
+
+| | write bypassed | write buffered |
+|---|---|---|
+| seq read | 7.9-8.1 GB/s | **26.04 GB/s** |
+| random, 1 thread | 6.8-7.0 | **24.34** |
+
+3.2x and 3.5x of pure fiction, on the row that sets tok/s. The original
+`nocache()` on the write fd was load-bearing and looked ornamental. The
+bypass covers the whole file's lifetime or it covers nothing.
+
+**So the fix is not the flag.** `O_DIRECT` is accepted at open and refused
+at transfer — tmpfs does this, and so would a device wanting a bigger
+block than the tool aligns to — so a bare flag turns a refusing filesystem
+into `short read -1` and a table of zeroes with no cause given. It now
+does what `bank_open` does: probe with one aligned transfer, fall back to
+a plain open plus `POSIX_FADV_RANDOM`, and label every row `(cache
+bypassed)` or `(PAGE CACHE, not the disk)` with a trailer explaining it.
+A measurement that quietly means something different is worse than one
+that is missing — §14 said that about the engine and it is truer of the
+tool, because the tool is what the claim rests on.
+
+**What is verified, and what is not.** macOS is unchanged against `main`
+within noise. The Linux body compiles and runs here only against stubs for
+`O_DIRECT` and `posix_fadvise` — covering both the probe-succeeds and the
+probe-refused paths, and confirming the write probe restores the file byte
+for byte — which is the same limitation §14 recorded for the engine, for
+the same reason. The three-column table above is the reporter's. **The
+platform still has not been measured from here.**
