@@ -858,25 +858,60 @@ static int cfg_sane(const waste_config *c)
  *     mscale_all_dim SQUARED, which is 1.8133x on K2.
  *   - YaRN rescales inv_freq globally, so it applies from position 0. It is
  *     not a long-context-only correction that a short prompt can ignore.
+ *
+ * A shape this does not implement leaves a reason in c->rope_err and the
+ * load refuses on it. Falling through to plain RoPE instead would be the
+ * same failure this function was added to fix: not a degraded answer but an
+ * unordered one, and one that looks like weight-shaped logits.
  */
 static void rope_init(waste_config *c, const js_doc *d, int cfg)
 {
     const double PI = 3.14159265358979323846;
     c->att_mul = 1.0f;
-    c->mla_nope = js_get(d, cfg, "mla_use_nope") >= 0;
+    c->rope_err[0] = 0;
+    /* By value, not by presence: a container carrying "mla_use_nope": false
+     * has to rotate. The presence idiom used for the other flags costs a
+     * feature when it misreads; here it costs the sequence order. */
+    c->mla_nope = js_bool(d, js_get(d, cfg, "mla_use_nope"), 0);
     const int dim = c->qk_rope, half = dim / 2;
-    if (c->mla_nope || half <= 0 || half > WASTE_MAX_ROPE_HALF) return;
+    if (c->mla_nope || half <= 0) return;
+    if (half > WASTE_MAX_ROPE_HALF) {
+        snprintf(c->rope_err, sizeof c->rope_err,
+                 "qk_rope_head_dim %d needs rotation, this build holds %d",
+                 dim, 2 * WASTE_MAX_ROPE_HALF);
+        return;
+    }
 
     const double base = js_num(d, js_get(d, cfg, "rope_theta"), 10000.0);
     for (int j = 0; j < half; j++)
         c->rope_inv_freq[j] = (float)(1.0 / pow(base, (double)(2 * j) / dim));
 
     const int rs = js_get(d, cfg, "rope_scaling");
-    if (rs < 0) return;
-    char type[16];
-    js_str(d, js_get(d, rs, "type"), type, sizeof type);
+    if (rs < 0) return;                     /* plain RoPE, computed above */
+    char type[24];
+    int ty = js_get(d, rs, "type");
+    if (ty < 0) ty = js_get(d, rs, "rope_type");   /* HF renamed the key */
+    js_str(d, ty, type, sizeof type);
+    if (strcmp(type, "yarn") != 0) {
+        snprintf(c->rope_err, sizeof c->rope_err,
+                 "rope_scaling type \"%s\" is not implemented, only yarn", type);
+        return;
+    }
+    /* factor <= 1 is not a refusal: YaRN's ramp is the identity there and
+     * both mscales collapse to 1, so plain RoPE is the right answer. */
     const double factor = js_num(d, js_get(d, rs, "factor"), 1.0);
-    if (strcmp(type, "yarn") != 0 || factor <= 1.0) return;
+    if (factor <= 1.0) return;
+    /* Unequal mscales put a ratio on cos/sin that nothing here applies.
+     * V3, R1, K2 and V2 all ship them equal; HF's defaults (1 and 0) are
+     * not, so an omitted mscale_all_dim lands here too. */
+    const double m_one = js_num(d, js_get(d, rs, "mscale"), 1.0);
+    const double m_dim = js_num(d, js_get(d, rs, "mscale_all_dim"), 0.0);
+    if (m_one != m_dim) {
+        snprintf(c->rope_err, sizeof c->rope_err,
+                 "rope_scaling mscale %g != mscale_all_dim %g, and the ratio "
+                 "on cos/sin is not implemented", m_one, m_dim);
+        return;
+    }
 
     const double orig = js_num(d, js_get(d, rs, "original_max_position_embeddings"), 4096.0);
     const double bf = js_num(d, js_get(d, rs, "beta_fast"), 32.0);
@@ -893,9 +928,8 @@ static void rope_init(waste_config *c, const js_doc *d, int cfg)
         const double extra = c->rope_inv_freq[j];
         c->rope_inv_freq[j] = (float)((extra / factor) * (1.0 - mask) + extra * mask);
     }
-    const double m_all = js_num(d, js_get(d, rs, "mscale_all_dim"), 0.0);
-    if (m_all != 0.0) {
-        const double ms = 0.1 * m_all * log(factor) + 1.0;
+    if (m_dim != 0.0) {
+        const double ms = 0.1 * m_dim * log(factor) + 1.0;
         c->att_mul = (float)(ms * ms);
     }
 }
@@ -1091,12 +1125,11 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         js_free(&d); free(src);
         return -2;                        /* -> WASTE_E_FORMAT */
     }
-    /* rope_init leaves the table empty when the slice is wider than it can
-     * hold. Running anyway would apply no rotation, which is not a degraded
-     * result but an unordered one, so refuse instead. */
-    if (!m->cfg.mla_nope && m->cfg.qk_rope > 2 * WASTE_MAX_ROPE_HALF) {
-        fprintf(stderr, "waste: qk_rope_head_dim %d needs rotation, this build "
-                        "holds %d\n", m->cfg.qk_rope, 2 * WASTE_MAX_ROPE_HALF);
+    /* rope_init leaves no table for a shape it does not implement. Running
+     * anyway would apply no rotation, which is not a degraded result but an
+     * unordered one, so refuse instead. */
+    if (m->cfg.rope_err[0]) {
+        fprintf(stderr, "waste: %s\n", m->cfg.rope_err);
         js_free(&d); free(src);
         return -2;                        /* -> WASTE_E_FORMAT */
     }

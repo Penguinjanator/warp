@@ -97,6 +97,9 @@ typedef struct {
     int   mla_nope;                  /* mla_use_nope: 1 = no rotation       */
     float rope_inv_freq[WASTE_MAX_ROPE_HALF];   /* qk_rope/2 used, YaRN-adjusted */
     float att_mul;                   /* YaRN mscale^2 on the attn scale, 1 = none */
+    char  rope_err[128];             /* non-empty: a shape rope_init does not
+                                      * implement, and why. The load refuses on
+                                      * it rather than running unrotated.    */
 } waste_config;
 
 typedef struct {

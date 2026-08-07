@@ -287,6 +287,18 @@ def main():
                     help="override qk_rope_head_dim. With --rope, a slice "
                          "wider than the build's WASTE_MAX_ROPE_HALF pair "
                          "table has to be refused at load, not run unrotated")
+    ap.add_argument("--nope-false", action="store_true",
+                    help="write mla_use_nope: false rather than omitting it. "
+                         "Same model either way — a loader that tests the key "
+                         "for presence reads it as NoPE and skips the rotation")
+    ap.add_argument("--rope-type", metavar="T",
+                    help="override rope_scaling.type, e.g. linear — a scaling "
+                         "the engine does not implement has to be refused, not "
+                         "quietly run as plain RoPE")
+    ap.add_argument("--mscale", type=float, metavar="X",
+                    help="override rope_scaling.mscale, leaving mscale_all_dim "
+                         "at 1.0. Unequal mscales put a ratio on cos/sin that "
+                         "the engine does not apply, so it refuses instead")
     args = ap.parse_args()
     rng = random.Random(args.seed)
     os.makedirs(args.out, exist_ok=True)
@@ -302,6 +314,12 @@ def main():
         cfg["model_type"] = "deepseek_v3"
         cfg["architectures"] = ["DeepseekV3ForCausalLM"]
         cfg.update(V3_ROPE)
+        if args.nope_false:
+            cfg["mla_use_nope"] = False
+        if args.rope_type:
+            cfg["rope_scaling"] = dict(cfg["rope_scaling"], type=args.rope_type)
+        if args.mscale is not None:
+            cfg["rope_scaling"] = dict(cfg["rope_scaling"], mscale=args.mscale)
     if args.qk_rope:
         cfg["qk_rope_head_dim"] = args.qk_rope
     if args.tokenizer:

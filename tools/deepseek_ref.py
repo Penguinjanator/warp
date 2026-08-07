@@ -74,8 +74,12 @@ def rope_tables(cfg, dim):
     sc = cfg.get("rope_scaling")
     half = torch.arange(0, dim, 2, dtype=torch.float32) / dim
     freq_extra = 1.0 / (base ** half)
-    if not sc or sc.get("type") not in ("yarn",):
+    kind = sc.get("type", sc.get("rope_type")) if sc else None
+    if not sc:
         return freq_extra, 1.0
+    if kind != "yarn":
+        raise SystemExit(f"rope_scaling type {kind!r} is not implemented here; "
+                         "the engine refuses the same shape at load")
     factor = float(sc["factor"])
     orig = float(sc.get("original_max_position_embeddings", 4096))
     bf, bs = float(sc.get("beta_fast", 32)), float(sc.get("beta_slow", 1))
@@ -89,8 +93,14 @@ def rope_tables(cfg, dim):
     inv_freq = freq_inter * (1 - mask) + freq_extra * mask
     # cos/sin carry mscale / mscale_all_dim, which is 1.0 when the two are equal
     # (K2: both 1.0). The attention scale carries mscale_all_dim squared, which
-    # is 1.8133x on K2. Same name, two different factors.
-    m_all = sc.get("mscale_all_dim", 0)
+    # is 1.8133x on K2. Same name, two different factors. Unequal mscales are
+    # refused rather than approximated, so this stays an oracle for exactly the
+    # shapes the engine accepts.
+    m_one, m_all = sc.get("mscale", 1.0), sc.get("mscale_all_dim", 0)
+    if float(m_one) != float(m_all):
+        raise SystemExit(f"rope_scaling mscale {m_one} != mscale_all_dim "
+                         f"{m_all}; the ratio on cos/sin is not implemented "
+                         "here, and the engine refuses it at load")
     att_mul = yarn_get_mscale(factor, float(m_all)) ** 2 if m_all else 1.0
     return inv_freq, att_mul
 

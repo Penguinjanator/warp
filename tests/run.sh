@@ -725,23 +725,53 @@ PY
         then ok "chunked prefill == token-at-a-time with rotation"
         else no "chunked prefill diverges on a rotated model"
         fi
+
+        # Same model, same seed, one line of config: mla_use_nope written out
+        # as false instead of omitted. A loader that tests the key for
+        # presence reads that as NoPE and skips the rotation, which is the
+        # pre-fix engine — so these logits have to match the ones above.
+        FALSE="$TMP/rope_nopefalse.waste"
+        if ! python3 tools/make_test_container.py --rope --nope-false --seed 0 \
+             "$FALSE" >/dev/null 2>&1; then
+            sk "mla_use_nope: false rotates" "container not built"
+        else
+            ./test_forward "$FALSE" "$RIDS" "$TMP/rope_false.bin" 0 >/dev/null 2>&1
+            if [ -s "$TMP/rope_false.bin" ] && cmp -s "$TMP/rope_seq.bin" "$TMP/rope_false.bin"
+            then ok "mla_use_nope: false rotates, like the same model without the key"
+            else no "mla_use_nope: false was read as NoPE and skipped the rotation"
+            fi
+        fi
     fi
 
-    # The rope table is a fixed WASTE_MAX_ROPE_HALF pairs. A container that
-    # needs more must be refused at load: running it would apply no rotation,
-    # and that is not a degraded answer but an unordered one.
-    WIDE="$TMP/rope_wide.waste"
-    if ! python3 tools/make_test_container.py --rope --qk-rope 132 "$WIDE" >/dev/null 2>&1; then
-        sk "a rope slice wider than the build holds is refused" "container not built"
-    # Read into a variable rather than piping: a refused load is a non-zero
-    # exit, which is the point, and under `set -o pipefail` that would sink
-    # the pipeline no matter what grep found.
-    elif printf '%s' "$(./test_forward "$WIDE" 3,7,11 "$TMP/wide.bin" 0 2>&1 || true)" \
-         | grep -q "needs rotation"; then
-        ok "a rope slice wider than the build holds is refused at load"
-    else
-        no "an over-wide rope slice loaded instead of being refused"
-    fi
+    # Shapes rope_init does not implement. Each has to be refused at load:
+    # running one would apply no rotation or the wrong one, and that is not a
+    # degraded answer but an unordered one.
+    rope_refused() {              # <what> <expected message> <container args...>
+        local what=$1 want=$2; shift 2
+        local dir="$TMP/rope_bad.waste"
+        rm -rf "$dir"
+        if ! python3 tools/make_test_container.py --rope "$@" "$dir" >/dev/null 2>&1; then
+            sk "$what is refused at load" "container not built"
+        # Read into a variable rather than piping: a refused load is a
+        # non-zero exit, which is the point, and under `set -o pipefail` that
+        # would sink the pipeline no matter what grep found.
+        elif printf '%s' "$(./test_forward "$dir" 3,7,11 "$TMP/bad.bin" 0 2>&1 || true)" \
+             | grep -q "$want"; then
+            ok "$what is refused at load"
+        else
+            no "$what loaded instead of being refused"
+        fi
+    }
+
+    # The rope table is a fixed WASTE_MAX_ROPE_HALF pairs.
+    rope_refused "a rope slice wider than the build holds" \
+                 "needs rotation" --qk-rope 132
+    # Anything but yarn — linear, dynamic — reaches none of the ramp below it.
+    rope_refused "an unimplemented rope_scaling type" \
+                 "not implemented, only yarn" --rope-type linear
+    # Unequal mscales put a ratio on cos/sin that rope_tables does not apply.
+    rope_refused "rope_scaling with mscale != mscale_all_dim" \
+                 "not implemented" --mscale 0.707
 fi
 
 # --------------------------------------------------------------- budget ----
