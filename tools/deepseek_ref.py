@@ -292,6 +292,9 @@ def main():
                          "the engine also omits; with --no-rope this reproduces "
                          "the engine")
     ap.add_argument("--dump-hidden", help="per-layer residual stream, engine's format")
+    ap.add_argument("--dump", default="",
+                    help="last token's logits as f32, the layout test_forward "
+                         "writes — this is what tests/run.sh diffs against")
     ap.add_argument("--upto", type=int, help="stop after N layers (bisecting)")
     ap.add_argument("--threads", type=int,
                     help="torch intra-op threads; default is one per physical core")
@@ -314,6 +317,11 @@ def main():
     if lg is None:
         print(f"stopped after {a.upto} layers, hidden dumped", file=sys.stderr)
         return 0
+    if a.dump:
+        v = lg.float().tolist()
+        with open(a.dump, "wb") as f:
+            f.write(struct.pack(f"<{len(v)}f", *v))
+        print(f"dumped logits -> {a.dump}", file=sys.stderr)
     pr = lg.softmax(-1)
     top = torch.topk(lg, a.top)
     print(json.dumps({
