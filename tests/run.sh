@@ -731,7 +731,7 @@ PY
         # presence reads that as NoPE and skips the rotation, which is the
         # pre-fix engine — so these logits have to match the ones above.
         FALSE="$TMP/rope_nopefalse.waste"
-        if ! python3 tools/make_test_container.py --rope --nope-false --seed 0 \
+        if ! python3 tools/make_test_container.py --rope --nope false --seed 0 \
              "$FALSE" >/dev/null 2>&1; then
             sk "mla_use_nope: false rotates" "container not built"
         else
@@ -740,6 +740,25 @@ PY
             then ok "mla_use_nope: false rotates, like the same model without the key"
             else no "mla_use_nope: false was read as NoPE and skipped the rotation"
             fi
+        fi
+
+        # null is how an HF config says "no scaling" and convert.py copies it
+        # verbatim, so it is the shape most containers on disk carry. It has
+        # to load as plain RoPE — the same as {} and the same as no key at
+        # all — rather than being read as a scaling with an unknown type.
+        none_ok=1
+        for shape in drop null empty; do
+            dir="$TMP/rope_$shape.waste"
+            rm -rf "$dir"
+            python3 tools/make_test_container.py --rope --rope-scaling "$shape" \
+                --seed 0 "$dir" >/dev/null 2>&1 || { none_ok=0; break; }
+            ./test_forward "$dir" "$RIDS" "$TMP/rs_$shape.bin" 0 >/dev/null 2>&1
+            [ -s "$TMP/rs_$shape.bin" ] || { none_ok=0; break; }
+            cmp -s "$TMP/rs_drop.bin" "$TMP/rs_$shape.bin" || { none_ok=0; break; }
+        done
+        if [ "$none_ok" = 1 ]
+        then ok "rope_scaling null and {} load as plain RoPE, like no key at all"
+        else no "rope_scaling null or {} did not load as plain RoPE"
         fi
     fi
 
@@ -772,6 +791,13 @@ PY
     # Unequal mscales put a ratio on cos/sin that rope_tables does not apply.
     rope_refused "rope_scaling with mscale != mscale_all_dim" \
                  "not implemented" --mscale 0.707
+    # A scaling object that carries no type is not the same as no scaling.
+    rope_refused "rope_scaling that carries no type" \
+                 "carries no type" --rope-scaling notype
+    # Present but not a boolean names no sequence order, so neither does a
+    # default picked for it.
+    rope_refused "mla_use_nope that is not true or false" \
+                 "not true or false" --nope 1
 fi
 
 # --------------------------------------------------------------- budget ----

@@ -188,6 +188,14 @@ static inline int js_at(const js_doc *d, int arr, int i)
     return p;
 }
 
+/* The token's type, or -1 for no such token. The accessors below fold
+ * "absent" and "present but not that type" into the same default; a caller
+ * that has to tell those apart needs this. */
+static inline int js_typeof(const js_doc *d, int t)
+{
+    return (t < 0 || t >= d->n) ? -1 : (int)d->tok[t].type;
+}
+
 static inline double js_num(const js_doc *d, int t, double dflt)
 {
     if (t < 0 || t >= d->n || d->tok[t].type != JS_NUM) return dflt;

@@ -871,8 +871,19 @@ static void rope_init(waste_config *c, const js_doc *d, int cfg)
     c->rope_err[0] = 0;
     /* By value, not by presence: a container carrying "mla_use_nope": false
      * has to rotate. The presence idiom used for the other flags costs a
-     * feature when it misreads; here it costs the sequence order. */
-    c->mla_nope = js_bool(d, js_get(d, cfg, "mla_use_nope"), 0);
+     * feature when it misreads; here it costs the sequence order.
+     *
+     * Present but not a boolean is refused rather than defaulted, because
+     * defaulting picks the sequence order from a manifest that did not say
+     * which one it wanted, and picks it silently. */
+    const int nope = js_get(d, cfg, "mla_use_nope");
+    c->mla_nope = 0;
+    if (nope >= 0 && js_typeof(d, nope) != JS_BOOL) {
+        snprintf(c->rope_err, sizeof c->rope_err,
+                 "mla_use_nope is present but is not true or false");
+        return;
+    }
+    c->mla_nope = js_bool(d, nope, 0);
     const int dim = c->qk_rope, half = dim / 2;
     if (c->mla_nope || half <= 0) return;
     if (half > WASTE_MAX_ROPE_HALF) {
@@ -886,12 +897,22 @@ static void rope_init(waste_config *c, const js_doc *d, int cfg)
     for (int j = 0; j < half; j++)
         c->rope_inv_freq[j] = (float)(1.0 / pow(base, (double)(2 * j) / dim));
 
+    /* A key that is absent, null or {} all mean no scaling, and js_size is 0
+     * for each — the plain-RoPE table above is already the whole answer.
+     * null is how HF configs spell it and convert.py copies them verbatim,
+     * so this is the common shape, not the corner. */
     const int rs = js_get(d, cfg, "rope_scaling");
-    if (rs < 0) return;                     /* plain RoPE, computed above */
+    if (rs < 0 || js_size(d, rs) == 0) return;
     char type[24];
     int ty = js_get(d, rs, "type");
     if (ty < 0) ty = js_get(d, rs, "rope_type");   /* HF renamed the key */
-    js_str(d, ty, type, sizeof type);
+    js_str(d, ty, type, sizeof type);              /* "" if absent or not a string */
+    if (!type[0]) {
+        snprintf(c->rope_err, sizeof c->rope_err,
+                 "rope_scaling carries no type string, and only yarn is "
+                 "implemented");
+        return;
+    }
     if (strcmp(type, "yarn") != 0) {
         snprintf(c->rope_err, sizeof c->rope_err,
                  "rope_scaling type \"%s\" is not implemented, only yarn", type);

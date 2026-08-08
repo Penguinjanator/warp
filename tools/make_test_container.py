@@ -287,10 +287,18 @@ def main():
                     help="override qk_rope_head_dim. With --rope, a slice "
                          "wider than the build's WASTE_MAX_ROPE_HALF pair "
                          "table has to be refused at load, not run unrotated")
-    ap.add_argument("--nope-false", action="store_true",
-                    help="write mla_use_nope: false rather than omitting it. "
-                         "Same model either way — a loader that tests the key "
-                         "for presence reads it as NoPE and skips the rotation")
+    ap.add_argument("--nope", metavar="JSON",
+                    help="write mla_use_nope with this JSON value rather than "
+                         "omitting the key. `false` is the same model, and a "
+                         "loader that tests for presence reads it as NoPE and "
+                         "skips the rotation; `1` or `\"true\"` say nothing a "
+                         "loader may act on, and have to be refused")
+    ap.add_argument("--rope-scaling", choices=("null", "empty", "drop", "notype"),
+                    metavar="SHAPE",
+                    help="replace the YaRN block: null | empty ({}) | drop "
+                         "(no key) all mean no scaling and must load as plain "
+                         "RoPE; notype is an object with a factor and no type, "
+                         "which must be refused")
     ap.add_argument("--rope-type", metavar="T",
                     help="override rope_scaling.type, e.g. linear — a scaling "
                          "the engine does not implement has to be refused, not "
@@ -314,12 +322,20 @@ def main():
         cfg["model_type"] = "deepseek_v3"
         cfg["architectures"] = ["DeepseekV3ForCausalLM"]
         cfg.update(V3_ROPE)
-        if args.nope_false:
-            cfg["mla_use_nope"] = False
+        if args.nope is not None:
+            cfg["mla_use_nope"] = json.loads(args.nope)
         if args.rope_type:
             cfg["rope_scaling"] = dict(cfg["rope_scaling"], type=args.rope_type)
         if args.mscale is not None:
             cfg["rope_scaling"] = dict(cfg["rope_scaling"], mscale=args.mscale)
+        if args.rope_scaling == "null":
+            cfg["rope_scaling"] = None
+        elif args.rope_scaling == "empty":
+            cfg["rope_scaling"] = {}
+        elif args.rope_scaling == "drop":
+            del cfg["rope_scaling"]
+        elif args.rope_scaling == "notype":
+            cfg["rope_scaling"] = {"factor": 40.0, "beta_fast": 1.0, "beta_slow": 1.0}
     if args.qk_rope:
         cfg["qk_rope_head_dim"] = args.qk_rope
     if args.tokenizer:
