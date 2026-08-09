@@ -3867,3 +3867,78 @@ re-run was that the new regime would make batching *more* valuable. It makes
 it less. A regime change invalidates a measurement's conclusion in whichever
 direction the arithmetic says, and the arithmetic has to be redone rather
 than re-argued.
+
+## 59. The trunk is not FFN, so contextual sparsity is aimed at 16% of it (2026-08-09)
+
+§58 left one question standing: 60 tok/s needs 11.2x fewer bytes per token,
+the experts are only a quarter of them, so it has to come from the trunk —
+**does K3's trunk have contextual sparsity?** The literature that makes this
+work (Deja Vu and its descendants) targets FFN blocks, where a ReLU-family
+activation produces true zeros and a small predictor can say in advance
+which neurons will fire.
+
+The first thing to measure was not the activations. It was where the bytes
+are:
+
+| per token, top-8 | GB | share | if it vanished entirely |
+|---|---|---|---|
+| attention (MLA + KDA) | 18.92 | **49.9%** | 2.00x |
+| routed experts | 9.10 | 24.0% | 1.32x |
+| shared experts (FFN) | 6.27 | **16.5%** | 1.20x |
+| routed latent projections | 2.44 | 6.4% | 1.07x |
+| lm_head | 1.19 | 3.1% | 1.03x |
+
+**Half of K3's per-token bytes are attention, and the FFN the technique
+addresses is a sixth.** Nothing here, deleted outright, reaches 2x. A
+generous compound — half the attention heads skippable *and* the FFN 90%
+sparse — is **1.66x** against the 11.2x required.
+
+### The sparsity is real, and it is worth 1.14x
+
+Measured anyway, because "is it harvestable at all" is worth knowing. Real
+hidden states from a K3 run (`WASTE_DUMP_HIDDEN`), shared-expert weights
+decoded from `trunk.bin`, SiTU applied as the container declares it
+(beta 4.0, linear_beta 25.0). Keeping only the largest intermediate channels
+for that token and zeroing the rest, relative L2 of the layer's output:
+
+| keep | L5 | L20 | L45 | L88 |
+|---|---|---|---|---|
+| 50% | 0.034 | 0.036 | 0.055 | 0.016 |
+| 25% | 0.094 | 0.103 | 0.148 | 0.041 |
+| 12.5% | 0.163 | 0.194 | 0.238 | 0.069 |
+| 6.25% | 0.230 | 0.267 | 0.317 | 0.092 |
+
+**A quarter of the channels carry 99% of the output energy** (rel L2 0.094 →
+1 − 0.094² = 0.991), consistently across depth, and the last layers are
+sparser than the middle ones. Against a flat activation, keeping a quarter
+would leave error 0.87; this is 0.09. The concentration is not marginal.
+
+And it is worth **1.14x**, because it applies to 16.5% of the bytes. Keeping
+half rather than a quarter — which is what a 93-layer error budget would
+more likely allow, since 9% per layer compounds — is **1.09x**.
+
+### What it settles
+
+**60 tok/s on this machine is closed.** Not for want of a trick: the bytes
+are too evenly spread for any single-component saving to matter, the one
+component the technique fits is a sixth of them, and the half that is
+attention has no "read a tenth of the weights" formulation at all — every
+output dimension of a projection depends on every input.
+
+The honest ceiling from 0.88 tok/s, adding everything measured today:
+top_k truncation 1.49x (taken), batching ≤1.56x and overlapping it (§58),
+FFN sparsity 1.09-1.14x if built. **About 2x, total.** Past that needs
+different hardware or a different model — the 6.1x of bandwidth efficiency
+is real but it is a kernel rewrite of the whole forward pass, which is
+`docs/BACKENDS.md`'s "a different engine, not a backend".
+
+Two caveats on the sparsity numbers, both in the direction of making them
+weaker rather than stronger. One token, four layers — the dump truncates per
+token, so this is a single position measured at four depths. And existence
+is not exploitability: skipping a column of `down_proj` requires knowing
+which channels matter *before* computing the activation that reveals them,
+which is the predictor half of Deja Vu and is not measured here at all.
+
+Not measured: attention-head-level sparsity (the 49.9%), whether the
+channel set is stable enough across tokens for a cheap predictor, and any
+of this on a model whose activation is ReLU-family rather than SiTU.
