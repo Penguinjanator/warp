@@ -3942,3 +3942,71 @@ which is the predictor half of Deja Vu and is not measured here at all.
 Not measured: attention-head-level sparsity (the 49.9%), whether the
 channel set is stable enough across tokens for a cheap predictor, and any
 of this on a model whose activation is ReLU-family rather than SiTU.
+
+## 60. The sparse channels are not the same channels (2026-08-09)
+
+§59 measured that K3's shared-expert FFN is genuinely sparse per token — a
+quarter of the intermediate channels carry 99% of the layer's output — and
+left the half that decides whether it is usable: **is it the same quarter
+next token?** Skipping a column of `down_proj` requires knowing which
+channels matter *before* computing the activation that reveals them.
+
+Eight tokens, each the last position of a growing prefix of one sentence
+(the dump truncates per token, so this is eight runs), top 25% by magnitude:
+
+| layer | Jaccard between tokens | random baseline | in all 8 | in at least one | a static set covers |
+|---|---|---|---|---|---|
+| 20 | **0.271** | 0.143 | 56 (4%) | 4289 (70%) | 57% |
+| 45 | **0.206** | 0.143 | 25 (2%) | 4934 (80%) | 49% |
+| 88 | **0.196** | 0.143 | 31 (2%) | 5083 (83%) | 48% |
+
+For sets of size p drawn at random the expected Jaccard is `p/(2-p)` =
+0.143. Measured is 0.20-0.27 — **1.4x to 1.9x chance, not 5x or 10x.**
+There is no stable core: 2-4% of the set is common to all eight. A fixed set
+chosen on the mean activation captures about half of any single token's.
+
+And the number that kills the batched form of the idea too: **70-83% of all
+channels appear in the top quarter of at least one of eight tokens.** A
+group of eight would have to read four fifths of the matrix regardless.
+
+The eight tokens are prefixes of the same sentence, which is the most
+favourable case for stability that could have been chosen. It still comes
+out close to noise.
+
+### Which closes it
+
+The shape is exactly §53's, from a different direction. There, the experts
+were individually meaningful and mutually orthogonal, so no static
+combination of them existed. Here the channels are individually meaningful
+per token and their identity is nearly unstructured across tokens, so no
+static selection of them exists either. **Both times the structure is real
+and local, and has no regularity to exploit above it.**
+
+So the ranking, complete, from 0.88 tok/s on this machine:
+
+| | worth | state |
+|---|---|---|
+| top_k truncation to 8 | 1.49x | measured, taken |
+| batching | ≤1.56x, overlaps the above | already default for prefill |
+| FFN contextual sparsity | 1.09-1.14x if it worked | **and it does not: §60** |
+| bandwidth efficiency 16.4% → 100% | 6.1x | a rewrite of the forward pass |
+| bytes per token, 36.4 GB → 3.25 | 11.2x | no mechanism found |
+
+**About 2x is the honest ceiling from here**, and 60 tok/s needs different
+hardware or a different model. That is the answer to the question §58 posed,
+arrived at without building anything.
+
+Two caveats, both real. This is magnitude ranking of the output, and Deja
+Vu's predictors are trained on the input rather than thresholded on the
+output — a learned predictor could in principle find structure that
+magnitude does not expose, since the activation is a deterministic function
+of x. What the 2-4% common core and the 83% union say is that it would have
+to find nearly all of it, which is the regime where the predictor costs what
+it saves. And the input used is the post-layer residual from
+`WASTE_DUMP_HIDDEN`, not the normalized state the engine hands the shared
+expert — a proxy, chosen because the byte arithmetic in §59 caps the whole
+direction at 1.14x regardless of how exactly it is measured.
+
+Not measured: a trained predictor, attention-head-level sparsity (the 49.9%
+of bytes §59 found there), and stability across genuinely unrelated prompts
+rather than prefixes of one.
