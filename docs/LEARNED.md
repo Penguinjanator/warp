@@ -3792,3 +3792,78 @@ does not, and nothing between them has been run), whether it is a fraction
 of RAM at all or an absolute headroom the OS needs — 3/4 is the safe side of
 the only two points there are, not a fitted value — and any of this on
 Linux, where the page-cache behaviour under `O_DIRECT` is not the same.
+
+## 58. §4D re-priced: batching is worth less now, not more (2026-08-09)
+
+§56 and §57 both turned on the same thing — a measurement priced when
+expert I/O was half a step, still being quoted after the cache made it 8%.
+So §4D was re-run rather than assumed, and it comes out the other way from
+the guess that prompted the re-run.
+
+`EFFICIENCY.md` §1 measured chunked prefill at **1.62x** over sequential and
+derived a 1.63x ceiling for any batching scheme, on the model that grouping
+removes I/O and none of the compute. Same measurement today, 56-token
+prompt, cache at a full working set:
+
+| top_k | mode | tok/s | | GB read |
+|---|---|---|---|---|
+| 16 | sequential | 0.43 | | 860.8 |
+| 16 | chunked | 0.69 | **1.60x** | 307.7 |
+| 8 | sequential | 0.67 | | 449.0 |
+| 8 | chunked | 0.86 | **1.28x** | 179.3 |
+
+**§1 reproduces exactly at top-16 — 1.60x against its 1.62x — and collapses
+to 1.28x at top-8.** Both levers take their gain from the same place, so
+they overlap instead of composing: 0.43 to 0.86 is 2.0x end to end where the
+product of the two would be 2.38x.
+
+**And the ceiling holds for batching across independent streams too, which
+§4D never separated from grouping within one.** The reason §1 gave is
+structural and does not care where the tokens come from: `vq_apply` costs
+one pass per (token, expert) pair, and the pair count is `T * K * 92`
+however they are grouped. That work is 64.2% of a step, so as B grows the
+per-token cost tends to it and no batching scheme beats **1/0.642 = 1.56x**.
+Aggregate throughput on this engine tops out near 1.4 tok/s, not the tens
+that a bytes-only argument suggests.
+
+The bytes-only argument is worth naming because it is the one that misleads.
+Per token this engine touches ~36.4 GB — 27.3 of resident trunk, 9.1 of
+experts at top-8 — and at the 195 GB/s this machine reaches on a streaming
+quantized matvec that would be 187 ms, i.e. 5.4 tok/s. It measures 0.88.
+**The engine runs at 16.4% of its own memory bandwidth**, because the step
+is dependent gather chains rather than streaming, which is the same thing
+`docs/BACKENDS.md` found on CUDA (84% of the step tracks core clock, 23%
+DRAM). Batching does not fix that; it amortizes bytes, and bytes are not
+what the clock is going into.
+
+### What that leaves, arithmetically
+
+60 tok/s is 68x from 0.88. The factor splits cleanly and neither half is
+optional:
+
+| | factor | built? |
+|---|---|---|
+| bytes per token, 36.4 GB to 3.25 | **11.2x** | no |
+| bandwidth efficiency, 16.4% to 100% | **6.1x** | no |
+| top_k truncation | 1.49x | yes, §56 |
+| batching | ≤1.56x, and it overlaps top_k | yes, and already default for prefill |
+
+11.2 x 6.1 = 68. The two levers that exist are, between them, worth about
+2x and are nearly spent; the whole remaining factor is in the two that do
+not. And the byte half cannot come from the experts: they are 9.1 GB of the
+36.4, so deleting them outright is 1.33x. **It has to come from the trunk,
+which is 75% of the bytes and 100% unconditional.**
+
+Which names the next measurement precisely, and it is a geometry question of
+exactly the kind that killed the merge in §53 before anything was built:
+**does K3's trunk have contextual sparsity at all** — is there a per-token
+prediction that keeps most of a layer's output while reading a tenth of its
+weights? If the answer is as flat as the merge alphas turned out to be, 60
+tok/s on this machine is closed and the honest ceiling is about 2x from
+here. Not run.
+
+Method note, and it is the third time today: the guess that prompted this
+re-run was that the new regime would make batching *more* valuable. It makes
+it less. A regime change invalidates a measurement's conclusion in whichever
+direction the arithmetic says, and the arithmetic has to be redone rather
+than re-argued.
