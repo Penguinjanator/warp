@@ -125,7 +125,17 @@ pre-read-ahead sweep; the ratios between them are the point and read-ahead
 does not change them — see [EFFICIENCY.md](EFFICIENCY.md).)
 
 So the default steps down a whole working set at a time and takes the
-largest that fits: `floor + 3x`, else `2x`, else `1x`, else the floor.
+largest that fits under **3/4** of the RAM this process may use:
+`floor + 3x`, else `2x`, else `1x`, else the floor.
+
+The quarter left to the OS is a measurement, not a margin of taste. It was
+an eighth until 2026-08-09, which put the ceiling at 56 GB on a 64 GB
+machine — inside the 46-52 GB cliff. That stayed harmless only because K3
+at top-16 asks for 80.77 GB and could never reach it. Lower `top_k` to 8
+and the working set halves, three multiples fit under the old ceiling, and
+the default picked 54.77 GB and ran at **0.08 tok/s against 0.77 at
+46 GB** — same container, ten times slower, higher hit rate, lower RSS.
+[LEARNED.md](LEARNED.md) §56.
 K3 lands on `floor + 1x` here — a 46.25 GB budget, 17.56 GB of cache, and
 the top of the measured curve with no flag given. A 128 GB machine still
 gets the full `3x`, and a model whose recommendation already fits, like

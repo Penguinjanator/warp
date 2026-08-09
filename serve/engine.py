@@ -75,7 +75,8 @@ class MemPlan(C.Structure):
                 ("min_expert_cache", C.c_uint64),
                 ("floor_bytes", C.c_uint64),
                 ("recommended_bytes", C.c_uint64),
-                ("vision_bytes", C.c_uint64)]
+                ("vision_bytes", C.c_uint64),
+                ("working_set_bytes", C.c_uint64)]
 
 
 class Cfg(C.Structure):

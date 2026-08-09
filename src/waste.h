@@ -92,6 +92,13 @@ typedef struct {
      * the queued image embeddings. waste_open folds it into the figures
      * above when vision is on, so the resolved budget accounts for it. */
     uint64_t vision_bytes;
+    /* One token's expert traffic: top_k records per MoE layer. The unit the
+     * cache is only useful in whole multiples of (Gate 5), and the step the
+     * automatic budget walks down in — which is why it is reported rather
+     * than left to be re-derived from `recommended_bytes`. It cannot be:
+     * recommended is capped at the container's whole expert set, so on a
+     * merged container the two stop being three times apart. */
+    uint64_t working_set_bytes;
 } waste_memplan;
 
 /* Compute the memory floor without loading weights. ctx_tokens sizes the
@@ -117,9 +124,12 @@ typedef struct {
      * only useful in whole multiples of one token's working set, so it
      * starts from waste_memplan.recommended_bytes (floor + 3x that set)
      * and steps down a whole multiple at a time until the total fits
-     * under 7/8 of waste_usable_ram(). It does not spend the remainder up to
+     * under 3/4 of waste_usable_ram(). It does not spend the remainder up to
      * that ceiling: the last fraction buys a little hit rate and risks
      * the OS paging the cache out, which costs far more than it gains.
+     * The quarter left to the OS is measured, not assumed: an eighth put
+     * the ceiling inside a cliff where the same container ran 10x slower
+     * with a higher hit rate (docs/LEARNED.md §39, §56).
      * When not even floor + 1x fits, it runs at floor_bytes.
      *
      * Loading fails with WASTE_E_RAM_BUDGET if the value given is below

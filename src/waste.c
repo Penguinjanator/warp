@@ -356,20 +356,42 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
     /* one layer's top-k experts, double buffered */
     const int top_k = (int)js_int(&d, js_get(&d, cfg, "num_experts_per_token"), 8);
     const int lyr = js_get(&d, 0, "layers");
-    uint64_t rec = 0;
+    uint64_t rec = 0, bank_total = 0;
     if (js_size(&d, lyr) > 0) {
         const int first = lyr + 2;   /* first member's value */
         const uint64_t bytes = (uint64_t)js_int(&d, js_get(&d, first, "bytes"), 0);
         const uint64_t n = (uint64_t)js_int(&d, js_get(&d, first, "experts"), 1);
         rec = n ? bytes / n : 0;
+        /* Every expert byte the container holds. cfg_sane refuses a bank
+         * whose expert count differs from the config's, so one layer's
+         * `bytes` times the layer count is the whole set — counted with the
+         * same `layers` as the working set below, which includes the dense
+         * layers that have no bank. That makes both about 1% loose on K3,
+         * in the direction that recommends slightly more rather than less,
+         * and changing it would move a figure tests/run.sh asserts. */
+        bank_total = bytes * (uint64_t)layers;
     }
     out->min_expert_cache = rec * (uint64_t)top_k * 2;
     out->floor_bytes = out->trunk_bytes + out->state_bytes +
                        out->scratch_bytes + out->min_expert_cache;
     /* A cache below one token's working set keeps nothing alive to the
-     * next token (Gate 5), so "recommended" starts at 3x that. */
-    out->recommended_bytes = out->floor_bytes +
-                             rec * (uint64_t)top_k * (uint64_t)layers * 3;
+     * next token (Gate 5), so "recommended" starts at 3x that — but never
+     * above the size of every expert in the container, because a cache that
+     * holds the whole bank cannot be improved by making it larger.
+     *
+     * Without the cap a merged container — one whose top_k equals its
+     * num_experts, which is what the k3-mini experiment on the branch of
+     * that name produces — asks for three times its entire bank: k3-mini at
+     * k=16 was recommending 80.77 GB when 47.45 GB holds every expert byte
+     * that exists. Unmerged containers are untouched — K3's bank is 952 GB
+     * against a 3x working set of 52 GB, and Kimi-Linear's 16.5 GB against
+     * 1.6 GB. */
+    out->working_set_bytes = rec * (uint64_t)top_k * (uint64_t)layers;
+    {
+        uint64_t want = out->working_set_bytes * 3;
+        if (bank_total && want > bank_total) want = bank_total;
+        out->recommended_bytes = out->floor_bytes + want;
+    }
 
     js_free(&d);
     free(src);
@@ -445,12 +467,26 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
      * cgroup those differ by the ratio between the host and the limit, and
      * sizing against the host there is not a slow run but a killed one. */
     const uint64_t phys = waste_usable_ram();
-    const uint64_t cap = phys ? phys - phys / 8 : 0;   /* 12% left to the OS */
+    /* A quarter left to the OS, not an eighth. The eighth was never measured
+     * — it was a plausible-looking margin — and on this 64 GB machine it
+     * puts the ceiling at 56 GB, inside the cliff §39 measured between 46
+     * and 52. It stayed harmless only because K3 at top-16 asks for 80.77 GB
+     * and could never reach it: the step-down landed on floor + 1x = 46 GB,
+     * the measured optimum, for the wrong reason. Lowering top_k shrinks the
+     * working set until three multiples fit under the old ceiling, and then
+     * the default picks 54.77 GB and runs at **0.08 tok/s against 0.77 at
+     * 46 GB** — same container, ten times slower, with a *higher* hit rate
+     * and a *lower* RSS, which is what paging looks like from in here
+     * (docs/LEARNED.md §56).
+     *
+     * A quarter puts the ceiling at 48 GB here: K3 at top-16 still resolves
+     * to 46.39 GB, top-8 to 45.98 instead of 54.77, and Kimi-Linear — whose
+     * recommendation fits many times over — is untouched. */
+    const uint64_t cap = phys ? phys - phys / 4 : 0;   /* 25% left to the OS */
     uint64_t budget = cfg.ram_budget_bytes;
 
     if (!budget) {
-        /* exact: recommended_bytes is floor + 3 * working_set by construction */
-        const uint64_t ws = (c->plan.recommended_bytes - c->plan.floor_bytes) / 3;
+        const uint64_t ws = c->plan.working_set_bytes;
         budget = c->plan.floor_bytes;
         for (int k = 3; k >= 1; k--) {
             const uint64_t b = c->plan.floor_bytes + ws * (uint64_t)k;
@@ -470,7 +506,7 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
      * this machine — worth saying out loud before it crawls. */
     if (cap && budget > cap)
         fprintf(stderr,
-                "waste: budget %.1f GB leaves under 12%% of the %.1f GB this "
+                "waste: budget %.1f GB leaves under 25%% of the %.1f GB this "
                 "process may use\n       the OS will page out the expert cache "
                 "and throughput collapses\n",
                 budget / 1073741824.0, phys / 1073741824.0);

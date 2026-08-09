@@ -640,7 +640,7 @@ head_ "RAM budget"
 # the machine — K3 asks for 80.63 GB — and a swap storm. So assert the
 # rule, not a number, and it holds on any host: the engine steps down a
 # whole token working set at a time and takes the largest of
-# floor + 3x, 2x, 1x that fits under 7/8 of the RAM this process may use,
+# floor + 3x, 2x, 1x that fits under 3/4 of the RAM this process may use,
 # or the floor when not even one multiple does, less at most one expert
 # record of slot rounding. Filling the cap instead is what put a 27 GB
 # cache on a 64 GB machine and cost 8x throughput — docs/LEARNED.md §16.
@@ -661,7 +661,7 @@ plan, info = j("plan", sys.argv[1]), j("info", sys.argv[1])
 # CPython at all and would read the host's RAM inside a container anyway.
 # This is the same number the engine sized itself against, so what the
 # check still tests is the rule — floor + the largest whole working set
-# under 7/8 of it — and not the RAM reading, which has its own platform
+# under 3/4 of it — and not the RAM reading, which has its own platform
 # code and no business being written twice. It is a capacity and not a
 # pressure reading, so it is the same in this process and in the `info`
 # one below; a ceiling that moved between the two would make this check
@@ -670,12 +670,13 @@ phys = plan["usable_ram_bytes"]
 if not phys:
     print("usable RAM unknown on this host")
     sys.exit(0)
-cap = phys - phys // 8
+cap = phys - phys // 4
 # what the engine actually holds: the plan's mandatory parts plus the
 # cache it really allocated, which is what `info` reports
 held = plan["floor_bytes"] - plan["min_expert_cache"] + info["expert_cache_bytes"]
-# recommended_bytes is floor + 3 * one token's working set, by construction
-ws = (plan["recommended_bytes"] - plan["floor_bytes"]) // 3
+# the engine reports it: recommended_bytes is capped at the container's whole
+# expert set, so on a merged container it is no longer floor + 3 * this
+ws = plan["working_set_bytes"]
 want = plan["floor_bytes"]
 for k in (3, 2, 1):
     if plan["floor_bytes"] + ws * k <= cap:

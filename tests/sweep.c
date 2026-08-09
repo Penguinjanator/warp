@@ -52,7 +52,7 @@ int main(int argc, char **argv)
     if (argc < 5) {
         fprintf(stderr,
                 "usage: %s CONTAINER ids,.. n_gen KEY=v1,v2,.. [repeat]\n"
-                "  KEY is lookahead, iodepth or cache (MB)\n", argv[0]);
+                "  KEY is lookahead, iodepth, cache (MB) or topk\n", argv[0]);
         return 2;
     }
     int ids[MAX_IDS], n = 0;
@@ -72,7 +72,13 @@ int main(int argc, char **argv)
     const int is_look = !strcmp(key, "lookahead");
     const int is_depth = !strcmp(key, "iodepth");
     const int is_cache = !strcmp(key, "cache");
-    if (!is_look && !is_depth && !is_cache) {
+    /* topk may only be *lowered* from what the container declares: the
+     * scratch the load allocated is sized from the manifest's top_k, and
+     * asking for more experts than that would run the MoE off the end of
+     * m->xacc and the per-expert LUTs. Truncation is the experiment;
+     * widening is a different container. */
+    const int is_topk = !strcmp(key, "topk");
+    if (!is_look && !is_depth && !is_cache && !is_topk) {
         fprintf(stderr, "unknown key %s\n", key);
         return 2;
     }
@@ -88,6 +94,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "load failed\n");
         return 1;
     }
+    const int top_k0 = m.cfg.top_k;
     printf("loaded in %.1fs — cache %d slots; %d arms x %d repeats, "
            "%d prompt + %d generated\n\n",
            now() - t0, m.cache.n_slots, n_arms, repeat, n, n_gen);
@@ -99,7 +106,14 @@ int main(int argc, char **argv)
            "GB read");
     for (int r = 0; r < repeat; r++) {
         for (int a = 0; a < n_arms; a++) {
-            if (is_look) {
+            if (is_topk) {
+                if (arm[a] < 1 || arm[a] > top_k0) {
+                    fprintf(stderr, "topk %d outside 1..%d (the container's)\n",
+                            arm[a], top_k0);
+                    return 2;
+                }
+                m.cfg.top_k = arm[a];
+            } else if (is_look) {
                 waste_model_set_lookahead(arm[a]);
             } else if (is_depth) {
                 m.cache.depth = arm[a] < 1 ? 1 : arm[a];

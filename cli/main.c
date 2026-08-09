@@ -486,13 +486,15 @@ static int cmd_plan(int argc, char **argv)
     if (o.json) {
         printf("{\"ctx\":%u,\"trunk_bytes\":%llu,\"state_bytes\":%llu,"
                "\"scratch_bytes\":%llu,\"min_expert_cache\":%llu,"
-               "\"floor_bytes\":%llu,\"recommended_bytes\":%llu",
+               "\"floor_bytes\":%llu,\"recommended_bytes\":%llu,"
+               "\"working_set_bytes\":%llu",
                o.ctx, (unsigned long long)p.trunk_bytes,
                (unsigned long long)p.state_bytes,
                (unsigned long long)p.scratch_bytes,
                (unsigned long long)p.min_expert_cache,
                (unsigned long long)p.floor_bytes,
-               (unsigned long long)p.recommended_bytes);
+               (unsigned long long)p.recommended_bytes,
+               (unsigned long long)p.working_set_bytes);
         /* The human form already says "machine N GB" and the JSON did not,
          * so anything reading this had to work out physical RAM for itself
          * — which on Windows means neither sysconf nor /proc exists and the
@@ -529,8 +531,14 @@ static int cmd_plan(int argc, char **argv)
     printf("  ---------------------------------\n");
     printf("  FLOOR                 %12s\n", b[4]);
     human(p.recommended_bytes, b[0], 32);
-    printf("  recommended           %12s   (floor + 3x a token's working set;\n"
-           "                                      below that the cache keeps\n"
+    /* Not "floor + 3x a working set" any more: waste_plan_memory caps the
+     * cache term at the container's whole expert set, which fires on merged
+     * containers (top_k == num_experts) and would make that phrase describe
+     * a number the engine did not pick. */
+    printf("  recommended           %12s   (floor + 3x a token's working set,\n"
+           "                                      capped at every expert the\n"
+           "                                      container holds; below one\n"
+           "                                      working set the cache keeps\n"
            "                                      nothing alive between tokens)\n", b[0]);
     if (p.vision_bytes) {
         char vb[32];
