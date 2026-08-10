@@ -118,9 +118,9 @@ because it then *spends* everything up to the cap. Expert cache is only
 worth anything in whole multiples of one token's working set — below one
 multiple it keeps nothing alive between tokens, and the fraction above a
 multiple buys a few points of hit rate while walking the machine into
-paging, where a hit costs a page fault. Filling a 7/8 cap gave K3 a
-27.32 GB cache on this laptop, sitting between two budgets measured at
-0.11 and 0.04 tok/s, when 17.5 GB runs at 0.33. (Those three are the
+paging, where a hit costs a page fault. Filling the cap — 7/8 of RAM, as it
+then was — gave K3 a 27.32 GB cache on this laptop, sitting between two
+budgets measured at 0.11 and 0.04 tok/s, when 17.5 GB runs at 0.33. (Those three are the
 pre-read-ahead sweep; the ratios between them are the point and read-ahead
 does not change them — see [EFFICIENCY.md](EFFICIENCY.md).)
 

@@ -12,9 +12,9 @@ WASTE is intentionally narrow, and it exists to find out how far local inference
 
 ```text
 $ waste run ~/models/k3.waste 'What is the capital of Italy?'
-waste: no --budget, using 46.25 GB of 64.00 GB (expert cache 17.56 GB)
+waste: no --budget, using 46.39 GB of 64.00 GB (expert cache 17.56 GB)
 The capital of Italy is **Rome**.
-[16 tokens, 25.95 s, 0.62 tok/s | experts 9038 hit / 14514 miss = 38%]
+[16 tokens, 26.87 s, 0.60 tok/s | experts 9000 hit / 14552 miss = 38%]
 ```
 
 **This is the full model, not a distilled or pruned version.** Its published weights occupy 1.42 TB; the converted WASTE container is 982 GB.
@@ -25,7 +25,7 @@ Kimi K3 is a mixture-of-experts model. It has 2.78 trillion parameters, but only
 
 The container is arranged so that one expert requires one aligned read. Those reads overlap with computation, while unused RAM becomes a bounded expert cache. A lookahead router predicts the experts needed by the next layer and starts reading them early; the real router still makes the decision, so this changes timing, not the result. Experts use 3-bit residual vector quantization, while the more sensitive shared weights remain at 4 or 8 bits.
 
-K3's linear attention and compressed latent KV cache also matter: at 4K context, the KV cache is about 0.21 GB instead of 11.25 GB. The result is an engine that needs 29.06 GB to open K3 and uses the rest of the available memory to avoid repeated disk reads.
+K3's linear attention and compressed latent KV cache also matter: at 4K context, the KV cache is about 0.21 GB instead of 11.25 GB. The result is an engine that needs 29.19 GB to open K3 and uses the rest of the available memory to avoid repeated disk reads.
 
 For the full design and measurements, see [docs/ENGINE.md](docs/ENGINE.md) and [docs/EFFICIENCY.md](docs/EFFICIENCY.md). The on-disk layout is documented in [docs/FORMAT.md](docs/FORMAT.md), while [docs/KDA.md](docs/KDA.md) describes Kimi Delta Attention.
 
@@ -36,10 +36,10 @@ internal SSD:
 
 | Model | Container | Minimum RAM | Decode speed |
 |---|---:|---:|---:|
-| Kimi K3 2.78T | 982 GB | 29.06 GB | 0.45–0.62 tok/s |
-| Kimi-Linear 48B | 19 GB | 1.28 GB | 10.65 tok/s |
+| Kimi K3 2.78T | 982 GB | 29.19 GB | 0.45–0.62 tok/s |
+| Kimi-Linear 48B | 19 GB | 1.32 GB | 10.62 tok/s |
 
-For K3, 64 GB is the practical minimum. A 32 GB machine can open the model but will page heavily. The default memory budget on the test machine is 46.25 GB, including a 17.56 GB expert cache.
+For K3, 64 GB is the practical minimum. A 32 GB machine can open the model but will page heavily. The default memory budget on the test machine is 46.39 GB, including a 17.56 GB expert cache.
 
 Most of that requirement is the 27.28 GB resident trunk rather than the cache. Shrinking the expert cache from 17.32 GB to 3.32 GB costs about 10% of throughput; enlarging it past the default costs everything. Measured across four cache sizes in one process:
 
@@ -51,6 +51,24 @@ Most of that requirement is the 27.28 GB resident trunk rather than the cache. S
 | 29.32 GB | 41.3% | 0.07–0.08 tok/s |
 
 The last two rows are the failure mode worth knowing about: the hit rate keeps climbing and the bytes read keep falling while throughput drops eightfold. The engine is inside its budget and the machine is not, so a cache hit becomes a page fault. Giving the process more memory is not always faster.
+
+Decoding with fewer experts per token is a knob rather than a rebuild:
+`num_experts_per_token` in the container manifest. K3 ships at 16. Measured
+on this machine, one load with the arms interleaved:
+
+| experts/token | decode | KL from top-16 | working set |
+|---:|---:|---:|---:|
+| 16 | 0.59 tok/s | — | 17.01 GiB |
+| 12 | 0.70 tok/s | 0.007 | 12.76 GiB |
+| **8** | **0.89 tok/s** | **0.037** | **8.50 GiB** |
+| 4 | 1.06 tok/s | 0.118 | 4.25 GiB |
+
+Top-8 is 1.49x for a divergence twice that of a quantization this project
+rejects elsewhere, and it reproduces top-16's greedy continuation on the
+prompts tested. Top-4 does not: its next-token distribution still looks
+close, and it stops following the prompt within a few tokens — which is why
+the gate here is a continuation and not a KL. This is a quality trade and
+the default stays 16.
 
 Storage is the main constraint. A cold K3 token reads about 17 GB of experts. The internal SSD sustains 12.78 GB/s; a tested USB enclosure managed 0.94 GB/s. Put the converted container on internal NVMe storage.
 
@@ -83,12 +101,12 @@ To build and test WASTE:
 
 To run Kimi K3:
 
-- **64 GB of RAM recommended**; 29.06 GB is the hard floor at 4K context;
+- **64 GB of RAM recommended**; 29.19 GB is the hard floor at 4K context;
 - **about 1 TB of internal NVMe storage** for the converted model;
 - another **1.42 TB of temporary storage** if converting the published weights
   yourself. This staging storage may be external and can be freed afterward.
 
-If you only want to try the engine, start with Kimi-Linear. Its container is 19 GB, it needs 1.28 GB of RAM, and it runs at about 10.7 tok/s on the same machine.
+If you only want to try the engine, start with Kimi-Linear. Its container is 19 GB, it needs 1.32 GB of RAM, and it runs at about 10.6 tok/s on the same machine.
 
 Python, PyTorch, and safetensors are needed only for model conversion and validation, never for inference.
 

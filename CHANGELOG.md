@@ -10,15 +10,23 @@ changed. Each entry names the section to read for the numbers behind it.
 
 ## 0.6.7 — 2026-08-10
 
-The engine decodes exactly as 0.6.6 did and nothing in `src/` moved, so a
-caller built against 0.6.6's header needs no recompile. What makes it a tag
-is that the second model this project ships numbers for is now usable the
-way K3 is: converted with a chat format it can actually read, and served
-over HTTP rather than from the command line only.
+The engine decodes exactly as 0.6.6 did — same logits, same container
+format — and two things underneath it changed. The second model this project
+ships numbers for is now usable the way K3 is: converted with a chat format
+it can actually read, and served over HTTP rather than from the command line
+only. And the automatic memory budget stopped being able to choose a value
+ten times slower than a smaller one.
 
-All of it came out of one support report — a Kimi-Linear container on a 16
-GB MacBook where `waste run` worked, `waste chat` answered oddly, and
-`python3 -m serve` printed its banner and exited.
+**`waste_memplan` gained a field, so this is not a drop-in header.** A caller
+that only reads the struct is fine; one that allocates or copies it must
+recompile. `serve/engine.py` mirrors the new layout.
+
+The chat half came out of one support report — a Kimi-Linear container on a
+16 GB MacBook where `waste run` worked, `waste chat` answered oddly, and
+`python3 -m serve` printed its banner and exited. The budget half came out
+of an experiment that failed: collapsing K3's experts down to one, which
+does not work and is recorded below, is what made a small enough working set
+to expose the ceiling.
 
 ### Added
 
@@ -55,6 +63,12 @@ GB MacBook where `waste run` worked, `waste chat` answered oddly, and
   naming `tools` and `reasoning_effort`. The serve suite is 211 checks, up
   from 174.
 
+- **`tests/sweep.c` takes a `topk=` arm**, lowering only, since the scratch
+  is sized at load from the manifest's `top_k`. One load with the arms
+  interleaved, which is what made §56's curve trustworthy after two earlier
+  attempts were spoiled by comparing arms across process lifetimes — the
+  failure `sweep.c` exists to prevent and that §32 and §33 already record.
+
 - **`tools/convert.py` installs a `chat.json` per architecture**, with
   `examples/chat-kimi-linear.json` alongside K3's. The architecture was
   already recognised; it simply had nothing to install and said so, which
@@ -72,6 +86,28 @@ GB MacBook where `waste run` worked, `waste chat` answered oddly, and
 
 ### Fixed
 
+- **The automatic budget could choose a value 10x slower than a smaller one**
+  (`src/waste.c`, [LEARNED.md](docs/LEARNED.md) §57). It stepped down a whole
+  working set at a time until the total fit under **7/8** of usable RAM. 7/8
+  of 64 GB is 56, inside the 46-52 GB band §39 measured as an eightfold
+  collapse: the engine stays inside its budget, the machine does not, and a
+  cache hit becomes a page fault.
+
+  It had stayed harmless by luck. K3 at top-16 asks for 80.77 GB, cannot have
+  it, and the step-down lands on `floor + 1x` = 46.39 GB — the measured
+  optimum, reached for the wrong reason. Lower `num_experts_per_token` to 8
+  and a token's working set halves, three multiples fit under the old
+  ceiling, and the default took 54.77 GB and ran at **0.08 tok/s against 0.77
+  at 46 GB**, with a *higher* hit rate and a *lower* RSS — which is what
+  paging looks like from inside the process.
+
+  The ceiling is now **3/4**, measured rather than assumed: 46 GB is the
+  largest budget on this machine known to be on the good side and 52 the
+  smallest known to be on the bad one. K3 at top-16 still resolves to
+  46.39 GB, Kimi-Linear is untouched, a 128 GB machine still gets the full
+  `floor + 3x`, and K3 at top-8 now resolves to 46.18 GB and **0.88 tok/s**
+  on the path a user gets by typing nothing.
+
 - **The server refused to start on any container without XTML markers**
   ([#34](https://github.com/sqliteai/waste/issues/34)). `ChatServer.__init__`
   resolved the four control tokens and let the `EngineError` out, so the
@@ -83,7 +119,66 @@ GB MacBook where `waste run` worked, `waste chat` answered oddly, and
   `code: "unsupported_chat_format"` and both reasons — no XTML markers, and
   what was wrong with the `chat.json`.
 
+### Changed
+
+- **`waste_memplan` reports `working_set_bytes`** — one token's expert
+  traffic, `top_k` records per MoE layer. Callers recovered it as
+  `(recommended_bytes - floor_bytes) / 3`, which stopped being true here:
+  `recommended_bytes` is now capped at the container's whole expert set,
+  because a cache holding every expert cannot be improved by growing. On an
+  ordinary container nothing moves — K3's bank is 952 GB against a 3x working
+  set of 52 GB — but the two are no longer three times apart in general, so
+  the quantity the rule is built on is reported instead of re-derived.
+  `waste plan --json` carries it.
+
+- **`README.md` figures re-measured on this commit**: K3's floor 29.06 →
+  29.19 GB, its default budget 46.25 → 46.39 GB, Kimi-Linear's floor 1.28 →
+  1.32 GB and its decode 10.65 → 10.62 tok/s. Drift from earlier commits,
+  not from any change here; the K3 decode range is left as it was, because
+  its low end was measured under conditions this pass did not reproduce.
+
 ### Measured and not adopted
+
+- **Merging a layer's experts into one, or into sixteen, is not a
+  compression of a MoE — it is a deletion of it** (§53-§55). Built because it
+  was asked for: 982 GB becomes 30 GB, decode goes 0.60 to 1.58 tok/s, and
+  the model emits `<|close|>` forever. No weighting helps, and the reason is
+  geometric — distinct experts are mutually **orthogonal** (cos 0.0006), so
+  their average has `1/sqrt(E)` of their norm and is 99.8% orthogonal to
+  every one of them. A gain sweep confirms it from the other side: scaling
+  the merged expert to *zero* is better than using it. Clustering into 16
+  does not rescue it, and pruning to the 16 busiest — which beats every
+  merge — still answers that the capital of Italy is Paris. The tooling
+  stays on the `k3-mini` branch rather than main.
+
+- **Fewer experts per token is worth taking; the default still does not
+  take it** (§56). `num_experts_per_token` 8 instead of 16 is **1.49x** at
+  KL 0.037, with top-16's greedy continuation reproduced; top-4 is 1.78x,
+  keeps the right argmax, and stops following the prompt within a few
+  tokens. It is a quality trade, so it is documented in `README.md` and left
+  to the caller rather than changed under anyone.
+
+- **§4D re-priced: batching is worth less in this regime, not more** (§58).
+  `docs/EFFICIENCY.md` §1's 1.62x reproduces exactly at top-16 (**1.60x**)
+  and falls to **1.28x** at top-8 — batching takes its gain from the I/O and
+  truncating `top_k` has already taken half of it, so the two overlap rather
+  than compose. The ceiling holds for batching across independent streams
+  too, which §4D never separated from grouping within one: `vq_apply` costs
+  one pass per (token, expert) pair however they are grouped, and that is
+  64.2% of a step, so no scheme beats **1.56x**.
+
+- **The trunk's contextual sparsity is real and unusable** (§59, §60). A
+  quarter of the shared expert's intermediate channels carry 99% of the
+  layer's output — but the trunk is **49.9% attention** against 16.5% FFN,
+  so perfect sparsity where the technique fits is worth **1.14x**. And the
+  channel identity is near-random across tokens: Jaccard 0.196-0.271 against
+  a 0.143 chance baseline, 2-4% of the set common to eight consecutive
+  tokens, 70-83% of all channels appearing in at least one of them. No
+  static core to prune, no cheap prediction to make. Taken together these
+  put the honest ceiling from 0.88 tok/s at about **2x**, and name what the
+  rest would cost: 6.1x of bandwidth efficiency, which is a rewrite of the
+  forward pass, and 11.2x of bytes per token, for which no mechanism was
+  found.
 
 - **Tool calls over `chat.json` are not built**, and the reason is not
   effort. Four prefix/suffix strings cannot carry a tool declaration, an
