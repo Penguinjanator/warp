@@ -169,7 +169,7 @@ one.
 Tool calls over `chat.json` remain unbuilt: four strings cannot carry a tool
 declaration, and the markup Kimi-Linear's tokenizer does have for it is not
 transcribed in this repo. That is what is left of
-[#34](https://github.com/sqliteai/waste/issues/34).
+[#34](https://github.com/sqliteai/warp/issues/34).
 
 ## HTTP
 

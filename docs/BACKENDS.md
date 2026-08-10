@@ -24,7 +24,7 @@ selected backend's name exposed for introspection (`vector_backend()`).
 Detection is careful: `cpu_supports_avx512()` checks CPUID *and* XGETBV, so
 a CPU whose OS has not enabled ZMM state is correctly rejected.
 
-WASTE adopts all of it:
+WARP adopts all of it:
 
 - one dispatch table, filled with a baseline that is **always compiled in**;
 - backends **partially override** — an unimplemented kernel keeps the CPU
@@ -36,7 +36,7 @@ WASTE adopts all of it:
 - **name introspection** (`waste_backend_name()`), surfaced by the CLI.
 
 One difference: sqlite-vector's distance functions all share a signature,
-so a 2-D array works. WASTE's kernels do not, so the table is a **struct of
+so a 2-D array works. WARP's kernels do not, so the table is a **struct of
 function pointers** (`waste_kernels` in
 [src/waste_backend.h](../src/waste_backend.h)). Same idea, C-idiomatic for
 heterogeneous ops.

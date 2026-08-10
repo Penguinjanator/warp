@@ -6,7 +6,12 @@ turned out wrong, the wrong version is kept — the refutations were worth
 more than the confirmations.
 
 Sections are dated and appended, never rewritten, so a number appears more
-than once as the engine changed under it. **Later wins.** The decode
+than once as the engine changed under it. **Later wins.** That rule also
+covers the project's name: it was WASTE until 2026-08-10 and is WARP now,
+and entries written before then say WASTE. They were not edited, for the
+same reason the wrong numbers were not. The binary, the header, the
+`WASTE_*` environment variables and the `.waste` container extension keep
+the old name in either case. The decode
 profile in particular is measured three times — §10 before the MLA
 absorption, §12 with a cold cache, and the README with the cache at the
 knee — and the shares move because the cache moves, not because one of

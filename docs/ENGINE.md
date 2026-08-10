@@ -161,7 +161,7 @@ are pressure, they move between the read and the allocation, and a budget
 resolved once at open cannot track them — bounding a run that lasts hours
 by an instantaneous reading makes the same command on the same machine
 two different runs. Whether current pressure should trim the multiplier
-is [issue #14](https://github.com/sqliteai/waste/issues/14), open.
+is [issue #14](https://github.com/sqliteai/warp/issues/14), open.
 
 ### What the floor is made of
 
@@ -344,7 +344,7 @@ is not worth an option. On one whose cores are not, it is worth more than
 the thread count. Third-party measurement on a Ryzen 9 9900X — Zen 5, two
 6-core CCDs with separate 32 MB L3 — running Kimi-Linear-48B, thread count
 and CPU count held constant so only locality differs
-([issue #23](https://github.com/sqliteai/waste/issues/23)):
+([issue #23](https://github.com/sqliteai/warp/issues/23)):
 
 | 6 threads on | median tok/s |
 |---|---|

@@ -1,14 +1,14 @@
-# WASTE — Weight-Aware Streaming Tensor Engine
+# WARP — Weight-Aware Runtime and Paging (formerly WASTE)
 
-WASTE is an embeddable inference engine written in C, with no third-party runtime dependencies. It keeps the model trunk in memory, streams selected experts directly from disk, and uses the remaining RAM as a bounded expert cache.
+WARP is an embeddable inference engine written in C, with no third-party runtime dependencies. It keeps the model trunk in memory, streams selected experts directly from disk, and uses the remaining RAM as a bounded expert cache.
 
 The project is driven by humans: the ideas, hypotheses, priorities, tests, and decisions are human. The code is written by LLMs. At this scale, that is the only way to iterate on new algorithms and test hypotheses fast enough.
 
 The goal is to run huge frontier models such as Kimi K3 on consumer hardware. Today, the complete 2.78-trillion-parameter Kimi K3 runs on a 64 GB MacBook Pro at about **0.6 tokens per second**.
 
-**Ultimately we want WASTE to execute Kimi K3 locally to improve itself** (we are currently using Opus 5 with extra thinking).
+**Ultimately we want WARP to execute Kimi K3 locally to improve itself** (we are currently using Opus 5 with extra thinking).
 
-WASTE is intentionally narrow, and it exists to find out how far local inference can be pushed when model weights live mostly on fast storage instead of RAM.
+WARP is intentionally narrow, and it exists to find out how far local inference can be pushed when model weights live mostly on fast storage instead of RAM.
 
 ```text
 $ waste run ~/models/k3.waste 'What is the capital of Italy?'
@@ -17,11 +17,11 @@ The capital of Italy is **Rome**.
 [16 tokens, 26.87 s, 0.60 tok/s | experts 9000 hit / 14552 miss = 38%]
 ```
 
-**This is the full model, not a distilled or pruned version.** Its published weights occupy 1.42 TB; the converted WASTE container is 982 GB.
+**This is the full model, not a distilled or pruned version.** Its published weights occupy 1.42 TB; the converted WARP container is 982 GB.
 
 ## How it works
 
-Kimi K3 is a mixture-of-experts model. It has 2.78 trillion parameters, but only about 4% of them are active for each token. WASTE keeps the shared part of the model in RAM and reads only the selected experts from disk.
+Kimi K3 is a mixture-of-experts model. It has 2.78 trillion parameters, but only about 4% of them are active for each token. WARP keeps the shared part of the model in RAM and reads only the selected experts from disk.
 
 The container is arranged so that one expert requires one aligned read. Those reads overlap with computation, while unused RAM becomes a bounded expert cache. A lookahead router predicts the experts needed by the next layer and starts reading them early; the real router still makes the decision, so this changes timing, not the result. Experts use 3-bit residual vector quantization, while the more sensitive shared weights remain at 4 or 8 bits.
 
@@ -78,7 +78,7 @@ Additional measurements, profiling data, router-lookahead results, and quantizat
 
 ## Vision
 
-Kimi K3 is multimodal, and WASTE can use one or more images together with text. Pass `--image` once per image:
+Kimi K3 is multimodal, and WARP can use one or more images together with text. Pass `--image` once per image:
 
 ```bash
 ./waste run ~/models/k3.waste "Describe this image" --image photo.jpg
@@ -92,7 +92,7 @@ See [docs/K3.md](docs/K3.md) for the vision architecture and measurements, and [
 
 ## What you need
 
-To build and test WASTE:
+To build and test WARP:
 
 - a C11 compiler and `make`;
 - macOS or Linux; Windows builds with MinGW-w64;
@@ -115,7 +115,7 @@ Python, PyTorch, and safetensors are needed only for model conversion and valida
 Build the engine and run the model-free test suite:
 
 ```bash
-git clone https://github.com/sqliteai/waste
+git clone https://github.com/sqliteai/warp
 cd waste
 make
 make check
@@ -176,7 +176,7 @@ Conversion takes about 4.7 hours with three workers on the test machine. See [do
 ./waste chat ~/models/k3.waste
 ```
 
-Do not set `--budget` unless you have a reason to. By default WASTE chooses a
+Do not set `--budget` unless you have a reason to. By default WARP chooses a
 safe memory budget, reports it, and refuses to start below the model's floor.
 Inside a container it sizes against the cgroup limit rather than the host's RAM.
 Use `./waste --help` for the complete command list.
@@ -200,11 +200,11 @@ It supports streaming, tools, structured output, thinking controls, and images. 
 
 ## Library
 
-WASTE is also an embeddable C library. The CLI and server both use the public API in [src/waste.h](src/waste.h). The inference path depends only on libc and pthreads. Text generation, memory planning, session persistence, and multimodal C examples are available in [examples/README.md](examples/README.md).
+WARP is also an embeddable C library. The CLI and server both use the public API in [src/waste.h](src/waste.h). The inference path depends only on libc and pthreads. Text generation, memory planning, session persistence, and multimodal C examples are available in [examples/README.md](examples/README.md).
 
 ## Why the name
 
-Every token answered by a cloud service is paid for twice: once on the invoice, and once in the electricity of a datacenter running a model that would fit — barely, awkwardly, but genuinely — on hardware already sitting on a desk. WASTE means to be the first concrete step toward ending that waste of tokens. The acronym came second.
+Every token answered by a cloud service is paid for twice: once on the invoice, and once in the electricity of a datacenter running a model that would fit — barely, awkwardly, but genuinely — on hardware already sitting on a desk. WARP means to be the first concrete step toward ending that waste of tokens — which the project's first name said outright, and which the rename did not change.
 
 ## Project status
 
@@ -229,6 +229,6 @@ Useful references:
 
 ## License
 
-WASTE is distributed under the permissive Apache 2.0 license, and **the project will always remain open source under a permissive license**. See [LICENSE](LICENSE).
+WARP is distributed under the permissive Apache 2.0 license, and **the project will always remain open source under a permissive license**. See [LICENSE](LICENSE).
 
 Copyright 2026 SQLite Cloud, Inc.

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-WASTE is an embeddable MoE inference engine in C11 (no third-party runtime
+WARP is an embeddable MoE inference engine in C11 (no third-party runtime
 deps) that keeps a model's dense trunk resident and streams routed experts
 from disk, using the remaining RAM as a bounded expert cache. Its proof
 point is Kimi K3 (2.78T params, 982 GiB container) on a 64 GB laptop.
