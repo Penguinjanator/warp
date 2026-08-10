@@ -48,8 +48,8 @@ extern "C" {
  */
 #define WASTE_VERSION_MAJOR  0
 #define WASTE_VERSION_MINOR  6
-#define WASTE_VERSION_PATCH  6
-#define WASTE_VERSION_STRING "0.6.6"
+#define WASTE_VERSION_PATCH  7
+#define WASTE_VERSION_STRING "0.6.7"
 #define WASTE_VERSION_NUMBER (WASTE_VERSION_MAJOR * 10000 + \
                               WASTE_VERSION_MINOR * 100 + \
                               WASTE_VERSION_PATCH)

@@ -249,10 +249,11 @@ opener and no terminator. Note that `<|im_start|>` — ChatML's, and what
 as six ordinary tokens, so a container given the generic template answers
 as if it were continuing prose. `waste tokenize` is the check.
 
-`serve/` does **not** serve this format. It renders K3's XTML and refuses
-at startup on a container whose tokenizer lacks those four markers, which
-is what a Kimi-Linear container is. `waste run` and `waste chat` are the
-supported paths.
+`serve/` serves this format too, from this same file: a container whose
+tokenizer has no XTML markers is chatted with through its `chat.json`.
+Plain conversation only — no tools, no reasoning channel, no images, each
+refused with a 400 naming the field rather than dropped. See
+[SERVE.md](../docs/SERVE.md), "serve/chatfmt.py".
 
 ## chat-k3.json — Kimi K3
 

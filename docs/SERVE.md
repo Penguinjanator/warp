@@ -121,34 +121,55 @@ Malformed output is expected, not exceptional: an unterminated element, a
 token limit. Every one ends as text or a dropped element. A truncated
 answer beats no answer.
 
-### Containers that are not K3
+### serve/chatfmt.py — containers that are not K3
 
-XTML is the only prompt format this server speaks, and the four markers are
-resolved from the container's own tokenizer at startup. A container whose
-`specials.json` does not carry them — any non-K3 one, Kimi-Linear included —
-cannot be chatted with here:
+XTML is not the only format any more, but it is the only complete one. At
+startup the server asks for the richer format first and falls back:
+
+1. **XTML**, if the container's tokenizer carries `<|open|>`, `<|sep|>`,
+   `<|close|>` and `<|end_of_msg|>` as single tokens. Channels, tools,
+   images — everything below in this document.
+2. **The container's own `chat.json`**, otherwise. The same four
+   prefix/suffix strings `waste chat` reads, so a container is addressed
+   identically over HTTP and on the command line, and a hand-edited
+   `chat.json` is honoured by both. Kimi-Linear is served this way.
 
 ```
-WARNING: /v1/chat/completions is unavailable for this container.
-  <|open|> is not a single token in this container (got 5): …
+chat     from ~/models/kimi-linear.waste/chat.json — plain conversation only,
+         no tools, no reasoning channel, no images
 ```
 
-The server still starts. `/health`, `/v1/models` and `/v1/completions` need
-no chat format and work normally; `/v1/chat/completions` returns 400 with
-`code: "unsupported_chat_format"` and a message naming the alternative. It
-used to raise out of the constructor instead, which took down four working
-endpoints to report one broken one, and told the operator only that a token
-had come out as five tokens.
+Plain means plain: system / user / assistant turns, blocking and streaming,
+with the stop token taken from the template's assistant suffix rather than
+guessed. Everything four strings cannot express is refused with a 400 that
+names the field — `tools`, `reasoning_effort`, an image part, a tool result
+turn. None of it is silently dropped; a server that ignores
+`reasoning_effort` reports a different amount of reasoning than it did.
 
-What does not change is the refusal itself. Rendering the prompt anyway
-would not fail visibly: markers the tokenizer does not have encode as
-ordinary text, so the model reads its own turn structure as prose and
-answers regardless — plausibly, and wrongly. This is the output-side twin of
-the tokenize/tokenize_markup split, and the same reasoning.
+`chat.json` is validated more strictly here than by the CLI's reader, which
+has a person watching and an interrupt key. Serving needs an `open`, a
+`user` turn, and an assistant suffix containing a control token — without
+the last one every reply runs to `max_tokens` and reports `finish_reason:
+"length"`, which reads as a broken model rather than a broken template. And
+every `<|…|>` in the file is resolved against the real vocabulary: markup
+the tokenizer does not have encodes as ordinary text, so the model would
+read its own turn structure as prose and answer anyway, plausibly and
+wrongly. That check is the reason this path is safe at all, and it is the
+same reasoning as the tokenize/tokenize_markup split — as is the rendering,
+where the template's strings go out as markup segments and the caller's
+content never does.
 
-`waste chat` and `waste run` are unaffected: they read the container's own
-`chat.json`, which `serve/` does not use at all. Serving a second prompt
-format is [#34](https://github.com/sqliteai/waste/issues/34).
+A container with neither format still starts and still serves `/health`,
+`/v1/models` and `/v1/completions`; only `/v1/chat/completions` returns 400,
+with `code: "unsupported_chat_format"` and both reasons — no XTML markers,
+*and* what was wrong with the chat.json. Resolving used to raise out of the
+constructor, which took down four working endpoints to report one broken
+one.
+
+Tool calls over `chat.json` remain unbuilt: four strings cannot carry a tool
+declaration, and the markup Kimi-Linear's tokenizer does have for it is not
+transcribed in this repo. That is what is left of
+[#34](https://github.com/sqliteai/waste/issues/34).
 
 ## HTTP
 
@@ -282,12 +303,13 @@ make serve-check                                  # everything
 K3_DIR=/Volumes/WasteDisk/k3 make serve-check     # plus the differential
 ```
 
-Five suites, in order of what they prove:
+Six suites, in order of what they prove:
 
 | file | what it checks | needs |
 |---|---|---|
 | `test_xtml.py` | every corpus case rendered **segment for segment against the release's own `encoding_k3.py`**, plus frozen goldens | the release, for the differential |
 | `test_regions.py` | round trip: anything the encoder can express, the parser reads back; every chunk split; malformed output | — |
+| `test_chatfmt.py` | the `chat.json` path: the templates `examples/` ships, everything the format refuses by name, and markup the tokenizer lacks refused at load | — |
 | `test_engine.py` | the ctypes binding against a **real engine** and a synthetic container | `libwaste` |
 | `test_server.py` | HTTP over real sockets against a scripted engine | — |
 | `test_integration.py` | the whole stack, no fakes | `libwaste` |

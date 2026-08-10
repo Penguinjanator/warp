@@ -21,7 +21,7 @@ if __package__ in (None, ""):                    # python3 serve/__main__.py
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     __package__ = "serve"
 
-from . import api                                            # noqa: E402
+from . import api, xtml                                      # noqa: E402
 from .engine import (CACHE_LFRU, CACHE_LRU,                  # noqa: E402
                      WASTE_E_ARG, WASTE_E_UNSUPPORTED,
                      Engine, EngineError, build_info, physical_ram,
@@ -199,8 +199,6 @@ examples:
             print(f"quant    {info['quant_summary']}")
         print(f"memory   {human(used['floor_bytes'])} resident, "
               f"expert cache {human(used['min_expert_cache'])}")
-        print(f"thinking {'off by default' if args.no_thinking else 'on'}"
-              f" — reasoning_effort per request")
         if args.vision:
             print("vision   on — requests may carry base64 images")
         if not args.api_key and args.host not in ("127.0.0.1", "localhost",
@@ -229,10 +227,18 @@ examples:
     if srv.chat_error:
         sys.stdout.flush()
         print(f"\nWARNING: /v1/chat/completions is unavailable for this "
-              f"container.\n  {srv.chat_error}.\n  serve/ renders K3's XTML "
-              f"prompt format and no other, so /v1/completions is the one "
-              f"generating\n  endpoint here. `waste chat` reads the "
-              f"container's chat.json and is unaffected.", file=sys.stderr)
+              f"container.\n  {srv.chat_error}.\n  /v1/completions is the "
+              f"one generating endpoint here. `waste chat` reads the\n"
+              f"  container's chat.json and is unaffected.", file=sys.stderr)
+    elif srv.chat_format is xtml:
+        print(f"thinking {'off by default' if args.no_thinking else 'on'}"
+              f" — reasoning_effort per request")
+    else:
+        # Serving from chat.json rather than XTML. Say what is missing, in
+        # the same breath as saying it works — a client that sends `tools`
+        # and gets a 400 should not be the first time this is mentioned.
+        print(f"chat     from {model}/chat.json — plain conversation only, "
+              f"no tools,\n         no reasoning channel, no images")
 
     shown = args.host if ":" not in args.host else f"[{args.host}]"
     print(f"\nlistening on http://{shown}:{args.port}  "

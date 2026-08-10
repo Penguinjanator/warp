@@ -8,6 +8,99 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
+## 0.6.7 — 2026-08-10
+
+The engine decodes exactly as 0.6.6 did and nothing in `src/` moved, so a
+caller built against 0.6.6's header needs no recompile. What makes it a tag
+is that the second model this project ships numbers for is now usable the
+way K3 is: converted with a chat format it can actually read, and served
+over HTTP rather than from the command line only.
+
+All of it came out of one support report — a Kimi-Linear container on a 16
+GB MacBook where `waste run` worked, `waste chat` answered oddly, and
+`python3 -m serve` printed its banner and exited.
+
+### Added
+
+- **A second prompt format for the server** (`serve/chatfmt.py`,
+  `docs/SERVE.md`). At startup the richer format is asked for first: XTML
+  when the container's tokenizer carries `<|open|>`, `<|sep|>`, `<|close|>`
+  and `<|end_of_msg|>` as single tokens, and otherwise the container's own
+  `chat.json` — the same four prefix/suffix strings `waste chat` has always
+  read. A container is now addressed identically over HTTP and on the
+  command line, and a hand-edited `chat.json` is honoured by both.
+
+  Plain means plain: system / user / assistant turns, blocking and
+  streaming, with the stop token taken from the template's assistant suffix
+  rather than guessed. Everything four strings cannot express is refused
+  with a 400 naming the field — `tools`, `reasoning_effort`, an image part,
+  a tool-result turn. None of it is dropped silently, on the same reasoning
+  the effort mapping already followed: a server that ignores
+  `reasoning_effort` reports a different amount of reasoning than it did.
+
+  `chat.json` is validated harder here than by the CLI's reader, which has a
+  person watching and an interrupt key. Serving requires an `open`, a `user`
+  turn, and an assistant suffix carrying a control token — without the last
+  one every reply runs to `max_tokens` and reports `finish_reason: "length"`,
+  which reads as a broken model rather than a broken template. And every
+  `<|…|>` in the file is resolved against the real vocabulary before the
+  format is used at all, because markup the tokenizer does not have encodes
+  as ordinary text and the model then reads its own turn structure as prose
+  and answers anyway, plausibly and wrongly. The rendering keeps the split
+  that makes the XTML path safe: the template's strings go out as markup
+  segments, the caller's content never does.
+
+  Measured on a Kimi-Linear container: a multi-turn conversation
+  round-trips, streaming deltas arrive, and both refusals come back as 400s
+  naming `tools` and `reasoning_effort`. The serve suite is 211 checks, up
+  from 174.
+
+- **`tools/convert.py` installs a `chat.json` per architecture**, with
+  `examples/chat-kimi-linear.json` alongside K3's. The architecture was
+  already recognised; it simply had nothing to install and said so, which
+  left every Kimi-Linear container to be finished by hand — and the obvious
+  hand fix, copying the ChatML `examples/chat.json`, is wrong in a way
+  nothing reports: `<|im_start|>` is not in Kimi's vocabulary and encodes as
+  six ordinary tokens.
+
+  So the converter also **refuses to install a template whose markup the
+  release's tokenizer does not carry**, naming the missing markers. Only
+  when there is a specials list to check against: a release without
+  `tokenizer_config.json` is no evidence, and refusing on none would be
+  worse than the unconditional copy it replaces.
+  `tests/test_convert_chat.py` covers both claims per architecture.
+
+### Fixed
+
+- **The server refused to start on any container without XTML markers**
+  ([#34](https://github.com/sqliteai/waste/issues/34)). `ChatServer.__init__`
+  resolved the four control tokens and let the `EngineError` out, so the
+  process died before binding a port — taking `/health`, `/v1/models` and
+  `/v1/completions` with it, none of which need a chat format at all, and
+  reporting only that `<|open|>` had come out as five tokens. The reason is
+  now held rather than raised, and a container with neither format serves
+  everything except `/v1/chat/completions`, which returns 400 with
+  `code: "unsupported_chat_format"` and both reasons — no XTML markers, and
+  what was wrong with the `chat.json`.
+
+### Measured and not adopted
+
+- **Tool calls over `chat.json` are not built**, and the reason is not
+  effort. Four prefix/suffix strings cannot carry a tool declaration, an
+  argument list, or a result turn — K3's encoder needs 647 lines for it.
+  Kimi-Linear's tokenizer does carry `<|tool_call_begin|>` and friends, so
+  it is reachable in principle, but the markup is not transcribed anywhere
+  in this repo and cannot be derived from the release on disk: that copy
+  ships no `chat_template` and no reference encoder. #34 holds this half.
+
+- **The `chat.json` renderer is transcribed and tested, not differentially
+  verified.** `serve/xtml.py` earns its confidence from a segment-for-segment
+  differential against the release's own `encoding_k3.py` under `K3_DIR`,
+  and there is no equivalent program for Kimi-Linear to check against. If an
+  Instruct release ships a `chat_template`, HF's Jinja renderer would be a
+  real oracle and a `tools/`-side check like the existing ones; until then
+  the weaker claim is the honest one.
+
 ## 0.6.6 — 2026-08-05
 
 The engine decodes exactly as 0.6.5 did and no container format moved. Two

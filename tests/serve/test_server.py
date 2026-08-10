@@ -18,21 +18,24 @@ a tool call to assert about.
 
 import json
 import http.client
+import shutil
 import socket
 import sys
+import tempfile
 import threading
 import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO))
 
 from serve import xtml                                      # noqa: E402
 from serve.engine import EngineError, WASTE_E_IO            # noqa: E402
 from serve.server import serve                              # noqa: E402
-from tests.serve.fake_engine import (FakeEngine, reply_plain,   # noqa: E402
-                                     reply_tool_call)
+from tests.serve.fake_engine import (FakeEngine, LINEAR_MARKERS,  # noqa: E402
+                                     reply_plain, reply_tool_call)
 
 
 class ServerTestCase(unittest.TestCase):
@@ -628,7 +631,7 @@ class TestCompletions(ServerTestCase):
 
 
 class TestContainerWithoutXTML(ServerTestCase):
-    """A non-K3 container: everything but chat, rather than nothing.
+    """A non-K3 container with no chat.json either: everything but chat.
 
     This used to raise out of the constructor, so `python3 -m serve` on a
     Kimi-Linear container exited before binding a port and the operator
@@ -637,7 +640,22 @@ class TestContainerWithoutXTML(ServerTestCase):
     what these assert.
     """
 
-    engine_kwargs = {"no_markers": True}
+    def setUp(self):
+        # An empty container directory: no XTML markers and no chat.json,
+        # so neither format resolves.
+        self.dir = tempfile.mkdtemp(prefix="serve-noxtml-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.engine_kwargs = {"no_markers": True, "model_path": self.dir}
+        super().setUp()
+
+    def test_the_error_gives_both_reasons(self):
+        """Either alone misleads: 'no XTML' reads as the wrong model when
+        the chat.json is simply absent."""
+        status, body = self.chat()
+        self.assertEqual(status, 400)
+        message = body["error"]["message"]
+        self.assertIn("XTML", message)
+        self.assertIn("chat.json", message)
 
     def test_the_server_starts(self):
         status, body = self.get("/health")
@@ -678,6 +696,86 @@ class TestContainerWithoutXTML(ServerTestCase):
                                  {"model": "test-model", "prompt": "start"})
         self.assertEqual(status, 200)
         self.assertEqual(body["choices"][0]["text"], "continued text")
+
+
+class TestChatFromChatJson(ServerTestCase):
+    """The other half: a container that describes its own format.
+
+    Same server, same endpoint, a different prompt format and a much
+    simpler reply parser — driven by the chat.json examples/ ships, so a
+    change to that file shows up here.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="serve-chatjson-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        shutil.copyfile(REPO / "examples" / "chat-kimi-linear.json",
+                        Path(self.dir) / "chat.json")
+        self.engine_kwargs = {"no_markers": True, "model_path": self.dir,
+                              "markers": dict(LINEAR_MARKERS)}
+        super().setUp()
+
+    def test_chat_answers(self):
+        self.engine.reply = "hello<|im_end|>"
+        status, body = self.chat()
+        self.assertEqual(status, 200)
+        self.assertEqual(body["choices"][0]["message"]["content"], "hello")
+        self.assertEqual(body["choices"][0]["finish_reason"], "stop")
+
+    def test_the_prompt_is_the_template(self):
+        """Control tokens in the order chat.json lays them out: the user
+        turn, its terminator, then the assistant opening."""
+        self.engine.reply = "x<|im_end|>"
+        self.chat()
+        control = [t for t in self.engine.prompts[-1] if t < 1000]
+        self.assertEqual(control, [12, 14, 15, 13, 14])
+
+    def test_a_control_token_in_the_question_stays_text(self):
+        """The boundary. The user's <|im_end|> must not close their turn —
+        there is exactly one real one in the prompt, from the template."""
+        self.engine.reply = "x<|im_end|>"
+        self.chat(messages=[{"role": "user",
+                             "content": "what does <|im_end|> do?"}])
+        self.assertEqual(self.engine.prompts[-1].count(15), 1)
+
+    def test_the_stop_token_comes_from_the_format(self):
+        self.engine.reply = "x<|im_end|>"
+        self.chat()
+        self.assertEqual(self.engine.calls[-1]["stop_tokens"], [15])
+
+    def test_streaming(self):
+        self.engine.reply = "hi<|im_end|>"
+        events = self.stream()
+        content = "".join(e["choices"][0]["delta"].get("content", "")
+                          for e in events
+                          if isinstance(e, dict) and e.get("choices"))
+        self.assertEqual(content, "hi")
+        self.assertEqual(events[-1], "[DONE]")
+
+    def test_thinking_is_off_by_default_rather_than_refusing_everything(self):
+        """The server's default is thinking on; this container has no
+        channel, so the default has to yield rather than 400 every request."""
+        self.engine.reply = "ok<|im_end|>"
+        self.assertEqual(self.chat()[0], 200)
+
+    def test_asking_for_reasoning_is_refused_not_ignored(self):
+        status, body = self.chat(reasoning_effort="high")
+        self.assertEqual(status, 400)
+        self.assertIn("reasoning channel", body["error"]["message"])
+
+    def test_tools_are_refused_by_name(self):
+        status, body = self.chat(tools=[
+            {"type": "function",
+             "function": {"name": "f", "parameters": {"type": "object"}}}])
+        self.assertEqual(status, 400)
+        self.assertIn("tool definitions", body["error"]["message"])
+
+    def test_completions_still_work(self):
+        self.engine.reply = "continued"
+        status, body = self.post("/v1/completions",
+                                 {"model": "test-model", "prompt": "start"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["choices"][0]["text"], "continued")
 
 
 class TestAuth(ServerTestCase):

@@ -214,6 +214,9 @@ Stdlib-only OpenAI-compatible HTTP. `xtml.py` is a **port** of the release's
 `encoding_k3.py` (K3 ships no Jinja template), checked segment-for-segment
 against that file whenever `K3_DIR` is set; `regions.py` is the streaming
 parser that reads replies back into reasoning / content / `tool_calls`;
+`chatfmt.py` is the fallback for a container with no XTML markers, serving
+it from the same `chat.json` the CLI reads — plain conversation only, with
+tools, thinking and images refused by name rather than dropped;
 `engine.py` is the ctypes binding plus one lock held for a whole generation
 (a `waste_ctx` is not thread-safe). Struct layouts in `engine.py` mirror
 `waste.h` field for field — change one, change the other.
