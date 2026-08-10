@@ -82,7 +82,22 @@ class ChatServer(ThreadingHTTPServer):
             self.model_info = {}
         # Markers by token id: the parser decides structure from ids, not
         # from what the text happens to spell. See regions.py.
-        self.markers = engine.marker_ids()
+        #
+        # A container whose tokenizer has no XTML markers cannot be chatted
+        # with, because this is the only prompt format serve/ speaks. That
+        # used to raise here, which took the whole process down — including
+        # /health, /v1/models and /v1/completions, none of which need a chat
+        # format at all — and told the operator only that a token was five
+        # tokens. Hold the reason and refuse the one endpoint that cannot be
+        # served. The refusal itself stays: markers the tokenizer does not
+        # have encode as ordinary text, and the model would read its own
+        # turn structure as prose and answer anyway. See #34.
+        try:
+            self.markers = engine.marker_ids()
+            self.chat_error = None
+        except EngineError as e:
+            self.markers = {}
+            self.chat_error = str(e)
         self.stop_tokens = [tid for tid, text in self.markers.items()
                             if text == "<|end_of_msg|>"]
 
@@ -246,6 +261,20 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_body()
         srv = self.server
         engine = srv.engine
+
+        # Before anything else, and before the engine lock: this container
+        # has no chat format we can render, and no request can change that.
+        # 400 rather than 501 because for an OpenAI client the unsupported
+        # thing is the model, which is a request parameter — and a 501 is
+        # the one status those clients tend to retry.
+        if srv.chat_error:
+            raise api.APIError(
+                f"this model cannot be used for chat completions: "
+                f"{srv.chat_error}. serve/ renders Kimi K3's XTML prompt "
+                f"format and no other. POST /v1/completions for raw "
+                f"continuation, or use `waste chat`, which reads the "
+                f"container's own chat.json",
+                status=400, param="model", code="unsupported_chat_format")
 
         stream = body.get("stream", False)
         if not isinstance(stream, bool):

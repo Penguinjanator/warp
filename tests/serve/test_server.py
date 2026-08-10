@@ -627,6 +627,59 @@ class TestCompletions(ServerTestCase):
         self.assertFalse(set(self.engine.prompts[-1]) & markers)
 
 
+class TestContainerWithoutXTML(ServerTestCase):
+    """A non-K3 container: everything but chat, rather than nothing.
+
+    This used to raise out of the constructor, so `python3 -m serve` on a
+    Kimi-Linear container exited before binding a port and the operator
+    lost /health, /v1/models and /v1/completions along with the one
+    endpoint that genuinely cannot work. Reaching setUp at all is half of
+    what these assert.
+    """
+
+    engine_kwargs = {"no_markers": True}
+
+    def test_the_server_starts(self):
+        status, body = self.get("/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "ok")
+
+    def test_models_still_lists_it(self):
+        status, body = self.get("/v1/models")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["data"][0]["id"], "test-model")
+
+    def test_chat_is_a_400_that_says_why_and_what_to_use(self):
+        status, body = self.chat()
+        self.assertEqual(status, 400)
+        err = body["error"]
+        self.assertEqual(err["code"], "unsupported_chat_format")
+        self.assertIn("XTML", err["message"])
+        self.assertIn("/v1/completions", err["message"])
+
+    def test_chat_refuses_before_touching_the_engine(self):
+        """No prompt built, no state reset: the request never reaches it."""
+        self.chat()
+        self.assertEqual(self.engine.prompts, [])
+        self.assertEqual(self.engine.resets, 0)
+
+    def test_streaming_chat_refuses_the_same_way(self):
+        """A 400 as a normal response, not an SSE stream of an error."""
+        status, body = self.post("/v1/chat/completions",
+                                 {"model": "test-model", "stream": True,
+                                  "messages": [{"role": "user",
+                                                "content": "hi"}]})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "unsupported_chat_format")
+
+    def test_completions_still_generate(self):
+        self.engine.reply = "continued text"
+        status, body = self.post("/v1/completions",
+                                 {"model": "test-model", "prompt": "start"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["choices"][0]["text"], "continued text")
+
+
 class TestAuth(ServerTestCase):
     server_kwargs = {"api_key": "secret-key"}
 

@@ -121,6 +121,35 @@ Malformed output is expected, not exceptional: an unterminated element, a
 token limit. Every one ends as text or a dropped element. A truncated
 answer beats no answer.
 
+### Containers that are not K3
+
+XTML is the only prompt format this server speaks, and the four markers are
+resolved from the container's own tokenizer at startup. A container whose
+`specials.json` does not carry them — any non-K3 one, Kimi-Linear included —
+cannot be chatted with here:
+
+```
+WARNING: /v1/chat/completions is unavailable for this container.
+  <|open|> is not a single token in this container (got 5): …
+```
+
+The server still starts. `/health`, `/v1/models` and `/v1/completions` need
+no chat format and work normally; `/v1/chat/completions` returns 400 with
+`code: "unsupported_chat_format"` and a message naming the alternative. It
+used to raise out of the constructor instead, which took down four working
+endpoints to report one broken one, and told the operator only that a token
+had come out as five tokens.
+
+What does not change is the refusal itself. Rendering the prompt anyway
+would not fail visibly: markers the tokenizer does not have encode as
+ordinary text, so the model reads its own turn structure as prose and
+answers regardless — plausibly, and wrongly. This is the output-side twin of
+the tokenize/tokenize_markup split, and the same reasoning.
+
+`waste chat` and `waste run` are unaffected: they read the container's own
+`chat.json`, which `serve/` does not use at all. Serving a second prompt
+format is [#34](https://github.com/sqliteai/waste/issues/34).
+
 ## HTTP
 
 | endpoint | notes |

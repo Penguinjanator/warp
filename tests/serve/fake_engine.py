@@ -65,6 +65,9 @@ class FakeEngine:
     reply: str = "Hello!"
     vision: bool = False
     ctx_max: int = 4096
+    # A container whose tokenizer has no XTML markers — any non-K3 one.
+    # marker_ids() is what discovers that, and it raises.
+    no_markers: bool = False
     # Raised by generate(), to exercise the error paths.
     fail_with: Optional[Exception] = None
     # Sleep this long before each token, to test client disconnects.
@@ -84,6 +87,11 @@ class FakeEngine:
         return self._lock
 
     def marker_ids(self) -> dict[int, str]:
+        if self.no_markers:
+            raise EngineError(
+                f"{xtml.OPEN_TOKEN} is not a single token in this container "
+                f"(got 5): its specials.json does not carry K3's XTML "
+                f"markers", WASTE_E_UNSUPPORTED)
         return dict(MARKERS)
 
     def model_info(self) -> dict:

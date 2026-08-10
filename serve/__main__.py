@@ -219,9 +219,24 @@ examples:
         print(f"{e}", file=sys.stderr)
         return 1
 
+    # Said at startup, not on the first 400: an operator who learns this
+    # from a client's error message has already written the client.
+    #
+    # The flush is not decoration. Redirected to a file, stdout is
+    # block-buffered and stderr is not, so without it this warning lands
+    # above the banner it is qualifying — and reads as if the container
+    # failed to load at all.
+    if srv.chat_error:
+        sys.stdout.flush()
+        print(f"\nWARNING: /v1/chat/completions is unavailable for this "
+              f"container.\n  {srv.chat_error}.\n  serve/ renders K3's XTML "
+              f"prompt format and no other, so /v1/completions is the one "
+              f"generating\n  endpoint here. `waste chat` reads the "
+              f"container's chat.json and is unaffected.", file=sys.stderr)
+
     shown = args.host if ":" not in args.host else f"[{args.host}]"
     print(f"\nlistening on http://{shown}:{args.port}  "
-          f"(POST /v1/chat/completions)")
+          f"(POST {'/v1/completions' if srv.chat_error else '/v1/chat/completions'})")
     # Flush before blocking forever. Redirected to a file, stdout is
     # block-buffered, so without this `python3 -m serve … > log &` shows an
     # empty log for as long as the server runs — which reads exactly like a
