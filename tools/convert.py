@@ -45,6 +45,7 @@ import argparse
 import io
 import json
 import os
+import re
 import shutil
 import struct
 import sys
@@ -1083,6 +1084,7 @@ def main():
     # six ordinary tokens, which silently destroys any chat template and the
     # media markers an image would be wrapped in.
     p_cfg = os.path.join(args.src, "tokenizer_config.json")
+    special_texts = set()
     if os.path.exists(p_cfg):
         dec = json.load(open(p_cfg)).get("added_tokens_decoder", {})
         specials = sorted(((int(i), v["content"]) for i, v in dec.items()),
@@ -1090,6 +1092,7 @@ def main():
         if specials:
             atomic_json(os.path.join(args.out, "specials.json"),
                         [{"id": i, "text": t} for i, t in specials])
+            special_texts = {t for _, t in specials}
             print(f"special tokens: {len(specials)} written")
 
     # ---- chat template ---------------------------------------------------
@@ -1125,7 +1128,15 @@ def main():
     # keeps saying so and falling back, which is better than a guessed
     # format that produces plausible wrong answers. And never over an
     # existing file — a hand-edited chat.json outranks the shipped one.
-    _tmpl_for = {"kimi-k3": "chat-k3.json"}
+    #
+    # The two Kimi releases use disjoint markup — K3's XTML brackets versus
+    # Kimi-Linear's <|im_*|> — so the map is per architecture and never a
+    # default. Installing the wrong one is not a visible failure: the markers
+    # are absent from the tokenizer, so they encode as ordinary text and the
+    # model reads its own turn structure as prose. That is what the marker
+    # check below refuses, and it also catches a release that renames them.
+    _tmpl_for = {"kimi-k3": "chat-k3.json",
+                 "kimi-linear": "chat-kimi-linear.json"}
     _hf0 = ((cfg.get("_outer", {}).get("architectures")
              or cfg.get("architectures") or [""]))[0]
     _arch0 = ("kimi-k3" if "KimiK3" in _hf0 else
@@ -1135,12 +1146,26 @@ def main():
     if _name and not os.path.exists(_dst):
         _src_tmpl = os.path.join(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__))), "examples", _name)
-        if os.path.exists(_src_tmpl):
-            atomic_copyfile(_src_tmpl, _dst)
-            print(f"chat.json: {_name} — `waste chat` will use it")
-        else:
+        if not os.path.exists(_src_tmpl):
             print(f"chat.json: examples/{_name} not found; the CLI will "
                   f"fall back to raw continuation")
+        else:
+            # Only when we have a specials list to check against: a release
+            # without tokenizer_config.json tells us nothing, and refusing on
+            # no evidence would be worse than the old unconditional copy.
+            _absent = sorted({
+                m for m in re.findall(
+                    r"<\|[^|>]*\|>",
+                    io.open(_src_tmpl, encoding="utf-8").read())
+                if m not in special_texts}) if special_texts else []
+            if _absent:
+                print(f"chat.json: examples/{_name} needs "
+                      f"{', '.join(_absent)}, which this release's tokenizer "
+                      f"does not have; not installing it (the CLI will fall "
+                      f"back to raw continuation)")
+            else:
+                atomic_copyfile(_src_tmpl, _dst)
+                print(f"chat.json: {_name} — `waste chat` will use it")
     elif os.path.exists(_dst):
         print("chat.json: already present, left alone")
     elif _arch0:

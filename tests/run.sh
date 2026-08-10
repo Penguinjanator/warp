@@ -1030,6 +1030,19 @@ else
     printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5
 fi
 
+# The chat.json the converter installs has to be the one whose markup the
+# release's tokenizer carries. Installing the wrong one is silent: absent
+# markers encode as ordinary text, so the model reads its own turn structure
+# as prose and still answers, plausibly and wrongly. Same stubs, no weights.
+if ! command -v python3 >/dev/null 2>&1; then
+    sk "convert.py chat.json" "python3 not installed"
+elif out=$(python3 tests/test_convert_chat.py 2>&1); then
+    ok "each architecture gets its own chat.json, and no one else's"
+else
+    no "convert.py chat.json"
+    printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5
+fi
+
 # ---------------------------------------------------------------- serve ----
 head_ "serve (OpenAI-compatible server)"
 
