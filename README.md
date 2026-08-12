@@ -139,7 +139,7 @@ With [aria2](https://aria2.github.io/), which resumes and needs no GUI:
 
 ```bash
 aria2c --dir ~/models --seed-time=60 \
-  'magnet:?xt=urn:btih:abe7123a60b2b1171c1c4dcaa381b93c46806afe&dn=k3.waste&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&tr=udp%3A%2F%2Fopen.demonii.com%3A1337%2Fannounce'
+  'magnet:?xt=urn:btih:54db69b0df8baf5e617744dda5d46c90a2d0f632&dn=k3.waste&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&tr=udp%3A%2F%2Fopen.demonii.com%3A1337%2Fannounce&tr=udp%3A%2F%2Ftracker.torrent.eu.org%3A451%2Fannounce&tr=https%3A%2F%2Ftracker.tamersunion.org%3A443%2Fannounce'
 ```
 
 This writes `~/models/k3.waste`, the directory the commands below expect. Point
