@@ -23,7 +23,7 @@ if __package__ in (None, ""):                    # python3 serve/__main__.py
 
 from . import api, xtml                                      # noqa: E402
 from .engine import (CACHE_LFRU, CACHE_LRU,                  # noqa: E402
-                     WASTE_E_ARG, WASTE_E_UNSUPPORTED,
+                     WASTE_E_ARG, WASTE_E_BUSY, WASTE_E_UNSUPPORTED,
                      Engine, EngineError, build_info, physical_ram,
                      plan_memory)
 from .server import serve                                    # noqa: E402
@@ -121,6 +121,8 @@ examples:
                         "since. Costs ~5%% on Kimi-Linear, ~1%% on K3")
     g.add_argument("--usage", default=None, metavar="PATH",
                    help="learned hotlist (default <model>/usage.waste)")
+    g.add_argument("--exclusive-open", action="store_true",
+                   help="ask for single-process ownership of this container")
 
     s = ap.add_argument_group("serving")
     s.add_argument("--max-tokens", type=bounded_int(1, (1 << 32) - 1),
@@ -177,7 +179,8 @@ examples:
             direct_io=not args.no_direct_io,
             vision=args.vision,
             verify_records=args.verify,
-            usage_path=args.usage)
+            usage_path=args.usage,
+            exclusive_open=args.exclusive_open)
     except EngineError as e:
         print(f"{e}", file=sys.stderr)
         # Two statuses that say nothing useful on their own when --cpus is
@@ -187,6 +190,9 @@ examples:
         elif args.cpus and e.status == WASTE_E_UNSUPPORTED:
             print("--cpus: this platform does not bind threads to CPUs "
                   "(Linux and Windows only)", file=sys.stderr)
+        elif args.exclusive_open and e.status == WASTE_E_BUSY:
+            print("--exclusive-open: another process owns this container; "
+                  "stop it or retry without --exclusive-open", file=sys.stderr)
         return 1
 
     try:

@@ -23,6 +23,30 @@ state save/load, model introspection and aggregate stats.
 Deliberately *not* in the API: logging to stdout, signal handlers, config
 files, argument parsing. Those belong to the host — the CLI included.
 
+### Optional container ownership
+
+On POSIX hosts, `waste_cfg.exclusive_open` asks `waste_open` to take a
+non-blocking advisory lock on the container directory before memory planning or
+model-sized allocation. A cooperating process that also requests exclusivity
+for the same container receives `WASTE_E_BUSY`; it does not wait. Paths are
+matched by device and inode, so aliases of one directory do not evade the
+check.
+
+Contexts in one process remain independent as documented: they share a
+reference-counted ownership entry, and the last `waste_close` releases it.
+Failures during planning, budget validation, or partial model loading release
+it as well. Lock descriptors are close-on-exec, and a forked child is treated
+as a different process rather than inheriting the parent's registry.
+
+Concurrent opens remain the default. Containers are read-only, and process
+ownership is host policy rather than a data-safety requirement; a workstation
+daemon can opt in through `waste_cfg.exclusive_open`, or `--exclusive-open` on
+the CLI and server. This is an advisory lock between cooperating WASTE
+processes, not RAM accounting or a security boundary. If the directory cannot
+be opened for locking or the filesystem does not support `flock`, the model
+continues without ownership. Windows keeps its existing lifecycle behavior and
+ignores the setting.
+
 ## 2. CLI as a first-class client
 
 `cli/` links the library and adds only host concerns: argv parsing, a

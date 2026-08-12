@@ -8,6 +8,99 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
+## 0.6.8 — unreleased
+
+Nothing changes for the two models this project ships numbers for: a
+Kimi-Linear forward is byte-identical to 0.6.7, and so is K3's. What changed
+is which *other* models the engine can read. The DeepSeek-V3 family — V3, R1
+and Kimi K2 — converts and now attends over an ordered sequence, which it did
+not before. Alongside that, a host can ask for exclusive ownership of a
+container, opt-in and off by default.
+
+**Callers must recompile against this header.** `exclusive_open` was appended
+to `waste_cfg`, and `WASTE_E_BUSY` was added to `waste_status`. The library is
+still pre-1.0 and does not promise a stable ABI; `serve/engine.py`'s ctypes
+mirror moved with the C header.
+
+### Added
+
+- **`convert.py` reads DeepSeek-V3 family checkpoints**
+  ([#26](https://github.com/sqliteai/warp/pull/26)). Three things stood between
+  a V3/R1/K2 checkpoint and a container, and each failed differently. fp8
+  block-scaled weights (`F8_E4M3` with a `_scale_inv` companion) are now
+  dequantized by both safetensors readers, with the tile size read from
+  `quantization_config.weight_block_size` rather than inferred from the two
+  shapes — inferring looks possible and is wrong whenever a dimension is not a
+  multiple of the tile, and a compatible-but-wrong size passes the shape check
+  while placing every scale on the wrong rows. DeepSeek's MoE tensor names
+  (`mlp.experts.E.{gate,up,down}_proj`) are detected from what is on disk and
+  normalised to the one spelling the engine knows; without it the expert probe
+  missed on every layer and reported `0 MB [missing]` after the download had
+  already finished. And the MoE *config* keys are normalised into the manifest
+  the same way — `src/model.c` reads `num_experts`, a DeepSeek config only
+  spells it `n_routed_experts`, so the finished container was refused at load
+  with no diagnostic. `moe_renormalize` is emitted only when true, because
+  `model.c` keys it on the field being present rather than on its value.
+  Verified end to end on `Kimi-K2-Instruct`: 61 layers, 384 experts top-8,
+  VQ3R, 354 GB expert set, 6.9 GB trunk.
+
+- **Opt-in single-process container ownership**
+  ([#29](https://github.com/sqliteai/warp/pull/29)). On POSIX hosts,
+  `waste_cfg.exclusive_open`, or `--exclusive-open` in the CLI and server,
+  takes a non-blocking advisory `flock` on the container directory. Multiple
+  contexts in one process share a device/inode-keyed reference; a cooperating
+  process that also requests exclusivity receives `WASTE_E_BUSY`. The last
+  close and every planning, budget, and partial-load failure release ownership;
+  descriptors are close-on-exec, and a forked child discards the copied
+  registry. Windows keeps its existing lifecycle behavior.
+
+  This is host policy, not RAM accounting. Container identity is a proxy for
+  memory oversubscription and a poor one — two processes on *different*
+  containers oversubscribe just as badly and are untouched by this, while two
+  small containers on a large machine are refused for nothing. That is why it
+  is off by default and why the budget question stayed open as
+  [#31](https://github.com/sqliteai/warp/issues/31).
+
+### Fixed
+
+- **MLA applied no rotary at all, so a non-NoPE container attended over an
+  unordered sequence** ([#27](https://github.com/sqliteai/warp/pull/27)).
+  Every occurrence of `rope` in `src/` was `qk_rope` used as a width;
+  `rope_theta`, `rope_scaling` and `mla_use_nope` were read nowhere. That is
+  correct for the Kimi models, which set `mla_use_nope` and pass those dims
+  through unrotated, and wrong for everything in the DeepSeek-V3 family, where
+  those dims are the only positional signal there is.
+
+  It is quiet rather than obvious: lexically determined answers still come out
+  right, which is why casual use does not catch it. On Kimi-K2 at VQ3R,
+  `"The capital of France is"` still answers `Paris.`; add a second turn
+  boundary and the top-1 next token is `<|im_end|>` at p=0.968 — an empty
+  assistant turn, because the model cannot tell which turn came first. With the
+  rotation it is `Hi` at 0.491. Not a degraded answer, an unordered one.
+
+  `rope_init` follows `DeepseekV3YarnRotaryEmbedding`: YaRN's ramp on
+  `inv_freq`, and `mscale_all_dim` squared onto the attention scale (1.8133 on
+  K2). The rotation is GPT-J interleaved, and k is rotated *before* it enters
+  the latent cache, because a cached entry is reused by every later query and
+  carries its own token's position. A rope shape this does not implement is
+  refused at load rather than run unrotated. Checked against an oracle whose
+  YaRN helpers are `exec`'d verbatim out of the DeepSeek release's
+  `modeling_deepseek.py`: 0.000023% relative L2 on this branch against 0.162%
+  on 0.6.7, and the mirror image the other way, so the comparison discriminates
+  rather than merely agreeing.
+
+  **Nothing moves for Kimi-Linear or K3.** `rope_init` returns before building
+  a table when `mla_use_nope` is set and leaves `att_mul` at exactly `1.0f`, so
+  those models take the previous path by construction rather than by a runtime
+  branch — verified byte-identical on a full forward.
+
+- **Advisory locking fails open when ownership cannot be established.** Only
+  actual `EWOULDBLOCK`/`EAGAIN` contention returns `WASTE_E_BUSY`. A directory
+  that is search-only, a filesystem without `flock`, or another non-contention
+  locking failure continues through the ordinary model-open path. This keeps
+  external FUSE, SMB, and NFS containers usable and leaves their real read
+  errors to the existing loader diagnostics.
+
 ## 0.6.7 — 2026-08-10
 
 The engine decodes exactly as 0.6.6 did — same logits, same container
