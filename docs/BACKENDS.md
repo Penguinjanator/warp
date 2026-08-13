@@ -342,6 +342,63 @@ structs and the two shared inlines in a new `src/simd.h`. The third hot
 path, the VQ gather, gets nothing — no x86 SIMD helps it either, for the
 same reason NEON does not.
 
+> **Qualified on 2026-08-13; the last sentence is about VQ3R only.** It was
+> written when 3x256 was the only expert format, and for that shape it is
+> exactly right: §41 measured why, and the arithmetic is not close. A
+> 256-entry stage table is 256 bytes — sixteen vector registers of the
+> thirty-two that exist — so it fits no byte-permute primitive on any ISA,
+> and blocking cannot make it fit.
+>
+> **VQ4P broke the premise, not the conclusion's wording.** 4x64 spends the
+> same 24 bits per 8-weight vector, and a 64-entry stage table is 64 bytes,
+> four registers — which is precisely what `vqtbl4q_s8` addresses. So the
+> apply *did* get a NEON kernel (`src/model.c`: four `vqtbl4q_s8` per 16
+> rows over a `vld3q_u8` deinterleave, inside a 64-row `VQ_TILE`), and an
+> x86 build takes the `else` branch — one row at a time, four scalar table
+> loads per row. That is not a narrower kernel, it is the absence of one, on
+> the same build where VQ3R's table gets `simd_avx512.c`.
+>
+> **How much this costs depends on who meets it, and that is narrower than
+> issue #32 states.** #32 says VQ4P is what `convert.py` produces by
+> default; it is not. `--index-bits` defaults to 8 and `--stages` to 3, so a
+> default conversion is VQ3R, and VQ4P has to be asked for explicitly with
+> `--index-bits 6 --stages 4 --entries 64`. An x86 build therefore meets the
+> scalar apply only when someone requests that shape. The catch is who that
+> is: the shape is exactly the one §50 left open as the 64-entry crossover,
+> so the people most likely to hit it are the people trying to answer the
+> open question — and they would get an ISA difference reported as a
+> table-size result.
+>
+> The candidate is AVX-512 **VBMI's `vpermi2b`**, which indexes 128 bytes
+> across two zmm registers — the same primitive with room to spare for 64
+> entries. Zen 4 and later, Ice Lake and later. `src/simd_avx512.c` already
+> exists and dispatch resolves once at init, so it is a slot to fill and not
+> an `#ifdef` in `model.c`.
+>
+> **Unmeasured in both directions, and worth saying before anyone spends a
+> weekend on it:** the path may be bound by the deinterleave rather than by
+> the lookup, in which case the table primitive buys much less than it looks
+> like it should; and cross-lane byte permutes are not uniformly cheap
+> across x86 microarchitectures. This is a hypothesis with an obvious first
+> experiment, not a plan — issue #32 tracks it.
+>
+> One consequence beyond the kernel: **`docs/LEARNED.md` §47's tuning table
+> is an ARM result.** `WASTE_XPAR`, `WASTE_XPAR_BATCH`, `WASTE_P6_CHUNK` and
+> the thread counts were all measured against the vectorized apply, and on
+> x86 the kernel underneath them is a different kernel, so the inversion
+> between Kimi-Linear and K3 has never been retested there. `CLAUDE.md`
+> carries those settings as engine-wide guidance; read them as ARM guidance
+> until someone re-runs them.
+>
+> If someone writes it, the bar is bit-identity against the portable path
+> and not "close" — `-DWASTE_P6_SCALAR` already makes the ARM path
+> self-checking, and §43 says why an int8 table raises the bar that far. The
+> check that decides it is *SIMD backend matches the CPU baseline*, and it
+> has to run on an `--index-bits 6` container: the suite's default
+> `WASTE_REF_MODEL` is a VQ3R conversion, and running the suite on the wrong
+> container shape is exactly how a load path once stayed broken through
+> green runs.
+
 **AVX2 is verified.** On Linux/x86_64 the engine reports `backend AVX2`,
 the suite is 12 passed / 0 failed, and *SIMD backend matches the CPU
 baseline* passes — that check runs `WASTE_BACKEND=cpu` against the
