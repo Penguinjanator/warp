@@ -19,7 +19,12 @@
  * as "disk N GB total, M GB/token"; pass M here, or leave it out and read
  * the GB/s.
  *
- * Build: cc -O2 -o diskbench tools/diskbench.c
+ * Build: cc -O2 -o diskbench tools/diskbench.c -lpthread
+ *   Windows cross:  x86_64-w64-mingw32-gcc-posix -O2 -o diskbench.exe \
+ *                       tools/diskbench.c -lpthread
+ *   The -posix driver is not optional there: mingw ships win32 and posix
+ *   threads as separate compilers and only -posix has pthread.h, the same
+ *   reason the Makefile names it for the engine.
  * Usage: ./diskbench /Volumes/WasteDisk/k3/.bench [file_gb] [rec_mb] [threads] [gb_per_token]
  */
 #define _GNU_SOURCE
