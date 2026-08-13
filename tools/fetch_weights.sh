@@ -197,7 +197,10 @@ for s in d.get("siblings", []):
     if f.endswith(".safetensors") or "/" in f or f == "model.safetensors.index.json":
         continue
     print(f)
-' 2>/dev/null)
+' 2>/dev/null | tr -d '\r')       # see the .shards comment below: CRLF here
+                                  # would put a %0D on every URL get_small
+                                  # asks for, and now record every one of
+                                  # them as missing
     if [ -n "$SMALL" ]; then
         log "repo lists $(printf '%s\n' "$SMALL" | wc -l | tr -d ' ') small files"
         # shellcheck disable=SC2086
@@ -229,14 +232,29 @@ fi
     exit 1; }
 
 # --- plan ------------------------------------------------------------------
-python3 - "$DEST/model.safetensors.index.json" > "$DEST/.shards" <<'PY'
+# Every python3 below is piped through `tr -d '\r'`, and that is load-bearing
+# rather than tidy (#36, gap 2). MSYS2 ships a *Windows* python3, whose stdout
+# does text-mode \n -> \r\n; .download-state is appended by bash and does not.
+# So `grep -qxF "$f" "$STATE"` compared "model-00001-of-00020.safetensors\r"
+# against the same name without it and never matched: on Windows every shard
+# looked absent, a finished 91.5 GB download reported "0 / 20 complete", and
+# the free-space check then refused to start on a total it had already
+# fetched. Everything the header above promises about surviving a long haul
+# was inert there, and the first run looks perfect, which is what makes it
+# easy to miss.
+#
+# `tr` rather than sys.stdout.reconfigure(): this has to be right on a Python
+# build that cannot be tested from here, and deleting a byte that must never
+# appear in a safetensors filename is checkable by reading. It is a no-op
+# everywhere else.
+python3 - "$DEST/model.safetensors.index.json" <<'PY' | tr -d '\r' > "$DEST/.shards"
 import json, sys
 idx = json.load(open(sys.argv[1]))
 for s in sorted(set(idx["weight_map"].values())):
     print(s)
 PY
 TOTAL=$(wc -l < "$DEST/.shards" | tr -d ' ')
-TOTAL_BYTES=$(python3 - "$DEST/model.safetensors.index.json" <<'PY'
+TOTAL_BYTES=$(python3 - "$DEST/model.safetensors.index.json" <<'PY' | tr -d '\r'
 import json, sys
 print(json.load(open(sys.argv[1])).get("metadata", {}).get("total_size", 0))
 PY

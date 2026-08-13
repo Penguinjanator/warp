@@ -44,6 +44,32 @@ no()   { printf "  \033[31mFAIL\033[0m  %s\n" "$1"; fail=$((fail+1)); }
 sk()   { printf "  \033[33mSKIP\033[0m  %s — %s\n" "$1" "$2"; skip=$((skip+1)); }
 head_() { printf "\n\033[1m%s\033[0m\n" "$1"; }
 
+# uv, with a deadline. A uv that is absent skips cleanly; a uv that is
+# present and cannot work does not fail, it *hangs*, and takes the suite
+# with it — MSYS2's mingw-w64-ucrt-x86_64-uv 0.12.1 opened no TCP sockets
+# at all, five processes and zero connections (#36). The packaging is not
+# this project's problem; a suite with no deadline on a subprocess is.
+#
+# Done by hand rather than with `timeout`, which is GNU coreutils and is not
+# on a stock macOS. Exit 124 matches what timeout would have returned, so a
+# caller that only checks for success sees a failure either way.
+UV_TIMEOUT="${UV_TIMEOUT:-600}"
+run_uv() {
+    uv "$@" &
+    uvpid=$!
+    uvwaited=0
+    while kill -0 "$uvpid" 2>/dev/null; do
+        if [ "$uvwaited" -ge "$UV_TIMEOUT" ]; then
+            kill -9 "$uvpid" 2>/dev/null
+            wait "$uvpid" 2>/dev/null
+            return 124
+        fi
+        sleep 1
+        uvwaited=$((uvwaited + 1))
+    done
+    wait "$uvpid"
+}
+
 head_ "build"
 if make -s test >/dev/null 2>&1 && make -s >/dev/null 2>&1; then
     ok "make && make test"
@@ -104,14 +130,14 @@ esac
 
 if command -v uv >/dev/null 2>&1; then
     ./test_k3parts "$TMP/k3parts.bin" >/dev/null 2>&1
-    if uv run --quiet --with torch --no-project python tools/k3parts_ref.py \
+    if run_uv run --quiet --with torch --no-project python tools/k3parts_ref.py \
            "$TMP/k3parts.bin" 2>/dev/null | grep -q "^PASS"; then
         ok "K3 components (SiTU, both decay gates, AttnRes)"
     else
         no "K3 components"
     fi
 
-    if KDA_T=24 KDA_H=4 KDA_K=32 KDA_V=32 uv run --quiet --with torch \
+    if KDA_T=24 KDA_H=4 KDA_K=32 KDA_V=32 run_uv run --quiet --with torch \
            --with fla-core --with einops --no-project python tools/kda_ref.py \
            2>/dev/null | grep -q "^PASS"; then
         ok "KDA kernel vs fla's naive_recurrent_kda"
@@ -328,15 +354,21 @@ if [ -d "$MODEL" ]; then
     if [ "$SYNTHETIC" = 1 ]; then
         sk "container round-trip" "synthetic container has no source weights"
     elif [ -d "$SRC" ] && command -v uv >/dev/null 2>&1; then
-        if uv run --quiet --with torch --no-project python tools/verify_container.py \
+        if run_uv run --quiet --with torch --no-project python tools/verify_container.py \
                --container "$MODEL" --src "$SRC" --experts 1 2>/dev/null \
                | grep -q "^PASS"; then
             ok "dequantized weights match the source"
         else
             no "container round-trip"
         fi
-    else
+    elif [ ! -d "$SRC" ]; then
         sk "container round-trip" "source weights not at $SRC"
+    else
+        # The weights are here and uv is not, which the single message this
+        # replaces reported as absent weights (#36). Someone then goes
+        # looking for a download that is already on the disk.
+        sk "container round-trip" \
+           "uv not installed (the weights at $SRC are here; verify_container.py runs under a plain torch interpreter too)"
     fi
 else
     sk "container checks" "no container at $MODEL"
@@ -621,7 +653,7 @@ import sys; sys.exit(0 if abs($eng - $sim) <= 5 else 1)" 2>/dev/null; then
     else
         GEN=""
         if [ -z "${WASTE_ORACLE:-}" ] && command -v uv >/dev/null 2>&1; then
-            uv run --no-project --with torch --with fla-core --with einops \
+            run_uv run --no-project --with torch --with fla-core --with einops \
                 python tools/kimi_ref.py --container "$MODEL" --prompt-ids "$IDS" \
                 --tokens 0 --dump "$TMP/oracle.bin" >/dev/null 2>&1 || true
             [ -s "$TMP/oracle.bin" ] && GEN="$TMP/oracle.bin"
@@ -629,9 +661,37 @@ import sys; sys.exit(0 if abs($eng - $sim) <= 5 else 1)" 2>/dev/null; then
         oracle_why=""
         if [ -z "$GEN" ] && [ -z "${WASTE_ORACLE:-}" ] && [ -f "${ORACLE%.bin}.json" ]; then
             oracle_why=$(python3 - "$MODEL" "${ORACLE%.bin}.json" <<'PY'
-import json, os, subprocess, sys
+import hashlib, json, os, subprocess, sys
 WASTE = os.path.join(os.curdir, "waste" + (".exe" if os.name == "nt" else ""))
 meta = json.load(open(sys.argv[2]))
+name = os.path.basename(sys.argv[2])
+
+# The codebooks, not just the trunk width. `trunk` alone let a container
+# through whose books were trained on a different --device, and the sidecar
+# records that axis ("converted_on") while the check ignored it: a default
+# conversion on a CPU-only machine also reports Q4G/Q8G/F32, so the gate
+# passed and the diff then failed by 2.77 (#36, gap 3). The comment above
+# already says why that is not an engine error — the same seed on a
+# different device trains different k-means books — so the gate has to see
+# the books themselves. Hashing codebooks.bin covers --device and every
+# other conversion knob at once, and it is under a megabyte to read.
+#
+# This is #7 recurring on a second axis, so the fix is the one the rotary
+# fixture already uses: pin the artefact, not a property of it.
+want_cb = meta.get("codebooks_sha256")
+if want_cb:
+    cb = os.path.join(sys.argv[1], "codebooks.bin")
+    try:
+        with open(cb, "rb") as f:
+            got_cb = hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        got_cb = None
+    if got_cb and got_cb != want_cb:
+        print(f"no uv to generate one, and the fixture's codebooks are not "
+              f"this container's ({want_cb[:12]} vs {got_cb[:12]}) — a "
+              f"cross-conversion diff is not an engine error, see {name}")
+        sys.exit(0)
+
 want = meta.get("trunk")
 r = subprocess.run([WASTE, "info", sys.argv[1], "--json"],
                    capture_output=True, text=True)
@@ -641,7 +701,7 @@ except Exception:
     sys.exit(0)                       # let the diff speak if info cannot
 if want and got != want:
     print(f"no uv to generate one, and the fixture is from a {want} trunk "
-          f"against this container's {got} — see {os.path.basename(sys.argv[2])}")
+          f"against this container's {got} — see {name}")
 PY
 )
         fi
@@ -738,7 +798,7 @@ else
         # is portable — the digest below is what says so.
         RGEN=""
         if command -v uv >/dev/null 2>&1; then
-            uv run --no-project --with torch \
+            run_uv run --no-project --with torch \
                 python tools/deepseek_ref.py --container "$ROPE" --ids "$RIDS" \
                 --dump "$TMP/rope_ref.bin" >/dev/null 2>&1 || true
             [ -s "$TMP/rope_ref.bin" ] && RGEN="$TMP/rope_ref.bin"
@@ -1042,10 +1102,19 @@ PYFV
         sk "peak RSS inside the budget" "sanitizer shadow memory makes RSS meaningless"
     elif [ "$SYNTHETIC" = 1 ]; then
         sk "peak RSS inside the budget" "needs a tokenizer to drive the CLI"
-    elif tests/check_budget.sh "$MODEL" 2>/dev/null | grep -q "^BUDGET OK"; then
-        ok "peak RSS stays inside the configured budget"
     else
-        no "peak RSS exceeded the budget"
+        # Not piped straight into grep: that discards the exit status, and
+        # 77 (could not measure) has to be told from a real overrun. On
+        # Windows the unmeasurable case was reported as an overrun (#36).
+        bud=$(tests/check_budget.sh "$MODEL" 2>/dev/null); brc=$?
+        if printf '%s' "$bud" | grep -q "^BUDGET OK"; then
+            ok "peak RSS stays inside the configured budget"
+        elif [ "$brc" = 77 ]; then
+            sk "peak RSS inside the budget" \
+               "$(printf '%s' "$bud" | sed -n 's/^BUDGET UNMEASURABLE: //p')"
+        else
+            no "peak RSS exceeded the budget"
+        fi
     fi
 else
     sk "budget checks" "no container at $MODEL"
@@ -1067,8 +1136,12 @@ if [ -n "${WASTE_SANITIZED:-}" ] && [ -f "$BIG/manifest.json" ]; then
     BIG=/nonexistent-under-sanitizer
 fi
 if [ -f "$BIG/manifest.json" ]; then
-    if tests/check_budget.sh "$BIG" 32 long 2>/dev/null | grep -q "^BUDGET OK"; then
+    bud=$(tests/check_budget.sh "$BIG" 32 long 2>/dev/null); brc=$?
+    if printf '%s' "$bud" | grep -q "^BUDGET OK"; then
         ok "peak RSS stays inside the budget on K3 too"
+    elif [ "$brc" = 77 ]; then
+        sk "peak RSS inside the budget on K3" \
+           "$(printf '%s' "$bud" | sed -n 's/^BUDGET UNMEASURABLE: //p')"
     else
         no "peak RSS exceeded the budget on K3"
     fi
@@ -1252,7 +1325,7 @@ fi
 if [ "$SYNTHETIC" = 1 ]; then
     sk "tokenizer diff" "synthetic container carries no tokenizer"
 elif [ -d "$MODEL" ] && command -v uv >/dev/null 2>&1 && [ -d "$SRC" ]; then
-    if uv run --quiet --with tiktoken --no-project python tools/tokdiff.py \
+    if run_uv run --quiet --with tiktoken --no-project python tools/tokdiff.py \
            "$MODEL" "$SRC" 2>/dev/null | tail -1 | grep -q "identical"; then
         ok "C tokenizer matches Python tiktoken"
     else

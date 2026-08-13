@@ -284,6 +284,23 @@ jobs:
             make clean >/dev/null
           done
 
+      # diskbench.c has no Makefile rule and was compiled by no job on any
+      # platform, so nothing noticed that it did not build for Windows at
+      # all — posix_memalign, pread and fsync all implicit (#36, gap 4).
+      # It is a standalone tool built with one cc line, which is exactly
+      # why it went unwatched; one cc line is also all it takes to watch it.
+      # LEARNED §46's standing rule sends people to this tool before they
+      # are allowed to call anything disk-bound, so it does not get to rot.
+      - name: diskbench builds, natively and for Windows
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends gcc-mingw-w64-x86-64
+          cc -O2 -Wall -Wextra -Werror -o /tmp/diskbench tools/diskbench.c
+          echo "ok: native"
+          x86_64-w64-mingw32-gcc -O2 -Wall -Wextra -Werror \
+              -o /tmp/diskbench.exe tools/diskbench.c
+          echo "ok: windows cross-build"
+
       # Every source file carries the licence header.
       - name: SPDX headers
         run: |
