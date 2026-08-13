@@ -8,7 +8,7 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
-## 0.6.8 — unreleased
+## 0.6.8 — 2026-08-13
 
 Nothing changes for the two models this project ships numbers for: a
 Kimi-Linear forward is byte-identical to 0.6.7, and so is K3's. What changed
