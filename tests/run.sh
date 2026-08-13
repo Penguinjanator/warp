@@ -1202,6 +1202,21 @@ fi
 # ------------------------------------------------------------ converter ----
 head_ "converter"
 
+# The fp8 converter path has two readers and a silent shape-preserving failure
+# mode, so keep its tile mapping under a small synthetic test instead of
+# relying on a multi-hour model conversion. Exit 77 is an explicit skip when
+# torch is unavailable, never a pass.
+if ! command -v python3 >/dev/null 2>&1; then
+    sk "fp8 block-scale mapping" "python3 not installed"
+else
+    out=$(python3 tests/test_fp8_blocks.py 2>&1); rc=$?
+    case "$rc" in
+        0)  ok "fp8 block scales, partial tiles, missing companions, and reader agreement" ;;
+        77) sk "fp8 block-scale mapping" "torch not installed" ;;
+        *)  no "fp8 block-scale mapping"; printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5 ;;
+    esac
+fi
+
 # Resume is the one converter behaviour that cannot be checked by looking at
 # a finished container: it is about the partial states a crash leaves. The
 # quantizer is stubbed out, so this needs neither torch nor source weights.
