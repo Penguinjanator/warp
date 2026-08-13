@@ -205,6 +205,69 @@ else
     kill $RSRV 2>/dev/null; wait $RSRV 2>/dev/null
 fi
 
+# get_small, the other half of the script, and the half that had no checks.
+# Its contract is that a file the repo's own listing names and the server
+# does not deliver is a failure and not a 404 (#35): one attempt with the
+# error discarded lost ten of eleven small files on a real download, and the
+# run still printed ALL SHARDS COMPLETE and rc=0.
+fetch_small() {                        # $1 = port, then MODE and file names
+    local port="$1"; shift
+    rm -rf "$FT/sm"; mkdir -p "$FT/sm"
+    { echo "DEST=$FT/sm; RAW=http://127.0.0.1:$port; LOG=\$DEST/log"
+      echo 'SMALL_RETRY=3; SMALL_BACKOFF=0'   # do not sleep through the suite
+      echo 'log() { printf "%s\n" "$*" >> "$LOG"; }'
+      echo 'hcurl() { curl "$@"; }'
+      sed -n '/^SMALL_MISSING=""$/,/^}$/p' tools/fetch_weights.sh
+      echo 'get_small "$@"'
+      echo 'printf "MISSING:[%s]\n" "$SMALL_MISSING"'
+    } > "$FT/gensm.sh"
+    bash "$FT/gensm.sh" "$@" 2>/dev/null
+}
+
+echo hello > "$FT/srv/small.txt"
+
+if [ -n "${NO_CURL:-}" ]; then
+    sk "a listed small file survives a transient failure" "curl not installed"
+elif ! start_server --flaky 2; then
+    no "range server did not start (small-file retry not run)"
+else
+    # Two 503s and then the file. The single attempt this replaces lost it
+    # here, silently, and the run went on to report success.
+    out=$(fetch_small $PORT req small.txt)
+    if [ "$(cat "$FT/sm/small.txt" 2>/dev/null)" = hello ] &&
+       echo "$out" | grep -q 'MISSING:\[\]' &&
+       grep -q "retry in" "$FT/sm/log"; then
+        ok "a listed small file survives a transient failure"
+    else
+        no "small-file retry ($out)"
+    fi
+    kill $RSRV 2>/dev/null; wait $RSRV 2>/dev/null
+fi
+
+# On a clean server, not the flaky one: --flaky counts per path, so a 404
+# there arrives behind two 503s and the check would be measuring both at
+# once.
+if [ -n "${NO_CURL:-}" ]; then
+    sk "a file the repo listed and did not serve is reported, not passed over" "curl not installed"
+elif ! start_server; then
+    no "range server did not start (small-file accounting not run)"
+else
+    # `req` records it; `opt` — the guessed fallback list — is the case the
+    # old "a 404 here is normal" comment was actually right about, and has
+    # to stay silent.
+    req_out=$(fetch_small $PORT req absent.txt); req_log=$(cat "$FT/sm/log" 2>/dev/null)
+    opt_out=$(fetch_small $PORT opt absent.txt); opt_log=$(cat "$FT/sm/log" 2>/dev/null)
+    if echo "$req_out" | grep -q 'MISSING:\[absent.txt\]' &&
+       echo "$req_log" | grep -q "MISSING absent.txt" &&
+       echo "$opt_out" | grep -q 'MISSING:\[\]' &&
+       ! echo "$opt_log" | grep -q "MISSING"; then
+        ok "a file the repo listed and did not serve is reported, not passed over"
+    else
+        no "small-file accounting (req=$req_out opt=$opt_out)"
+    fi
+    kill $RSRV 2>/dev/null; wait $RSRV 2>/dev/null
+fi
+
 if [ -n "${NO_CURL:-}" ]; then
     sk "a server without Range support restarts the shard instead of giving up" "curl not installed"
 elif ! start_server --no-range; then
