@@ -53,7 +53,7 @@ of this section can stay about the mechanism:
 | AVX2 | `simd_avx2.c` | verified on Linux/x86_64 |
 | AVX-512 | `simd_avx512.c` | compiled and dispatched, never executed — CI runner is Zen 3, confirmed 2026-07-29 |
 | Metal | `metal.m` | correct, off by default, 22% slower |
-| CUDA, BLAS, ROCm | — | not implemented; the flag refuses to build. For CUDA that is a measured decision as of 2026-08-04, not an omission — see below |
+| CUDA, BLAS, ROCm | — | not implemented; the flag refuses to build. For CUDA that is a measured decision, not an omission — discrete cards 2026-08-04, coherent memory 2026-08-13, both third-party; see below |
 | SVE, RVV | — | not implemented |
 
 Details for each are in the dated sections below. The rest of this one
@@ -322,8 +322,11 @@ now exercised, which is more than the macOS-only build could do.
 CUDA remains untested and untestable here on two counts: there is no
 NVIDIA GPU on this machine, and there is still no CUDA source to compile
 — `WASTE_ENABLE_CUDA=1` stops the build with a message saying so. *(Both
-are still true. Since 2026-08-04 the question has been answered on other
-people's hardware instead — see "CUDA: the gates, answered off-repo".)*
+are still true, and the second is now the reason rather than an accident:
+see "Coherent memory: the shape claim does not hold". Since 2026-08-04 the
+question itself has been answered on other people's hardware — first on a
+discrete card, then on a coherent-memory part that reversed one half of the
+answer.)*
 
 ## AVX2 and AVX-512 (2026-07-28)
 
@@ -463,11 +466,13 @@ different engine, not a backend. The code stays, off by default, because
 it is correct and because that argument should be re-run if the CPU path
 ever stops being bandwidth-bound.
 
-**That re-run has since happened, on NVIDIA hardware, and it splits this
-paragraph in two.** The "different engine, not a backend" conclusion
-survives. The reasoning under it — no headroom, plus a round-trip per call
-— does not transfer to a discrete card unchanged. The next section is what
-replaced it; read the two together.
+**That re-run has since happened, twice, on NVIDIA hardware, and what is
+left of this paragraph is smaller than it looks.** The reasoning under it —
+no headroom, plus a round-trip per call — does not transfer to a discrete
+card unchanged (next section). And the conclusion itself, "a different
+engine, not a backend", was a *shape* stated from a *mechanism*, and does
+not survive a vehicle where the mechanism is absent (2026-08-13 section
+below). Read all three together; the last one is the current position.
 
 ## CUDA: the gates, answered off-repo (2026-08-04)
 
@@ -545,6 +550,66 @@ one-time load and deletes the deciding row. That is still one dispatch per
 layer with the residual never returning to the host, i.e. still a different
 engine and not a backend. The GPU VQ-decode throughput measured above
 applies to it unchanged.
+
+> **Superseded in part on 2026-08-13.** The condition this paragraph names
+> was met from the other side, and the sentence about filling the
+> `waste_backend` slots is false on that class of vehicle. The discrete-card
+> answer above is unaffected. See the next section.
+
+## Coherent memory: the shape claim does not hold (2026-08-13)
+
+**Third-party, third contributor, not reproduced here** — the same standing
+caution as the two sections above. `mccoyspace` ran an incremental CUDA
+offload on an NVIDIA **GB10**, a coherent unified-memory part rather than a
+discrete card, on K3 and Kimi-Linear. Numbers, contracts and the negative
+results are in `docs/LEARNED.md` §61; what follows is only what it means for
+this document.
+
+**Two sentences in this file were wrong, and they were wrong in the same
+way.** Metal concluded that making a GPU pay "would mean moving the whole
+forward pass on-device ... a different engine, not a backend", and the
+section above concluded that filling the `waste_backend` slots "would still
+reproduce the Metal result on different silicon." Both took a *mechanism*
+that had been measured — synchronous launch and a round-trip per call, over
+several hundred small dependent matvecs — and restated it as a *shape*.
+Coherent memory removes the round trip without removing the dependency, so
+the mechanism is absent and the shape claim does not follow.
+
+What was actually done there was incremental and kernel-class — KDA, then
+the dense projections, then the VQ gather — with **attention state, routing
+and final expert accumulation left on the CPU**. That is much closer to
+filling slots than to a rewritten engine, and it paid: 0.34-0.35 → 0.902
+tok/s on K3 under a byte-identical-logits capture, 0.637 tok/s at 121.35 W
+on a held-out set.
+
+**Read the held-out figure against this machine, not against that host's
+CPU.** The README publishes 0.45-0.62 tok/s for K3 on an M5 Pro laptop, so
+0.637 clears the top of that band by about 3% — the same order as the band's
+own width. The 2.6x is real and it is the right ratio for asking whether the
+GPU paid *on that host*; it is the wrong one for asking whether the hardware
+buys anything over a laptop. Both readings belong here.
+
+**What does not change:**
+
+- **The discrete-card answer** of the previous section. PCIe is still
+  slower than host RAM and a 16 GB card still does not hold a 16.5 GiB
+  expert bank. GB10 is not evidence about a 5060 Ti.
+- **The build guard.** `src/cuda.cu` still does not exist and
+  `WASTE_ENABLE_CUDA=1` still stops the build. Nothing here is a decision
+  to accept a CUDA backend.
+- **The reason it is not one.** This project cannot execute a line of that
+  code — no NVIDIA hardware, no way to regress-check a numerical contract
+  per release. Adding a surface no machine here can reach is a maintenance
+  question, not a kernel question, and it is sharpened rather than softened
+  by issue #36: the suite's non-synthetic path does not run in CI on any
+  platform either. That is what has to be answered before code, and
+  answering it afterwards is how a project acquires a backend nobody can
+  fix.
+
+The design detail worth carrying into any such discussion: CUDA emitted one
+partial per selected expert and the **CPU reduced them in original router
+order**, which is what made byte-identical logits reachable and route
+invariance an interpretable gate rather than a tolerance.
 
 ## CI
 
