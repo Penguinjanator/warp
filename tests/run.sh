@@ -1338,6 +1338,30 @@ fi
 # ------------------------------------------------------------ converter ----
 head_ "converter"
 
+# The fp8 converter path has two readers and a silent shape-preserving failure
+# mode, so keep its tile mapping under a small synthetic test instead of
+# relying on a multi-hour model conversion. Exit 77 is an explicit skip when
+# torch is unavailable, never a pass.
+#
+# Through uv, like every other torch checker here: torch is not a dependency
+# of this repo and is not a system package on the machines that run this. As
+# bare `python3` the whole check reported "torch not installed" and skipped
+# everywhere, CI included — where the Linux job is the one that installs uv,
+# so this is exactly where it does get to run.
+if ! command -v uv >/dev/null 2>&1; then
+    # The guard is on uv rather than python3 for the same reason: without uv
+    # run_uv exits 127 and the catch-all below would call that a failure.
+    sk "fp8 block-scale mapping" "uv not installed"
+else
+    out=$(run_uv run --quiet --with torch --no-project \
+              python tests/test_fp8_blocks.py 2>&1); rc=$?
+    case "$rc" in
+        0)  ok "fp8 block scales, partial tiles, missing companions, and reader agreement" ;;
+        77) sk "fp8 block-scale mapping" "torch not installed" ;;
+        *)  no "fp8 block-scale mapping"; printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5 ;;
+    esac
+fi
+
 # Resume is the one converter behaviour that cannot be checked by looking at
 # a finished container: it is about the partial states a crash leaves. The
 # quantizer is stubbed out, so this needs neither torch nor source weights.
