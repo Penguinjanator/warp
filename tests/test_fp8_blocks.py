@@ -6,6 +6,16 @@
 These tests use small synthetic tensors so they do not need model weights. A
 missing torch installation is an explicit skip, matching tests/run.sh's rule
 that unavailable prerequisites must never look like a pass.
+
+The one case nothing here can catch, stated because it is the reason the tile
+size is read from the checkpoint's config rather than inferred from the two
+shapes: a *compatible but wrong* block size. 300 rows against 3 scale rows
+admits both 128 (the truth, with a partial last tile) and 100 (a clean split).
+Both satisfy the shape check below, both produce a tensor of the right size,
+and the wrong one applies every scale to the wrong rows. No assertion over
+shapes can separate them, which is why `unblock_scale` takes `block` as an
+argument instead of deriving it — the check that matters happened before this
+file was reached.
 """
 
 import json
@@ -81,14 +91,25 @@ def test_partial_last_row_and_column_are_cropped_after_mapping():
 
 
 def test_missing_scale_companion_is_rejected():
-    with tempfile.TemporaryDirectory() as root:
-        write_safetensors_model(root, (2, 3), include_scale=False)
-        try:
-            ST(root).tensor("weight")
-        except KeyError as exc:
-            assert "weight_scale_inv" in str(exc)
-        else:
-            raise AssertionError("fp8 tensor without its scale companion was accepted")
+    """Both readers refuse, not just the one that is easy to remember.
+
+    ST and ShardReader each carry their own copy of this guard, and covering
+    only ST left the convert.py one free to return the tensor unscaled: a
+    mutation that deleted its `raise` kept the whole suite green. That is the
+    silent-wrong-answer this file exists to prevent, in the reader #26's own
+    description called out as "a second reader and was easy to miss".
+    """
+    for label, read in (("mxfp4.ST", lambda r: ST(r).tensor("weight")),
+                        ("convert.ShardReader", lambda r: ShardReader(r).get("weight"))):
+        with tempfile.TemporaryDirectory() as root:
+            write_safetensors_model(root, (2, 3), include_scale=False)
+            try:
+                read(root)
+            except KeyError as exc:
+                assert "weight_scale_inv" in str(exc), f"{label}: {exc}"
+            else:
+                raise AssertionError(
+                    f"{label} accepted an fp8 tensor with no scale companion")
 
 
 def test_gross_scale_shape_mismatch_is_rejected():
