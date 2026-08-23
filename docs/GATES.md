@@ -6,8 +6,8 @@ expensive step it protects, the test, and the recorded verdict.
 
 **Read this as a log, not as a status page.** The gates are dated and kept
 as they were written, including the projections that the finished engine
-went on to beat or miss. Every gate below has run except Gate 7, which is
-open; where one carries a forecast, a note says what actually happened. The measured end-to-end
+went on to beat or miss. Every gate below has now run; where one carries a
+forecast, a note says what actually happened. The measured end-to-end
 numbers live in [LEARNED.md](LEARNED.md) §12 and §16 and in the README —
 those are the ones to quote.
 
@@ -21,7 +21,7 @@ those are the ones to quote.
 | 3 | quantization quality at 2–3 bit | ✅ run 2026-07-27, repeated on real K3 experts |
 | 4 | engine correctness | ✅ all three steps passed 2026-07-27 |
 | 6 | is per-expert bit allocation a real lever? | ❌ run 2026-07-29 — refuted, nothing to allocate |
-| 7 | is the budget resolver's quantum still a working set? | ⏳ **open** — opened 2026-08-01 |
+| 7 | is the budget resolver's quantum still a working set? | ❌ run 2026-08-23 — refuted, the quantum stands |
 
 ## Gate 0 — does the trace→simulate methodology work, and what does real
 ## batch-1 routing look like? ✅ PASSED (with a sobering data point)
@@ -148,7 +148,11 @@ guess.
 > because a prefetched record has to survive from one layer to the next
 > rather than from one token to the next. The floor is a property of a
 > demand-only cache, which was the only kind that existed when this gate
-> ran. Whether the budget resolver's quantum should follow is Gate 7.
+> ran. Whether the budget resolver's quantum should follow was Gate 7, and
+> the answer is no: measured at 200 tokens rather than four, that same 287-slot
+> arm runs 23–35% behind `floor + 1x`. The lookahead works *within* a token
+> and does not substitute for cross-token reuse, which is what a session
+> longer than a few tokens buys.
 
 Correctness: cache on vs cache off is **bit-identical**, and both match the
 oracle at rel 1.50e-06. Placement decides speed, never precision.
@@ -316,7 +320,8 @@ scarce, and 0–2% of the reads, which are. The table is in
 that would revive it.
 
 ## Gate 7 — is the budget resolver's quantum still one token's working set?
-## ⏳ OPEN, raised 2026-08-01. Not run
+## ❌ RUN 2026-08-23 on a 128 GB Strix Halo. Refuted: §39's window closes at
+## 200 tokens, so the quantum stands and nothing in the resolver changes
 
 *Protects:* redesigning the rule that picks the default memory budget, and
 with it what every user of this engine gets when they pass no `--budget`.
@@ -373,3 +378,28 @@ hour, which was arithmetic done hopefully.
 The collapsed budgets are deliberately not in the grid: at 0.075 tok/s two
 hundred tokens is forty-four minutes *each*, and there is nothing left to
 learn there — §39 and §33 have both already refused them.
+
+*Verdict: the change is refuted and the rule stands.* Run by `Lrrr908` on a
+128 GB Ryzen AI Max+ 395, K3, 200 tokens and 3 repeats per arm, interleaved
+in one process. Against a `floor + 1x` of 0.113 tok/s the 3–4 GB band
+measured **0.073–0.087 — 64.6% to 77%**, where the kill criterion asked for
+90%. §39's window is a four-token window, and the resolver keeps stepping in
+whole multiples of a token's working set. No code changed.
+
+The mechanism is visible in the hit rate rather than in the clock, which is
+what makes the verdict survive being measured on somebody else's machine: at
+287 slots the two runs agree within 0.6 points, because at that size
+essentially every hit is the lookahead working *within* a token. At ~1,500
+slots the long run gains five points over the short one, and that difference
+is cross-token reuse — the thing four tokens cannot show. The full reading,
+including the caveat that the two runs use different prompts, is in
+[LEARNED.md](LEARNED.md) §63.
+
+Two things the run produced that this gate did not ask for. `floor + 2x` and
+`floor + 3x` are arms a 64 GB host can never select, and they are smooth —
+monotone to 4,463 slots and 56.6% hit, no knee. And the **absence of §16's
+paging cliff is narrower than it reads**: that collapse is a fraction of
+physical RAM, not a cache size, and the largest arm here reached only ~66% of
+RAM where the 64 GB machine was still healthy at ~72%. `cache=70000` would be
+the arm that actually tests it. Not run, and worth running either way — §63
+says what each outcome would mean.

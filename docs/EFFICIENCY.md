@@ -364,7 +364,11 @@ cache 8% *more*, because speculative records get evicted before use — it is
 a prefetch at small caches and a scheduling change at large ones. And it
 moves what §4B and the budget resolver rest on: a record now has to survive
 one attention rather than one token, so a cache far below a token's working
-set is no longer worth zero ([GATES.md](GATES.md) Gate 7).
+set is no longer worth zero. It is still not worth *choosing*: Gate 7 ran
+that arm over 200 tokens instead of four and it landed 23–35% behind
+`floor + 1x`, because the lookahead works within a token and cross-token
+reuse is what the extra size buys. The resolver's quantum stands
+([GATES.md](GATES.md) Gate 7, [LEARNED.md](LEARNED.md) §63).
 
 The same hook in `moe_chunk` was built and removed: a chunk layer claims
 ~550 slots against a decode layer's 16, the speculative records are what

@@ -4270,3 +4270,123 @@ a missing tool reports SKIP rather than accusing the engine since #42), but
 the real-container gap is exactly the one that matters for a numerical
 contract, and it is open. That is the argument for carrying a seam and not
 kernels: the seam is something this project can review and keep honest.
+
+## 63. Gate 7: §39's window is a four-token window (2026-08-23)
+
+**Third-party, and the first Gate 7 data of any kind.** `Lrrr908` ran the
+grid on a 128 GB Ryzen AI Max+ 395 (Strix Halo, Zen 5), K3, `tests/sweep.c`,
+one process, interleaved arms, 200 generated tokens and 3 repeats per arm,
+on commit 2056d44f. Reported in issue #37. Not reproduced here — this
+project's machine is 64 GB and cannot select half the arms below.
+
+### The kill criterion fired
+
+Gate 7 was posed with the criterion declared in advance: *if at 200+ tokens
+a 3–4 GB cache is no longer within ~10% of `floor + 1x`, the rule stands as
+written and §39 becomes a note about short sessions.*
+
+| cache | slots | median tok/s | vs `floor + 1x` |
+|---|---:|---:|---:|
+| 3072 MiB | 259 | 0.082 | 72.6% |
+| 3400 MiB | 287 | 0.073 | **64.6%** |
+| 4096 MiB | 346 | 0.087 | 77.0% |
+| 17606 MiB (`floor + 1x`) | 1487 | 0.113 | — |
+| 17740 MiB | 1499 | 0.114 | 100.9% |
+| 35212 MiB (`floor + 2x`) | 2975 | 0.136 | 120.4% |
+| 52818 MiB (`floor + 3x`) | 4463 | 0.154 | 136.3% |
+
+23–35% below, against a threshold of 10%. **So the quantum stands.** The
+budget resolver keeps stepping in whole multiples of one token's working
+set, no code changes, and §39's *"a 3.32 GB cache is within 10% of a
+17.32 GB one"* is now a statement about four-token sessions specifically.
+
+§39 named its own failure mode in the sentence that opened this gate —
+*"four generated tokens is exactly the length that flatters a small cache,
+and cross-token reuse is what a large one buys."* That was a prediction.
+It is now a measurement.
+
+### The mechanism, from the counter rather than the clock
+
+The comparison confounds two things: 200 tokens against §39's four, **and**
+a Strix Halo with a Kingston NVMe against an M5 Pro. No 4-token arm was run
+on that host, so nothing in the dataset separates them.
+
+It survives because the deciding quantity need not be throughput. Hit rate
+falls out of the routing trace and the cache policy; it does not care what
+the disk or the cores are doing, and both runs report it stable across
+repeats. It is the one column that can be set beside a different machine:
+
+| slots | §39, 4 tokens | Gate 7, 200 tokens |
+|---:|---:|---:|
+| 287 | 29.1% | 29.7% |
+| ~1490–1500 | 36.2% | 41.0 / 41.2% |
+| 2537 | 41.3% | — |
+| 2975 | — | 49.8% |
+
+**The small cache gains 0.6 points and the large one gains five.** At 287
+slots essentially every hit is the lookahead, which works within a token and
+therefore cannot know how many follow; everything above that is cross-token
+reuse, which is exactly what four tokens cannot exhibit. Put most sharply:
+**the 200-token run reaches at 1,499 slots the hit rate the 4-token run
+needed 2,537 slots to reach.**
+
+**Caveat, because it matters more than the agreement does:** the two runs
+use different prompts — a 13-token code prompt against §39's id list — so
+the routing traces differ and these are not the same experiment. Read the
+shape, not the digits. It corroborates a mechanism from a quantity the host
+cannot move; it is not a controlled length sweep, and nobody has run one.
+
+### What only a >64 GB host could produce
+
+The resolver takes the largest of `floor + 3x/2x/1x` that fits under 7/8 of
+RAM. On the 64 GB machine here that is always `floor + 1x`, so `floor + 2x`
+and `floor + 3x` had never been selected by anything.
+
+They are smooth. tok/s rises and GB read falls **monotonically across the
+entire grid**, hit rate climbing to 56.6% at 4,463 slots with no knee and no
+inversion. That is new information rather than a replication.
+
+### "No cliff observed" is correct, and narrower than it reads
+
+§16's eightfold collapse is a **fraction of physical RAM**, not a cache
+size. On the 64 GB machine it sits between the 46 GB arm (~72% of RAM,
+0.63 tok/s, healthy) and the 52 GB arm (~81%, 0.07 tok/s, dead).
+
+Gate 7's largest arm peaked at **79.3 GiB on a 128 GB host, about 66%** —
+below the fraction that was still healthy here. So the monotone curve is
+what should have happened, and it is **not** evidence that the cliff is
+absent at 128 GB; it is evidence that the grid stopped short of it. The arm
+that would test it is roughly `cache=70000`, which puts total RSS near 81%
+of that host's RAM. Not run.
+
+Both outcomes would be worth having. If it collapses, §16 is a fraction and
+travels. If it does not, the fraction is wrong and §57's headroom — an
+eighth, set without measurement until §57 went looking — is holding back
+machines that do not need it.
+
+### Two smaller things this turned up
+
+**The first repeat of an arm is reproducibly the slowest, on a third
+machine.** Both smallest arms have an r1 off their own r2/r3 (0.091 against
+0.066/0.082; 0.054 against 0.073/0.075). Issue #44 reports the identical
+shape on a Zen 2 Windows box and cites this one as the second instance.
+Three hosts, three vendors, two operating systems — past the point where it
+should be filed as each reporter's local noise. It is why the table above is
+medians.
+
+**`waste plan`'s working set is computed over 93 layers, not 92.** It is
+`rec × top_k × layers` with the total layer count, including the dense layer
+that has no bank, so a reader computing `FORMAT.md`'s record size × 1,472
+gets 17.01 GiB and does not match the 17.19 GiB printed at them. The
+arithmetic is deliberate and `src/waste.c` says so — *"about 1% loose on K3,
+in the direction that recommends slightly more rather than less, and
+changing it would move a figure `tests/run.sh` asserts."* The gap is
+documentation, not arithmetic: the explanation sits where the number is
+computed and the person who trips on it is reading a terminal.
+
+### Read the shape, not the absolutes
+
+Gate 7's throughput runs 0.05–0.16 tok/s against 0.45–0.62 here, on a
+Kingston NVMe serving every expert miss. The ratios and the curve are the
+contribution; the absolute figures are a different machine and should not be
+set against this project's.
