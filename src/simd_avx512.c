@@ -123,6 +123,9 @@ static void lutb_range_avx512(int lo, int hi, void *p)
 }
 
 #if defined(__AVX512VBMI__)
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx512vbmi")))
+#endif
 static void vq_rows_p6_avx512(int b, int e, void *p)
 {
     vqp_arg *a = (vqp_arg *)p;
@@ -178,11 +181,21 @@ static void vq_rows_p6_avx512(int b, int e, void *p)
                         const __m512i r2v = _mm512_permutexvar_epi8(j2, T2);
                         const __m512i r3v = _mm512_permutexvar_epi8(j3, T3);
 
+                        /* Note on permute & sign extension:
+                         * j0..j3 select table entries for byte 0 of each dword. The upper
+                         * 3 bytes of each dword in j0..j3 are zero, so they select T[0].
+                         * The following slli_epi32(..., 24) / srai_epi32(..., 24) shifts
+                         * byte 0 to the high position and sign-extends it to int32, cleanly
+                         * discarding the unselected upper bytes.
+                         */
                         const __m512i r0_s = _mm512_srai_epi32(_mm512_slli_epi32(r0v, 24), 24);
                         const __m512i r1_s = _mm512_srai_epi32(_mm512_slli_epi32(r1v, 24), 24);
                         const __m512i r2_s = _mm512_srai_epi32(_mm512_slli_epi32(r2v, 24), 24);
                         const __m512i r3_s = _mm512_srai_epi32(_mm512_slli_epi32(r3v, 24), 24);
 
+                        /* Accumulate in 32-bit: two's-complement addition mod 2^32 truncated
+                         * to int16 at block exit is bit-identical to accumulating mod 2^16.
+                         */
                         const __m512i stage_sum = _mm512_add_epi32(
                             _mm512_add_epi32(r0_s, r1_s),
                             _mm512_add_epi32(r2_s, r3_s));
