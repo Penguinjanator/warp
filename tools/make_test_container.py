@@ -33,8 +33,13 @@ import zlib
 MAGIC_EXPERT = 0x50584557        # 'WEXP'
 MAGIC_CODEBOOK = 0x4B424357      # 'WCBK'
 ALIGN = 4096
-FMT_F32, FMT_Q8G, FMT_Q4G, FMT_VQ3R = 0, 2, 3, 4
+FMT_F32, FMT_Q8G, FMT_Q4G, FMT_VQ3R, FMT_VQ4P = 0, 2, 3, 4, 8
 VEC_DIM, CB_ENTRIES, STAGES, IDX_BLOCK = 8, 256, 3, 64
+# --index-bits 6 switches all three: the engine accepts 6 only as 4 stages
+# of 64 entries (src/model.c), which is also the only combination
+# convert.py writes. PACKED and INDEX_BITS are set in main() after the
+# arguments are read; the default leaves every byte below identical.
+PACKED, INDEX_BITS = False, 8
 GROUP = 128
 KINDS = ("gate", "up", "down")
 
@@ -241,6 +246,33 @@ def block_indices(idx, M, N):
     return bytes(out)
 
 
+def block_indices_packed6(idx, M, N):
+    """block_indices, then four 6-bit stages squeezed into three bytes per
+    row — the VQ4P layout. Same [M/B][pos][row_in_block] blocking; only the
+    trailing per-row run changes, from four whole bytes to three packed
+    ones, which keeps a VQ4P record the same size as VQ3R's. Little-endian
+    bit order, LSB of stage 0 at bit 0, byte-for-byte the packing
+    tools/convert.py's block_indices_packed writes, so the engine's
+    P6_J0..P6_J3 unpack recovers the stages in order."""
+    nvr = N // VEC_DIM
+    pad = (-M) % IDX_BLOCK
+    nb = (M + pad) // IDX_BLOCK
+    out = bytearray(nb * nvr * IDX_BLOCK * 3)
+    for b in range(nb):
+        for v in range(nvr):
+            for r in range(IDX_BLOCK):
+                row = b * IDX_BLOCK + r
+                if row >= M:
+                    continue                      # padding stays zero
+                src = row * nvr + v
+                s0, s1, s2, s3 = (idx[s][src] for s in range(4))
+                dst = ((b * nvr + v) * IDX_BLOCK + r) * 3
+                out[dst]     = (s0 | (s1 << 6)) & 0xFF
+                out[dst + 1] = ((s1 >> 2) | (s2 << 4)) & 0xFF
+                out[dst + 2] = ((s2 >> 4) | (s3 << 2)) & 0xFF
+    return bytes(out)
+
+
 def write_expert(f, layer, eid, cb_base, shapes, rng):
     hdr_size = 48
     off, offsets, body = hdr_size, [], bytearray()
@@ -249,7 +281,8 @@ def write_expert(f, layer, eid, cb_base, shapes, rng):
         idx = [[rng.randrange(CB_ENTRIES) for _ in range(nvec)]
                for _ in range(STAGES)]
         offsets.append(off)
-        b = block_indices(idx, M, N)
+        b = block_indices_packed6(idx, M, N) if PACKED \
+            else block_indices(idx, M, N)
         body += b
         off += len(b)
     corr_off = off
@@ -261,7 +294,8 @@ def write_expert(f, layer, eid, cb_base, shapes, rng):
     total = hdr_size + len(body)
     blocks = (total + ALIGN - 1) // ALIGN
     hdr = struct.pack("<IHHBBHHHIIIIIIII",
-                      MAGIC_EXPERT, layer, eid, FMT_VQ3R, 0, cb_base, 0, 0,
+                      MAGIC_EXPERT, layer, eid,
+                      FMT_VQ4P if PACKED else FMT_VQ3R, 0, cb_base, 0, 0,
                       blocks, offsets[0], offsets[1], offsets[2], corr_off,
                       zlib.crc32(bytes(body)) & 0xFFFFFFFF, 0, 0)
     assert len(hdr) == hdr_size
@@ -336,6 +370,13 @@ def main():
                     help="also write a small tiktoken-style vocabulary with "
                          "K3's XTML specials, so the container can be driven "
                          "with text instead of raw ids")
+    ap.add_argument("--index-bits", type=int, default=8, choices=(6, 8),
+                    help="6 writes a VQ4P container: 4 stages of 64 entries, "
+                         "indices packed 4x6 bits into 3 bytes, the only "
+                         "combination the engine accepts at index_bits 6 and "
+                         "the one convert.py writes. Default is 8, and at 8 "
+                         "every byte of the container is exactly what this "
+                         "script wrote before the flag existed.")
     ap.add_argument("--prefix", default="", metavar="PFX",
                     help="put the text tensors under a tensor_prefix, e.g. "
                          "language_model., and add one tensor outside it — "
@@ -382,6 +423,13 @@ def main():
                          "at 1.0. Unequal mscales put a ratio on cos/sin that "
                          "the engine does not apply, so it refuses instead")
     args = ap.parse_args()
+    if args.index_bits == 6:
+        # The engine validates index_bits 6 only as 4 stages of 64 entries
+        # (src/model.c), so there is no other combination to write. Both
+        # constants are read by the writers below; reassigning them here is
+        # the whole of the switch.
+        global STAGES, CB_ENTRIES, PACKED, INDEX_BITS
+        STAGES, CB_ENTRIES, PACKED, INDEX_BITS = 4, 64, True, 6
     rng = random.Random(args.seed)
     os.makedirs(args.out, exist_ok=True)
 
@@ -582,14 +630,27 @@ def main():
                               "bytes": total, "codebook_base": cb_base}
             cb_base += len(KINDS) * STAGES
 
+    # index_bits is absent from every container written before VQ4P and the
+    # engine reads the absence as 8 (src/model.c), so the default container
+    # keeps omitting the key — adding it would change manifest bytes that
+    # the rotary fixture hashes. Same for fmt and bits_per_weight, which at
+    # index_bits 8 stay exactly what this script wrote before the flag
+    # existed.
+    eq = {"fmt": "VQ3R", "stages": STAGES, "vec_dim": VEC_DIM,
+          "entries": CB_ENTRIES, "index_block": IDX_BLOCK,
+          "bits_per_weight": STAGES}
+    if PACKED:
+        eq["fmt"] = "VQ4P"
+        eq["index_bits"] = INDEX_BITS
+        # stages*index_bits/vec_dim = 3.00; 4*6/8, same as convert.py
+        eq["bits_per_weight"] = STAGES * INDEX_BITS / VEC_DIM
+
     manifest = {
         "format_version": 0,
         "arch": cfg["model_type"],
         "tensor_prefix": args.prefix,
         "config": cfg,
-        "expert_quant": {"fmt": "VQ3R", "stages": STAGES, "vec_dim": VEC_DIM,
-                         "entries": CB_ENTRIES, "index_block": IDX_BLOCK,
-                         "bits_per_weight": STAGES},
+        "expert_quant": eq,
         "layers": layers,
         "trunk": t.index,
     }
