@@ -101,29 +101,44 @@ static void  ec_volatile(waste_ecache *c, int si) { (void)c; (void)si; }
 #include <sys/mman.h>
 int waste_wire(void *p, size_t n) { return mlock(p, n) == 0; }
 #else
-/* VirtualLock is bounded by the process *maximum working set*, not by
- * available memory, and the default maximum is far below any cache worth
- * wiring. So this wired nothing at all on Windows: 5928 of 5928 slots
- * refused with ERROR_WORKING_SET_QUOTA on a machine with 54 GB free and
- * nothing paging (#36, gap 5). mlock has no equivalent requirement, which
- * is why the port worked everywhere else and this went unnoticed.
+/* VirtualLock is bounded by the process working set, not by available
+ * memory, and the default is far below any cache worth wiring. So this
+ * wired nothing at all on Windows: 5928 of 5928 slots refused with
+ * ERROR_WORKING_SET_QUOTA on a machine with 54 GB free and nothing paging
+ * (#36, gap 5). mlock has no equivalent requirement, which is why the port
+ * worked everywhere else and this went unnoticed.
  *
- * Raise the ceiling on demand rather than up front: waste_wire is handed one
- * slot at a time and never learns the total, so the first refusal is the
- * only place the size actually needed is known. SetProcessWorkingSetSize
- * takes both bounds, so the current minimum is read back and preserved —
- * passing a minimum above the maximum fails the call outright.
+ * The bound is the *minimum* working set, not the maximum — "the maximum
+ * number of pages that a process can lock is equal to the number of pages
+ * in its minimum working set minus a small overhead". The first fix for
+ * this raised the maximum and deliberately preserved the minimum, and so
+ * wired exactly as much as before: nothing. Measured on the reporter's host
+ * rather than reasoned about — the maximum went from 1.3 MB to 2049 MB and
+ * the lock still failed with 1453; raising both bounds made the same lock
+ * succeed. So `lo` has to move, and `hi` is carried up with it because a
+ * minimum above the maximum fails the call outright.
  *
- * If the raise is refused — it can need SE_INC_WORKING_SET_NAME, which a
- * service account may not hold — latch and stop asking. The caller's
- * accounting is unchanged, since a latched call still reports failure; what
- * goes away is thousands of syscalls that cannot succeed. Reporting the
- * failure honestly is the existing behaviour and stays: an engine that
- * refused to open because it could not wire its cache would be worse than
- * one running with a pageable cache.
+ * That makes this a stronger request than it looks. Raising the minimum
+ * tells Windows to keep that many pages resident for this process, which is
+ * the point when wiring an expert cache — but the host gives up that memory,
+ * and `grow` is how much it gives up.
  *
- * Unverified on a real Windows host: no machine here has one. It builds
- * under both toolchains and the failure path is the previous behaviour. */
+ * Raise on demand rather than up front: waste_wire is handed one slot at a
+ * time and never learns the total, so the first refusal is the only place
+ * the size actually needed is known.
+ *
+ * If the raise is refused — a job object with a working-set cap will refuse
+ * it — latch and stop asking. The caller's accounting is unchanged, since a
+ * latched call still reports failure; what goes away is thousands of
+ * syscalls that cannot succeed, which cost ~4% in the original report.
+ * Reporting the failure honestly is the existing behaviour and stays: an
+ * engine that refused to open because it could not wire its cache would be
+ * worse than one running with a pageable cache.
+ *
+ * SE_INC_WORKING_SET_NAME is *not* required for this: the reporter's probe
+ * raised both bounds successfully with the privilege disabled, so the
+ * AdjustTokenPrivileges path an earlier version of this comment anticipated
+ * does not have to be written. */
 static int wire_quota_exhausted;      /* raise refused; stop trying */
 
 int waste_wire(void *p, size_t n)
@@ -138,11 +153,18 @@ int waste_wire(void *p, size_t n)
         return 0;
     }
     /* Room for this slot and the ones behind it, so the raise is not paid
-     * once per slot. Overshooting costs nothing: the maximum is a ceiling
-     * the process may reach, not a reservation. */
+     * once per slot. Overshooting is not free here, unlike when this raised
+     * only the maximum: the minimum is a reservation the host honours, so
+     * `grow` is memory taken from the rest of the machine. One slot plus
+     * as much again is the smallest step that still amortises. */
     const SIZE_T grow = n + (n < (64u << 20) ? (64u << 20) : n);
-    if (hi > (SIZE_T)-1 - grow || !SetProcessWorkingSetSize(GetCurrentProcess(),
-                                                            lo, hi + grow)) {
+    if (lo > (SIZE_T)-1 - grow) {
+        wire_quota_exhausted = 1;
+        return 0;
+    }
+    const SIZE_T need = lo + grow;
+    if (!SetProcessWorkingSetSize(GetCurrentProcess(), need,
+                                  need > hi ? need : hi)) {
         wire_quota_exhausted = 1;
         return 0;
     }
