@@ -4131,3 +4131,142 @@ no NVIDIA hardware, no way to regress-check a numerical contract, and — per
 issue #36, filed the same week — a suite whose non-synthetic path does not
 run in CI on any platform either. That is the open question about CUDA now,
 and it is not a question about kernels.
+
+## 62. The seam is a property of the engine, not of one vehicle (2026-08-23)
+
+**Third-party, same contributor as §61, and again not reproduced here.**
+`mccoyspace` extended the GB10 coherent-memory CUDA work from K3 and
+Kimi-Linear to **Kimi-K2-Instruct**. Reported in issue #11; the report and
+the experimental branch are linked from there. Nothing below ran on this
+machine.
+
+§61 closed by saying the open question about CUDA *"is not a question about
+kernels"* — it was whether any of it is maintainable, and underneath that,
+whether the arrangement was about the engine's structure or about one
+model. This is the entry that answers the second half, and the answer
+decided the first.
+
+### K2 has no KDA layers, and that is the finding
+
+Both models the GB10 work had used have KDA, and §61's offload arc *began*
+with a KDA pilot. K2 is 61 MLA layers and no KDA at all, with a different
+expert geometry — 384 experts top-8 against K3's 896 top-16.
+
+What that composition needed was **a geometry allowlist, not a second
+implementation.** The existing dense and VQ3R machinery was reused
+unchanged; the patch adds exact K2 qualification and permits the zero-KDA
+composition, while continuing to reject unknown models and VQ formats.
+
+A seam that holds across {KDA, top-16-of-896} and {no KDA, top-8-of-384} is
+a seam about the engine rather than about the vehicle. That is worth more
+than the speedup below, and it is what the maintenance decision turned on.
+
+### The numbers, and what can be checked from here
+
+| | K2 on GB10 |
+|---|---:|
+| CPU fallback, mean | **1.223 tok/s** |
+| CPU fallback, best | 1.227 tok/s |
+| CUDA, mean | **2.748 tok/s** |
+| CUDA, best | 3.001 tok/s |
+| speedup | 2.25x |
+
+Nothing here could verify a throughput figure — `README.md` says in as many
+words that nobody on this project has a K2 container. What could be checked
+is whether this is the same model this project validated for correctness in
+0.6.8, and it is: 61 layers, 384 experts top-8, 1.026 T total against the
+1.03 T recorded there, and **31.69 B active per token, agreeing to the
+digit** with @fab2s's independent conversion on different hardware. Two
+conversions converging on the active count is what would have caught a
+neighbouring shape.
+
+**So the CPU row is the more useful half of the result.** 1.223 tok/s is
+the first K2 throughput figure this project has from anyone, and it is the
+only K2 denominator that exists. It is an ARM CPU on a GB10, not a laptop,
+so it is not a substitute for one either — which is why it is here and not
+in `README.md`, under the same rule as §48, §50 and §61.
+
+**The reading that inverts from §61.** For K3, 2.6x was the right
+denominator for *"did the GPU pay on this host"* and the wrong one for
+*"does this hardware buy anything over a laptop"*, because 0.45-0.62 tok/s
+is published for K3 on an M5 Pro. For K2 the second reading is simply
+unavailable: there is no laptop number to hold 2.748 against. The 2.25x is
+uncontested because nothing exists to contest it, which is a reason to want
+a K2 container here — not a reason to doubt it.
+
+**A caveat on the mean.** It is two CUDA runs per prompt family across
+three families, against one CPU reference each, 64 tokens per run. That is
+a sound shape for a qualification and a thin one for a throughput figure:
+issues #37 and #44 both report machines where the first repeat of an arm is
+reproducibly the slowest, on byte-identical work, and §50 hit a third that
+produced occasional 30% low outliers with no cause identified. Read 2.25x
+as indicative.
+
+### The contract, per stage rather than in aggregate
+
+Across 195 causal comparisons: generated tokens, argmax, top-10 ordering
+and ordered routes unchanged, with zero route changes and zero fallbacks.
+Within that, the two paths hold **different contracts**, and the
+distinction is load-bearing:
+
+| path | contract |
+|---|---|
+| VQ3R expert apply | **byte-exact** |
+| dense fast path | bounded, worst max abs logit diff `4.9114e-5` |
+
+Both are right and neither should be read onto the other. §43's argument is
+that an int8 lookup table makes the engine *discontinuous* — one entry
+rounding the other way propagates rather than averaging out — so on the VQ
+path an approximate match is not a match. That is the path that is
+byte-exact. The dense projections are ordinary floating-point, where a
+bounded difference is a legitimate contract and not a weakened one.
+Summarising the pair as "byte-identical" would carry the strong claim onto
+the weaker half; summarising it as "within tolerance" would throw away the
+half that had to be exact.
+
+A 4,608-token soak over 24 requests and four deterministic cycles produced
+identical SHA-256 hashes on repeated outputs, with no request failures,
+restarts, swap reads or writes, CUDA errors, or post-warm RSS growth;
+maximum GPU temperature 67 C.
+
+### What it does not establish
+
+- **Not a discrete-card result.** §50 stands untouched: PCIe is still
+  slower than the host's own RAM. GB10 has no H2D term to pay.
+- **VQ4P is rejected on K2**, and unqualified shapes fail closed. The path
+  refuses unless the complete K2 fingerprint and VQ3R geometry match.
+  That is the right instinct and the reason an out-of-tree accelerator is
+  safe to have at all: it cannot silently engage on a shape nobody
+  qualified.
+- **`/v1/chat/completions` is unavailable** on that branch.
+- It remains an experimental-branch result, not an upstream-supported
+  profile, and this repository has executed none of it.
+
+### The decision this settled
+
+Issue #11's item 3 — *what a maintainable arrangement looks like* — was the
+question left after §61, and it is now answered:
+
+1. **The implementation stays out of tree.** `src/cuda.cu` does not exist
+   here and `WASTE_ENABLE_CUDA=1` still refuses.
+2. **The seam is upstream and lives in `waste.h`**, with its shape designed
+   from a review branch rather than agreed in the abstract. Private symbols
+   a fork reaches past would be the permanent private fork this arrangement
+   exists to avoid.
+3. **A named hardware owner runs the real-model contract per adopted
+   release**, and **a release where that validation did not run carries no
+   current qualification claim.** A release that says "not validated this
+   cycle" is better than one carrying a stale claim.
+
+The reason is in this section rather than in §61: a backend that needed an
+allowlist and not a second implementation to reach a model with an entire
+kernel class missing is a backend whose interface can be reviewed here,
+even though its kernels cannot be run here.
+
+**What has not changed.** #36's larger point stands — no job on any
+platform runs the suite against a real container. Two pieces closed this
+week (`diskbench` is built by CI natively and cross since cf3ecc6/0016b1c;
+a missing tool reports SKIP rather than accusing the engine since #42), but
+the real-container gap is exactly the one that matters for a numerical
+contract, and it is open. That is the argument for carrying a seam and not
+kernels: the seam is something this project can review and keep honest.
