@@ -260,7 +260,13 @@ def write_tokenizer(outdir):
 
     base = len(tokens)
     specials = [{"id": base + i, "text": s} for i, s in enumerate(SPECIALS)]
-    with open(os.path.join(outdir, "specials.json"), "w") as f:
+    # newline="\n" on every JSON the container carries. Python's text mode
+    # translates on Windows, so the same seed builds a byte-different
+    # container there. The engine parses it either way and nothing fails
+    # loudly — what breaks is any gate that hashes a container to prove
+    # provenance. #36 gap 2, one layer in.
+    with open(os.path.join(outdir, "specials.json"), "w",
+              newline="\n") as f:
         json.dump(specials, f, indent=1)
 
     return base + len(SPECIALS)
@@ -443,7 +449,11 @@ def main():
         "layers": layers,
         "trunk": t.index,
     }
-    with open(os.path.join(args.out, "manifest.json"), "w") as f:
+    # See the note beside specials.json above: this container is hashed by
+    # tests/run.sh to date the rotary fixture, so a CRLF manifest reads as
+    # "regenerate me" on Windows against a fixture that is perfectly good.
+    with open(os.path.join(args.out, "manifest.json"), "w",
+              newline="\n") as f:
         json.dump(manifest, f, indent=1)
 
     total = sum(os.path.getsize(os.path.join(args.out, f))

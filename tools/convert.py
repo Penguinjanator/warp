@@ -70,8 +70,12 @@ def atomic_copyfile(src, dst):
 
 
 def atomic_json(path, value):
+    # newline="\n" so a container converted on Windows is byte-identical to
+    # one converted anywhere else. Python's text mode translates, the engine
+    # parses either, and nothing fails loudly — what breaks is every gate
+    # that hashes a container to prove its provenance. #36 gap 2.
     tmp = path + ".tmp"
-    with io.open(tmp, "w", encoding="utf-8") as out:
+    with io.open(tmp, "w", encoding="utf-8", newline="\n") as out:
         json.dump(value, out, indent=1)
         out.flush()
         os.fsync(out.fileno())
@@ -1400,7 +1404,7 @@ def main():
               f"manifest listed: {', '.join(dropped)}", file=sys.stderr)
 
     manifest_tmp = manifest_path + ".tmp"
-    with open(manifest_tmp, "w") as f:
+    with open(manifest_tmp, "w", newline="\n") as f:   # see atomic_json
         json.dump(manifest, f, indent=1)
         f.flush()
         os.fsync(f.fileno())

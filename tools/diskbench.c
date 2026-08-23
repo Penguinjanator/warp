@@ -247,7 +247,15 @@ static void *rand_reader(void *p) {
     double got = 0;
     for (int i = 0; i < g_reps; i++) {
         seed = seed * 1103515245u + 12345u;
-        off_t off = (off_t)(seed % nrec) * g_rec;
+        /* int64_t, not off_t, which is a signed 32-bit long under LLP64 —
+         * MSYS2 UCRT64, the documented Windows path — and truncated every
+         * offset at the default 8 GB file. The loud half wrapped negative
+         * and waste_pread refused it, which cost ~40% off the random rows
+         * and inverted them with thread count. The quiet half wrapped
+         * positive and read the wrong place *successfully*, keeping the
+         * working set inside the first 2 GiB — an SSD's SLC cache, which
+         * is the flattery this whole tool exists to avoid. #36 gap 4. */
+        int64_t off = (int64_t)(seed % nrec) * (int64_t)g_rec;
         int64_t r = waste_pread(fd, buf, g_rec, off);
         if (r != (int64_t)g_rec) { fprintf(stderr, "short read %lld: %s\n", (long long)r, strerror(errno)); break; }
         got += r;
@@ -274,7 +282,7 @@ int main(int argc, char **argv) {
      * cannot be derived from what was measured does not get printed. */
     double gb_tok = argc > 5 ? atof(argv[5]) : 0.0;
     g_file = (size_t)(file_gb * (1u << 30));
-    g_rec  = (size_t)(rec_mb * (1u << 20)) & ~4095UL;
+    g_rec  = (size_t)(rec_mb * (1u << 20)) & ~(size_t)4095;
     /* A record under one page rounds to zero and divides by it two screens
      * further down, as a crash rather than as a usage error. */
     if (!g_rec || g_file < g_rec) {

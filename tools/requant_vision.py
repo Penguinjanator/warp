@@ -121,7 +121,9 @@ def main():
         os.fsync(tf.fileno())
 
     tmp = man_path + ".tmp"
-    with io.open(tmp, "w", encoding="utf-8") as f:
+    # newline="\n": a manifest rewritten on Windows must stay byte-comparable
+    # with the container convert.py built. #36 gap 2.
+    with io.open(tmp, "w", encoding="utf-8", newline="\n") as f:
         json.dump(man, f, indent=1)
     os.replace(tmp, man_path)          # the container flips in one step
     print(f"appended {added / 2**20:.0f} MB, manifest updated")
