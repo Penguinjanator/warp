@@ -4338,9 +4338,14 @@ cannot move; it is not a controlled length sweep, and nobody has run one.
 
 ### What only a >64 GB host could produce
 
-The resolver takes the largest of `floor + 3x/2x/1x` that fits under 7/8 of
-RAM. On the 64 GB machine here that is always `floor + 1x`, so `floor + 2x`
-and `floor + 3x` had never been selected by anything.
+The resolver takes the largest of `floor + 3x/2x/1x` that fits under **3/4**
+of usable RAM. On the 64 GB machine here that is always `floor + 1x`, so
+`floor + 2x` and `floor + 3x` had never been selected by anything.
+
+(Three quarters, not the seven eighths this gate was written against and
+which issue #37 quoted on both sides. §57 moved it on 2026-08-09 and
+`src/waste.c` has read `phys - phys / 4` since. It does not change any arm
+above: `floor + 3x` is 80.77 GB and clears either ceiling on a 128 GB host.)
 
 They are smooth. tok/s rises and GB read falls **monotonically across the
 entire grid**, hit rate climbing to 56.6% at 4,463 slots with no knee and no
@@ -4361,8 +4366,8 @@ of that host's RAM. Not run.
 
 Both outcomes would be worth having. If it collapses, §16 is a fraction and
 travels. If it does not, the fraction is wrong and §57's headroom — an
-eighth, set without measurement until §57 went looking — is holding back
-machines that do not need it.
+quarter, and an eighth before §57 went looking — is holding back machines
+that do not need it.
 
 ### Two smaller things this turned up
 

@@ -536,6 +536,20 @@ static int cmd_plan(int argc, char **argv)
     printf("  minimum expert cache  %12s\n", b[3]);
     printf("  ---------------------------------\n");
     printf("  FLOOR                 %12s\n", b[4]);
+    /* The working set is quoted by the line below and by every discussion of
+     * the budget, and until now it was printed by `--json` alone — so the
+     * only way to see it was to compute it, and computing it from FORMAT.md's
+     * record size gives a different answer. It is `rec x top_k x layers` with
+     * the *total* layer count, dense layers included, which is ~1% above the
+     * MoE-only product (K3: 17.19 vs 17.01 GiB). src/waste.c explains why it
+     * stays that way; the person who trips on it is reading a terminal, not
+     * waste.c, so the number and the count are printed together. Reported by
+     * Lrrr908 in #37, LEARNED.md §63. */
+    human(p.working_set_bytes, b[1], 32);
+    printf("  one token's working set %11s   (top-k records per layer, counted\n"
+           "                                      over every layer including the\n"
+           "                                      dense ones, so ~1%% above the\n"
+           "                                      per-record arithmetic)\n", b[1]);
     human(p.recommended_bytes, b[0], 32);
     /* Not "floor + 3x a working set" any more: waste_plan_memory caps the
      * cache term at the container's whole expert set, which fires on merged

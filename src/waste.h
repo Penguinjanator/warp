@@ -93,12 +93,19 @@ typedef struct {
      * the queued image embeddings. waste_open folds it into the figures
      * above when vision is on, so the resolved budget accounts for it. */
     uint64_t vision_bytes;
-    /* One token's expert traffic: top_k records per MoE layer. The unit the
-     * cache is only useful in whole multiples of (Gate 5), and the step the
-     * automatic budget walks down in — which is why it is reported rather
-     * than left to be re-derived from `recommended_bytes`. It cannot be:
-     * recommended is capped at the container's whole expert set, so on a
-     * merged container the two stop being three times apart. */
+    /* One token's expert traffic: top_k records per layer, counted over the
+     * container's *total* layer count rather than its MoE layers alone. The
+     * dense layers have no bank, so this is about 1% above the traffic a
+     * token really moves on K3 — 17.19 against 17.01 GiB — deliberately, in
+     * the direction that recommends slightly more rather than less. Anyone
+     * checking it against FORMAT.md's record size will land on the smaller
+     * figure and should not read the difference as a bug (#37, LEARNED §63).
+     *
+     * It is the unit the cache is only useful in whole multiples of (Gate 5),
+     * and the step the automatic budget walks down in — which is why it is
+     * reported rather than left to be re-derived from `recommended_bytes`. It
+     * cannot be: recommended is capped at the container's whole expert set, so
+     * on a merged container the two stop being three times apart. */
     uint64_t working_set_bytes;
 } waste_memplan;
 
