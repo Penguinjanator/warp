@@ -8,6 +8,169 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
+## 0.6.9 — 2026-08-24
+
+Almost none of this is the engine. It is the space no CI job could reach —
+Windows, real containers, and the four feasibility gates that were still open —
+and most of it was found by people running hardware this project does not own.
+`GATES.md` now has no open gate for the first time, and two of the three that
+closed this cycle closed *against* the change they were proposing.
+
+**No recompile needed.** `src/waste.h` changed only in a comment this cycle, so
+unlike 0.6.8 there is no ABI move. `waste_kernels` gained a slot, but that lives
+in `src/waste_backend.h` and is not public.
+
+### Added
+
+- **VQ4P's apply is a dispatch slot, and x86 has a kernel**
+  ([#38](https://github.com/sqliteai/warp/issues/38),
+  [#41](https://github.com/sqliteai/warp/pull/41)). `vq_rows_p6` was an
+  `#ifdef` in `model.c` with an ARM-only body, so §47's tuning did not travel.
+  It is now `waste_k.vq_rows_p6`, with the NEON body moved behind it unchanged
+  and an AVX-512 VBMI implementation registered beside it. The refactor is
+  **bit-identical on ARM against a real `index_bits: 6` container**, checked
+  here on both a VQ4P and a same-geometry 8-bit control. The VBMI kernel itself
+  is `compiled and dispatched, never executed` — no machine here has AVX-512,
+  the same standing caveat `docs/BACKENDS.md` records. It carries
+  `__attribute__((target("avx512vbmi")))` so a VBMI instruction cannot be
+  placed in the F+BW kernels that share its translation unit and SIGILL on
+  Skylake-SP.
+
+- **`WASTE_DUMP_SCORES=path`** ([#45](https://github.com/sqliteai/warp/pull/45)),
+  the whole router vector per (token, layer), not only the winners. It records
+  `score[e] + bias[e]` — what the selection loop ranks on — rather than `w[j]`,
+  which takes `score[best]` without the bias and is applied after the choice is
+  made. A residency prior, a dynamic-k rule and a pruning criterion are all
+  questions about the experts that *lost*, and a trace of the chosen cannot
+  answer them.
+
+- **`WASTE_CCR_LAMBDA`** ([#46](https://github.com/sqliteai/warp/pull/46)), a
+  cache-residency bonus applied to ranking only, off unless set
+  ([arXiv:2412.00099](https://arxiv.org/abs/2412.00099)). `w[j]` still takes the
+  untouched `score[best]`; only which K run moves. Reproduced here on
+  Kimi-Linear at `--budget 4G`, `-n 120`: hit 76.1% → **89.5%** at lambda 0.10
+  and bytes per token 0.231 → 0.167, a 27.7% saving. See *not adopted* below
+  for why the default did not move.
+
+- **`waste plan` prints one token's working set.** It quoted the quantity in
+  the line below it and never showed it, so the only way to see the number was
+  to compute it — and computing it from `FORMAT.md`'s record size gives a
+  different answer, because the engine counts every layer including the dense
+  ones. 17.19 against 17.01 GiB on K3, deliberately, in the direction that
+  recommends slightly more. `src/waste.h` had described the field as `top_k`
+  records per *MoE* layer, which is the sentence that produces the mismatch for
+  anyone who believes it.
+
+- **The fp8 block-scale mapping has a test**
+  ([#39](https://github.com/sqliteai/warp/issues/39),
+  [#40](https://github.com/sqliteai/warp/pull/40)). The only stub naming it
+  replaced it with the identity, so nothing exercised the tile arithmetic
+  0.6.8 shipped.
+
+### Fixed
+
+The five gaps of [#36](https://github.com/sqliteai/warp/issues/36) — a real
+Kimi-Linear container on Windows, whole-model oracle PASS on AVX2 — and the two
+that survived the first attempt:
+
+- **`WASTE_MLOCK` wired nothing on Windows.** `VirtualLock` is bounded by the
+  process *minimum* working set; the first fix raised the maximum and preserved
+  the minimum, so it wired exactly as much as the bug did: 5928 of 5928 slots
+  refused, twice. Measured on the reporter's host rather than reasoned about —
+  the maximum went 1.3 MB → 2049 MB and the lock still failed. Raising both
+  bounds wires the cache. `SE_INC_WORKING_SET_NAME` turns out not to be
+  required.
+
+- **`diskbench` truncated its offset through a 32-bit `off_t`**
+  ([#43](https://github.com/sqliteai/warp/pull/43)), at its own default 8 GB
+  file size, under LLP64. The loud half wrapped negative and was refused; the
+  quiet half wrapped *positive* and read the wrong place successfully, keeping
+  the working set inside the first 2 GiB — inside an SSD's SLC cache, which is
+  the flattery the tool exists to avoid. Random rows went 0.36 → 1.48 GB/s on
+  the reporter's box and stopped inverting with thread count. `docs/GATES.md`
+  Gate H and the README's 12.78 GB/s are unaffected: macOS `off_t` is 64-bit.
+
+- **A container's JSON went through Python text mode**, so the same conversion
+  produced byte-different containers on Windows and the provenance gate added
+  below reported a good fixture as stale. `convert.py` and `requant_vision.py`
+  had it too, which means a K3 container converted on Windows was not
+  byte-comparable with one converted anywhere else.
+
+- **A missing tool said the engine was broken**
+  ([#42](https://github.com/sqliteai/warp/pull/42)). Without `diffutils` the
+  suite reported `expert cache changes results` — a bit-identity violation in
+  the expert cache — on a clean checkout, because `cmp` was absent. Eight
+  failures became eight skips naming the tool, verified here with `cmp` hidden;
+  `python3` joins `curl` in guarding the download checks. UCRT64 is the
+  documented Windows path and ships neither.
+
+- **`check_budget.sh` said FAIL where it meant "could not measure"**, so the
+  budget ceiling was untested on Windows rather than merely misreported. It now
+  exits 77 and reads the real number through `PeakWorkingSetSize`.
+
+- **The oracle fixture gated on `trunk` and not on provenance.** A container
+  converted with a different `--device` trains different codebooks; the sidecar
+  now carries `codebooks_sha256`, which covers every conversion knob at once.
+  This is [#7](https://github.com/sqliteai/warp/issues/7) recurring on a second
+  axis and it is not Windows-specific.
+
+- **CRLF in `.shards`** made every promise that file's header makes about
+  surviving a long haul inert on Windows, first run included; the API listing
+  had it too.
+
+Also: `get_small()` dropped API-listed files silently and called the run a
+success ([#35](https://github.com/sqliteai/warp/issues/35)); the cpu-list bind
+check raced on a wall-clock assumption
+([#30](https://github.com/sqliteai/warp/issues/30)); `diskbench` is now built by
+CI natively and cross, under `-Werror`, which caught a mingw driver flavour on
+its first real run; and the CLI help said `--threads 0` is one per *core* when
+it is one per logical CPU ([#44](https://github.com/sqliteai/warp/pull/44)).
+
+### Documentation
+
+`docs/GATES.md` has **no open gate**. Gate 7 closed refuted — see below —
+and `docs/LEARNED.md` gains §61 through §64.
+
+`docs/BACKENDS.md` carries a correction it owed: two sentences took one
+measured mechanism — synchronous launch and a round trip per call over several
+hundred small dependent matvecs — and restated it as a claim about *shape*.
+Coherent memory removes the round trip without removing the dependency, so
+neither claim follows. The superseded paragraphs are marked and kept.
+`docs/ENGINE.md` gains thread placement on a single-CCD part, written as a
+bound with the noise floor stated rather than as a result.
+
+### Measured, and not adopted
+
+- **The budget resolver's quantum stands.** Gate 7, run on a 128 GB Strix Halo
+  ([#37](https://github.com/sqliteai/warp/issues/37), §63): at 200 tokens
+  rather than four, a 3–4 GB cache measures **64.6%–77%** of `floor + 1x`,
+  where the kill criterion asked for 90%. §39's window is a four-token window,
+  and cross-token reuse is what the extra size buys.
+
+- **Cache-conditional routing stays a knob.** README prices `top-8` against two
+  bars — KL 0.037 *and* it reproduces top-16's greedy continuation. Lambda 0.10
+  clears the first at 0.0232 and not the second; confirmed here on a second
+  machine, where `contiguous` became `consecutive`.
+
+- **The thread default did not move**, though 16 threads on an 8-core SMT part
+  measure ~1.6x below the 6–8 plateau. §47 already has the setting inverting
+  between models and [#37](https://github.com/sqliteai/warp/issues/37) added
+  that it inverts between expert formats on one machine. Three axes is a
+  decision, not a table.
+
+- **No budget policy fixes two K3 opens on a 64 GB machine**
+  ([#31](https://github.com/sqliteai/warp/issues/31), §64). Gate 1 ran: neither
+  process reached decode, and the machine needed a power cycle. Two floors are
+  58.38 GB against a 51.54 GB ceiling, so a reservation ledger and a trimmed
+  multiplier meet the same wall — they divide the cache *above* the floor, and
+  the floor is what busts the budget. The narrower case survives in
+  [#49](https://github.com/sqliteai/warp/issues/49).
+
+- **VQ4P is not a throughput upgrade over VQ3R on a GB10**, despite complete
+  and exact CUDA coverage, because it read 8.11% more expert bytes (§62). And
+  `src/cuda.cu` still does not exist: the build guard stays, now for a
+  maintenance reason rather than a performance one.
+
 ## 0.6.8 — 2026-08-13
 
 Nothing changes for the two models this project ships numbers for: a
