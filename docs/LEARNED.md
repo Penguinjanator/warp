@@ -4395,3 +4395,122 @@ Gate 7's throughput runs 0.05–0.16 tok/s against 0.45–0.62 here, on a
 Kingston NVMe serving every expert miss. The ratios and the curve are the
 contribution; the absolute figures are a different machine and should not be
 set against this project's.
+
+## 64. Gate 1: two K3 opens do not degrade, they take the machine (2026-08-24)
+
+Issue #31 asked for the collapse to be reproduced deliberately rather than
+inferred from a sample that was being used to argue something else. It was,
+on the 64 GB laptop this project develops on, and **the gate has an answer
+that is not a throughput number: neither process ever generated a token.**
+
+### The baseline, which is the only throughput figure here
+
+One auto-budget K3 open, 30 generated tokens, `waste bench`:
+
+| | |
+|---|---:|
+| decode | **0.39 tok/s** (2556 ms/token) |
+| peak RSS | **45.39 GB** against a resolved 46.39 GB |
+| expert cache | 17.56 GB |
+| hit | 30.9% — 17,393 hit / 38,868 miss |
+| read | 573.26 GB total, 19.109 GB/token |
+| wall, load included | 79.9 s |
+
+The hit rate is low because 30 tokens is a short session and §63 is the
+reason: at 200 tokens the same cache size measures around 41%, and the
+difference is cross-token reuse that has not had time to accumulate. So this
+denominator is *pessimistic*, which matters only for a ratio that in the end
+could not be computed.
+
+### What the pair did
+
+Two of those, started together, same container, no `--budget` on either. The
+resolver is deterministic and machine-wide, so both selected the same
+46.39 GB: **92.78 GB of intent on 68.72 GB of RAM, 135%.**
+
+At 93 seconds — by which point the single-process run had finished
+everything — neither had reached decode:
+
+```
+PID    ELAPSED  %CPU     RSS      COMMAND
+16459  01:33     87.9    9.4 GB   ./waste bench k3.waste -n 30
+16460  01:33    211.6    9.9 GB   ./waste bench k3.waste -n 30
+```
+
+9.4 and 9.9 GB resident against 27.28 GB of trunk each: both still loading.
+Swap went from 15.06 GB used to 38.50 GB used between two samples minutes
+apart, the allocation growing 15.36 → 39.94 GB as the OS tried to keep up.
+
+Shortly after, the machine stopped responding and needed a power cycle.
+**Zero tokens on either side, no partial result, and the scratchpad holding
+the run's output was on `/private/tmp` and did not survive the reboot.**
+
+### The finding
+
+§16 priced the neighbourhood at "8x slower", and that framing turns out to
+understate this configuration by the wrong kind of margin. 8x was one process
+sitting near the paging cliff. Two processes past it is not slow — it is a
+**liveness failure that arrives before generation starts**, in the trunk load,
+where the resident set is being touched for the first time and there is
+nothing optional left to evict.
+
+That kills the null hypothesis outright. *"Do nothing, and say so — the engine
+already prints what it chose; a host that runs two of them can read both
+lines"* assumes there is a host left to read them on.
+
+### The arithmetic that should have been done first, and settles gate 3
+
+| | | share of RAM |
+|---|---:|---:|
+| physical | 68.72 GB | |
+| resolver ceiling, 3/4 (`src/waste.c`) | 51.54 GB | 75% |
+| one automatic open | 46.39 GB | 68% |
+| **two automatic opens** | **92.78 GB** | **135%** |
+| **two opens at the absolute floor** | **58.38 GB** | **85%** |
+
+The last row is the one that matters and it needed no experiment. K3's floor
+is 29.19 GB, almost all of it the 27.28 GB resident trunk, and it is not
+negotiable — it is the memory the engine refuses to open without. **Two of
+them exceed the ceiling this machine applies to one**, and land at 85% of
+physical, above the ~81% that §39 measured as already dead and well past the
+~72% that was still healthy.
+
+So on this machine **no budget policy makes two K3 opens coexist.** A
+reservation ledger would drive the second process to its floor and the pair
+would still oversubscribe; trimming the multiplier has the same ceiling. Both
+candidates in #31's gate 3 are mechanisms for dividing the cache *above* the
+floor, and the floor alone is what busts the budget.
+
+What is left is therefore not a budget mechanism at all:
+
+- **Refuse the second open** — which #31 lists as a non-goal in as many words
+  ("anything that refuses an open that would otherwise have succeeded"), and
+  which is what `exclusive_open` already does opt-in since #29, on the key
+  #31 correctly criticised.
+- **Stop duplicating the trunk** — one resident copy shared between contexts,
+  which is a different engine shape (a server, or shared mappings) and not a
+  resolver change.
+
+A ledger still covers the cases where the floors *do* fit and only the caches
+contend — K3 beside Kimi-Linear, or two Kimi-Linear opens on a 128 GB host.
+It does not cover the case this issue opened on.
+
+### What this does not establish
+
+- **No tok/s ratio, because there is none.** Nothing here says how much
+  slower two K3 processes are; it says they do not get that far.
+- **macOS only.** Linux with an OOM killer would have shot one process rather
+  than freezing, and the surviving one might well have completed. That is a
+  different result and worth having from anyone who can produce it safely.
+- **Gate 2 as written must not be run on this machine.** *"Same pair, second
+  process pinned to `--budget` floor by hand"* is 46.39 + 29.19 = 75.58 GB,
+  110% of RAM — the same experiment with a smaller number. The table above
+  answers it by arithmetic instead.
+
+### Operationally
+
+This experiment costs a reboot and should be run in a memory-limited cgroup
+or on a machine with room, not on a bare laptop. The estimate that preceded
+it — "20-30 minutes of paging, with a real chance the OS starts killing
+things" — was wrong in kind rather than in degree: macOS grew swap to 40 GB
+and froze instead of killing anything.
