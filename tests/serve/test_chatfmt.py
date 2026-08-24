@@ -167,9 +167,25 @@ class TestRender(Base):
         self.assertIn(contains, str(cm.exception))
 
     def test_tools(self):
-        self.refuses("tool definitions",
-                     tools=[{"type": "function",
-                             "function": {"name": "f", "parameters": {}}}])
+        segs = self.render(
+            [{"role": "user", "content": "hi"}],
+            tools=[{
+                "type": "function",
+                "function": {"name": "f", "parameters": {}},
+            }],
+        )
+
+        self.assertEqual(
+            segs[0].text,
+            "<|im_system|>tool_declare<|im_middle|>",
+        )
+        self.assertTrue(segs[0].markup)
+
+        self.assertIn('"name":"f"', segs[1].text)
+        self.assertFalse(segs[1].markup)
+
+        self.assertEqual(segs[2].text, "<|im_end|>")
+        self.assertTrue(segs[2].markup)
 
     def test_thinking(self):
         self.refuses("no reasoning channel", thinking=True)
@@ -179,14 +195,41 @@ class TestRender(Base):
                      response_format={"type": "json_object"})
 
     def test_a_tool_result_turn(self):
-        self.refuses("tool call",
-                     [{"role": "tool", "content": "42", "tool_call_id": "a"}])
+        segs = self.render([
+            {"role": "tool", "content": "42", "tool_call_id": "a"}
+        ])
+
+        rendered = "".join(s.text for s in segs)
+
+        self.assertIn(
+            "<|im_system|>system<|im_middle|>",
+            rendered,
+        )
+        self.assertIn("## Return of a\n42", rendered)
+        self.assertIn("<|im_end|>", rendered)
 
     def test_an_assistant_turn_carrying_tool_calls(self):
-        self.refuses("tool call",
-                     [{"role": "assistant", "content": None, "tool_calls": [
-                         {"id": "a", "function": {"name": "f",
-                                                  "arguments": "{}"}}]}])
+        segs = self.render([
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "a",
+                    "function": {
+                        "name": "f",
+                        "arguments": "{}",
+                    },
+                }],
+            }
+        ])
+
+        rendered = "".join(s.text for s in segs)
+
+        self.assertIn("<|tool_calls_section_begin|>", rendered)
+        self.assertIn("<|tool_call_begin|>a", rendered)
+        self.assertIn("<|tool_call_argument_begin|>{}", rendered)
+        self.assertIn("<|tool_call_end|>", rendered)
+        self.assertIn("<|tool_calls_section_end|>", rendered)
 
     def test_an_image_part(self):
         self.refuses("cannot place one", [{"role": "user", "content": [
@@ -255,3 +298,82 @@ class TestPlainParser(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+# ---------------------------------------------------------------------------
+# Kimi K2 native tool protocol — development tests
+# ---------------------------------------------------------------------------
+
+class TestKimiK2ToolProtocol(Base):
+
+    def setUp(self):
+        super().setUp()
+        self.fmt = self.load(SHIPPED)
+
+    def test_kimi_k2_tool_declaration(self):
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather for a city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"}
+                    },
+                    "required": ["city"]
+                }
+            }
+        }]
+
+        segs = self.fmt.build_chat_segments(
+            [{"role": "user", "content": "weather in Paris?"}],
+            tools=tools,
+            thinking=False,
+        )
+
+        rendered = "".join(s.text for s in segs)
+
+        self.assertIn(
+            "<|im_system|>tool_declare<|im_middle|>",
+            rendered,
+        )
+        self.assertIn('"name":"get_weather"', rendered)
+        self.assertIn("<|im_end|>", rendered)
+
+    def test_kimi_k2_assistant_tool_call_round_trip_render(self):
+        messages = [
+            {"role": "user", "content": "weather in Paris?"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": '{"city":"Paris"}',
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "18 C",
+            },
+        ]
+
+        segs = self.fmt.build_chat_segments(
+            messages,
+            thinking=False,
+        )
+
+        rendered = "".join(s.text for s in segs)
+
+        self.assertIn("<|tool_calls_section_begin|>", rendered)
+        self.assertIn("<|tool_call_begin|>call_1", rendered)
+        self.assertIn(
+            '<|tool_call_argument_begin|>{"city":"Paris"}',
+            rendered,
+        )
+        self.assertIn("<|tool_call_end|>", rendered)
+        self.assertIn("## Return of call_1", rendered)

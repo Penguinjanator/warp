@@ -196,11 +196,20 @@ class ChatFormat:
         without knowing which — the two formats differ in what they can
         express, not in how they are asked.
         """
+        segments: list[Segment] = []
+
         if tools:
-            raise ChatFormatError(
-                "this container is served from its chat.json, which cannot "
-                "express tool definitions; drop 'tools', or use a Kimi K3 "
-                "container, whose XTML format carries them", param="tools")
+            # Kimi K2 native tool declaration format.  Keep structural
+            # markers separate from the JSON payload so caller-controlled
+            # strings cannot be interpreted as model markup.
+            segments.append(
+                Segment("<|im_system|>tool_declare<|im_middle|>",
+                        markup=True)
+            )
+            segments.append(
+                Segment(json.dumps(tools, separators=(",", ":")))
+            )
+            segments.append(Segment("<|im_end|>", markup=True))
         for name in ("tool_choice", "response_format", "response_schema"):
             if kwargs.get(name) is not None:
                 raise ChatFormatError(
@@ -216,15 +225,32 @@ class ChatFormat:
                 "this container is served from its chat.json, which cannot "
                 "place an image")
 
-        segments: list[Segment] = []
         for i, message in enumerate(messages):
             role = message.get("role")
             role = _ROLE_ALIASES.get(role, role)
-            if role == "tool" or message.get("tool_calls"):
-                raise ChatFormatError(
-                    "this container is served from its chat.json, which "
-                    "cannot express a tool call or its result",
-                    param=f"messages[{i}]")
+
+            # Kimi K2 represents a tool result as a system-style turn whose
+            # content begins with "## Return of <tool_call_id>".
+            if role == "tool":
+                pair = self.roles.get("system")
+                if pair is None:
+                    raise ChatFormatError(
+                        f'messages[{i}] is a tool result, but this '
+                        f'container\'s chat.json has no system turn',
+                        param=f"messages[{i}].role")
+                tool_call_id = message.get("tool_call_id")
+                if not tool_call_id:
+                    raise ChatFormatError(
+                        f"messages[{i}] is a tool result without "
+                        "tool_call_id",
+                        param=f"messages[{i}].tool_call_id")
+                prefix, suffix = pair
+                segments.append(Segment(prefix, markup=True))
+                segments.append(Segment(f"## Return of {tool_call_id}\n"))
+                segments.extend(_content_segments(message.get("content"), i))
+                segments.append(Segment(suffix, markup=True))
+                continue
+
             pair = self.roles.get(role)
             if pair is None:
                 raise ChatFormatError(
@@ -234,6 +260,50 @@ class ChatFormat:
             prefix, suffix = pair
             segments.append(Segment(prefix, markup=True))
             segments.extend(_content_segments(message.get("content"), i))
+
+            tool_calls = message.get("tool_calls")
+            if tool_calls:
+                if role != "assistant":
+                    raise ChatFormatError(
+                        f"messages[{i}] carries tool_calls on a non-assistant "
+                        "turn",
+                        param=f"messages[{i}].tool_calls")
+
+                segments.append(
+                    Segment("<|tool_calls_section_begin|>", markup=True)
+                )
+
+                for j, call in enumerate(tool_calls):
+                    call_id = call.get("id")
+                    function = call.get("function") or {}
+                    arguments = function.get("arguments", "")
+
+                    if not call_id:
+                        raise ChatFormatError(
+                            f"messages[{i}].tool_calls[{j}] has no id",
+                            param=f"messages[{i}].tool_calls[{j}].id")
+
+                    if not isinstance(arguments, str):
+                        arguments = json.dumps(
+                            arguments, separators=(",", ":")
+                        )
+
+                    segments.append(
+                        Segment("<|tool_call_begin|>", markup=True)
+                    )
+                    segments.append(Segment(str(call_id)))
+                    segments.append(
+                        Segment("<|tool_call_argument_begin|>", markup=True)
+                    )
+                    segments.append(Segment(arguments))
+                    segments.append(
+                        Segment("<|tool_call_end|>", markup=True)
+                    )
+
+                segments.append(
+                    Segment("<|tool_calls_section_end|>", markup=True)
+                )
+
             segments.append(Segment(suffix, markup=True))
 
         if add_generation_prompt:
