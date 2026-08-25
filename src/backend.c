@@ -196,6 +196,11 @@ void waste_backend_init(unsigned flags)
     /* AVX2 / AVX-512 / SVE / RVV modules register here as they land, in
      * best-first order, each overwriting only what it implements. */
 
+    /* Whatever the best CPU kernel turned out to be, keep a copy of it:
+     * an accelerator is about to overwrite the slot, and the small-matvec
+     * path still needs a kernel the thread pool can split. */
+    waste_k.mvq_rows_cpu = waste_k.mvq_rows_f32;
+
     /* 3. accelerators: compiled in only when enabled at build time, and
      * still free to decline if this machine has no usable device. */
     if (flags & WASTE_BE_NO_DEVICE) { pthread_mutex_unlock(&g_init_mu); return; }

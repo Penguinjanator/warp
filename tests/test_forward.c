@@ -10,6 +10,7 @@
  */
 
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdlib.h>
@@ -119,18 +120,35 @@ int main(int argc, char **argv)
     if (getenv("WASTE_PROFILE")) {
         /* indented names are sub-totals of the line above and are excluded
          * from `tot`, so the percentages add to 100 */
-        const char *names[9] = {"  LUT build","kda","mla","moe(all)",
+        const char *names[10] = {"  LUT build","kda","mla","moe(all)",
                                 "  expert I/O","  expert mm","lm_head",
-                                "  LUT apply","  batched mm"};
+                                "  LUT apply","  batched mm","  trunk matvec"};
         double tot = 0;
-        for (int i = 0; i < 9; i++)
-            tot += (i == 0 || i == 4 || i == 5 || i == 7 || i == 8) ? 0 : waste_prof[i];
+        for (int i = 0; i < 10; i++)
+            tot += (i == 0 || i == 4 || i == 5 || i == 7 || i == 8 || i == 9) ? 0 : waste_prof[i];
         printf("\n-- profile (s, %d steps) --\n", n + n_gen);
-        for (int i = 0; i < 9; i++)
+        for (int i = 0; i < 10; i++)
             if (waste_prof[i] > 0)
                 printf("  %-14s %7.2f  %5.1f%%\n", names[i], waste_prof[i],
                        100.0 * waste_prof[i] / tot);
         printf("  %-14s %7.2f\n", "accounted", tot);
+        { extern uint64_t waste_tmv_bytes; extern uint64_t waste_prof_n[16];
+          printf("  trunk matvec: %llu calls, %.2f GB, %.1f GB/s\n",
+                 (unsigned long long)waste_prof_n[9],
+                 waste_tmv_bytes / 1e9,
+                 waste_prof[9] > 0 ? waste_tmv_bytes / waste_prof[9] / 1e9 : 0.0);
+          extern double waste_tmv_t[4]; extern uint64_t waste_tmv_b[4], waste_tmv_c[4];
+          const char *bn[4] = {"   <1MB","  1-8MB"," 8-32MB","  >32MB"};
+          for (int k = 0; k < 4; k++)
+              if (waste_tmv_c[k])
+                  printf("    %s  %7llu calls %8.2f GB %7.2f s %7.1f GB/s\n", bn[k],
+                         (unsigned long long)waste_tmv_c[k], waste_tmv_b[k]/1e9,
+                         waste_tmv_t[k], waste_tmv_b[k]/waste_tmv_t[k]/1e9); }
+    }
+    if (getenv("WASTE_METAL_SELFTEST")) {
+        void waste_metal_selftest(void);
+        fprintf(stderr, "-- selftest after decode --\n");
+        waste_metal_selftest();
     }
     printf("\ncache: %llu hits / %llu misses = %.1f%% hit, %llu evictions, "
            "%.2f GB read\n",

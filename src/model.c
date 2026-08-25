@@ -38,7 +38,12 @@
 #include <time.h>
 double waste_prof[16];
 uint64_t waste_prof_n[16];
-enum { P_LUTB, P_KDA, P_MLA, P_ROUTE, P_EDEQ, P_EMM, P_HEAD, P_LUTA, P_MM };
+uint64_t waste_tmv_bytes;
+/* matvec_t by call size: [<1MB, <8MB, <32MB, rest] */
+double waste_tmv_t[4];
+uint64_t waste_tmv_b[4], waste_tmv_c[4];
+enum { P_LUTB, P_KDA, P_MLA, P_ROUTE, P_EDEQ, P_EMM, P_HEAD, P_LUTA, P_MM,
+       P_TMV, P_KDAK };
 static int prof_on = -1;
 static pthread_mutex_t prof_mu = PTHREAD_MUTEX_INITIALIZER;
 static double pnow(void)
@@ -162,6 +167,8 @@ static inline float dotf(const float *a, const float *b, int n)
 
 static int q8_off = 1;     /* 1 = keep the trunk stored as int8          */
 static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
+static int sdot4_on = 0;   /* WASTE_SDOT4: Q4G trunk through SDOT        */
+static int sdot4_sg = 32;  /* activations sharing one int8 scale         */
 static int i8mm_on = 0;    /* SMMLA batched matmul; costs activation int8 */
 static const char *dump_route = NULL;  /* WASTE_DUMP_ROUTE, see moe_layer */
 static const char *dump_scores = NULL; /* WASTE_DUMP_SCORES, see moe_layer */
@@ -185,6 +192,23 @@ static void model_opts_init(void)
     if (e && *e == '0') q8_off = 0;
     e = getenv("WASTE_SDOT");
     sdot_on = e && *e != '0';
+    /* The 4-bit trunk through SDOT. K3's trunk is 28.0 GB of Q4G and every
+     * byte is read once per token, so this kernel is ~40% of a decode step.
+     * The f32 path reaches 60 GB/s on this machine against a 217 GB/s
+     * streaming ceiling (tools/mvqbw.c) because a 4-bit weight has to
+     * become a float before it can be multiplied; quantizing the
+     * activations too puts it at 202 GB/s, i.e. at the machine. What it
+     * costs is that the arithmetic is no longer the f32 reference's —
+     * hence a switch, and hence WASTE_SDOT4_SG, which sets how many
+     * activations share one int8 scale (32 by default; the weights' own
+     * group is 128). */
+    e = getenv("WASTE_SDOT4");
+    sdot4_on = e && *e != '0';
+    if (sdot4_on && !(waste_cpu_features() & WASTE_CPU_DOTPROD)) sdot4_on = 0;
+    e = getenv("WASTE_SDOT4_SG");
+    sdot4_sg = e ? atoi(e) : 32;
+    if (sdot4_sg != 16 && sdot4_sg != 32 && sdot4_sg != 64 && sdot4_sg != 128)
+        sdot4_sg = 32;
     /* Here with the rest of them: read per-load, this was the one env
      * switch still written by every concurrent waste_model_load.
      * waste_cpu_features() is self-caching and does not need the backend. */
@@ -278,11 +302,52 @@ void waste_mvq_rows_f32(int b, int e, void *p)
         unp = (int8_t *)malloc((size_t)g);
         if (!unp) return;
     }
+    (void)unp;
     for (int o = b; o < e; o++) {
         const int8_t *row = a->W + (size_t)o * a->rowbytes;
         const uint16_t *ws = a->ws + (size_t)o * ng;
         float acc = 0;
         for (int k = 0; k < ng; k++) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+            /* Q4G, whole group: unpack in registers instead of staging the
+             * nibbles through a byte buffer. Same FMAs into the same 4-lane
+             * accumulator in the same order, so the result is bit for bit
+             * what the staged path produces — measured with tools/mvqbw.c,
+             * where dropping the staging buffer is worth 1.24x on K3's
+             * [12288 x 7168] trunk shape at 18 threads. The staged path
+             * stays for 3-bit rows, for a group that is not a multiple of
+             * 32, and for the ragged last group. */
+            if (a->bits == 4 && (k + 1) * g <= a->in && (g & 31) == 0) {
+                const uint8_t *p4 = (const uint8_t *)row + (size_t)k * g / 2;
+                const float *xx = x + (size_t)k * g;
+                const uint8x16_t m0f = vdupq_n_u8(0x0f);
+                const int8x16_t  m8  = vdupq_n_s8(8);
+                float32x4_t s0 = vdupq_n_f32(0);
+                for (int j = 0; j < g / 2; j += 16) {
+                    const uint8x16_t by = vld1q_u8(p4 + j);
+                    const int8x16_t lo =
+                        vsubq_s8(vreinterpretq_s8_u8(vandq_u8(by, m0f)), m8);
+                    const int8x16_t hi =
+                        vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(by, 4)), m8);
+                    const int8x16x2_t z = vzipq_s8(lo, hi);
+                    const float *xp = xx + 2 * j;
+                    for (int h = 0; h < 2; h++) {
+                        const int16x8_t l16 = vmovl_s8(vget_low_s8(z.val[h]));
+                        const int16x8_t h16 = vmovl_s8(vget_high_s8(z.val[h]));
+                        s0 = vfmaq_f32(s0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(l16))),
+                                       vld1q_f32(xp + 16 * h + 0));
+                        s0 = vfmaq_f32(s0, vcvtq_f32_s32(vmovl_s16(vget_high_s16(l16))),
+                                       vld1q_f32(xp + 16 * h + 4));
+                        s0 = vfmaq_f32(s0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(h16))),
+                                       vld1q_f32(xp + 16 * h + 8));
+                        s0 = vfmaq_f32(s0, vcvtq_f32_s32(vmovl_s16(vget_high_s16(h16))),
+                                       vld1q_f32(xp + 16 * h + 12));
+                    }
+                }
+                acc += f16_to_f32(ws[k]) * vaddvq_f32(s0);
+                continue;
+            }
+#endif
             const int8_t *w;
             if (a->bits == 3) {
                 const uint8_t *p3 = (const uint8_t *)row;
@@ -325,6 +390,97 @@ void waste_mvq_rows_f32(int b, int e, void *p)
     free(unp);
 }
 
+/* ---- Q4G x int8 activations (SDOT) --------------------------------------
+ * Two nibbles per byte, low first, so the even and odd elements of a group
+ * face different halves of the byte. Rather than interleaving the weights
+ * back together, quant_act4 writes the activations deinterleaved — the
+ * group's even elements first, then its odd ones — so each half of the
+ * unpacked byte meets a contiguous int8 vector and the kernel is two
+ * vdotq_s32 per sixteen bytes with nothing in between.
+ *
+ * `sg` activations share one scale. The weights' group of 128 sets how
+ * many weight scales there are and cannot change; the activation scale is
+ * ours to choose, and a hidden state has outliers, so a finer one is the
+ * cheap half of the accuracy. It costs one horizontal add and one fmul per
+ * sub-group.
+ */
+typedef struct {
+    float *y; const uint8_t *W; const uint16_t *ws;
+    const int8_t *xq; const float *xs;
+    int in, ng, group, sg, ns;
+    size_t rowbytes;
+} mvq4_arg;
+
+static void mvq4_rows_sdot(int b, int e, void *p)
+{
+#if defined(__ARM_FEATURE_DOTPROD)
+    const mvq4_arg *a = (const mvq4_arg *)p;
+    const int ng = a->ng, g = a->group, ns = a->ns, half = a->sg / 2;
+    const uint8x16_t m0f = vdupq_n_u8(0x0f);
+    const int8x16_t  m8  = vdupq_n_s8(8);
+    for (int o = b; o < e; o++) {
+        const uint8_t *row = a->W + (size_t)o * a->rowbytes;
+        const uint16_t *ws = a->ws + (size_t)o * ng;
+        float acc = 0;
+        for (int k = 0; k < ng; k++) {
+            const uint8_t *p4 = row + (size_t)k * g / 2;
+            const int8_t *xe = a->xq + (size_t)k * g;
+            const int8_t *xo = xe + g / 2;
+            const float wsf = f16_to_f32(ws[k]);
+            const float *xsc = a->xs + (size_t)k * ns;
+            for (int t = 0; t < ns; t++) {
+                int32x4_t d = vdupq_n_s32(0);
+                const int j0 = t * half;
+                for (int j = j0; j < j0 + half; j += 16) {
+                    const uint8x16_t by = vld1q_u8(p4 + j);
+                    const int8x16_t lo =
+                        vsubq_s8(vreinterpretq_s8_u8(vandq_u8(by, m0f)), m8);
+                    const int8x16_t hi =
+                        vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(by, 4)), m8);
+                    d = vdotq_s32(d, lo, vld1q_s8(xe + j));
+                    d = vdotq_s32(d, hi, vld1q_s8(xo + j));
+                }
+                acc += wsf * xsc[t] * (float)vaddvq_s32(d);
+            }
+        }
+        a->y[o] = acc;
+    }
+#else
+    (void)b; (void)e; (void)p;
+#endif
+}
+
+/* int8 activations for the kernel above: per sub-group amax, deinterleaved
+ * within each weight group, zero-padded past `n` so a ragged last group
+ * contributes nothing. */
+static void quant_act4(const float *x, int n, int g, int sg, int8_t *q, float *sc)
+{
+    const int ng = (n + g - 1) / g, ns = g / sg;
+    for (int k = 0; k < ng; k++) {
+        for (int t = 0; t < ns; t++) {
+            const int beg = k * g + t * sg;
+            const int end = (beg + sg < n) ? beg + sg : (beg < n ? n : beg);
+            float amax = 0;
+            for (int i = beg; i < end; i++) {
+                const float v = fabsf(x[i]);
+                if (v > amax) amax = v;
+            }
+            const float s = amax > 0 ? amax / 127.0f : 1.0f;
+            sc[k * ns + t] = s;
+            const float inv = 1.0f / s;
+            for (int i = beg; i < beg + sg; i++) {
+                int v = 0;
+                if (i < end) {
+                    v = (int)lrintf(x[i] * inv);
+                    v = v > 127 ? 127 : (v < -127 ? -127 : v);
+                }
+                const int r = i - k * g;
+                q[k * g + (r >> 1) + ((r & 1) ? g / 2 : 0)] = (int8_t)v;
+            }
+        }
+    }
+}
+
 static void mvq_rows(int b, int e, void *p)
 {
     mvq_arg *a = (mvq_arg *)p;
@@ -358,11 +514,16 @@ static void matvec(float *y, const float *W, const float *x, int out, int in)
 }
 
 /* A device backend takes the whole range at once; the pool would otherwise
- * split one GPU dispatch into a dozen. */
-static inline void run_rows(int n, int min_chunk, waste_range_fn fn, void *arg)
+ * split one GPU dispatch into a dozen. Below `device_min_bytes` the
+ * dispatch floor is larger than the work, so the pool keeps it — with the
+ * CPU kernel, which is a different function pointer since the accelerator
+ * has overwritten the one the pool would otherwise have called. */
+static inline void run_rows(int n, int min_chunk, waste_range_fn fn, void *arg,
+                            size_t bytes)
 {
-    if (waste_k.on_device) fn(0, n, arg);
-    else waste_parallel_for(n, min_chunk, fn, arg);
+    if (waste_k.on_device && bytes >= waste_k.device_min_bytes) { fn(0, n, arg); return; }
+    waste_parallel_for(n, min_chunk,
+                       waste_k.on_device ? waste_k.mvq_rows_cpu : fn, arg);
 }
 
 /* Quantize x into per-group int8 (same grouping as the weights). */
@@ -388,19 +549,51 @@ static void quant_act(const float *x, int n, int g, int8_t *q, float *sc)
 }
 
 /* Matvec against a trunk tensor, quantized path when available. */
+static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
+                           const float *x, int out, int in);
+
+/* Every dense trunk projection lands here, and on K3 that is 28.0 GB of
+ * Q4G read once per token — the single largest byte term in a decode step
+ * (docs/LEARNED.md §59). It has no bucket of its own in the profile, which
+ * is why "kda 29%" was being read as if it were all recurrence. */
 static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
                      const float *x, int out, int in)
+{
+    if (!prof_on) { matvec_t_inner(m, y, t, x, out, in); return; }
+    const double t0 = pnow();
+    matvec_t_inner(m, y, t, x, out, in);
+    const double dt = pnow() - t0;
+    const uint64_t nb = t ? (uint64_t)out * t->rowbytes : 0;
+    const int bk = nb < (1u<<20) ? 0 : nb < (8u<<20) ? 1 : nb < (32u<<20) ? 2 : 3;
+    pthread_mutex_lock(&prof_mu);
+    waste_prof[P_TMV] += dt; waste_prof_n[P_TMV]++;
+    waste_tmv_bytes += nb;
+    waste_tmv_t[bk] += dt; waste_tmv_b[bk] += nb; waste_tmv_c[bk]++;
+    pthread_mutex_unlock(&prof_mu);
+}
+
+static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
+                           const float *x, int out, int in)
 {
     if (!t || (!t->q && !t->data)) { memset(y, 0, (size_t)out * sizeof(float)); return; }
     if (!t->q) { matvec(y, t->data, x, out, in); return; }
     const int g = t->group, ng = (in + g - 1) / g;
+    if (sdot4_on && t->bits == 4 && (g & 31) == 0 && g % sdot4_sg == 0 &&
+        (sdot4_sg & 31) == 0) {
+        quant_act4(x, in, g, sdot4_sg, m->xq, m->xs);
+        mvq4_arg a = { y, (const uint8_t *)t->q, t->qs, m->xq, m->xs,
+                       in, ng, g, sdot4_sg, g / sdot4_sg, t->rowbytes };
+        waste_parallel_for(out, 64, mvq4_rows_sdot, &a);
+        return;
+    }
     if (sdot_on && t->bits == 8) {
         quant_act(x, in, g, m->xq, m->xs);
         mvq_arg a = { y, t->q, t->qs, m->xq, m->xs, in, ng, g, 8, (size_t)ng * g };
         waste_parallel_for(out, 64, mvq_rows, &a);
     } else {
         mvq_arg a = { y, t->q, t->qs, NULL, x, in, ng, g, t->bits, t->rowbytes };
-        run_rows(out, 64, waste_k.mvq_rows_f32, &a);
+        run_rows(out, 64, waste_k.mvq_rows_f32, &a,
+                 (size_t)out * t->rowbytes);
     }
 }
 
@@ -3044,6 +3237,24 @@ void waste_model_reset(waste_model *m)
  * is the whole point — a new process costs 48 seconds of model load on K3
  * and, worse, a different machine state. */
 void waste_model_set_lookahead(int n) { lookahead_n = n < 0 ? 0 : n; }
+
+/* For tests/sweep.c: the SDOT trunk path is chosen once from the
+ * environment, and an arm has to be able to flip it inside one process —
+ * two arms in two processes are two computers (docs/LEARNED.md §33). */
+void waste_model_set_sdot4(int on, int sg)
+{
+    if (on && !(waste_cpu_features() & WASTE_CPU_DOTPROD)) on = 0;
+    sdot4_on = on;
+    if (sg == 32 || sg == 64 || sg == 128) sdot4_sg = sg;
+}
+/* For tests/sweep.c: the size above which a matvec goes to the device.
+ * 0 sends everything, a very large value sends nothing — which is how one
+ * process measures both arms of "is the GPU worth it here". */
+void waste_model_set_device_min_kb(long kb)
+{
+    waste_k.device_min_bytes = kb < 0 ? (size_t)-1 : (size_t)kb << 10;
+}
+
 int  waste_model_get_lookahead(void)  { return lookahead_n; }
 
 /* Read-ahead. The internal SSD reaches 12.89 GB/s at queue depth 2 against
