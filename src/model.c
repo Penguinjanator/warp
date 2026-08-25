@@ -39,6 +39,16 @@
 double waste_prof[16];
 uint64_t waste_prof_n[16];
 uint64_t waste_tmv_bytes;
+int *waste_route_cap; int waste_route_n, waste_route_cap_n;
+/* WASTE_TRUNK_CHECK=1: run the f32 reference beside whichever quantized
+ * trunk kernel is selected and accumulate the relative error on real
+ * activations. Two kernels can agree with the reference to 4e-5 on one
+ * model and disagree with each other by 0.13 of a logit norm on another
+ * (docs/EXP1.md §2c), so the only way to rank them is to measure them
+ * where they run, on the tensors they run on. */
+static int trunk_check = 0;
+double waste_tcheck_num, waste_tcheck_den, waste_tcheck_max;
+unsigned long long waste_tcheck_n;
 /* matvec_t by call size: [<1MB, <8MB, <32MB, rest] */
 double waste_tmv_t[4];
 uint64_t waste_tmv_b[4], waste_tmv_c[4];
@@ -167,8 +177,13 @@ static inline float dotf(const float *a, const float *b, int n)
 
 static int q8_off = 1;     /* 1 = keep the trunk stored as int8          */
 static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
-static int sdot4_on = 0;   /* WASTE_SDOT4: Q4G trunk through SDOT        */
-static int sdot4_sg = 32;  /* activations sharing one int8 scale         */
+/* Which kernel the Q4G trunk matvec uses. The trunk is 28.0 GB of Q4G on
+ * K3 and every byte is read once per token, so this one choice is ~46% of
+ * a decode step (docs/EXP1.md §1). See model_opts_init for what each mode
+ * costs in accuracy. */
+enum { TK_F32 = 0, TK_SDOT = 1, TK_I8MM = 2, TK_SMLAL = 3 };
+static int trunk_kern = TK_F32;   /* WASTE_TRUNK_KERNEL                   */
+static int sdot4_sg = 32;  /* TK_SDOT only: activations per int8 scale    */
 static int i8mm_on = 0;    /* SMMLA batched matmul; costs activation int8 */
 static const char *dump_route = NULL;  /* WASTE_DUMP_ROUTE, see moe_layer */
 static const char *dump_scores = NULL; /* WASTE_DUMP_SCORES, see moe_layer */
@@ -202,13 +217,37 @@ static void model_opts_init(void)
      * hence a switch, and hence WASTE_SDOT4_SG, which sets how many
      * activations share one int8 scale (32 by default; the weights' own
      * group is 128). */
-    e = getenv("WASTE_SDOT4");
-    sdot4_on = e && *e != '0';
-    if (sdot4_on && !(waste_cpu_features() & WASTE_CPU_DOTPROD)) sdot4_on = 0;
+    /* WASTE_TRUNK_KERNEL: 0 f32 (the reference), 1 SDOT, 2 i8mm, 3 SMLAL.
+     *
+     * The f32 path reaches 65 GB/s on this machine against a 188 GB/s
+     * streaming ceiling (tools/mvqbw.c) because a 4-bit weight has to
+     * become a float before it can be multiplied. Quantizing the
+     * activations too removes that, and the three ways of doing it are a
+     * straight speed-for-accuracy line:
+     *
+     *   1 SDOT   int8 activations       173 GB/s   max|d| 0.695
+     *   2 i8mm   15-bit, two planes     144 GB/s   max|d| 0.016
+     *   3 SMLAL  int16 activations      113 GB/s   max|d| 0.005
+     *   0 f32    exact                   78 GB/s   0
+     *
+     * SDOT is fastest and is not payable: on K3 it measures KL 0.289
+     * teacher-forced over twelve positions, against §56's KL 0.118 for a
+     * truncation that repo calls broken. The error is small at one
+     * position (rel L2 0.03) and the KDA recurrence accumulates it — which
+     * is also why the same kernel measures KL 0.0013 on Kimi-Linear's 27
+     * layers. i8mm buys 43x the accuracy for 83% of the speed. */
+    e = getenv("WASTE_TRUNK_KERNEL");
+    trunk_kern = e ? atoi(e) : TK_F32;
+    if (trunk_kern < 0 || trunk_kern > TK_SMLAL) trunk_kern = TK_F32;
+    if ((trunk_kern == TK_SDOT || trunk_kern == TK_I8MM) &&
+        !(waste_cpu_features() & WASTE_CPU_DOTPROD)) trunk_kern = TK_F32;
+    if (trunk_kern == TK_I8MM && !(waste_cpu_features() & WASTE_CPU_I8MM))
+        trunk_kern = TK_SMLAL;
+    e = getenv("WASTE_TRUNK_CHECK");
+    trunk_check = e && *e != '0';
     e = getenv("WASTE_SDOT4_SG");
     sdot4_sg = e ? atoi(e) : 32;
-    if (sdot4_sg != 16 && sdot4_sg != 32 && sdot4_sg != 64 && sdot4_sg != 128)
-        sdot4_sg = 32;
+    if (sdot4_sg != 32 && sdot4_sg != 64 && sdot4_sg != 128) sdot4_sg = 32;
     /* Here with the rest of them: read per-load, this was the one env
      * switch still written by every concurrent waste_model_load.
      * waste_cpu_features() is self-caching and does not need the backend. */
@@ -404,13 +443,6 @@ void waste_mvq_rows_f32(int b, int e, void *p)
  * cheap half of the accuracy. It costs one horizontal add and one fmul per
  * sub-group.
  */
-typedef struct {
-    float *y; const uint8_t *W; const uint16_t *ws;
-    const int8_t *xq; const float *xs;
-    int in, ng, group, sg, ns;
-    size_t rowbytes;
-} mvq4_arg;
-
 static void mvq4_rows_sdot(int b, int e, void *p)
 {
 #if defined(__ARM_FEATURE_DOTPROD)
@@ -448,6 +480,128 @@ static void mvq4_rows_sdot(int b, int e, void *p)
 #else
     (void)b; (void)e; (void)p;
 #endif
+}
+
+/* The i8mm kernel is its own translation unit: FEAT_I8MM is not in the
+ * baseline the portable ARM build targets, so arm_neon.h hides vmmlaq_s32
+ * unless the file asks for it. src/simd_i8mm.c does, the Makefile gives
+ * only that file the flag, and this call is guarded by the runtime bit —
+ * the same arrangement simd_avx2.c has on x86, and for the same reason.
+ * See docs/EXP1.md §2 for what it buys: 144 GB/s against the f32 path's
+ * 78 and 43x SDOT's accuracy. */
+void waste_mvq4_rows_i8mm(int b, int e, void *p);
+
+/* ---- Q4G x int16 activations (SMLAL) ------------------------------------
+ * No i8mm needed and 15 bits of activation exactly as SMMLA gets, at 113
+ * GB/s instead of 144. It is here as the portable member of the family and
+ * as the fallback when FEAT_I8MM is absent. Activations are deinterleaved
+ * even|odd inside the group, as for SDOT. */
+static void mvq4_rows_smlal(int b, int e, void *p)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    const mvq4_arg *a = (const mvq4_arg *)p;
+    const int ng = a->ng, g = a->group;
+    const int16_t *x16 = (const int16_t *)a->xq;
+    const uint8x16_t m0f = vdupq_n_u8(0x0f);
+    const int8x16_t  m8  = vdupq_n_s8(8);
+    for (int o = b; o < e; o++) {
+        const uint8_t *row = a->W + (size_t)o * a->rowbytes;
+        const uint16_t *ws = a->ws + (size_t)o * ng;
+        float acc = 0;
+        for (int k = 0; k < ng; k++) {
+            const uint8_t *p4 = row + (size_t)k * g / 2;
+            const int16_t *xe = x16 + (size_t)k * g;
+            const int16_t *xo = xe + g / 2;
+            int32x4_t d0 = vdupq_n_s32(0), d1 = vdupq_n_s32(0);
+            for (int j = 0; j < g / 2; j += 16) {
+                const uint8x16_t by = vld1q_u8(p4 + j);
+                const int8x16_t lo =
+                    vsubq_s8(vreinterpretq_s8_u8(vandq_u8(by, m0f)), m8);
+                const int8x16_t hi =
+                    vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(by, 4)), m8);
+                const int16x8_t l0 = vmovl_s8(vget_low_s8(lo)),
+                                l1 = vmovl_s8(vget_high_s8(lo));
+                const int16x8_t h0 = vmovl_s8(vget_low_s8(hi)),
+                                h1 = vmovl_s8(vget_high_s8(hi));
+                d0 = vmlal_s16(d0, vget_low_s16(l0),  vld1_s16(xe + j + 0));
+                d1 = vmlal_s16(d1, vget_high_s16(l0), vld1_s16(xe + j + 4));
+                d0 = vmlal_s16(d0, vget_low_s16(l1),  vld1_s16(xe + j + 8));
+                d1 = vmlal_s16(d1, vget_high_s16(l1), vld1_s16(xe + j + 12));
+                d0 = vmlal_s16(d0, vget_low_s16(h0),  vld1_s16(xo + j + 0));
+                d1 = vmlal_s16(d1, vget_high_s16(h0), vld1_s16(xo + j + 4));
+                d0 = vmlal_s16(d0, vget_low_s16(h1),  vld1_s16(xo + j + 8));
+                d1 = vmlal_s16(d1, vget_high_s16(h1), vld1_s16(xo + j + 12));
+            }
+            acc += f16_to_f32(ws[k]) * a->xs[k] *
+                   (float)(vaddvq_s32(d0) + vaddvq_s32(d1));
+        }
+        a->y[o] = acc;
+    }
+#else
+    (void)b; (void)e; (void)p;
+#endif
+}
+
+/* Activations for mvq4_rows_i8mm: one amax per weight group, a base-128
+ * split into two int8 planes, laid out the way the B operand is read. */
+static void quant_act4_mm(const float *x, int n, int g, int8_t *q, float *sc)
+{
+    const int ng = (n + g - 1) / g;
+    for (int k = 0; k < ng; k++) {
+        const int beg = k * g, end = (beg + g < n) ? beg + g : n;
+        float amax = 0;
+        for (int i = beg; i < end; i++) {
+            const float v = fabsf(x[i]);
+            if (v > amax) amax = v;
+        }
+        const float s = amax > 0 ? amax / 16383.0f : 1.0f;
+        sc[k] = s;
+        const float inv = 1.0f / s;
+        int8_t *base = q + (size_t)k * 2 * g;
+        memset(base, 0, (size_t)2 * g);
+        for (int i = beg; i < beg + g; i++) {
+            int v = 0;
+            if (i < end) {
+                v = (int)lrintf(x[i] * inv);
+                v = v > 16383 ? 16383 : (v < -16383 ? -16383 : v);
+            }
+            int hi = (v + 64) >> 7;
+            if (hi > 127) hi = 127; else if (hi < -128) hi = -128;
+            const int lo = v - 128 * hi;
+            const int r = i - beg, h = r >> 1;
+            int8_t *pl = base + ((r & 1) ? g : 0);
+            pl[(h >> 3) * 16 + (h & 7)]     = (int8_t)hi;
+            pl[(h >> 3) * 16 + 8 + (h & 7)] = (int8_t)lo;
+        }
+    }
+}
+
+/* Activations for mvq4_rows_smlal: int16, one amax per weight group,
+ * deinterleaved even|odd inside the group. */
+static void quant_act4_16(const float *x, int n, int g, int8_t *q, float *sc)
+{
+    const int ng = (n + g - 1) / g;
+    int16_t *x16 = (int16_t *)q;
+    for (int k = 0; k < ng; k++) {
+        const int beg = k * g, end = (beg + g < n) ? beg + g : n;
+        float amax = 0;
+        for (int i = beg; i < end; i++) {
+            const float v = fabsf(x[i]);
+            if (v > amax) amax = v;
+        }
+        const float s = amax > 0 ? amax / 32767.0f : 1.0f;
+        sc[k] = s;
+        const float inv = 1.0f / s;
+        for (int i = beg; i < beg + g; i++) {
+            int v = 0;
+            if (i < end) {
+                v = (int)lrintf(x[i] * inv);
+                v = v > 32767 ? 32767 : (v < -32767 ? -32767 : v);
+            }
+            const int r = i - beg;
+            x16[(size_t)k * g + (r >> 1) + ((r & 1) ? g / 2 : 0)] = (int16_t)v;
+        }
+    }
 }
 
 /* int8 activations for the kernel above: per sub-group amax, deinterleaved
@@ -578,13 +732,44 @@ static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
     if (!t || (!t->q && !t->data)) { memset(y, 0, (size_t)out * sizeof(float)); return; }
     if (!t->q) { matvec(y, t->data, x, out, in); return; }
     const int g = t->group, ng = (in + g - 1) / g;
-    if (sdot4_on && t->bits == 4 && (g & 31) == 0 && g % sdot4_sg == 0 &&
-        (sdot4_sg & 31) == 0) {
-        quant_act4(x, in, g, sdot4_sg, m->xq, m->xs);
+    if (trunk_kern != TK_F32 && t->bits == 4 && (g & 31) == 0) {
         mvq4_arg a = { y, (const uint8_t *)t->q, t->qs, m->xq, m->xs,
                        in, ng, g, sdot4_sg, g / sdot4_sg, t->rowbytes };
-        waste_parallel_for(out, 64, mvq4_rows_sdot, &a);
-        return;
+        waste_range_fn fn = NULL;
+        if (trunk_kern == TK_SDOT && g % sdot4_sg == 0) {
+            quant_act4(x, in, g, sdot4_sg, m->xq, m->xs);
+            fn = mvq4_rows_sdot;
+        } else if (trunk_kern == TK_I8MM) {
+            quant_act4_mm(x, in, g, m->xq, m->xs);
+            fn = waste_mvq4_rows_i8mm;
+        } else if (trunk_kern == TK_SMLAL) {
+            quant_act4_16(x, in, g, m->xq, m->xs);
+            fn = mvq4_rows_smlal;
+        }
+        if (fn) {
+            waste_parallel_for(out, 64, fn, &a);
+            if (trunk_check) {
+                float *ref = (float *)malloc((size_t)out * sizeof(float));
+                if (ref) {
+                    mvq_arg r = { ref, t->q, t->qs, NULL, x, in, ng, g,
+                                  t->bits, t->rowbytes };
+                    waste_parallel_for(out, 64, waste_k.mvq_rows_cpu, &r);
+                    double num = 0, den = 0;
+                    for (int i = 0; i < out; i++) {
+                        const double d = (double)y[i] - ref[i];
+                        num += d * d; den += (double)ref[i] * ref[i];
+                        if (fabs(d) > waste_tcheck_max) waste_tcheck_max = fabs(d);
+                    }
+                    if (den > 0) {
+                        waste_tcheck_num += num / den;
+                        waste_tcheck_den += 1.0;
+                        waste_tcheck_n++;
+                    }
+                    free(ref);
+                }
+            }
+            return;
+        }
     }
     if (sdot_on && t->bits == 8) {
         quant_act(x, in, g, m->xq, m->xs);
@@ -1631,7 +1816,10 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     }
     {
         const int nmax = c->hidden > c->dense_inter ? c->hidden : c->dense_inter;
-        m->xq = (int8_t *)calloc((size_t)nmax + 256, 1);
+        /* Two bytes per activation: the i8mm path writes two int8 planes
+         * and the SMLAL path writes int16, both over the padded group
+         * count rather than over `in`. */
+        m->xq = (int8_t *)calloc((size_t)nmax * 2 + 1024, 1);
         m->xs = (float *)calloc((size_t)nmax / 32 + 64, sizeof(float));
     }
 
@@ -2945,6 +3133,21 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
      * next_layer_top field docs/FORMAT.md has reserved since the skeleton.
      * Both questions are "is the signal there", and both are cheaper to
      * answer from a trace than from a build. */
+    /* Route capture, for tests/sweep.c.
+     *
+     * On K3 at top-8 two kernels that agree with the f32 path to 4e-5 on
+     * Kimi-Linear differ from *each other* by logit rel L2 0.13 — because
+     * any perturbation, however small, eventually flips one expert out of
+     * eight at some layer, and a flipped expert is a discrete change with
+     * a size of its own. So a logit norm cannot separate "the arithmetic
+     * moved" from "the selection moved", and on this model it is mostly
+     * measuring the second. This records what was actually selected, which
+     * is the interpretable gate §61 and §62 used on the CUDA work. */
+    if (waste_route_cap && waste_route_n + K <= waste_route_cap_n) {
+        for (int j = 0; j < K; j++) waste_route_cap[waste_route_n + j] = idx[j];
+        waste_route_n += K;
+    }
+
     if (dump_route) {
         /* Third group on the line: what the *next* layer's router says about
          * *this* layer's hidden state. That is the predictor deltafin calls
@@ -3241,10 +3444,13 @@ void waste_model_set_lookahead(int n) { lookahead_n = n < 0 ? 0 : n; }
 /* For tests/sweep.c: the SDOT trunk path is chosen once from the
  * environment, and an arm has to be able to flip it inside one process —
  * two arms in two processes are two computers (docs/LEARNED.md §33). */
-void waste_model_set_sdot4(int on, int sg)
+void waste_model_set_sdot4(int mode, int sg)
 {
-    if (on && !(waste_cpu_features() & WASTE_CPU_DOTPROD)) on = 0;
-    sdot4_on = on;
+    const uint32_t f = waste_cpu_features();
+    if ((mode == TK_SDOT || mode == TK_I8MM) && !(f & WASTE_CPU_DOTPROD)) mode = TK_F32;
+    if (mode == TK_I8MM && !(f & WASTE_CPU_I8MM)) mode = TK_SMLAL;
+    if (mode < 0 || mode > TK_SMLAL) mode = TK_F32;
+    trunk_kern = mode;
     if (sg == 32 || sg == 64 || sg == 128) sdot4_sg = sg;
 }
 /* For tests/sweep.c: the size above which a matvec goes to the device.

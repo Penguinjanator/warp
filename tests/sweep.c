@@ -44,6 +44,10 @@
 extern double waste_prof[16];
 extern uint64_t waste_prof_n[16];
 extern uint64_t waste_tmv_bytes;
+extern int *waste_route_cap;
+extern int waste_route_n, waste_route_cap_n;
+extern double waste_tcheck_num, waste_tcheck_den, waste_tcheck_max;
+extern unsigned long long waste_tcheck_n;
 #if defined(WASTE_ENABLE_METAL)
 extern double waste_metal_t_gpu, waste_metal_t_copy, waste_metal_t_wrap;
 extern unsigned long long waste_metal_n_gpu, waste_metal_n_fallback, waste_metal_bytes;
@@ -64,7 +68,7 @@ int main(int argc, char **argv)
     if (argc < 5) {
         fprintf(stderr,
                 "usage: %s CONTAINER ids,.. n_gen KEY=v1,v2,.. [repeat]\n"
-                "  KEY is lookahead, iodepth, cache (MB), topk or sdot4\n", argv[0]);
+                "  KEY is lookahead, iodepth, cache (MB), topk, trunk or devkb\n", argv[0]);
         return 2;
     }
     int ids[MAX_IDS], n = 0;
@@ -80,6 +84,8 @@ int main(int argc, char **argv)
     for (char *p = strtok(eq + 1, ","); p && n_arms < MAX_ARMS; p = strtok(NULL, ","))
         arm[n_arms++] = atoi(p);
     const int repeat = argc > 5 ? atoi(argv[5]) : 3;
+    const char *sgs = getenv("WASTE_SDOT4_SG");
+    const int sdot4_sg_env = sgs ? atoi(sgs) : 32;
 
     const int is_look = !strcmp(key, "lookahead");
     const int is_depth = !strcmp(key, "iodepth");
@@ -90,9 +96,9 @@ int main(int argc, char **argv)
      * m->xacc and the per-expert LUTs. Truncation is the experiment;
      * widening is a different container. */
     const int is_topk = !strcmp(key, "topk");
-    /* sdot4=0,32,64,128 — 0 is the f32 trunk path, anything else
-     * is the SDOT path at that activation sub-group size. */
-    const int is_sdot4 = !strcmp(key, "sdot4");
+    /* trunk=0,1,2,3 — which kernel the Q4G trunk matvec uses:
+     * 0 f32 (the reference), 1 SDOT, 2 i8mm, 3 SMLAL. */
+    const int is_sdot4 = !strcmp(key, "trunk");
     /* devkb=N sends every matvec of N KB or more to the accelerator;
      * -1 sends none. No effect in a build without one. */
     const int is_dev = !strcmp(key, "devkb");
@@ -139,10 +145,17 @@ int main(int argc, char **argv)
      * docs/LEARNED.md §56 is the reminder that the continuation is the
      * gate. */
     const int kl_on = getenv("WASTE_SWEEP_KL") != NULL;
+    int *ref_routes = NULL;
+    const int kl_v = kl_on ? atoi(getenv("WASTE_SWEEP_KL")) : 0;
     float *ref_lg = NULL; int ref_ids[512]; int ref_n = 0;
     if (kl_on) {
         ref_lg = (float *)malloc((size_t)n_gen * m.cfg.vocab * sizeof(float));
         if (!ref_lg) { fprintf(stderr, "no room for the reference logits\n"); return 1; }
+        /* One slot per (position, layer, selected expert), generously. */
+        waste_route_cap_n = (n + n_gen + 4) * (m.cfg.n_layers + 1) * m.cfg.top_k;
+        waste_route_cap = (int *)malloc((size_t)waste_route_cap_n * sizeof(int));
+        ref_routes = (int *)malloc((size_t)waste_route_cap_n * sizeof(int));
+        if (!waste_route_cap || !ref_routes) { fprintf(stderr, "no room for routes\n"); return 1; }
     }
     printf("%8s %6s %7s %9s %9s %9s%s\n", key, "rep", "slots", "tok/s", "hit",
            "GB read", prof ? "   tmv GB/s   kda s  luta s" : "");
@@ -158,7 +171,7 @@ int main(int argc, char **argv)
             } else if (is_dev) {
                 waste_model_set_device_min_kb(arm[a]);
             } else if (is_sdot4) {
-                waste_model_set_sdot4(arm[a] != 0, arm[a] ? arm[a] : 32);
+                waste_model_set_sdot4(arm[a], sdot4_sg_env);
             } else if (is_look) {
                 waste_model_set_lookahead(arm[a]);
             } else if (is_depth) {
@@ -180,6 +193,11 @@ int main(int argc, char **argv)
             int gen[512]; int ngen = 0;
             const int is_ref = kl_on && r == 0 && a == 0;
             double kl_sum = 0, l2_sum = 0, kl_time = 0; int top10 = 0, argmax_same = 0;
+            double pos_l2[512];
+            for (int i = 0; i < 512; i++) pos_l2[i] = 0;
+            waste_route_n = 0;
+            waste_tcheck_num = waste_tcheck_den = waste_tcheck_max = 0;
+            waste_tcheck_n = 0;
             memset(waste_prof, 0, sizeof waste_prof);
             memset(waste_prof_n, 0, sizeof waste_prof_n);
             waste_tmv_bytes = 0;
@@ -213,6 +231,7 @@ int main(int argc, char **argv)
                         if (pp > 1e-12) kl += pp * ((R[v] - mr - log(sr)) - (lg[v] - mq - log(sq)));
                     }
                     kl_sum += kl; l2_sum += sqrt(num / (den > 0 ? den : 1));
+                    if (kl_v > 1) pos_l2[i] = sqrt(num / (den > 0 ? den : 1));
                     /* top-10 overlap, by selection sort on both */
                     int ti[10], qi[10];
                     for (int t = 0; t < 10; t++) {
@@ -245,10 +264,44 @@ int main(int argc, char **argv)
                    m.cache.n_slots, n_gen / dt,
                    100.0 * (double)h / (double)(h + mi ? h + mi : 1),
                    (double)m.cache.bytes_read / 1073741824.0);
+            /* Two different questions, and only the second one matters.
+             * The engine renormalizes the selected weights and sums the
+             * experts, so *which* expert sits at rank 3 changes nothing —
+             * two near-tied scores swapping is invisible in the output.
+             * What is visible is an expert entering or leaving the set.
+             * Comparing the ordered list conflates the two and reports a
+             * harmless rank swap as two mismatches. */
+            int route_rank = 0, route_set = 0, route_tot = waste_route_n;
+            if (kl_on) {
+                if (is_ref) memcpy(ref_routes, waste_route_cap,
+                                   (size_t)waste_route_n * sizeof(int));
+                else {
+                    const int K = m.cfg.top_k;
+                    for (int i = 0; i < waste_route_n; i++)
+                        if (waste_route_cap[i] == ref_routes[i]) route_rank++;
+                    for (int g0 = 0; g0 + K <= waste_route_n; g0 += K)
+                        for (int u = 0; u < K; u++)
+                            for (int v = 0; v < K; v++)
+                                if (ref_routes[g0 + u] == waste_route_cap[g0 + v])
+                                    { route_set++; break; }
+                }
+            }
+            if (kl_v > 1 && !is_ref) {
+                printf("      relL2 by position:");
+                for (int i = 0; i < n_gen && i < 24; i++) printf(" %.1e", pos_l2[i]);
+                printf("\n");
+            }
             if (kl_on && !is_ref)
-                printf("   KL %.3e relL2 %.2e top10 %.1f%% argmax %d/%d",
+                printf("   KL %.3e relL2 %.2e top10 %.1f%% argmax %d/%d"
+                       " route set %.2f%% rank %.2f%%",
                        kl_sum / n_gen, l2_sum / n_gen, top10 * 10.0 / n_gen,
-                       argmax_same, n_gen);
+                       argmax_same, n_gen,
+                       route_tot ? 100.0 * route_set / route_tot : 0.0,
+                       route_tot ? 100.0 * route_rank / route_tot : 0.0);
+            if (waste_tcheck_n)
+                printf("   [vs f32: mean relL2 %.3e over %llu matvecs, max|d| %.3g]",
+                       waste_tcheck_num / waste_tcheck_den,
+                       (unsigned long long)waste_tcheck_n, waste_tcheck_max);
             if (prof)
                 printf("   %9.1f %7.2f %8.2f",
                        waste_prof[9] > 0 ? waste_tmv_bytes / waste_prof[9] / 1e9 : 0.0,

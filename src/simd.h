@@ -38,6 +38,17 @@ typedef struct {
     size_t rowbytes;
 } mvq_arg;
 
+/* The 4-bit trunk matvec with the activations quantized too. `xq` holds
+ * them in whatever layout the chosen kernel reads — see src/model.c's
+ * quant_act4* — and `xs` one scale per weight group. It lives here rather
+ * than in model.c because src/simd_i8mm.c has to see it. */
+typedef struct {
+    float *y; const uint8_t *W; const uint16_t *ws;
+    const int8_t *xq; const float *xs;
+    int in, ng, group, sg, ns;
+    size_t rowbytes;
+} mvq4_arg;
+
 typedef struct {
     float *lut; const float *booksT; const float *x;
     int cb_base, stages, entries, vec_dim;

@@ -19,8 +19,8 @@ Append to this file as things are measured. Commit often.
 | # | lever | state | measured |
 |---|---|---|---|
 | 1 | fused NEON unpack for Q4G (bit-identical) | **landed** | 1.24x on the kernel, ~1.08x end to end |
-| 2 | Q4G through SDOT (int8 activations) | **built, off by default** | 1.22x end to end, KL 0.29 on K3 — too much |
-| 3 | Q4G through SMLAL / SMMLA (int16 / 14-bit activations) | benchmarked only | 1.44x / 1.85x on the kernel, 43-141x more accurate than 2 |
+| 2 | Q4G through SDOT (int8 activations) | **built, off by default** | 1.22x end to end, and 4700x the error of 3 — not worth it |
+| 3 | Q4G through i8mm / SMLAL | **built, `WASTE_TRUNK_KERNEL=2`** | **1.18x end to end**, per-matvec rel L2 **1.4e-08** |
 | 4 | Metal trunk matvec, rewritten | **built, loses in place** | 133-159 GB/s standalone, **8 GB/s inside the engine** — unexplained, see §5 |
 | 5 | Metal VQ3R apply | benchmarked only | **123 GB/s of index against the CPU's ~29** once enough rows are in flight |
 | 6 | VQ3R with a register-resident int8 table | benchmarked only | 1.76x single-thread over the current gather |
@@ -305,3 +305,87 @@ nothing measured here gets past it without reading fewer bytes.
 Refuted or parked on this branch, with the numbers: SDOT for the trunk
 (§2b, quality), VQ3R in registers as a way to reach VQ4P (§6), a bigger
 expert cache at top-8 (§4).
+
+
+---
+
+## 2c. The three kernels ranked, and the instrument it took to rank them
+
+*(2026-08-25, after the panic.)*
+
+The i8mm and SMLAL kernels are in the engine. `WASTE_TRUNK_KERNEL` picks
+one — 0 f32, 1 SDOT, 2 i8mm, 3 SMLAL — and `tests/sweep.c` has a `trunk=`
+arm so all four are measured in one process.
+
+The i8mm one lives in **`src/simd_i8mm.c`**, its own translation unit with
+its own `-march`, entered only after `waste_cpu_features()` reports
+FEAT_I8MM — the arrangement `simd_avx2.c` has on x86, for a reason this
+branch learned the hard way. Written inside `model.c` it compiled to
+**nothing at all**: FEAT_I8MM is ARMv8.6, the portable ARM build targets
+older, `arm_neon.h` hides `vmmlaq_s32` behind
+`__ARM_FEATURE_MATMUL_INT8`, and the `#if` around the body left an empty
+function that never wrote to the caller's output buffer. The runtime
+feature bit said yes, the compiler had said no, and nothing connected the
+two. Logits came out 109% off. **A kernel that can be compiled out has to
+be somewhere the build system can see** — and `mmq_rows_i8mm`, which has
+been in `model.c` behind the same `#if` since before this branch, has the
+same property: it is live only under `WASTE_NATIVE=1`.
+
+### The measurement that ranks them is not the one that looked obvious
+
+Teacher-forced logit KL over 8 generated tokens said SDOT 0.43, i8mm
+0.008, SMLAL 0.49 — i.e. that the *most* accurate kernel of the three was
+the second worst. It is not. **On K3 that metric is measuring when the
+first expert flip happens, and after one flip the trajectories are
+unrelated.** Two kernels that each agree with the f32 path to 4e-5 on
+Kimi-Linear differ from *each other* by rel L2 0.13 on K3 — a number that
+has nothing to do with either one's arithmetic.
+
+Three instruments were added to get past that, and the order matters:
+
+- **route agreement, set and rank kept apart.** The engine renormalizes the
+  selected weights and sums the experts, so which expert sits at rank 3
+  changes nothing and two near-tied scores swapping is invisible in the
+  output. Comparing the ordered list reports a harmless swap as two
+  mismatches: SDOT scores 56% by rank and 88% by set. The set is the
+  number that means something.
+- **`WASTE_TRUNK_CHECK=1`**, which runs the f32 reference beside whichever
+  kernel is selected, on the real activations, and accumulates the
+  relative error per matvec. This is the one that settled it.
+- a short horizon. At three generated tokens the chaos has not had time to
+  start and the ranking is legible; at eight it is not.
+
+| trunk kernel | mean rel L2 per matvec (3954 real matvecs) | route set @3 tok | KL @3 tok | tok/s |
+|---|---|---|---|---|
+| f32 (the reference) | — | 100% | 0 | 0.93-0.99 |
+| SDOT | **6.50e-05** | 86.5% | 1.2e+00 | 1.10 |
+| **i8mm** | **1.39e-08** | **99.91%** | 1.6e-04 | **1.10-1.13** |
+| SMLAL | **3.52e-09** | **100.00%** | 6.0e-07 | 1.06-1.09 |
+
+Monotone in the arithmetic, as it should have been all along. And the two
+top rows are **below f32 re-association noise**: rearranging a float sum
+moves a result by ~1e-7, and these move it by 1e-8 and 3e-9.
+
+**i8mm is the pick**: 1.18x end to end on K3 at top-8, the trunk matvec
+from 56 to 105 GB/s, and an error four orders of magnitude under SDOT's
+for 97% of SDOT's speed. It is **opt-in**, not default: it is not
+bit-identical, and on a model whose router lives on near-ties, "not
+bit-identical" eventually means "different text". Whether 1.18x buys that
+is a shipping decision, and §56 is the precedent either way — that section
+recommends top-8, which is KL 0.037, 230x more damage than this, for
+1.49x.
+
+### The methodological note, which is the durable part
+
+**On K3, a logit norm between two arms over more than a few generated
+tokens is not a quality measurement.** The router's top-k boundary sits on
+near-ties — §52 already recorded that the score-correction bias reorders
+the selection on 368 of 368 K3 routing lines — so a perturbation of 1e-9
+and one of 1e-4 both eventually flip an expert, and after that the two
+runs are answering different questions. What separates them is the error
+*before* the flip, and that has to be measured where it happens.
+
+This is §43's finding one level up. There, an int8 lookup table made the
+kernel discontinuous, so "numerically equivalent" was not good enough and
+bit-identity became the bar. Here the discontinuity is the router itself,
+and it applies to every kernel in the engine at once.

@@ -145,11 +145,17 @@ int main(int argc, char **argv)
                          (unsigned long long)waste_tmv_c[k], waste_tmv_b[k]/1e9,
                          waste_tmv_t[k], waste_tmv_b[k]/waste_tmv_t[k]/1e9); }
     }
+#if defined(WASTE_ENABLE_METAL)
+    /* The same kernel on this file's own buffers, after a real decode.
+     * docs/EXP1.md §5b: before decode it measures 132 GB/s and after it
+     * measures 9, which is what a dispatch-rate claim has to be checked
+     * against before any Metal number is believed. */
     if (getenv("WASTE_METAL_SELFTEST")) {
         void waste_metal_selftest(void);
         fprintf(stderr, "-- selftest after decode --\n");
         waste_metal_selftest();
     }
+#endif
     printf("\ncache: %llu hits / %llu misses = %.1f%% hit, %llu evictions, "
            "%.2f GB read\n",
            (unsigned long long)m.cache.hits, (unsigned long long)m.cache.misses,

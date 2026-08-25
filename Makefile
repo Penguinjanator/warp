@@ -108,7 +108,7 @@ SRC := src/model.c src/kda.c src/backend.c src/ecache.c src/version.c \
 # build while backend.c still emitted the call to it, so the link failed
 # with an undefined waste_kda_register_neon.
 ifneq (,$(filter arm% aarch64%,$(ARCH)))
-SRC += src/kda_neon.c
+SRC += src/kda_neon.c src/simd_i8mm.c
 endif
 
 # One translation unit per x86 ISA, each built with its own flags so the
@@ -187,6 +187,10 @@ src/metal.o: src/metal.m
 # where these translation units are not in SRC at all.
 src/simd_avx2.o:   override CFLAGS += -mavx2 -mfma
 src/simd_avx512.o: override CFLAGS += -mavx512f -mavx512bw -mavx512vbmi
+# FEAT_I8MM is ARMv8.6 and the portable ARM build targets something older,
+# so arm_neon.h hides vmmlaq_s32 without this. Entered only after
+# waste_cpu_features() reports the bit, exactly like the two above.
+src/simd_i8mm.o:   override CFLAGS += -march=armv8.2-a+i8mm
 
 all: waste$(EXE) libwaste.a libwaste.$(SOEXT) libwastevq.$(SOEXT)
 
@@ -217,6 +221,7 @@ src/metal.pic.o: src/metal.m
 
 src/simd_avx2.pic.o:   override CFLAGS += -mavx2 -mfma
 src/simd_avx512.pic.o: override CFLAGS += -mavx512f -mavx512bw -mavx512vbmi
+src/simd_i8mm.pic.o:   override CFLAGS += -march=armv8.2-a+i8mm
 
 libwaste.$(SOEXT): $(SHOBJ)
 	$(CC) $(CFLAGS) -shared -o $@ $^ $(SHLDFLAGS) $(LDLIBS)
