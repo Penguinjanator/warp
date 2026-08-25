@@ -218,6 +218,12 @@ static inline void waste_aligned_free(void *p)
 /* GetSystemInfo would answer for the current processor group only, so it
  * says 64 on a machine with more. The pool caps at 64 anyway, but the
  * number is also reported to the user. */
+/* Windows exposes heterogeneous cores through
+ * GetSystemCpuSetInformation's EfficiencyClass, which is a different
+ * enough shape that it waits until someone has a machine to measure it
+ * on. 0 means "no split to make". */
+static inline int waste_perf_cpu_count(void) { return 0; }
+
 static inline int waste_cpu_count(void)
 {
     const DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
@@ -307,6 +313,9 @@ static inline int waste_open_stream(const char *path, int bypass)
 
 #include <stdlib.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>          /* hw.perflevel0, for waste_perf_cpu_count */
+#endif
 
 #define WASTE_O_BINARY 0
 
@@ -327,6 +336,52 @@ static inline int waste_cpu_count(void)
 {
     const long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 1 ? (int)n : 1;
+}
+
+/* How many of them are performance cores, or 0 where the question has no
+ * answer on this platform.
+ *
+ * The pool needs it because this machine's cores are not interchangeable
+ * and a fork-join barrier waits for the slowest participant: LEARNED §47
+ * measured a wide SIMD kernel peaking at exactly the performance-core
+ * count and *degrading* past it, while the latency-bound kernel beside it
+ * kept improving to eighteen. One number cannot serve both, so the pool
+ * has to know where the line is.
+ *
+ * macOS reports it directly. `hw.perflevel0` is the fastest level on
+ * Apple Silicon by definition — level 0 is the highest-performing one —
+ * and an Intel Mac has one level, so the answer equals the total and the
+ * caller treats that as "no split to make".
+ *
+ * Linux has no such sysctl. `cpu_capacity` is the DT-derived big.LITTLE
+ * capacity and exists on arm64 systems that have asymmetric cores; where
+ * every CPU reports the same value, or the file is absent, there is
+ * nothing to split. */
+static inline int waste_perf_cpu_count(void)
+{
+#if defined(__APPLE__)
+    int v = 0; size_t sz = sizeof v;
+    if (sysctlbyname("hw.perflevel0.logicalcpu", &v, &sz, NULL, 0) == 0 && v > 0)
+        return v;
+    return 0;
+#elif defined(__linux__)
+    int best = 0, n = 0;
+    for (int i = 0; i < 1024; i++) {
+        char path[96];
+        snprintf(path, sizeof path,
+                 "/sys/devices/system/cpu/cpu%d/cpu_capacity", i);
+        FILE *f = fopen(path, "r");
+        if (!f) { if (i == 0) return 0; break; }
+        int c = 0;
+        if (fscanf(f, "%d", &c) != 1) c = 0;
+        fclose(f);
+        if (c > best) { best = c; n = 1; }
+        else if (c == best && c > 0) n++;
+    }
+    return best > 0 ? n : 0;
+#else
+    return 0;
+#endif
 }
 
 static inline int64_t waste_file_size(int fd)

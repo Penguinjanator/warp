@@ -199,6 +199,33 @@ static int p6_chunk = 4;               /* WASTE_P6_CHUNK, see vq_apply    */
 static int xpar_on = 0;                /* WASTE_XPAR=1 opts in; see below   */
 static int metal_moe = 0;              /* WASTE_METAL_MOE, see moe_layer    */
 static int vq8_on = 0;                 /* WASTE_VQ8: int8 VQ3R table        */
+/* Which kernels are cut for the performance cores rather than the whole
+ * pool. A bitmask because LEARNED §47's finding is per kernel, not per
+ * machine: bit 0 the VQ apply, bit 1 the quantized trunk matvec, bit 2 the
+ * LUT build. 0 is the pool for everything, which is what every number in
+ * this repo before now was measured on. */
+enum { WIDE_VQ = 1, WIDE_TRUNK = 2, WIDE_LUTB = 4 };
+/* On by default, which LEARNED §47 explicitly declined to do — and the
+ * difference is what "on" means. §47 measured *capping the pool* at the
+ * performance-core count: 25% on one model and -34% on the other, because
+ * the kernel that wants every core loses them all. This takes cores away
+ * from nothing. The VQ apply and the LUT build are cut for the fast group
+ * and everything else still gets the whole machine, so the trunk matvec is
+ * unaffected and only the two kernels whose barrier was waiting on an
+ * efficiency core change. Measured positive on both models, and the split
+ * is by row so the logits are bit-identical either way (checked). The
+ * trunk matvec is deliberately *not* in the default: it measures neutral
+ * on both, so it is a switch and not a choice. WASTE_WIDE=0 turns it off. */
+static int wide_mask = WIDE_VQ | WIDE_LUTB;   /* WASTE_WIDE */
+
+/* One call site's dispatch: the fast group when this kernel is in the
+ * mask, the whole pool otherwise. */
+static inline void pf_wide(int bit, int n, int min_chunk, waste_range_fn fn,
+                           void *arg)
+{
+    if (wide_mask & bit) waste_parallel_for_fast(n, min_chunk, fn, arg);
+    else waste_parallel_for(n, min_chunk, fn, arg);
+}
 static int xpar_batch = 4;             /* WASTE_XPAR_BATCH, see moe_layer  */
 static pthread_once_t model_opts_once = PTHREAD_ONCE_INIT;
 
@@ -295,6 +322,9 @@ static void model_opts_init(void)
      * a float one walked in memory. 1.76x on the kernel single-threaded
      * (tools/lutbw.c kernel E). Off by default: it quantizes the table,
      * which makes the path discontinuous in §43's sense. */
+    { const char *e2 = getenv("WASTE_WIDE");
+      if (e2) wide_mask = atoi(e2);
+      if (wide_mask < 0) wide_mask = 0; }
     { const char *e2 = getenv("WASTE_VQ8");
       vq8_on = e2 && *e2 != '0'; }
     { const char *e2 = getenv("WASTE_METAL_MOE");
@@ -2329,7 +2359,7 @@ static void vq_build_lut(waste_model *m, float *lut, int cb_base,
     /* Vectors are independent. The build was serial while everything around
      * it used the pool, and on K3 it is 8.0 GFLOP per token — 7.0 of them
      * for the down projections, which are rebuilt once per routed expert. */
-    waste_parallel_for(N / vec_dim, 16, waste_k.lutb_range, &a);
+    pf_wide(WIDE_LUTB, N / vec_dim, 16, waste_k.lutb_range, &a);
     if (q) vq_quant_lut(lut, N / vec_dim, stages, entries, q, qs);
     PROF_END(P_LUTB);
 }
@@ -2616,15 +2646,15 @@ static void vq_apply(waste_model *m, float *y, const uint8_t *idx,
     const int nv = N / m->vec_dim;
     if (m->index_bits == 6) {
         vqp_arg a = { y, idx, scale, q, qs, nv };
-        waste_parallel_for(M, VQ_TILE * p6_chunk, waste_k.vq_rows_p6, &a);
+        pf_wide(WIDE_VQ, M, VQ_TILE * p6_chunk, waste_k.vq_rows_p6, &a);
     } else if (vq8_on && q && waste_k.vq_rows_e) {
         vqp_arg a = { y, idx, scale, q, qs, nv };
-        waste_parallel_for(M, VQ_TILE * VQ_SUPER, waste_k.vq_rows_e, &a);
+        pf_wide(WIDE_VQ, M, VQ_TILE * VQ_SUPER, waste_k.vq_rows_e, &a);
     } else {
         vq_arg a = { y, idx, scale, lut, nv, m->stages, m->cb_entries };
         /* min_chunk = VQ_TILE keeps every thread's range block-aligned,
          * which the blocked index layout requires. */
-        waste_parallel_for(M, VQ_TILE * VQ_SUPER, vq_rows, &a);
+        pf_wide(WIDE_VQ, M, VQ_TILE * VQ_SUPER, vq_rows, &a);
     }
     PROF_END(P_LUTA);
 }
@@ -3628,6 +3658,10 @@ void waste_model_set_metal_moe(int on) { metal_moe = on; }
  * allocated at load, i.e. when WASTE_VQ8 was set in the environment
  * — the table is a load-time allocation and an arm cannot conjure it. */
 void waste_model_set_vq8(int on) { vq8_on = on; }
+
+void waste_model_set_wide(int mask) { wide_mask = mask < 0 ? 0 : mask; }
+int  waste_model_fast_threads(void) { return waste_pool_fast(); }
+int  waste_pool_threads_public(void) { return waste_pool_threads(); }
 
 void waste_model_set_device_min_kb(long kb)
 {

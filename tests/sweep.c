@@ -108,7 +108,11 @@ int main(int argc, char **argv)
      * Needs WASTE_VQ8 set in the environment so the load allocates
      * the shadow table; the arm only chooses which kernel runs. */
     const int is_vq8 = !strcmp(key, "vq8");
-    if (!is_look && !is_depth && !is_cache && !is_topk && !is_sdot4 && !is_dev && !is_gmoe && !is_vq8) {
+    /* wide=0,1,2,3.. — which kernels are cut for the performance
+     * cores instead of the whole pool. 1 VQ apply, 2 trunk matvec,
+     * 4 LUT build, added together. */
+    const int is_wide = !strcmp(key, "wide");
+    if (!is_look && !is_depth && !is_cache && !is_topk && !is_sdot4 && !is_dev && !is_gmoe && !is_vq8 && !is_wide) {
         fprintf(stderr, "unknown key %s\n", key);
         return 2;
     }
@@ -132,6 +136,8 @@ int main(int argc, char **argv)
     { const char *tk = getenv("WASTE_SWEEP_TOPK");
       if (tk) { int v = atoi(tk);
                 if (v >= 1 && v <= top_k0) m.cfg.top_k = v; } }
+    printf("pool: %d threads, %d on the fast cores\n",
+           waste_pool_threads_public(), waste_model_fast_threads());
     printf("loaded in %.1fs — cache %d slots; %d arms x %d repeats, "
            "%d prompt + %d generated\n\n",
            now() - t0, m.cache.n_slots, n_arms, repeat, n, n_gen);
@@ -174,6 +180,8 @@ int main(int argc, char **argv)
                     return 2;
                 }
                 m.cfg.top_k = arm[a];
+            } else if (is_wide) {
+                waste_model_set_wide(arm[a]);
             } else if (is_vq8) {
                 waste_model_set_vq8(arm[a]);
             } else if (is_gmoe) {

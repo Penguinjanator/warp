@@ -39,10 +39,22 @@ typedef void (*waste_range_fn)(int begin, int end, void *arg);
 typedef struct {
     pthread_t th[64];
     pthread_mutex_t mu;
-    pthread_cond_t start, done;
+    /* Two start signals, not one. A fast job must not wake the efficiency
+     * cores at all: they would take no chunk, but they would still have to
+     * be scheduled before they could say so, and with the barrier waiting
+     * on a count they decrement, their wake-up latency lands on the
+     * critical path of every dispatch. The first version of this had one
+     * condvar and measured exactly nothing, for that reason. */
+    pthread_cond_t start, start_slow, done;
     waste_range_fn fn;
     void *arg;
     int n, nthreads, next_chunk, chunk, active, epoch, stop;
+    /* How many of the pool's threads are meant for the fast cores, and
+     * how many a given job wants. `n_fast` counts the calling thread,
+     * which is a worker too; `job_workers` is what the current job set,
+     * and a worker whose index is past it wakes, takes nothing and goes
+     * back to sleep. See waste_parallel_for_fast. */
+    int n_fast, job_workers;
     /* The cpuset every participant binds to, and a generation so a thread
      * knows whether it has already done so. 0 = placement is the OS's. */
     waste_cpumask cpus;
@@ -85,16 +97,26 @@ static inline void waste__bind_self(void)
     waste_bind_thread_cpus(&g_pool.cpus);
 }
 
+/* Each worker knows its own index so a job can decline the slow ones. */
+typedef struct { waste_pool *P; int idx; } waste_worker;
+static waste_worker g_workers[64];
+
 static void *waste__worker(void *p)
 {
-    waste_pool *P = (waste_pool *)p;
+    waste_worker *W = (waste_worker *)p;
+    waste_pool *P = W->P;
     int seen = 0;
     waste__bind_self();
+    /* Which signal this worker sleeps on for the rest of its life. */
+    const int slow = P->n_fast && W->idx >= P->n_fast - 1;
+    pthread_cond_t *sig = slow ? &P->start_slow : &P->start;
     for (;;) {
         pthread_mutex_lock(&P->mu);
-        while (!P->stop && P->epoch == seen) pthread_cond_wait(&P->start, &P->mu);
+        while (!P->stop && P->epoch == seen) pthread_cond_wait(sig, &P->mu);
         if (P->stop) { pthread_mutex_unlock(&P->mu); return NULL; }
         seen = P->epoch;
+        const int mine = W->idx < P->job_workers - 1;
+        if (!mine) { pthread_mutex_unlock(&P->mu); continue; }
         pthread_mutex_unlock(&P->mu);
 
         for (;;) {
@@ -142,27 +164,82 @@ static inline void waste_pool_init(int nthreads, const waste_cpumask *cpus)
     if (nthreads < 1) nthreads = 1;
     pthread_mutex_init(&g_pool.mu, NULL);
     pthread_cond_init(&g_pool.start, NULL);
+    pthread_cond_init(&g_pool.start_slow, NULL);
     pthread_cond_init(&g_pool.done, NULL);
+
+    /* The fast group. It is the first `n_fast` participants — the calling
+     * thread plus workers 0..n_fast-2 — and on macOS they are created at
+     * a quality of service the scheduler answers with a performance core.
+     * There is no affinity API on this platform, so the class is the whole
+     * mechanism: QOS_CLASS_USER_INTERACTIVE prefers the P cluster, and
+     * the E-core threads simply do not participate in a fast job, which is
+     * what leaves the cluster to the ones that do.
+     *
+     * A cpuset overrides it: a caller who has named CPUs has said what it
+     * wants and the two mechanisms would fight. */
+    {
+        const char *e = getenv("WASTE_PCORES");
+        int f = e ? atoi(e) : waste_perf_cpu_count();
+        if (cpus || f <= 0 || f >= nthreads) f = 0;   /* nothing to split */
+        g_pool.n_fast = f;
+    }
+
     /* Count only workers that actually exist.  Waiting for a failed
      * pthread_create as though it were alive otherwise hangs forever. */
     g_pool.nthreads = 1;
+    g_pool.job_workers = nthreads;
     for (int i = 0; i < nthreads - 1; i++) {
-        if (pthread_create(&g_pool.th[i], NULL, waste__worker, &g_pool)) break;
+        pthread_attr_t attr, *ap = NULL;
+#if defined(__APPLE__)
+        if (g_pool.n_fast && pthread_attr_init(&attr) == 0) {
+            pthread_attr_set_qos_class_np(&attr,
+                i < g_pool.n_fast - 1 ? QOS_CLASS_USER_INTERACTIVE
+                                      : QOS_CLASS_UTILITY, 0);
+            ap = &attr;
+        }
+#else
+        (void)attr;
+#endif
+        g_workers[i].P = &g_pool;
+        g_workers[i].idx = i;
+        const int rc = pthread_create(&g_pool.th[i], ap, waste__worker,
+                                      &g_workers[i]);
+#if defined(__APPLE__)
+        if (ap) pthread_attr_destroy(ap);
+#endif
+        if (rc) break;
         g_pool.nthreads++;
     }
+    if (g_pool.n_fast > g_pool.nthreads) g_pool.n_fast = g_pool.nthreads;
     pthread_mutex_unlock(&g_pool_init_mu);
 }
 
+/* How many participants a fast job gets, or the whole pool where the
+ * machine has no split to make. */
+static inline int waste_pool_fast(void)
+{ return g_pool.n_fast ? g_pool.n_fast : g_pool.nthreads; }
+
 /* Runs fn over [0,n) split into chunks; every chunk boundary is a multiple
- * of min_chunk. Blocks until complete. */
-static inline void waste_parallel_for(int n, int min_chunk, waste_range_fn fn, void *arg)
+ * of min_chunk. Blocks until complete.
+ *
+ * `workers` is how many participants to cut the work for. Everything the
+ * engine does went through the whole pool until LEARNED §47, which found
+ * that the barrier makes an efficiency core a straggler for a kernel wide
+ * enough to be limited by its slowest lane — and that the same machine
+ * wants every core for the kernel next to it. So the count is per call
+ * site now, and the two available answers are the pool and the fast
+ * group. Results do not depend on it: the split is by row either way. */
+static inline void waste_parallel_for_n(int n, int min_chunk, waste_range_fn fn,
+                                        void *arg, int workers)
 {
     /* Before the serial path too: a pool of one still runs the kernel, and
      * on the CPUs it was told to. A thread-local check, so this costs a
      * load per dispatch and a syscall once per thread. */
     waste__bind_self();
-    if (g_pool.nthreads <= 1 || n <= min_chunk) { fn(0, n, arg); return; }
-    int chunk = (n + g_pool.nthreads - 1) / g_pool.nthreads;
+    if (workers > g_pool.nthreads) workers = g_pool.nthreads;
+    if (workers < 1) workers = 1;
+    if (workers <= 1 || n <= min_chunk) { fn(0, n, arg); return; }
+    int chunk = (n + workers - 1) / workers;
     if (chunk < min_chunk) chunk = min_chunk;
     /* Round up to a whole number of min_chunk units: callers that block
      * their data (the VQ tile) need every range to start on a boundary. */
@@ -175,9 +252,11 @@ static inline void waste_parallel_for(int n, int min_chunk, waste_range_fn fn, v
     pthread_mutex_lock(&g_pool.mu);
     g_pool.fn = fn; g_pool.arg = arg; g_pool.n = n; g_pool.chunk = chunk;
     g_pool.next_chunk = 0;
-    g_pool.active = g_pool.nthreads - 1;
+    g_pool.job_workers = workers;
+    g_pool.active = workers - 1;
     g_pool.epoch++;
     pthread_cond_broadcast(&g_pool.start);
+    if (workers > g_pool.n_fast) pthread_cond_broadcast(&g_pool.start_slow);
     pthread_mutex_unlock(&g_pool.mu);
 
     /* the calling thread is a worker too */
@@ -198,12 +277,27 @@ static inline void waste_parallel_for(int n, int min_chunk, waste_range_fn fn, v
     pthread_mutex_unlock(&g_pool_run_mu);
 }
 
+static inline void waste_parallel_for(int n, int min_chunk, waste_range_fn fn,
+                                      void *arg)
+{ waste_parallel_for_n(n, min_chunk, fn, arg, g_pool.nthreads); }
+
+/* For a kernel whose lanes are wide and whose barrier therefore waits for
+ * the slowest core in it. Falls back to the whole pool on a machine with
+ * one kind of core, so a call site can use it unconditionally. */
+static inline void waste_parallel_for_fast(int n, int min_chunk,
+                                           waste_range_fn fn, void *arg)
+{ waste_parallel_for_n(n, min_chunk, fn, arg, waste_pool_fast()); }
+
 static inline void waste_pool_shutdown(void)
 {
     if (!g_pool.nthreads) return;
     pthread_mutex_lock(&g_pool.mu);
+    g_pool.job_workers = g_pool.nthreads;
     g_pool.stop = 1;
+    /* Both signals: a slow worker never hears the fast one, and a shutdown
+     * that only wakes half the pool joins forever. */
     pthread_cond_broadcast(&g_pool.start);
+    pthread_cond_broadcast(&g_pool.start_slow);
     pthread_mutex_unlock(&g_pool.mu);
     for (int i = 0; i < g_pool.nthreads - 1; i++) pthread_join(g_pool.th[i], NULL);
     memset(&g_pool, 0, sizeof g_pool);

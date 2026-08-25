@@ -25,6 +25,7 @@ Append to this file as things are measured. Commit often.
 | 5 | Metal VQ3R apply, batched per layer | **built, `WASTE_METAL_MOE=1`** | **1.14x on Kimi-Linear**, a wash on K3 — §5c |
 | 6 | VQ3R with a register-resident int8 table | **built, `WASTE_VQ8=1`** | 1.76x on the kernel, **1.19x on the bucket, 1.05x end to end** |
 | 7 | GPU LUT build | not started | §61 says this is where a coherent-memory GPU pays most |
+| 8 | a pool that knows which cores are fast | **built, on by default** | **1.28x on Kimi-Linear, 1.08-1.11x on K3, bit-identical** |
 
 Instruments added on this branch: `tools/mvqbw.c`, `tools/metalbw.m`, a new
 kernel in `tools/lutbw.c`, and — the one that matters most — `P_TMV`, a
@@ -604,6 +605,13 @@ hosts and two operating systems).
 | exp1, f32 trunk (the fused unpack alone, bit-identical) | 0.970-0.988 | 1.11x |
 | exp1, **i8mm trunk** | 1.064-1.133 | **1.24x** |
 | exp1, i8mm + int8 VQ table | 1.115-1.124 | **1.27x** |
+| exp1, all of it + the fast-core pool (§8) | **1.100-1.111**, spread 1% | **1.25x** |
+
+(The last row is a different sitting and its `WASTE_WIDE=0` control read
+0.855-1.002 rather than 1.115-1.124 — §33's rule, and the reason the
+within-run ratio is the number to carry: 1.11x for the pool, on top of
+1.24x for the kernel. The best stable reading taken on this branch is
+**1.178 tok/s**.)
 
 And against what `README.md` publishes for the default configuration —
 top-16, automatic budget, **0.45-0.62 tok/s** — the same build measures
@@ -620,3 +628,88 @@ The one honest summary: **the trunk matvec was 46% of a decode step and
 nobody had looked, and it is now 21%.** Everything else on this branch is
 either a switch with its numbers written down or a negative result with
 the same.
+
+
+---
+
+## 8. The pool that knows which cores are fast
+
+*(2026-08-25.)*
+
+Three kernels on this branch wanted the same thing and §47 had already
+named it: *"a pool that knows which cores are performance cores and sizes
+SIMD-heavy work to them while leaving the latency-bound kernels the whole
+machine."* Built.
+
+`waste_perf_cpu_count()` in `platform.h` answers 6 here from
+`hw.perflevel0.logicalcpu` — level 0 is the fastest level on Apple Silicon
+by definition, and a machine with one level answers "no split to make".
+Linux gets the big.LITTLE `cpu_capacity` reading; Windows gets 0 until
+someone has a machine to measure `EfficiencyClass` on.
+
+The pool then has a **fast group**: the calling thread plus workers
+0..n_fast-2, created at `QOS_CLASS_USER_INTERACTIVE`, which is the whole
+placement mechanism available on macOS — there is no affinity API, and
+`QOS_CLASS_UTILITY` for the rest keeps them off the P cluster's back.
+`waste_parallel_for_fast()` cuts the work for that group only.
+
+`WASTE_WIDE` is a bitmask over call sites, because §47's finding is per
+kernel and not per machine: 1 the VQ apply, 2 the trunk matvec, 4 the LUT
+build. **The default is 5** — see below for why 2 is not in it.
+
+### The first version measured nothing, and that is the interesting part
+
+With one condition variable the fast job still `pthread_cond_broadcast`
+to every worker; the twelve efficiency-core threads woke, found no chunk
+to take, and decremented the same `active` the barrier waits on. So the
+job did not wait for their *work* and did wait for their *wake-up*, which
+on a busy machine is the same critical path. Measured: 1.181 against 1.182
+tok/s, i.e. exactly nothing.
+
+Two start signals fixes it — the slow group sleeps on its own condvar and
+a fast job never touches it, and `active` counts participants rather than
+threads. **A barrier is only as narrow as what it is allowed not to wake.**
+
+### What it is worth
+
+Bit-identical, always: the split is by row, so the result does not depend
+on how many threads take it. `cmp`-clean against `WASTE_WIDE=0` on a real
+container.
+
+| | LUT apply | tok/s |
+|---|---|---|
+| Kimi-Linear, pool | 0.99 s | 10.01-10.08 |
+| Kimi-Linear, **fast group** | **0.51 s** | **12.80-12.82** |
+| | **1.94x** | **1.28x** |
+
+| K3, top-8, i8mm + int8 VQ table | LUT apply | tok/s | spread |
+|---|---|---|---|
+| pool (`WASTE_WIDE=0`) | 3.61-4.00 s | 0.855-1.002 | **17%** |
+| **fast group** (default) | **3.10-3.17 s** | **1.100-1.111** | **1%** |
+
+Five repeats each, interleaved, one process. **1.11x on the median — and
+the spread goes from 17% to 1%.** That second column is worth as much as
+the first: the efficiency cores were not only the straggler, they were the
+variance. Everything in this repo that has had to be reported as a range
+on this machine was partly reporting this.
+
+Per kernel, K3, measured separately:
+
+| mask | what it moves |
+|---|---|
+| 1 — VQ apply | 4.4 → 4.0 s with the fp32 table, **3.2 → 2.7 s with the int8 one** |
+| 2 — trunk matvec | nothing, on either model |
+| 4 — LUT build | ~1.03x on K3, nothing on Kimi-Linear |
+
+The ordering is exactly §47's mechanism. The int8 table kernel is the
+widest of the three and gains most (1.20x); the fp32 gather is
+latency-bound, so a slow core costs it proportionally less and it gains
+1.08x; the trunk matvec is memory-bound at every thread count and gains
+nothing, which is why bit 2 is a switch and not a default.
+
+**And it is why this is a default where §47's version was not.** §47
+measured *capping* the pool — 25% on one model, -34% on the other, because
+the kernel that wants all eighteen cores loses twelve of them. This takes
+nothing away from anything: the two kernels whose barrier was waiting on
+an efficiency core stop waiting, and every other kernel still gets the
+whole machine.

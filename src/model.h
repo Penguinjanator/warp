@@ -263,6 +263,9 @@ void        waste_model_set_sdot4(int on, int sg);
 void        waste_model_set_device_min_kb(long kb);
 void        waste_model_set_metal_moe(int on);
 void        waste_model_set_vq8(int on);
+void        waste_model_set_wide(int mask);
+int         waste_model_fast_threads(void);
+int         waste_pool_threads_public(void);
 int         waste_model_get_lookahead(void);
 const char *waste_model_read_error(const waste_model *m, int *layer, int *expert);
 /* Clears both sticky per-call flags: the record error and the context
