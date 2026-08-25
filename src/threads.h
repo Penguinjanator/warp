@@ -191,10 +191,17 @@ static inline void waste_pool_init(int nthreads, const waste_cpumask *cpus)
     for (int i = 0; i < nthreads - 1; i++) {
         pthread_attr_t attr, *ap = NULL;
 #if defined(__APPLE__)
-        if (g_pool.n_fast && pthread_attr_init(&attr) == 0) {
-            pthread_attr_set_qos_class_np(&attr,
-                i < g_pool.n_fast - 1 ? QOS_CLASS_USER_INTERACTIVE
-                                      : QOS_CLASS_UTILITY, 0);
+        /* Raise the fast group and leave everyone else exactly as they
+         * were. Marking the rest QOS_CLASS_UTILITY was tried and is a 25%
+         * regression on K3: a full-pool job — the trunk matvec, 46% of a
+         * decode step — then runs twelve of its eighteen threads at a
+         * class the scheduler answers with an efficiency core, so the
+         * kernel that wants every core loses two thirds of them. The fast
+         * group only has to be *preferred*, not the others demoted; during
+         * a fast job the rest are asleep and compete for nothing anyway. */
+        if (g_pool.n_fast && i < g_pool.n_fast - 1 &&
+            pthread_attr_init(&attr) == 0) {
+            pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
             ap = &attr;
         }
 #else
