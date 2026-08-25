@@ -102,7 +102,9 @@ int main(int argc, char **argv)
     /* devkb=N sends every matvec of N KB or more to the accelerator;
      * -1 sends none. No effect in a build without one. */
     const int is_dev = !strcmp(key, "devkb");
-    if (!is_look && !is_depth && !is_cache && !is_topk && !is_sdot4 && !is_dev) {
+    /* gpumoe=0,1 — the routed experts' VQ applies as device batches. */
+    const int is_gmoe = !strcmp(key, "gpumoe");
+    if (!is_look && !is_depth && !is_cache && !is_topk && !is_sdot4 && !is_dev && !is_gmoe) {
         fprintf(stderr, "unknown key %s\n", key);
         return 2;
     }
@@ -168,6 +170,8 @@ int main(int argc, char **argv)
                     return 2;
                 }
                 m.cfg.top_k = arm[a];
+            } else if (is_gmoe) {
+                waste_model_set_metal_moe(arm[a]);
             } else if (is_dev) {
                 waste_model_set_device_min_kb(arm[a]);
             } else if (is_sdot4) {

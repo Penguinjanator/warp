@@ -21,8 +21,8 @@ Append to this file as things are measured. Commit often.
 | 1 | fused NEON unpack for Q4G (bit-identical) | **landed** | 1.24x on the kernel, ~1.08x end to end |
 | 2 | Q4G through SDOT (int8 activations) | **built, off by default** | 1.22x end to end, and 4700x the error of 3 — not worth it |
 | 3 | Q4G through i8mm / SMLAL | **built, `WASTE_TRUNK_KERNEL=2`** | **1.18x end to end**, per-matvec rel L2 **1.4e-08** |
-| 4 | Metal trunk matvec, rewritten | **built, loses in place** | 133-159 GB/s standalone, **8 GB/s inside the engine** — unexplained, see §5 |
-| 5 | Metal VQ3R apply | benchmarked only | **123 GB/s of index against the CPU's ~29** once enough rows are in flight |
+| 4 | Metal trunk matvec, rewritten | **built, loses in place** | 133-159 GB/s standalone, 76 in the engine, **8 at 45 GB RSS** — §5b |
+| 5 | Metal VQ3R apply, batched per layer | **built, `WASTE_METAL_MOE=1`** | **1.14x on Kimi-Linear**, a wash on K3 — §5c |
 | 6 | VQ3R with a register-resident int8 table | benchmarked only | 1.76x single-thread over the current gather |
 | 7 | GPU LUT build | not started | §61 says this is where a coherent-memory GPU pays most |
 
@@ -389,3 +389,156 @@ This is §43's finding one level up. There, an int8 lookup table made the
 kernel discontinuous, so "numerically equivalent" was not good enough and
 bit-identity became the bar. Here the discontinuity is the router itself,
 and it applies to every kernel in the engine at once.
+
+
+---
+
+## 5b (answered). The GPU's throughput in this process is a function of RSS
+
+*(2026-08-25.)*
+
+The 8 GB/s was not a mystery about Metal. It is memory pressure, and one
+row settles it — K3, top-8, the trunk matvec, changing nothing but the
+expert cache:
+
+| expert cache | process RSS | trunk matvec on the GPU |
+|---|---|---|
+| 17,736 MB | ~45 GB | **7.5-8.6 GB/s** |
+| 3,400 MB | ~31 GB | **71-76 GB/s** |
+
+Standalone the same kernel measures 133-159 GB/s. So the GPU loses about
+1.8x at 31 GB of resident set and about 17x at 45 GB, on a 64 GB machine,
+**for host memory it is not even reading** — in that run the trunk stayed
+on the CPU and only 3.4 GB of cache slots were wrapped for the device.
+
+What it is *not*, each ruled out by a measurement rather than an argument:
+
+- not `newBufferWithBytesNoCopy` — a self-test inside the engine's own
+  process reaches 104 GB/s over 32 rotating no-copy host buffers, and 132
+  with an `x`/`y` memcpy around every dispatch;
+- not the footprint of the *Metal* allocations — `mtres` holds 44 GB of
+  no-copy host buffers and still averages 100 GB/s;
+- not the engine's habits — rewriting the 1.34 MB table between
+  dispatches, reading the output straight back, and idling 1 ms of CPU in
+  between measure 127, 125 and 139 GB/s against a 127 GB/s baseline
+  (`tools/metalbw.m` §10);
+- not dispatch shape — see §5c.
+
+**This is §16 and §24 arriving in a third place.** Those found that a cache
+above what the machine will leave resident cannot be bought at any price,
+and that a "hit" on such memory is a page fault. This finds that the same
+pressure taxes the GPU's access to memory that is not paged at all, and by
+more than it taxes the CPU's. The practical form: **on this machine, a
+budget that is good for the expert cache is bad for the GPU, and they
+cannot both be satisfied.**
+
+## 5c. The VQ3R apply on the device, built
+
+`WASTE_METAL_MOE=1`. Per layer, in batches of `WASTE_XPAR_BATCH` experts:
+one command buffer with a **concurrent** compute encoder holding the
+batch's gate and up applies, then the CPU's SiTU and down tables, then a
+second command buffer for the batch's down applies. `waste_metal_vq3r()`
+in `src/waste_metal.h` is the entry point — the one thing the Metal
+backend offers that is not a `waste_kernels` slot, because the slot shape
+is per row range and the unit that pays here is a batch.
+
+Correct: rel L2 3.6e-07 against the CPU path, argmax and top-10 identical.
+
+**Concurrency inside one command buffer is the whole design, and it had to
+be measured.** N separate command buffers serialize; N dispatches inside
+one concurrent encoder do not:
+
+| | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|---|
+| separate command buffers | 127 | 97 | 73 | 41 | 21 | — |
+| one concurrent encoder | 124 | 127 | 123 | 126 | 126 | 90 |
+
+(GB/s of index, 49,152 rows total split N ways.) So the engine can bind
+each routed expert's own cache slot and still get the occupancy §5a needed.
+
+**On Kimi-Linear it wins:**
+
+| | tok/s | LUT apply |
+|---|---|---|
+| CPU | 11.11 / 11.18 | 0.99 s |
+| device batches | **12.41 / 12.70** | **0.59 s** |
+
+**On K3 it does not.** Two independent reasons, both measured:
+
+| K3, top-16, cache 3400, 8 steps | expert I/O | LUT apply | accounted |
+|---|---|---|---|
+| CPU | 2.69 | 5.78 | **13.81** |
+| device, whole layer at once | 8.19 | 4.31 | 18.47 |
+| device, batches of 4 | 4.55 | 4.13 | 14.49 |
+| device, batches of 8 | 5.99 | 4.09 | 15.88 |
+
+The first is **§44, exactly as written**: holding a batch's records before
+any arithmetic starts is a barrier against the read-ahead, and on K3 it
+costs more than the apply saves. Batching bounds it — 8.19 down to 4.55 —
+and does not remove it. `WASTE_IO_DEPTH=8` changes nothing, which is what
+says the barrier is structural rather than a queue depth.
+
+The second is that **the apply itself only reaches 36 GB/s in the engine
+against 126 standalone**, at every batch size tried. That is §5b's
+mechanism again and it is the ceiling on this whole direction: until a
+Metal dispatch inside this process runs at the speed the same dispatch
+runs outside it, no amount of restructuring pays.
+
+At the recommended operating point — top-8, cache 17,736 — the two arms
+measure 0.976 and 0.900 tok/s. A wash, on the wrong side.
+
+## 7 (revised). What the branch actually delivers, and the honest ceiling
+
+Clean measurement, one process, arms interleaved, three repeats, K3, cache
+17,736 MB. Discard repeat 1 of each arm — §63 records the first repeat
+being reproducibly the slowest on three different hosts, and it is again:
+
+| | top-16 (container default) | top-8 (§56's recommendation) |
+|---|---|---|
+| f32 trunk (this branch, fused unpack) | 0.658 / 0.661 | 0.970 / 0.988 |
+| **i8mm trunk** | 0.644 / 0.715 | **1.120 / 1.133** |
+| main, same settings (§56) | — | 0.885 |
+
+**1.27x over main at the operating point it recommends, and 1.8-2.5x over
+the 0.45-0.62 tok/s the README publishes for the default.** i8mm pays at
+top-8 and is a wash at top-16, which is Amdahl and nothing else: the LUT
+apply is 7.1 s of a 12-token top-16 run and 4.2 s of a top-8 one, so the
+trunk is a much smaller share of the second.
+
+### The ceiling, from the bytes
+
+Per token at top-8 this engine touches 28.5 GB of Q4G trunk and 9.1 GB of
+expert index. At the CPU's 188 GB/s streaming ceiling that is 0.20 s, i.e.
+**5 tok/s**; at the GPU's 284 GB/s, 0.13 s, i.e. **7.6 tok/s**. Those are
+the walls. Today's 1.13 tok/s is 22% of the first.
+
+What the remaining 4.5x is made of, and what is known about each:
+
+| term | today | best measured | what stands in the way |
+|---|---|---|---|
+| trunk matvec, 28.5 GB | 0.27 s (i8mm, 108 GB/s) | 0.15 s at the CPU's ceiling | SMMLA is already at 77% of it; the rest is the gather in the scale path |
+| VQ3R apply, 9.1 GB of index | 0.36 s (25 GB/s) | 0.074 s on the GPU | §5b, and §44's barrier |
+| LUT build | 0.13 s | ~0.02 s on the GPU | §5b; §61 says this is the biggest single GPU win there is |
+| expert I/O | ~0.28 s, mostly hidden | — | becomes the wall the moment the applies get faster |
+| everything else | ~0.14 s | — | |
+
+**So the honest statement is that 2 tok/s is reachable on this machine and
+5 is not, without reading fewer bytes.** Every byte-reduction lever this
+repo has measured has failed on quality: a 3-bit trunk (§13), per-expert
+bit allocation (§20), demoting the routing tail (§23), merging experts
+(§53), clustering them (§54), FFN contextual sparsity (§59, §60) and
+2-stage experts (§50). The one that worked is `top_k`, and it is taken.
+
+### Next, in order
+
+1. **The GPU LUT build.** It is the one term above with a 6x and no known
+   obstacle other than §5b, and §61 measured it as the difference between
+   3.8 and 9.1 tok/s on a coherent-memory part.
+2. **§5b itself.** Everything Metal is capped at a third of its standalone
+   speed until this is understood. The next experiment is the cheapest one
+   not yet run: the same self-test at several cache sizes, to get the curve
+   rather than the two points above — in a memory-limited cgroup or with
+   the cache pinned small, not on a bare 45 GB laptop (§64, and the panic
+   at the top of this file).
+3. **The read barrier**, if 1 and 2 land: an async submit so the CPU can
+   hold the next batch while the device runs the current one.

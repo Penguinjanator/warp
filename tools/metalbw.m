@@ -33,7 +33,7 @@ static NSString *const kSrc = @R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 
-struct P { uint in; uint ng; uint rowbytes; uint m; uint nv; uint st; uint en; };
+struct P { uint in; uint ng; uint rowbytes; uint m; uint nv; uint st; uint en; uint st2; };
 
 /* ---- 1. how fast can this GPU read host memory at all ---------------- */
 kernel void streamsum(device const uint4 *W [[buffer(0)]],
@@ -177,6 +177,44 @@ kernel void vq3r_dec(device float           *y   [[buffer(0)]],
     y[blk * 64 + r] = acc;
 }
 
+/* ---- 8. the same apply, with the v loop split across threadgroups -----
+ * The occupancy finding in §5a needed 73,728 rows in one dispatch, which
+ * means every routed expert's record held before any arithmetic starts —
+ * the barrier docs/LEARNED.md §44 measured as a regression on K3. But rows
+ * are not the only axis. One apply loops over nv = 448 vector positions
+ * and each is independent, so splitting that loop S ways multiplies the
+ * threads in flight by S without touching how many experts are in hand.
+ * Partial sums go to a [S][M] buffer and a second pass adds them in a
+ * fixed order, so the result does not depend on S. */
+kernel void vq3r_split(device float           *part [[buffer(0)]],
+                       device const uchar     *idx  [[buffer(1)]],
+                       device const float     *lut  [[buffer(2)]],
+                       constant P             &p    [[buffer(3)]],
+                       uint2 tg  [[threadgroup_position_in_grid]],
+                       uint  tid [[thread_index_in_threadgroup]])
+{
+    const uint blk = tg.x, sp = tg.y, S = p.st2;
+    const uint v0 = (p.nv * sp) / S, v1 = (p.nv * (sp + 1)) / S;
+    float acc = 0.0f;
+    for (uint v = v0; v < v1; v++) {
+        device const float *b = lut + (ulong)v * p.st * p.en;
+        device const uchar *ix = idx + ((ulong)blk * p.nv + v) * 64 * p.st + tid * p.st;
+        acc += b[ix[0]] + b[p.en + ix[1]] + b[2 * p.en + ix[2]];
+    }
+    part[(ulong)sp * p.m + blk * 64 + tid] = acc;
+}
+
+kernel void vq3r_reduce(device float       *y    [[buffer(0)]],
+                        device const float *part [[buffer(1)]],
+                        constant P         &p    [[buffer(2)]],
+                        uint gid [[thread_position_in_grid]])
+{
+    if (gid >= p.m) return;
+    float a = 0.0f;
+    for (uint s = 0; s < p.st2; s++) a += part[(ulong)s * p.m + gid];
+    y[gid] = a;
+}
+
 /* ---- 3. the VQ3R expert apply, through the precomputed table ----------
  * lut is [v][stage][code]; idx is [rowblock][v][row][stage] with a 64-row
  * block, which is what src/model.c's vq_rows walks. One thread per row,
@@ -235,7 +273,7 @@ static id<MTLComputePipelineState> mkpipe(id<MTLDevice> d, id<MTLLibrary> lib, N
     return p;
 }
 
-typedef struct { unsigned in, ng, rowbytes, m, nv, st, en; } P;
+typedef struct { unsigned in, ng, rowbytes, m, nv, st, en, st2; } P;
 
 int main(int argc, char **argv)
 {
@@ -257,6 +295,8 @@ int main(int argc, char **argv)
     id<MTLComputePipelineState> pMvqV   = mkpipe(dev, lib, @"mvq4v");
     id<MTLComputePipelineState> pLut256 = mkpipe(dev, lib, @"vq3r_lut256");
     id<MTLComputePipelineState> pDec    = mkpipe(dev, lib, @"vq3r_dec");
+    id<MTLComputePipelineState> pSplit  = mkpipe(dev, lib, @"vq3r_split");
+    id<MTLComputePipelineState> pRed    = mkpipe(dev, lib, @"vq3r_reduce");
 
     /* ---- 1. streaming bandwidth, 2 GB ---- */
     {
@@ -264,7 +304,7 @@ int main(int argc, char **argv)
         id<MTLBuffer> W = [dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
         memset(W.contents, 1, bytes);
         id<MTLBuffer> out = [dev newBufferWithLength:64 options:MTLResourceStorageModeShared];
-        P p = {0,0,(unsigned)(bytes/16),0,0,0,0};
+        P p = {0,0,(unsigned)(bytes/16),0,0,0,0,1};
         double best = 1e18;
         for (int r = 0; r < reps; r++) {
             id<MTLCommandBuffer> cb = [q commandBuffer];
@@ -298,7 +338,7 @@ int main(int argc, char **argv)
         for (size_t i = 0; i < (size_t)M*ng; i++) sp[i] = 0x3800;
         float *xp = X.contents;
         for (unsigned i = 0; i < K; i++) xp[i] = sinf(i * 0.017f) * 0.9f;
-        P p = {K, ng, rowbytes, M, 0,0,0};
+        P p = {K, ng, rowbytes, M, 0,0,0,1};
         double best = 1e18, sum = 0;
         for (int r = 0; r < reps; r++) {
             id<MTLCommandBuffer> cb = [q commandBuffer];
@@ -354,7 +394,7 @@ int main(int argc, char **argv)
         for (size_t i = 0; i < ibytes; i++) ip[i] = (unsigned char)(i * 101 + (i >> 8));
         float *lp = L.contents;
         for (size_t i = 0; i < lbytes/4; i++) lp[i] = (float)((i % 251) - 125) * 0.01f;
-        P p = {0,0,0,M,nv,ST,EN};
+        P p = {0,0,0,M,nv,ST,EN,1};
         /* codebook for the reconstruction arm: [st][en][vd] halves */
         id<MTLBuffer> CB = [dev newBufferWithLength:(size_t)ST*EN*VD*2
                                             options:MTLResourceStorageModeShared];
@@ -393,6 +433,204 @@ int main(int argc, char **argv)
                    mean*1e3, ibytes/mean/1e9, ibytes/best/1e9);
         }
     }
+    /* ---- 7. does splitting one dispatch into N in-flight command buffers
+     * cost the occupancy that made §5a work?
+     *
+     * It decides the design of a Metal MoE. One dispatch over every routed
+     * expert's rows needs every record held first, which is exactly the
+     * barrier docs/LEARNED.md §44 measured as a regression on K3 — the
+     * hint has already queued all K reads and waiting for the last one
+     * before starting the first expert stops them overlapping. If N
+     * command buffers in flight aggregate on the GPU the way one big grid
+     * does, the barrier is unnecessary: encode each expert as its record
+     * arrives, commit without waiting, and join at the end of the layer. */
+    {
+        const unsigned M = 3072 * 16, N = 3584, VD = 8, ST = 3, EN = 256;
+        const unsigned nv = N / VD;
+        const size_t ibytes = (size_t)M * nv * ST;
+        const size_t lbytes = (size_t)nv * ST * EN * 4;
+        id<MTLBuffer> I = [dev newBufferWithLength:ibytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> L = [dev newBufferWithLength:lbytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> Y = [dev newBufferWithLength:M*4 options:MTLResourceStorageModeShared];
+        memset(I.contents, 0x5a, ibytes);
+        { float *lp = L.contents; for (size_t i = 0; i < lbytes/4; i++) lp[i] = (float)(i%251)*0.01f; }
+        printf("\n7. one grid of %u rows against N command buffers of %u/N:\n", M, M);
+        for (int parts = 1; parts <= 16; parts *= 2) {
+            const unsigned rows = M / parts;
+            P p = {0,0,0,rows,nv,ST,EN,1};
+            double best = 1e18, sum = 0;
+            for (int r = 0; r < reps; r++) {
+                const double t0 = now();
+                id<MTLCommandBuffer> last = nil;
+                for (int k = 0; k < parts; k++) {
+                    id<MTLCommandBuffer> cb = [q commandBuffer];
+                    id<MTLComputeCommandEncoder> en = [cb computeCommandEncoder];
+                    [en setComputePipelineState:pLut];
+                    [en setBuffer:Y offset:(NSUInteger)k*rows*4 atIndex:0];
+                    [en setBuffer:I offset:(NSUInteger)k*rows*nv*ST atIndex:1];
+                    [en setBuffer:L offset:0 atIndex:2];
+                    [en setBytes:&p length:sizeof p atIndex:3];
+                    [en dispatchThreadgroups:MTLSizeMake(rows/64,1,1)
+                       threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+                    [en endEncoding]; [cb commit];
+                    last = cb;
+                }
+                [last waitUntilCompleted];
+                const double dt = now() - t0;
+                if (dt < best) best = dt; if (r) sum += dt;
+            }
+            const double mean = sum/(reps-1);
+            printf("   %2d buffer(s) of %6u rows   %8.3f ms   %7.1f GB/s index\n",
+                   parts, rows, mean*1e3, ibytes/mean/1e9);
+        }
+    }
+
+    /* ---- 8. v-split ---- */
+    {
+        const unsigned M = 3072, N = 3584, VD = 8, ST = 3, EN = 256;
+        const unsigned nv = N / VD;
+        const size_t ibytes = (size_t)M * nv * ST;
+        const size_t lbytes = (size_t)nv * ST * EN * 4;
+        id<MTLBuffer> I = [dev newBufferWithLength:ibytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> L = [dev newBufferWithLength:lbytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> Y = [dev newBufferWithLength:M*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> PT = [dev newBufferWithLength:(size_t)M*4*64 options:MTLResourceStorageModeShared];
+        memset(I.contents, 0x5a, ibytes);
+        { float *lp = L.contents; for (size_t i = 0; i < lbytes/4; i++) lp[i] = (float)(i%251)*0.01f; }
+        printf("\n8. one apply [%u x %u], the v loop split S ways:\n", M, N);
+        for (int S = 1; S <= 32; S *= 2) {
+            P p = {0,0,0,M,nv,ST,EN,(unsigned)S};
+            double best = 1e18, sum = 0;
+            for (int r = 0; r < reps; r++) {
+                const double t0 = now();
+                id<MTLCommandBuffer> cb = [q commandBuffer];
+                id<MTLComputeCommandEncoder> en = [cb computeCommandEncoder];
+                [en setComputePipelineState:pSplit];
+                [en setBuffer:PT offset:0 atIndex:0]; [en setBuffer:I offset:0 atIndex:1];
+                [en setBuffer:L offset:0 atIndex:2];
+                [en setBytes:&p length:sizeof p atIndex:3];
+                [en dispatchThreadgroups:MTLSizeMake(M/64,S,1)
+                   threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+                [en setComputePipelineState:pRed];
+                [en setBuffer:Y offset:0 atIndex:0]; [en setBuffer:PT offset:0 atIndex:1];
+                [en setBytes:&p length:sizeof p atIndex:2];
+                [en dispatchThreads:MTLSizeMake(M,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                [en endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                const double dt = now() - t0;
+                if (dt < best) best = dt; if (r) sum += dt;
+            }
+            const double mean = sum/(reps-1);
+            printf("   S=%2d  %8.3f ms   %7.1f GB/s index (best %.1f)\n",
+                   S, mean*1e3, ibytes/mean/1e9, ibytes/best/1e9);
+        }
+    }
+
+    /* ---- 9. N dispatches inside ONE command buffer, concurrent encoder --
+     * §7 showed N command buffers serialize. A concurrent compute encoder
+     * is the other way to say "these do not depend on each other", and it
+     * is the one that matters here: an expert's index lives in its own
+     * cache slot, so a fused apply is N dispatches over N buffers rather
+     * than one dispatch over a contiguous grid. If these overlap, the
+     * engine can bind each routed expert's slot separately and still get
+     * the occupancy §5a needed. */
+    {
+        const unsigned M = 3072 * 16, N = 3584, VD = 8, ST = 3, EN = 256;
+        const unsigned nv = N / VD;
+        const size_t ibytes = (size_t)M * nv * ST;
+        const size_t lbytes = (size_t)nv * ST * EN * 4;
+        id<MTLBuffer> I = [dev newBufferWithLength:ibytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> L = [dev newBufferWithLength:lbytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> Y = [dev newBufferWithLength:M*4 options:MTLResourceStorageModeShared];
+        memset(I.contents, 0x5a, ibytes);
+        { float *lp = L.contents; for (size_t i = 0; i < lbytes/4; i++) lp[i] = (float)(i%251)*0.01f; }
+        printf("\n9. one command buffer, N concurrent dispatches of %u/N rows:\n", M);
+        for (int parts = 1; parts <= 32; parts *= 2) {
+            const unsigned rows = M / parts;
+            P p = {0,0,0,rows,nv,ST,EN,1};
+            double best = 1e18, sum = 0;
+            for (int r = 0; r < reps; r++) {
+                const double t0 = now();
+                id<MTLCommandBuffer> cb = [q commandBuffer];
+                id<MTLComputeCommandEncoder> en =
+                    [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+                [en setComputePipelineState:pLut];
+                [en setBuffer:L offset:0 atIndex:2];
+                [en setBytes:&p length:sizeof p atIndex:3];
+                for (int k = 0; k < parts; k++) {
+                    [en setBuffer:Y offset:(NSUInteger)k*rows*4 atIndex:0];
+                    [en setBuffer:I offset:(NSUInteger)k*rows*nv*ST atIndex:1];
+                    [en dispatchThreadgroups:MTLSizeMake(rows/64,1,1)
+                       threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+                }
+                [en endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                const double dt = now() - t0;
+                if (dt < best) best = dt; if (r) sum += dt;
+            }
+            const double mean = sum/(reps-1);
+            printf("   %2d dispatch(es) of %6u rows  %8.3f ms  %7.1f GB/s index\n",
+                   parts, rows, mean*1e3, ibytes/mean/1e9);
+        }
+    }
+
+    /* ---- 10. what the engine does differently ---------------------------
+     * §9 said sixteen concurrent dispatches reach 126 GB/s. In the engine
+     * the same kernel at the same batch sizes measures 36. Three things
+     * differ and this separates them: the CPU rewrites the table between
+     * dispatches (it is built per token, and per expert for the down
+     * projection), the CPU reads the output straight afterwards, and the
+     * GPU idles between command buffers while the CPU does the SiTU and
+     * the next table. */
+    {
+        const unsigned M = 3072 * 16, N = 3584, VD = 8, ST = 3, EN = 256;
+        const unsigned nv = N / VD;
+        const size_t ibytes = (size_t)M * nv * ST;
+        const size_t lbytes = (size_t)nv * ST * EN * 4;
+        id<MTLBuffer> I = [dev newBufferWithLength:ibytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> L = [dev newBufferWithLength:lbytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> Y = [dev newBufferWithLength:M*4 options:MTLResourceStorageModeShared];
+        float *host_lut = (float *)malloc(lbytes);
+        float *host_y = (float *)malloc(M*4);
+        memset(I.contents, 0x5a, ibytes);
+        for (size_t i = 0; i < lbytes/4; i++) host_lut[i] = (float)(i%251)*0.01f;
+        memcpy(L.contents, host_lut, lbytes);
+        const char *nm[4] = { "back to back            ",
+                              "+ rewrite the table     ",
+                              "+ read the output       ",
+                              "+ 1 ms of CPU in between" };
+        printf("\n10. sixteen concurrent dispatches, with the engine's habits:\n");
+        for (int mode = 0; mode < 4; mode++) {
+            P p = {0,0,0,3072,nv,ST,EN,1};
+            double sum = 0;
+            for (int r = 0; r < reps; r++) {
+                const double t0 = now();
+                if (mode >= 1) memcpy(L.contents, host_lut, lbytes);
+                id<MTLCommandBuffer> cb = [q commandBuffer];
+                id<MTLComputeCommandEncoder> en =
+                    [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+                [en setComputePipelineState:pLut];
+                [en setBuffer:L offset:0 atIndex:2];
+                [en setBytes:&p length:sizeof p atIndex:3];
+                for (int k = 0; k < 16; k++) {
+                    [en setBuffer:Y offset:(NSUInteger)k*3072*4 atIndex:0];
+                    [en setBuffer:I offset:(NSUInteger)k*3072*nv*ST atIndex:1];
+                    [en dispatchThreadgroups:MTLSizeMake(3072/64,1,1)
+                       threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+                }
+                [en endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                if (mode >= 2) memcpy(host_y, Y.contents, M*4);
+                if (mode >= 3) { const double t1 = now();
+                                 volatile double z = 0;
+                                 while (now() - t1 < 0.001) z += 1; (void)z; }
+                const double dt = now() - t0 - (mode >= 3 ? 0.001 : 0);
+                if (r) sum += dt;
+            }
+            const double mean = sum/(reps-1);
+            printf("   %s %8.3f ms  %7.1f GB/s index\n", nm[mode], mean*1e3,
+                   ibytes/mean/1e9);
+        }
+        free(host_lut); free(host_y);
+    }
+
     /* dispatch floor */
     {
         double best = 1e18;

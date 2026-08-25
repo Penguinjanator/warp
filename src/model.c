@@ -30,6 +30,7 @@
 #include "kda.h"
 #include "simd.h"
 #include "waste_backend.h"
+#include "waste_metal.h"
 #include "waste_format.h"
 
 #define MAXP 512
@@ -196,6 +197,7 @@ static int dump_pos0 = 0;
 static int lookahead_n = 0;            /* WASTE_LOOKAHEAD, see moe_layer  */
 static int p6_chunk = 4;               /* WASTE_P6_CHUNK, see vq_apply    */
 static int xpar_on = 0;                /* WASTE_XPAR=1 opts in; see below   */
+static int metal_moe = 0;              /* WASTE_METAL_MOE, see moe_layer    */
 static int xpar_batch = 4;             /* WASTE_XPAR_BATCH, see moe_layer  */
 static pthread_once_t model_opts_once = PTHREAD_ONCE_INIT;
 
@@ -280,6 +282,16 @@ static void model_opts_init(void)
      * the read-ahead. No batch size wins both — docs/LEARNED.md §44 has
      * the sweep. Which regime a run is in depends on the model and the
      * machine, not on anything the container states, so it is a switch. */
+    /* The routed experts' VQ applies as one device batch per layer phase.
+     * One apply is too small to fill this GPU — 3072 rows measures 12 GB/s
+     * of index against the CPU's 24.5 — and a layer's sixteen of them in
+     * one concurrent command buffer measure 126. So the switch is not
+     * "use the GPU", it is "batch the layer", and it costs the barrier
+     * docs/LEARNED.md §44 describes: every record held before any
+     * arithmetic starts. Off by default until that trade is measured on
+     * more than one machine. */
+    { const char *e2 = getenv("WASTE_METAL_MOE");
+      metal_moe = e2 && *e2 != '0'; }
     { const char *e2 = getenv("WASTE_XPAR");
       xpar_on = e2 && *e2 != '0'; }
     /* Experts held — and so barriered — at a time. Small keeps the reads
@@ -1831,7 +1843,10 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         int nmax = c->hidden > c->moe_inter ? c->hidden : c->moe_inter;
         if (lt > nmax) nmax = lt;
         const size_t nvmax = (size_t)(nmax / m->vec_dim + 1);
-        m->lut = (float *)malloc((size_t)3 * nvmax *
+        /* Page-aligned: a device backend wraps these with no copy, and
+         * newBufferWithBytesNoCopy refuses anything else. */
+        m->lut_bytes = (size_t)3 * nvmax * m->stages * m->cb_entries * sizeof(float);
+        m->lut = (float *)waste_dio_alloc((size_t)3 * nvmax *
                                  m->stages * m->cb_entries * sizeof(float));
         /* An int8 shadow of m->lut, region for region, filled by
          * vq_build_lut. Same element count as the float table and a
@@ -1853,7 +1868,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
             m->xga  = (float *)malloc((size_t)K * c->moe_inter * sizeof(float));
             m->xub  = (float *)malloc((size_t)K * c->moe_inter * sizeof(float));
             m->xacc = (float *)malloc((size_t)K * lt2 * sizeof(float));
-            m->xlut = (float *)malloc((size_t)K * reg * sizeof(float));
+            m->xlut = (float *)waste_dio_alloc((size_t)K * reg * sizeof(float));
             if (m->index_bits == 6) {
                 m->xlut8 = (int8_t *)malloc((size_t)K * reg);
                 m->xqs = (float *)malloc((size_t)K * nsc * sizeof(float));
@@ -1929,10 +1944,10 @@ void waste_model_free(waste_model *m)
         if (m->bank[L].fd >= 0) close(m->bank[L].fd);
     }
     free(m->x); free(m->h); free(m->tmp); free(m->att); free(m->logits);
-    free(m->ff); free(m->e_gate); free(m->e_up); free(m->e_down); free(m->lut);
+    free(m->ff); free(m->e_gate); free(m->e_up); free(m->e_down); waste_dio_free(m->lut);
     free(m->lut8); free(m->lut8_scale);
     free(m->xga); free(m->xub); free(m->xacc);
-    free(m->xlut); free(m->xlut8); free(m->xqs);
+    waste_dio_free(m->xlut); free(m->xlut8); free(m->xqs);
     free(m->xq); free(m->xs); waste_dio_free(m->miss_buf);
     free(m->blockres); free(m->prefix_sum); free(m->ares);
     free(m->cx); free(m->cnorm); free(m->cresid); free(m->cq); free(m->ckv);
@@ -3199,6 +3214,140 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
         q_gate = m->lut8; q_up = q_gate + lut_sz; q_down = q_up + lut_sz;
         qs_gate = m->lut8_scale; qs_up = qs_gate + nsc; qs_down = qs_up + nsc;
     }
+#if defined(WASTE_ENABLE_METAL)
+    /* ---- the routed experts, in batches, applied on the device ---------
+     *
+     * Two phases per batch. Phase 1 is the batch's gate and up in one
+     * command buffer — they share the layer's two tables, because every
+     * routed expert sees the same input. Phase 2 is the batch's down, each
+     * with its own table, because each sees its own activated
+     * intermediate.
+     *
+     * Batches rather than the whole layer, and the reason is measured:
+     * holding all K records before any arithmetic starts is the barrier
+     * docs/LEARNED.md §44 describes, and with the applies on the device it
+     * costs more than they save — expert I/O went 2.69 -> 8.19 s over
+     * eight steps while the apply went 5.78 -> 4.31. The hint above has
+     * already queued every read; a batch only has to wait for its own.
+     *
+     * Between the phases the CPU does the SiTU and builds the batch's down
+     * tables, which is where §61's "build the LUT on the device" would go
+     * next — on that vehicle it was the difference between 3.8 and 9.1
+     * tok/s.
+     */
+    if (metal_moe && m->xga && m->index_bits != 6 && K > 1 &&
+        K <= WASTE_PF_MAX && m->cache.n_slots >= 4 * K) {
+        const uint8_t *recs[WASTE_PF_MAX];
+        waste_vq_job jobs[2 * WASTE_PF_MAX];
+        const size_t rec_bytes = m->bank[L].rec_bytes;
+        int ok = 1, lut_done = 0;
+        for (int j0 = 0; j0 < K && ok; j0 += xpar_batch) {
+            int j1 = j0 + xpar_batch;
+            if (j1 > K) j1 = K;
+            PROF_START(P_EDEQ);
+            int n = j0;
+            for (; n < j1; n++) {
+                recs[n] = waste_ecache_hold(&m->cache, L, idx[n], bank_fetch, m);
+                if (!recs[n]) break;
+            }
+            PROF_END(P_EDEQ);
+            if (n < j1) { ok = 0; break; }
+
+            if (!lut_done) {
+                const waste_expert_hdr *h0 = (const waste_expert_hdr *)recs[j0];
+                vq_build_lut(m, lut_gate, h0->codebook_id + 0 * m->stages,
+                             xin, lat, m->stages, m->cb_entries, m->vec_dim,
+                             NULL, NULL);
+                vq_build_lut(m, lut_up, h0->codebook_id + 1 * m->stages,
+                             xin, lat, m->stages, m->cb_entries, m->vec_dim,
+                             NULL, NULL);
+                lut_done = 1;
+            }
+
+            PROF_START(P_LUTA);
+            int nj = 0;
+            for (int j = j0; j < j1; j++) {
+                const waste_expert_hdr *h = (const waste_expert_hdr *)recs[j];
+                waste_vq_job *g1 = &jobs[nj++], *u1 = &jobs[nj++];
+                g1->y = m->xga + (size_t)j * inter;
+                g1->rec = recs[j]; g1->rec_bytes = rec_bytes;
+                g1->idx_off = (uint32_t)h->gate_off;
+                g1->sc_off = (uint32_t)h->chan_corr_off;
+                g1->lut = m->lut; g1->lut_bytes = m->lut_bytes;
+                g1->lut_off = 0;
+                g1->m = inter; g1->nv = lat / m->vec_dim;
+                g1->stages = m->stages; g1->entries = m->cb_entries;
+                *u1 = *g1;
+                u1->y = m->xub + (size_t)j * inter;
+                u1->idx_off = (uint32_t)h->up_off;
+                u1->sc_off = (uint32_t)(h->chan_corr_off + (size_t)inter * 2);
+                u1->lut_off = (uint32_t)lut_sz;
+            }
+            ok = waste_metal_vq3r(jobs, nj) == 0;
+            PROF_END(P_LUTA);
+            if (!ok) break;
+
+            PROF_START(P_EMM);
+            for (int j = j0; j < j1; j++) {
+                float *g2 = m->xga + (size_t)j * inter;
+                const float *u2 = m->xub + (size_t)j * inter;
+                if (c->act_situ)
+                    for (int i = 0; i < inter; i++)
+                        g2[i] = waste_situ_pair(g2[i], u2[i], c->situ_beta,
+                                                c->situ_linear_beta);
+                else
+                    for (int i = 0; i < inter; i++) g2[i] = silu(g2[i]) * u2[i];
+            }
+            PROF_END(P_EMM);
+
+            PROF_START(P_LUTB);
+            for (int j = j0; j < j1; j++) {
+                const waste_expert_hdr *h = (const waste_expert_hdr *)recs[j];
+                lutb_arg a = { m->xlut + (size_t)j * m->xlut_sz, m->codebooksT,
+                               m->xga + (size_t)j * inter,
+                               h->codebook_id + 2 * m->stages, m->stages,
+                               m->cb_entries, m->vec_dim };
+                waste_parallel_for(inter / m->vec_dim, 16, waste_k.lutb_range, &a);
+            }
+            PROF_END(P_LUTB);
+
+            {
+            PROF_START(P_LUTA);
+            nj = 0;
+            for (int j = j0; j < j1; j++) {
+                const waste_expert_hdr *h = (const waste_expert_hdr *)recs[j];
+                waste_vq_job *d = &jobs[nj++];
+                d->y = m->xacc + (size_t)j * lat;
+                d->rec = recs[j]; d->rec_bytes = rec_bytes;
+                d->idx_off = (uint32_t)h->down_off;
+                d->sc_off = (uint32_t)(h->chan_corr_off + (size_t)2 * inter * 2);
+                d->lut = m->xlut;
+                d->lut_bytes = (size_t)K * m->xlut_sz * sizeof(float);
+                d->lut_off = (uint32_t)((size_t)j * m->xlut_sz);
+                d->m = lat; d->nv = inter / m->vec_dim;
+                d->stages = m->stages; d->entries = m->cb_entries;
+            }
+            ok = waste_metal_vq3r(jobs, nj) == 0;
+            PROF_END(P_LUTA);
+            }
+            waste_ecache_release(&m->cache);
+        }
+        if (ok) {
+            PROF_START(P_EMM);
+            for (int j = 0; j < K; j++) {
+                const float *accj = m->xacc + (size_t)j * lat;
+                const float wj = w[j];
+                for (int i = 0; i < lat; i++) ysum[i] += wj * accj[i];
+            }
+            PROF_END(P_EMM);
+            goto moe_done;
+        }
+        /* Anything that did not run on the device falls through to the
+         * serial loop, which re-reads and reports the reason. */
+        waste_ecache_release(&m->cache);
+    }
+#endif
+
     /* Expert-parallel path. Needs the per-expert scratch, and needs the
      * cache to be able to hold all K records at once — the held set is
      * unevictable, so a cache that is not comfortably larger than K would
@@ -3456,6 +3605,9 @@ void waste_model_set_sdot4(int mode, int sg)
 /* For tests/sweep.c: the size above which a matvec goes to the device.
  * 0 sends everything, a very large value sends nothing — which is how one
  * process measures both arms of "is the GPU worth it here". */
+/* For tests/sweep.c: the routed experts' applies on the device, or not. */
+void waste_model_set_metal_moe(int on) { metal_moe = on; }
+
 void waste_model_set_device_min_kb(long kb)
 {
     waste_k.device_min_bytes = kb < 0 ? (size_t)-1 : (size_t)kb << 10;
