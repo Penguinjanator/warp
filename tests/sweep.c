@@ -104,7 +104,11 @@ int main(int argc, char **argv)
     const int is_dev = !strcmp(key, "devkb");
     /* gpumoe=0,1 — the routed experts' VQ applies as device batches. */
     const int is_gmoe = !strcmp(key, "gpumoe");
-    if (!is_look && !is_depth && !is_cache && !is_topk && !is_sdot4 && !is_dev && !is_gmoe) {
+    /* vq8=0,1 — the VQ3R apply through the int8 register table.
+     * Needs WASTE_VQ8 set in the environment so the load allocates
+     * the shadow table; the arm only chooses which kernel runs. */
+    const int is_vq8 = !strcmp(key, "vq8");
+    if (!is_look && !is_depth && !is_cache && !is_topk && !is_sdot4 && !is_dev && !is_gmoe && !is_vq8) {
         fprintf(stderr, "unknown key %s\n", key);
         return 2;
     }
@@ -170,6 +174,8 @@ int main(int argc, char **argv)
                     return 2;
                 }
                 m.cfg.top_k = arm[a];
+            } else if (is_vq8) {
+                waste_model_set_vq8(arm[a]);
             } else if (is_gmoe) {
                 waste_model_set_metal_moe(arm[a]);
             } else if (is_dev) {

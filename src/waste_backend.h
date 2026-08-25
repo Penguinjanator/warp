@@ -83,6 +83,9 @@ typedef struct {
     void (*mvq_rows_f32)(int b, int e, void *arg);
     void (*lutb_range)(int lo, int hi, void *arg);
     void (*vq_rows_p6)(int b, int e, void *arg);
+    /* VQ3R through an int8 table held in registers. NULL where no
+     * backend implements it, which is every non-ARM target today. */
+    void (*vq_rows_e)(int b, int e, void *arg);
 
     /* Set by a backend that wants the whole row range in one call — a GPU
      * dispatch must not be split across pool threads. Call sites use

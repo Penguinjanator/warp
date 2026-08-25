@@ -198,6 +198,7 @@ static int lookahead_n = 0;            /* WASTE_LOOKAHEAD, see moe_layer  */
 static int p6_chunk = 4;               /* WASTE_P6_CHUNK, see vq_apply    */
 static int xpar_on = 0;                /* WASTE_XPAR=1 opts in; see below   */
 static int metal_moe = 0;              /* WASTE_METAL_MOE, see moe_layer    */
+static int vq8_on = 0;                 /* WASTE_VQ8: int8 VQ3R table        */
 static int xpar_batch = 4;             /* WASTE_XPAR_BATCH, see moe_layer  */
 static pthread_once_t model_opts_once = PTHREAD_ONCE_INIT;
 
@@ -290,6 +291,12 @@ static void model_opts_init(void)
      * docs/LEARNED.md §44 describes: every record held before any
      * arithmetic starts. Off by default until that trade is measured on
      * more than one machine. */
+    /* The VQ3R apply through an int8 table held in registers rather than
+     * a float one walked in memory. 1.76x on the kernel single-threaded
+     * (tools/lutbw.c kernel E). Off by default: it quantizes the table,
+     * which makes the path discontinuous in §43's sense. */
+    { const char *e2 = getenv("WASTE_VQ8");
+      vq8_on = e2 && *e2 != '0'; }
     { const char *e2 = getenv("WASTE_METAL_MOE");
       metal_moe = e2 && *e2 != '0'; }
     { const char *e2 = getenv("WASTE_XPAR");
@@ -1853,7 +1860,10 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
          * quarter of the bytes. */
         const size_t reg = nvmax * (size_t)m->stages * m->cb_entries;
         const size_t nsc = nvmax / WASTE_VQ_LUT_BLK + 2;
-        if (m->index_bits == 6) {
+        /* The int8 shadow of the table. VQ4P needs it; VQ3R uses it only
+         * under WASTE_VQ8, and the allocation is 1 MB on K3, so it is
+         * simpler to have it than to make every consumer test twice. */
+        if (m->index_bits == 6 || vq8_on) {
             m->lut8 = (int8_t *)malloc(3 * reg);
             m->lut8_scale = (float *)malloc(3 * nsc * sizeof(float));
         }
@@ -1869,12 +1879,12 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
             m->xub  = (float *)malloc((size_t)K * c->moe_inter * sizeof(float));
             m->xacc = (float *)malloc((size_t)K * lt2 * sizeof(float));
             m->xlut = (float *)waste_dio_alloc((size_t)K * reg * sizeof(float));
-            if (m->index_bits == 6) {
+            if (m->index_bits == 6 || vq8_on) {
                 m->xlut8 = (int8_t *)malloc((size_t)K * reg);
                 m->xqs = (float *)malloc((size_t)K * nsc * sizeof(float));
             }
             if (!m->xga || !m->xub || !m->xacc || !m->xlut ||
-                (m->index_bits == 6 && (!m->xlut8 || !m->xqs))) {
+                ((m->index_bits == 6 || vq8_on) && (!m->xlut8 || !m->xqs))) {
                 free(m->xga); free(m->xub); free(m->xacc);
                 free(m->xlut); free(m->xlut8); free(m->xqs);
                 m->xga = m->xub = m->xacc = m->xlut = m->xqs = NULL;
@@ -2577,6 +2587,9 @@ static void vq_apply_serial(waste_model *m, float *y, const uint8_t *idx,
     if (m->index_bits == 6) {
         vqp_arg a = { y, idx, scale, q, qs, nv };
         waste_k.vq_rows_p6(0, M, &a);
+    } else if (vq8_on && q && waste_k.vq_rows_e) {
+        vqp_arg a = { y, idx, scale, q, qs, nv };
+        waste_k.vq_rows_e(0, M, &a);
     } else {
         vq_arg a = { y, idx, scale, lut, nv, m->stages, m->cb_entries };
         vq_rows(0, M, &a);
@@ -2604,6 +2617,9 @@ static void vq_apply(waste_model *m, float *y, const uint8_t *idx,
     if (m->index_bits == 6) {
         vqp_arg a = { y, idx, scale, q, qs, nv };
         waste_parallel_for(M, VQ_TILE * p6_chunk, waste_k.vq_rows_p6, &a);
+    } else if (vq8_on && q && waste_k.vq_rows_e) {
+        vqp_arg a = { y, idx, scale, q, qs, nv };
+        waste_parallel_for(M, VQ_TILE * VQ_SUPER, waste_k.vq_rows_e, &a);
     } else {
         vq_arg a = { y, idx, scale, lut, nv, m->stages, m->cb_entries };
         /* min_chunk = VQ_TILE keeps every thread's range block-aligned,
@@ -3607,6 +3623,11 @@ void waste_model_set_sdot4(int mode, int sg)
  * process measures both arms of "is the GPU worth it here". */
 /* For tests/sweep.c: the routed experts' applies on the device, or not. */
 void waste_model_set_metal_moe(int on) { metal_moe = on; }
+
+/* For tests/sweep.c. Only effective when the int8 shadow was
+ * allocated at load, i.e. when WASTE_VQ8 was set in the environment
+ * — the table is a load-time allocation and an arm cannot conjure it. */
+void waste_model_set_vq8(int on) { vq8_on = on; }
 
 void waste_model_set_device_min_kb(long kb)
 {

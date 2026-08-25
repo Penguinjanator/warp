@@ -23,7 +23,7 @@ Append to this file as things are measured. Commit often.
 | 3 | Q4G through i8mm / SMLAL | **built, `WASTE_TRUNK_KERNEL=2`** | **1.18x end to end**, per-matvec rel L2 **1.4e-08** |
 | 4 | Metal trunk matvec, rewritten | **built, loses in place** | 133-159 GB/s standalone, 76 in the engine, **8 at 45 GB RSS** — §5b |
 | 5 | Metal VQ3R apply, batched per layer | **built, `WASTE_METAL_MOE=1`** | **1.14x on Kimi-Linear**, a wash on K3 — §5c |
-| 6 | VQ3R with a register-resident int8 table | benchmarked only | 1.76x single-thread over the current gather |
+| 6 | VQ3R with a register-resident int8 table | **built, `WASTE_VQ8=1`** | 1.76x on the kernel, **1.19x on the bucket, 1.05x end to end** |
 | 7 | GPU LUT build | not started | §61 says this is where a coherent-memory GPU pays most |
 
 Instruments added on this branch: `tools/mvqbw.c`, `tools/metalbw.m`, a new
@@ -542,3 +542,81 @@ bit allocation (§20), demoting the routing tail (§23), merging experts
    at the top of this file).
 3. **The read barrier**, if 1 and 2 land: an async submit so the CPU can
    hold the next batch while the device runs the current one.
+
+
+---
+
+## 6b. The register-table VQ3R apply, built — and the scaling wall again
+
+`WASTE_VQ8=1`. The kernel is `vq_rows_e_neon` in `src/kda_neon.c`; the
+int8 shadow of the table is the one VQ4P already builds, with the same one
+scale per 32 vector positions, so nothing new was needed on the write side.
+
+| | kernel, 1 thread | the `LUT apply` bucket | end to end |
+|---|---|---|---|
+| Kimi-Linear | — | 0.98 → 0.88 s (1.11x) | 10.65 → 11.20 (1.05x) |
+| K3, top-8 | 6.6 → 11.6 GB/s (**1.76x**) | 4.42 → 3.71 s (**1.19x**) | 1.067 → 1.120 (**1.05x**) |
+
+**1.76x on the kernel and 1.19x on the bucket it is 100% of.** That gap is
+§46's "scaling failure nobody has explained" and §47's answer to it,
+reproduced by a third kernel: a wide, fast, SIMD-heavy loop does not
+scale on this machine the way the latency-bound one it replaces does,
+because `waste_parallel_for` cuts work into one chunk per thread and the
+twelve efficiency cores are stragglers the barrier waits for.
+
+Measured here directly, K3 top-8, the `LUT apply` bucket:
+
+| threads | fp32 table | int8 register table | ratio |
+|---|---|---|---|
+| 6 | 3.06-3.30 s | **2.38-2.39 s** | **1.32x** |
+| 18 | 3.00-4.41 | 2.53-3.72 | 1.19x |
+
+The wide kernel gains more of its isolated speedup at the performance-core
+count, exactly as §47 predicted — and six threads is 24% worse *overall*,
+because the trunk matvec loses more than the apply gains (60 → 32 GB/s).
+**Neither thread count is right for both kernels, and that is now three
+kernels deep**: VQ4P (§47), this, and the i8mm trunk matvec.
+
+So §47's parked recommendation is the standing one, with a third instance
+behind it: **a pool that knows which cores are performance cores, and
+sizes SIMD-heavy work to them while leaving the latency-bound kernels the
+whole machine.** On macOS that is QoS classes rather than affinity —
+`QOS_CLASS_USER_INTERACTIVE` prefers P-cores, `QOS_CLASS_BACKGROUND` is
+confined to E-cores — so it is buildable here, and it is the cheapest
+remaining item on this list that does not depend on §5b.
+
+**Quality**: route set agreement 89-97%, teacher-forced. That is worse
+than the i8mm trunk's 98.2% for a fifth of the gain, so it is off by
+default and stays a switch.
+
+---
+
+## 9. Where the branch ends, for now
+
+K3, `tests/sweep.c`, one process, arms interleaved, three repeats, cache
+17,736 MB, top-8 — §56's recommended operating point. Repeat 1 of each arm
+discarded (§63: the first repeat is reproducibly the slowest, on three
+hosts and two operating systems).
+
+| | tok/s | vs main |
+|---|---|---|
+| main at the same settings (§56) | 0.885 | 1.00x |
+| exp1, f32 trunk (the fused unpack alone, bit-identical) | 0.970-0.988 | 1.11x |
+| exp1, **i8mm trunk** | 1.064-1.133 | **1.24x** |
+| exp1, i8mm + int8 VQ table | 1.115-1.124 | **1.27x** |
+
+And against what `README.md` publishes for the default configuration —
+top-16, automatic budget, **0.45-0.62 tok/s** — the same build measures
+**1.12 tok/s, i.e. 1.8 to 2.5x**, of which §56's `top_k` truncation is the
+larger half and this branch is the rest.
+
+**What is not here is a factor of five.** §7 has the arithmetic: 37.6 GB
+per token at top-8, a 188 GB/s CPU ceiling and a 284 GB/s GPU one, so 5
+and 7.6 tok/s are the walls and 1.12 is 22% of the first. Closing that gap
+needs the three things §7 lists, and two of them are blocked on §5b, which
+is a property of this machine's memory rather than of any kernel.
+
+The one honest summary: **the trunk matvec was 46% of a decode step and
+nobody had looked, and it is now 21%.** Everything else on this branch is
+either a switch with its numbers written down or a negative result with
+the same.
