@@ -46,10 +46,10 @@ import io
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from .regions import Delta
+from .regions import Delta, ToolCall
 from .xtml import Segment
 
 # The markup that has to exist in the tokenizer. Anything of this shape in
@@ -61,6 +61,14 @@ _MARKER_RE = re.compile(r"<\|[^|>]*\|>")
 _ROLE_ALIASES = {"developer": "system"}
 
 _ROLES = ("system", "user", "assistant")
+
+_KIMI_TOOL_MARKERS = (
+    "<|tool_calls_section_begin|>",
+    "<|tool_calls_section_end|>",
+    "<|tool_call_begin|>",
+    "<|tool_call_argument_begin|>",
+    "<|tool_call_end|>",
+)
 
 
 class ChatFormatError(ValueError):
@@ -94,11 +102,14 @@ class ChatFormat:
     opening: str
     stop_marker: str
     stop_id: int
+    tool_markers: dict[int, str] = field(default_factory=dict)
 
     @property
     def markers(self) -> dict[int, str]:
-        """The parser's marker table: what ends the assistant's turn."""
-        return {self.stop_id: self.stop_marker}
+        """Control-token ids understood by the reply parser."""
+        out = {self.stop_id: self.stop_marker}
+        out.update(self.tool_markers)
+        return out
 
     # ---- loading --------------------------------------------------------
 
@@ -173,8 +184,31 @@ class ChatFormat:
                     f"chat format disagree")
             ids[text] = got[0]
 
-        return cls(roles=roles, opening=opening, stop_marker=stop_marker,
-                   stop_id=ids[stop_marker])
+        # Kimi K2 carries a richer native tool-call protocol in reserved
+        # tokenizer tokens even though chat.json itself only describes the
+        # ordinary conversation turns. Discover those markers defensively:
+        # they count as structure only when every required marker is a real
+        # single special token in this container.
+        discovered: dict[int, str] = {}
+        candidates: list[tuple[int, str]] = []
+
+        for text in _KIMI_TOOL_MARKERS:
+            got = engine.tokenize(text, markup=True)
+            if len(got) != 1:
+                candidates = []
+                break
+            candidates.append((got[0], text))
+
+        if len(candidates) == len(_KIMI_TOOL_MARKERS):
+            discovered = dict(candidates)
+
+        return cls(
+            roles=roles,
+            opening=opening,
+            stop_marker=stop_marker,
+            stop_id=ids[stop_marker],
+            tool_markers=discovered,
+        )
 
     # ---- rendering ------------------------------------------------------
 
@@ -199,6 +233,14 @@ class ChatFormat:
         segments: list[Segment] = []
 
         if tools:
+            if not self.tool_markers:
+                raise ChatFormatError(
+                    "this container is served from its chat.json, which "
+                    "cannot express tool definitions because its tokenizer "
+                    "does not carry the Kimi K2 native tool markers",
+                    param="tools",
+                )
+
             # Kimi K2 native tool declaration format.  Keep structural
             # markers separate from the JSON payload so caller-controlled
             # strings cannot be interpreted as model markup.
@@ -338,48 +380,141 @@ def _content_segments(content: Any, index: int) -> list[Segment]:
 
 
 class PlainParser:
-    """Reading back a reply that has no structure but its ending.
+    """Read a chat.json reply, including Kimi K2 native tool calls.
 
-    RegionParser's counterpart for a chat.json container, with the surface
-    server.py uses: feed_token, finished, finish, content, reasoning,
-    tool_calls, openai_message. There is no element stack and there are no
-    channels, because the format has none — everything the model emits is
-    the answer until the turn's stop token arrives.
-
-    Token-driven only. RegionParser also has a text path, for hosts without
-    token ids and for the XTML goldens; there is nothing here that needs
-    one, and a scanning path would reintroduce exactly the ambiguity the
-    id-driven one exists to avoid — a model quoting `<|im_end|>` in an
-    answer would end its own turn.
+    Structure is recognized only from tokenizer marker ids. Marker-looking
+    text carried by an ordinary token remains ordinary model content.
     """
 
     def __init__(self, *, markers: Optional[dict[int, str]] = None):
         self._markers = dict(markers or {})
-        self.reasoning = ""          # never set: no channel to fill it
+        self.reasoning = ""
         self.content = ""
-        self.tool_calls: list[Any] = []
+        self.tool_calls: list[ToolCall] = []
         self._done = False
+
+        # Kimi K2 tool-call parsing state.
+        self._tool_state = "content"
+        self._tool_header = ""
+        self._tool_arguments = ""
+        self._current_tool: Optional[ToolCall] = None
 
     @property
     def finished(self) -> bool:
         return self._done
 
+    def _marker(self, token_id: int) -> Optional[str]:
+        return self._markers.get(token_id)
+
+    def _begin_tool_call(self) -> None:
+        self._tool_header = ""
+        self._tool_arguments = ""
+        self._current_tool = None
+        self._tool_state = "header"
+
+    def _parse_tool_header(self) -> ToolCall:
+        """Parse Kimi's `functions.<name>:<index>` call header."""
+        raw = self._tool_header.strip()
+
+        if raw.startswith("functions."):
+            raw = raw[len("functions."):]
+
+        name = raw
+        index = len(self.tool_calls)
+
+        if ":" in raw:
+            maybe_name, maybe_index = raw.rsplit(":", 1)
+            if maybe_name:
+                name = maybe_name
+            try:
+                index = int(maybe_index)
+            except ValueError:
+                pass
+
+        return ToolCall(name=name, index=index)
+
     def feed_token(self, token_id: int, piece: str) -> Delta:
         delta = Delta()
+
         if self._done:
             return delta
-        if token_id in self._markers:
+
+        marker = self._marker(token_id)
+
+        if marker == "<|im_end|>":
             self._done = True
             return delta
-        if piece:
-            self.content += piece
-            delta.content = piece
+
+        if marker == "<|tool_calls_section_begin|>":
+            self._tool_state = "section"
+            return delta
+
+        if marker == "<|tool_call_begin|>":
+            self._begin_tool_call()
+            return delta
+
+        if marker == "<|tool_call_argument_begin|>":
+            if self._tool_state == "header":
+                self._current_tool = self._parse_tool_header()
+                self.tool_calls.append(self._current_tool)
+                self._tool_state = "arguments"
+            return delta
+
+        if marker == "<|tool_call_end|>":
+            if self._current_tool is not None:
+                self._current_tool.json_block = self._tool_arguments
+            self._current_tool = None
+            self._tool_state = "section"
+            return delta
+
+        if marker == "<|tool_calls_section_end|>":
+            self._current_tool = None
+            self._tool_state = "content"
+            return delta
+
+        # Unknown structural markers retain the old plain-parser behavior:
+        # a real control-token id ends the generated turn.
+        if marker is not None:
+            self._done = True
+            return delta
+
+        if not piece:
+            return delta
+
+        if self._tool_state == "header":
+            self._tool_header += piece
+            return delta
+
+        if self._tool_state == "arguments":
+            self._tool_arguments += piece
+            if self._current_tool is not None:
+                self._current_tool.json_block = self._tool_arguments
+                delta.tool_calls.append(self._current_tool.index)
+            return delta
+
+        if self._tool_state == "section":
+            # Ignore stray ordinary text between Kimi tool-call structures.
+            return delta
+
+        self.content += piece
+        delta.content = piece
         return delta
 
     def finish(self) -> Delta:
-        """Nothing is ever held back, so there is nothing to flush."""
+        """Flush any in-progress Kimi tool argument block."""
+        if self._current_tool is not None:
+            self._current_tool.json_block = self._tool_arguments
         return Delta()
 
     def openai_message(self) -> dict:
-        return {"role": "assistant",
-                "content": self.content if self.content else None}
+        message = {
+            "role": "assistant",
+            "content": self.content if self.content else None,
+        }
+
+        if self.tool_calls:
+            message["tool_calls"] = [
+                call.to_openai() for call in self.tool_calls
+            ]
+
+        return message

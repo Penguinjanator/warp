@@ -39,6 +39,15 @@ from tests.serve.fake_engine import FakeEngine, LINEAR_MARKERS   # noqa: E402
 SHIPPED = REPO / "examples" / "chat-kimi-linear.json"
 CHATML = REPO / "examples" / "chat.json"
 
+KIMI_K2_MARKERS = {
+    **LINEAR_MARKERS,
+    21: "<|tool_calls_section_begin|>",
+    22: "<|tool_calls_section_end|>",
+    23: "<|tool_call_begin|>",
+    24: "<|tool_call_argument_begin|>",
+    25: "<|tool_call_end|>",
+}
+
 
 class Base(unittest.TestCase):
     """A container directory holding whatever chat.json the test wants."""
@@ -78,8 +87,32 @@ class TestLoad(Base):
         fmt = self.load(SHIPPED)
         self.assertEqual(fmt.stop_marker, "<|im_end|>")
         self.assertEqual(fmt.stop_id, 15)
-        self.assertEqual(fmt.markers, {15: "<|im_end|>"})
+        self.assertEqual(fmt.markers[15], "<|im_end|>")
         self.assertEqual(sorted(fmt.roles), ["assistant", "system", "user"])
+
+    def test_kimi_tool_markers_are_discovered_when_available(self):
+        fmt = self.load(SHIPPED, markers=KIMI_K2_MARKERS)
+
+        self.assertEqual(
+            fmt.markers[21],
+            "<|tool_calls_section_begin|>",
+        )
+        self.assertEqual(
+            fmt.markers[22],
+            "<|tool_calls_section_end|>",
+        )
+        self.assertEqual(
+            fmt.markers[23],
+            "<|tool_call_begin|>",
+        )
+        self.assertEqual(
+            fmt.markers[24],
+            "<|tool_call_argument_begin|>",
+        )
+        self.assertEqual(
+            fmt.markers[25],
+            "<|tool_call_end|>",
+        )
 
     def test_markup_the_tokenizer_lacks_is_refused_at_load(self):
         """examples/chat.json is ChatML, and <|im_start|> is not in this
@@ -167,12 +200,15 @@ class TestRender(Base):
         self.assertIn(contains, str(cm.exception))
 
     def test_tools(self):
-        segs = self.render(
+        fmt = self.load(SHIPPED, markers=KIMI_K2_MARKERS)
+
+        segs = fmt.build_chat_segments(
             [{"role": "user", "content": "hi"}],
             tools=[{
                 "type": "function",
                 "function": {"name": "f", "parameters": {}},
             }],
+            thinking=False,
         )
 
         self.assertEqual(
@@ -307,7 +343,10 @@ class TestKimiK2ToolProtocol(Base):
 
     def setUp(self):
         super().setUp()
-        self.fmt = self.load(SHIPPED)
+        self.fmt = self.load(
+            SHIPPED,
+            markers=KIMI_K2_MARKERS,
+        )
 
     def test_kimi_k2_tool_declaration(self):
         tools = [{
@@ -377,3 +416,114 @@ class TestKimiK2ToolProtocol(Base):
         )
         self.assertIn("<|tool_call_end|>", rendered)
         self.assertIn("## Return of call_1", rendered)
+
+# ---------------------------------------------------------------------------
+# Kimi K2 native generated tool-call parsing
+# ---------------------------------------------------------------------------
+
+class TestKimiK2ToolParser(unittest.TestCase):
+
+    MARKERS = {
+        1001: "<|im_end|>",
+        1002: "<|tool_calls_section_begin|>",
+        1003: "<|tool_calls_section_end|>",
+        1004: "<|tool_call_begin|>",
+        1005: "<|tool_call_argument_begin|>",
+        1006: "<|tool_call_end|>",
+    }
+
+    def parser(self):
+        return PlainParser(markers=self.MARKERS)
+
+    def feed(self, parser, items):
+        for token_id, piece in items:
+            parser.feed_token(token_id, piece)
+
+    def test_kimi_tool_call_is_parsed(self):
+        p = self.parser()
+
+        self.feed(p, [
+            (2000, "I'll check the weather."),
+            (1002, "<|tool_calls_section_begin|>"),
+            (1004, "<|tool_call_begin|>"),
+            (2001, "functions.get_weather:0"),
+            (1005, "<|tool_call_argument_begin|>"),
+            (2002, '{"city": "Paris"}'),
+            (1006, "<|tool_call_end|>"),
+            (1003, "<|tool_calls_section_end|>"),
+            (1001, "<|im_end|>"),
+        ])
+
+        self.assertEqual(
+            p.content,
+            "I'll check the weather.",
+        )
+
+        self.assertEqual(len(p.tool_calls), 1)
+
+        call = p.tool_calls[0]
+
+        self.assertEqual(call.name, "get_weather")
+        self.assertEqual(call.index, 0)
+        self.assertEqual(call.json_block, '{"city": "Paris"}')
+
+        msg = p.openai_message()
+
+        self.assertEqual(msg["role"], "assistant")
+        self.assertEqual(
+            msg["content"],
+            "I'll check the weather.",
+        )
+        self.assertEqual(len(msg["tool_calls"]), 1)
+        self.assertEqual(
+            msg["tool_calls"][0]["function"]["name"],
+            "get_weather",
+        )
+        self.assertEqual(
+            msg["tool_calls"][0]["function"]["arguments"],
+            '{"city": "Paris"}',
+        )
+
+    def test_literal_marker_text_remains_content(self):
+        p = self.parser()
+
+        self.feed(p, [
+            (
+                2000,
+                "literal <|tool_call_begin|> text"
+            ),
+            (1001, "<|im_end|>"),
+        ])
+
+        self.assertEqual(
+            p.content,
+            "literal <|tool_call_begin|> text",
+        )
+        self.assertEqual(p.tool_calls, [])
+
+    def test_kimi_tool_call_delta_reports_change(self):
+        p = self.parser()
+
+        p.feed_token(
+            1002,
+            "<|tool_calls_section_begin|>",
+        )
+        p.feed_token(
+            1004,
+            "<|tool_call_begin|>",
+        )
+        p.feed_token(
+            2000,
+            "functions.get_weather:0",
+        )
+        p.feed_token(
+            1005,
+            "<|tool_call_argument_begin|>",
+        )
+
+        delta = p.feed_token(
+            2001,
+            '{"city":"Paris"}',
+        )
+
+        self.assertIn(0, delta.tool_calls)

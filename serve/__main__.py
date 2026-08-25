@@ -240,11 +240,19 @@ examples:
         print(f"thinking {'off by default' if args.no_thinking else 'on'}"
               f" — reasoning_effort per request")
     else:
-        # Serving from chat.json rather than XTML. Say what is missing, in
-        # the same breath as saying it works — a client that sends `tools`
-        # and gets a 400 should not be the first time this is mentioned.
-        print(f"chat     from {model}/chat.json — plain conversation only, "
-              f"no tools,\n         no reasoning channel, no images")
+        # Serving from chat.json rather than XTML. Report capabilities from
+        # the format actually discovered in this container's tokenizer.
+        # Kimi K2 may carry its native tool protocol even though chat.json
+        # itself only describes the ordinary conversation turns.
+        tool_status = (
+            "native tools"
+            if srv.chat_format.tool_markers
+            else "no tools"
+        )
+        print(
+            f"chat     from {model}/chat.json — conversation + {tool_status}, "
+            f"\n         no reasoning channel, no images"
+        )
 
     shown = args.host if ":" not in args.host else f"[{args.host}]"
     print(f"\nlistening on http://{shown}:{args.port}  "
