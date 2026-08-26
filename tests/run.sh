@@ -25,6 +25,51 @@ SRC="${WASTE_REF_SRC:-/Volumes/WasteDisk/kimi-linear}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# python3, probed by RUNNING it rather than by looking it up. Same door as
+# the missing cmp guarded below, wearing the opposite disguise: present,
+# not absent.
+#
+# On Windows the name is usually the Microsoft Store's App Execution Alias:
+# a zero-byte reparse point on PATH that `command -v` finds happily, that
+# exits 49, and that prints an advert for the Store instead of running
+# anything. Every `command -v python3` guard in this file was written for an
+# *absent* interpreter, so it saw the tool present and let all 39 call sites
+# run against something that is not one. Measured on a stock Windows 10 box,
+# MinGW-w64 GCC 15.2, Python 3.13 installed and working under its own name:
+# 7 passed, 7 failed, 16 skipped. The failures read "range server did not
+# start", "convert.py resume", "serve suite", i.e. the engine called broken
+# when what is wrong is a shim on PATH, which is the one thing line 10 says
+# this suite must never do. The 16 skips were the same cause one step
+# earlier: make_test_container.py is python3 too, so the synthetic container
+# never built and every check needing one skipped for want of a container.
+#
+# Real Python installs the versionless `python` on Windows, and `py` besides,
+# so a working interpreter is normally sitting right there under another
+# name. Prefer a python3 that answers; otherwise shim the first name that
+# does into PATH, which reaches the call sites here and the subprocesses
+# (check_budget.sh, the serve suite) without editing either. With the shim
+# the same box runs 44 passed, 0 failed, 13 skipped.
+#
+# If nothing answers, PY_MISS carries the reason and the checks SKIP loudly,
+# which is what the `command -v` guard always meant to do, now for the right
+# reason.
+PY_MISS=
+if ! python3 -c '' >/dev/null 2>&1; then
+    PY_REAL=
+    for _cand in python py; do
+        command -v "$_cand" >/dev/null 2>&1 || continue
+        "$_cand" -c '' >/dev/null 2>&1 && { PY_REAL="$_cand"; break; }
+    done
+    if [ -n "$PY_REAL" ]; then
+        mkdir -p "$TMP/bin"
+        printf '#!/usr/bin/env bash\nexec %s "$@"\n' "$PY_REAL" > "$TMP/bin/python3"
+        chmod +x "$TMP/bin/python3"
+        PATH="$TMP/bin:$PATH"
+    else
+        PY_MISS="no working python3 (the name on PATH is not an interpreter)"
+    fi
+fi
+
 # Without a reference container, build a synthetic one: a few megabytes of
 # deterministic noise in the real format. It cannot check the engine against
 # the oracle — those logits belong to actual Kimi-Linear weights — but every
@@ -229,8 +274,7 @@ if stat --version >/dev/null 2>&1; then SM=gnu; else SM=bsd; fi
 # as the download script being broken. Measured on a fresh MSYS2 UCRT64
 # install, where it turned all five of these into failures. So the guard
 # carries the reason rather than a flag, and one variable covers both tools.
-DL_MISS=
-command -v python3 >/dev/null 2>&1 || DL_MISS="python3 not installed"
+DL_MISS="$PY_MISS"
 [ -n "$DL_MISS" ] || command -v curl >/dev/null 2>&1 || DL_MISS="curl not installed"
 
 # The path goes in argv, not into the source: MSYS2 rewrites POSIX paths in
@@ -629,7 +673,7 @@ PY
     # is 16, and read 36.6% where the engine measured 30.4%. A simulator
     # that disagrees quietly is how a policy question gets the wrong answer
     # for a week, so the agreement is asserted rather than remembered.
-    if [ "$SYNTHETIC" != 1 ] && command -v python3 >/dev/null 2>&1; then
+    if [ "$SYNTHETIC" != 1 ] && [ -z "$PY_MISS" ]; then
         TR="$TMP/sim.trace"
         rm -f "$TR"
         eng=$(WASTE_LOOKAHEAD=0 WASTE_DUMP_ROUTE="$TR" WASTE_CACHE_MB=1024 \
@@ -1419,8 +1463,8 @@ fi
 # Resume is the one converter behaviour that cannot be checked by looking at
 # a finished container: it is about the partial states a crash leaves. The
 # quantizer is stubbed out, so this needs neither torch nor source weights.
-if ! command -v python3 >/dev/null 2>&1; then
-    sk "convert.py resume" "python3 not installed"
+if [ -n "$PY_MISS" ]; then
+    sk "convert.py resume" "$PY_MISS"
 elif out=$(python3 tests/test_convert_resume.py 2>&1); then
     ok "resume keeps finished layers, never renumbers them, and publishes"
 else
@@ -1432,8 +1476,8 @@ fi
 # release's tokenizer carries. Installing the wrong one is silent: absent
 # markers encode as ordinary text, so the model reads its own turn structure
 # as prose and still answers, plausibly and wrongly. Same stubs, no weights.
-if ! command -v python3 >/dev/null 2>&1; then
-    sk "convert.py chat.json" "python3 not installed"
+if [ -n "$PY_MISS" ]; then
+    sk "convert.py chat.json" "$PY_MISS"
 elif out=$(python3 tests/test_convert_chat.py 2>&1); then
     ok "each architecture gets its own chat.json, and no one else's"
 else
@@ -1462,8 +1506,8 @@ if [ "${WASTE_SANITIZED:-0}" = 1 ]; then
     # python3 is not, and the run dies in the allocator rather than
     # reporting anything about the server.
     sk "serve suite" "not run under the sanitizers"
-elif ! command -v python3 >/dev/null 2>&1; then
-    sk "serve suite" "python3 not installed"
+elif [ -n "$PY_MISS" ]; then
+    sk "serve suite" "$PY_MISS"
 elif ! make -s "libwaste.$SOEXT" >/dev/null 2>&1; then
     no "libwaste.$SOEXT failed to build"
 else
