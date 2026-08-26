@@ -15,6 +15,31 @@ CC      ?= cc
 CFLAGS  ?= -O2 -std=gnu11 -Wall -Wextra
 LDLIBS  := -lm -lpthread
 
+# The interpreter for the three Python recipes below, resolved by RUNNING a
+# candidate rather than by looking one up. On Windows the name `python3` on
+# PATH is usually the Microsoft Store App Execution Alias: a zero-byte
+# reparse point that exists, exits 49, and prints an advert for the Store
+# instead of running anything, so a recipe reports its own tool broken. Same
+# finding as tests/run.sh, which shims PATH because it has 49 call sites and
+# subprocesses to cover; three recipes want a name instead. PATH set inside
+# run.sh does not reach a recipe make runs itself, which is why this is here
+# and not there.
+#
+# Windows installs the versionless `python`, and `py` besides, so a working
+# interpreter is normally there under another name. If none answers this
+# stays `python3` and the recipe fails loudly at first use, which is right
+# for a build target: unlike the suite, there is nothing here to skip.
+#
+# Recursive rather than `:=` so the probe runs only when a recipe actually
+# expands $(PY). Immediate assignment costs every `make` invocation two
+# process spawns, `make clean` and a no-op build included, and on the box
+# this was found the first spawn is the Store alias itself: measured 196 ms
+# added per invocation, which nearly triples a no-op make. The fallback
+# lives inside the shell for the same reason, since an `ifeq` on $(PY)
+# would force the expansion at parse time and undo it.
+PY = $(shell for p in python3 python py; do \
+         "$$p" -c '' >/dev/null 2>&1 && { echo "$$p"; exit 0; }; done; echo python3)
+
 # The target triple rather than `uname -m`, because those differ the moment
 # anyone cross-compiles: building for Windows from this ARM laptop, uname
 # says arm64 and would put the NEON translation unit into an x86 binary
@@ -299,7 +324,7 @@ check: test
 # libwaste as a shared object rather than the archive the CLI links, and
 # because it is the one part of this repo that is not C.
 serve-check: libwaste.$(SOEXT)
-	@python3 -m unittest discover -s tests/serve -t . -p "test_*.py"
+	@$(PY) -m unittest discover -s tests/serve -t . -p "test_*.py"
 
 # Sanitizers. Separate targets rather than a flag on `make`, because they
 # need a full rebuild: mixing instrumented and uninstrumented objects
@@ -320,7 +345,7 @@ asan:
 	 $(MAKE) --no-print-directory clean; exit $$rc
 
 fuzz: test
-	@python3 tools/fuzz_container.py --runs $(FUZZ_RUNS)
+	@$(PY) tools/fuzz_container.py --runs $(FUZZ_RUNS)
 
 FUZZ_RUNS ?= 200
 
@@ -332,7 +357,7 @@ fuzz-asan:
 	    CFLAGS="-std=gnu11 -Wall -Wextra -DVQ_SUPER=$(VQ_SUPER) -MMD -MP $(SAN_FLAGS)" \
 	    LDLIBS="-lm -lpthread $(SAN_FLAGS)"
 	@rc=0; ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
-	    python3 tools/fuzz_container.py --runs $(FUZZ_RUNS) || rc=$$?; \
+	    $(PY) tools/fuzz_container.py --runs $(FUZZ_RUNS) || rc=$$?; \
 	 $(MAKE) --no-print-directory clean; exit $$rc
 
 .PHONY: all test check serve-check clean asan fuzz fuzz-asan
