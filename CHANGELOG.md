@@ -8,9 +8,41 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
-## Unreleased
+## 0.7.1 — 2026-08-27
+
+**0.7.0 did not build on x86_64 Linux, on Windows, or under ASan.** That is
+the reason this release exists; if you are on any of those, 0.7.0 is not
+installable and this is the fix. Apple Silicon was unaffected, which is why
+it shipped.
+
+The rest is the test suite learning to tell a tie from a defect. Four checks
+were red or blind across the three models, and every one of them turned out
+to be measuring a discrete choice by the distance between logits — a
+question that measurement cannot answer. None was an engine bug. The engine
+changes here are two: the i8mm guard above, and one printf format.
 
 ### Fixed
+
+- **The i8mm call site is guarded on the same predicate as its source file**
+  (`docs/LEARNED.md` §72). `model.c` declared and called
+  `waste_mvq4_rows_i8mm` unguarded, but the Makefile adds `src/simd_i8mm.c`
+  to `SRC` only for `arm%|aarch64%`, so on every other platform the symbol
+  does not exist:
+
+  ```
+  model.c:805: undefined reference to `waste_mvq4_rows_i8mm'
+  ```
+
+  Three of five CI jobs failed at the link, and one of them is `asan +
+  fuzz` — so the sanitizers had never run against anything 0.7.0 added.
+  `simd_i8mm.c` was already careful, defining the symbol twice so it exists
+  in every ARM build even where `-march` did not take; what was missing is
+  that **a dispatcher and the list of files that satisfies it have to be
+  guarded on the same predicate**. `TK_I8MM` is already unreachable off ARM,
+  so this is dead code being compiled, not behaviour. Verified rather than
+  assumed: compiling `model.c` for x86_64 leaves the symbol undefined at
+  0.7.0 and unreferenced now, a full x86_64 build links, and the arm64
+  object still calls it.
 
 - **The two K3 checks were measuring the router, not the arithmetic**
   (`docs/LEARNED.md` §71). Chunked prefill and the CPU backend each differed
@@ -52,6 +84,50 @@ changed. Each entry names the section to read for the numbers behind it.
   above both printed as `0.112161` while selecting differently, which reads
   as a selection bug. Nine digits round-trip a float.
 
+- **The GLM oracle check was failing on both Linux jobs, on an exact tie**
+  (`docs/LEARNED.md` §72). It had been red since 0.7.0, saying only "the GLM
+  path diverges from the oracle". linux-x86_64 and linux-arm64 report rel L2
+  0.00783997 and 0.00783999 — **two different ISAs agreeing to five
+  significant figures is not a platform difference** — and at the worst
+  logit macOS, both Linux runs and the shipped fixture all print -7.3257,
+  while only the freshly generated Linux oracle prints -7.43141.
+
+  At layer 2, token 15 the four visible pools score 0, 0, 0 and 0.00164 with
+  `keep=2`: pool 3 wins outright and the second slot is an **exact
+  three-way tie**, margin 0.000e+00. The engine takes pool 1;
+  `torch.topk`, called in `kimi_ref.py` with `sorted=False` and so free to
+  answer in any order, takes pool 2 on Linux and pool 1 on macOS. One pool
+  of four tokens attended differently is worth rel L2 0.0078 in the logits,
+  and it is a defect in neither.
+
+  `kimi_ref.py` already wrote the trace that says this, under the same
+  `WASTE_DUMP_DSA` the engine uses, and its own comment says why: so the two
+  selections "can be diffed directly rather than inferred from a logit
+  difference". **Nothing was diffing them.** `tests/dsa_diff.py` now does,
+  reporting the same three answers `route_diff.py` does over the pool
+  ranking instead of the expert ranking.
+
+  Recorded because the measurement is the useful part, this is what it was
+  **not**: not a stale fixture (the engine matches it to 5.72e-06), not
+  macOS skipping the real comparison, not torch's version (`uv` resolves the
+  same 2.13.0, fla-core 0.5.2 and einops 0.8.2 on both), not
+  `-ffp-contract`, not thread count, not UB under ASan/UBSan, and **not a
+  router tie** — the tightest top-2-of-8 boundary gap in that prefill is
+  9.4e-03.
+
+- **A refusal check has three outcomes, not two.** `rope_refused` grepped
+  `test_forward`'s output for the expected refusal and called anything else
+  "loaded instead of being refused". A `test_forward` that is killed says
+  nothing, and saying nothing is not the same as loading a container it
+  should have rejected; the check could not tell them apart and reported the
+  more alarming one. It now separates them and prints what came back either
+  way.
+
+- **Checks say what they saw.** Every comparison above now reports magnitude
+  and location on failure rather than a bare verdict. Two of these were
+  investigated for hours against a bare FAIL, and the answer each time was
+  four numbers the check already had in hand.
+
 ## 0.7.0 — 2026-08-27
 
 A third model, and the two things that had to change for it to be worth
@@ -87,8 +163,7 @@ here either.
 > are right, but the cause named here is not: `trunk_kern` defaults to
 > `TK_F32`, so neither kernel was in the run. It is a single routing tie at
 > a relative margin of 7.3e-07, and the checks were measuring the router
-> rather than the arithmetic. See Unreleased, above, and `docs/LEARNED.md`
-> §71.
+> rather than the arithmetic. See 0.7.1, above, and `docs/LEARNED.md` §71.
 
 ### Added
 
