@@ -102,6 +102,40 @@ LOGITPY
 # could catch anything. tests/route_diff.py judges the flip instead, and a
 # flip on a margin the reference could resolve is still a failure — a louder
 # one, naming the layer.
+# What a failed logit comparison actually looked like. A bare FAIL says two
+# dumps differ and nothing else, and "differs" covers both a kernel that is
+# slightly off and a path that computed something else entirely — the two
+# need different investigations and the verdict cannot tell them apart. Half
+# a session went into rediscovering that for the two checks above; the cost
+# of not repeating it is four numbers.
+logit_report() {
+    python3 - "$1" "$2" <<'REPORTPY'
+import struct, sys
+def L(p):
+    b = open(p, "rb").read()
+    return struct.unpack(f"<{len(b)//4}f", b)
+try:
+    a, b = L(sys.argv[1]), L(sys.argv[2])
+except OSError as e:
+    print(f"        cannot read a dump: {e}")
+    raise SystemExit
+if len(a) != len(b):
+    print(f"        different lengths: {len(a)} vs {len(b)}")
+    raise SystemExit
+if not a:
+    print("        both dumps are empty")
+    raise SystemExit
+d = [abs(x - y) for x, y in zip(a, b)]
+i = d.index(max(d))
+n2 = sum(x * x for x in d) ** 0.5
+r2 = sum(x * x for x in b) ** 0.5
+print(f"        max abs {max(d):.6g} at logit {i} ({a[i]:.6g} vs {b[i]:.6g}), "
+      f"rel L2 {(n2 / r2 if r2 else float('inf')):.6g}")
+print(f"        argmax {a.index(max(a))} vs {b.index(max(b))}, "
+      f"{sum(1 for x in d if x >= 1e-3)} of {len(d)} logits at or past 1e-3")
+REPORTPY
+}
+
 route_verdict() {
     # $1 the other path's route trace, $2 the check's name
     if [ ! -s "$TMP/seq.route" ] || [ ! -s "$1" ] || [ ! -s "$TMP/seq.scores" ]; then
@@ -1216,7 +1250,18 @@ PYB
                 then ok "mHC, the clamped SwiGLU and DSA match a PyTorch oracle built from this container"
                 else ok "mHC, the clamped SwiGLU and DSA match the shipped GLM fixture"
                 fi
-            else no "the GLM path diverges from the oracle"
+            else
+                no "the GLM path diverges from the oracle"
+                logit_report "$TMP/glm_seq.bin" "${GGEN:-$GFIX}"
+                # Which oracle matters: with uv the reference is generated
+                # from this container and a difference is the engine's;
+                # without it the comparison is against the shipped fixture,
+                # whose provenance check above has already confirmed the
+                # container is byte-identical to the one it was made from.
+                if [ -n "$GGEN" ]
+                then printf "        against an oracle generated from this container\n"
+                else printf "        against the shipped fixture (no uv here to generate one)\n"
+                fi
             fi
         else
             sk "engine vs the GLM oracle" \

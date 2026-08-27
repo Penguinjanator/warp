@@ -543,8 +543,22 @@ static void mvq4_rows_sdot(int b, int e, void *p)
  * only that file the flag, and this call is guarded by the runtime bit —
  * the same arrangement simd_avx2.c has on x86, and for the same reason.
  * See docs/EXP1.md §2 for what it buys: 144 GB/s against the f32 path's
- * 78 and 43x SDOT's accuracy. */
+ * 78 and 43x SDOT's accuracy.
+ *
+ * The guard is the link, not the ISA. src/simd_i8mm.c already defines this
+ * for every ARM build — a real SMMLA kernel where the flag took, a zeroing
+ * refusal where it did not — but the Makefile adds that file to SRC only
+ * for `arm%|aarch64%`, so on x86 and on Windows the symbol does not exist
+ * at all. Declaring and calling it unguarded there is an undefined
+ * reference at link time, which is how 0.7.0 shipped unable to build on
+ * three of five CI platforms. The Makefile's own comment records the same
+ * failure once before, from the other direction: a findstring that left
+ * kda_neon.c out while backend.c still called into it. A dispatcher and
+ * the list of files that satisfies it have to be guarded on the same
+ * predicate, and this is that predicate. */
+#if defined(__ARM_NEON) || defined(__aarch64__)
 void waste_mvq4_rows_i8mm(int b, int e, void *p);
+#endif
 
 /* ---- Q4G x int16 activations (SMLAL) ------------------------------------
  * No i8mm needed and 15 bits of activation exactly as SMMLA gets, at 113
@@ -598,7 +612,10 @@ static void mvq4_rows_smlal(int b, int e, void *p)
 }
 
 /* Activations for mvq4_rows_i8mm: one amax per weight group, a base-128
- * split into two int8 planes, laid out the way the B operand is read. */
+ * split into two int8 planes, laid out the way the B operand is read.
+ * Inside the same guard as its only caller, or -Wunused-function fires on
+ * every build that cannot reach it. */
+#if defined(__ARM_NEON) || defined(__aarch64__)
 static void quant_act4_mm(const float *x, int n, int g, int8_t *q, float *sc)
 {
     const int ng = (n + g - 1) / g;
@@ -630,6 +647,8 @@ static void quant_act4_mm(const float *x, int n, int g, int8_t *q, float *sc)
         }
     }
 }
+
+#endif
 
 /* Activations for mvq4_rows_smlal: int16, one amax per weight group,
  * deinterleaved even|odd inside the group. */
@@ -795,9 +814,11 @@ static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
         if (trunk_kern == TK_SDOT && g % sdot4_sg == 0) {
             quant_act4(x, in, g, sdot4_sg, m->xq, m->xs);
             fn = mvq4_rows_sdot;
+#if defined(__ARM_NEON) || defined(__aarch64__)
         } else if (trunk_kern == TK_I8MM) {
             quant_act4_mm(x, in, g, m->xq, m->xs);
             fn = waste_mvq4_rows_i8mm;
+#endif
         } else if (trunk_kern == TK_SMLAL) {
             quant_act4_16(x, in, g, m->xq, m->xs);
             fn = mvq4_rows_smlal;
