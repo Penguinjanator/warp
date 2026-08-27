@@ -941,6 +941,33 @@ float waste_situ_pair(float g, float u, float beta, float lbeta)
     return a * (lbeta > 0.0f ? lbeta * tanhf(u / lbeta) : u);
 }
 
+/* SwiGLU and the two variants of it this family ships, over a whole range.
+ *
+ * One function rather than the if/else that used to sit at each of its
+ * seven call sites: GLM-5.3-Flash adds a third form and the sites are
+ * exactly the places a new one gets forgotten. `g` is the gate half and is
+ * overwritten with the product; `u` is the up half.
+ *
+ * The clamp is not cosmetic. GLM applies it to gate above and to up on both
+ * sides *before* the SiLU, and at limit 10 it fires on real activations —
+ * dropping it leaves a model that looks right and drifts. */
+void waste_act_pair_range(const waste_config *c, float *g, const float *u, int n)
+{
+    if (c->act_situ) {
+        for (int i = 0; i < n; i++)
+            g[i] = waste_situ_pair(g[i], u[i], c->situ_beta, c->situ_linear_beta);
+    } else if (c->swiglu_limit > 0.0f) {
+        const float lim = c->swiglu_limit;
+        for (int i = 0; i < n; i++) {
+            const float a = g[i] > lim ? lim : g[i];
+            const float b = u[i] > lim ? lim : (u[i] < -lim ? -lim : u[i]);
+            g[i] = silu(a) * b;
+        }
+    } else {
+        for (int i = 0; i < n; i++) g[i] = silu(g[i]) * u[i];
+    }
+}
+
 static void softmax(float *x, int n)
 {
     float mx = x[0];
@@ -1192,6 +1219,31 @@ static int validate_text_tensors(waste_model *m)
             REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L), hid, c->n_heads * c->v_head);
         }
 
+        if (c->hc_mult) {
+            const int nmix = (2 + c->hc_mult) * c->hc_mult;
+            const char *site[2] = { "attn", "ffn" };
+            for (int i = 0; i < 2; i++) {
+                REQUIRE_MATRIX(tname("%smodel.layers.%d.hc_%s_fn", c->prefix, L, site[i]),
+                               nmix, c->hc_mult * hid);
+                REQUIRE_DATA(tname("%smodel.layers.%d.hc_%s_base", c->prefix, L, site[i]),
+                             (size_t)nmix);
+                REQUIRE_DATA(tname("%smodel.layers.%d.hc_%s_scale", c->prefix, L, site[i]), 3);
+            }
+        }
+        if (c->index_topk && !c->kda_layer[L]) {
+            const char *ix = "%smodel.layers.%d.self_attn.indexer.%s";
+            REQUIRE_MATRIX(tname(ix, c->prefix, L, "wq_b.weight"),
+                           c->index_heads * c->index_dim, c->q_lora);
+            REQUIRE_MATRIX(tname(ix, c->prefix, L, "wk.weight"), c->index_dim, hid);
+            REQUIRE_VECTOR(tname(ix, c->prefix, L, "k_norm.weight"), c->index_dim);
+            REQUIRE_VECTOR(tname(ix, c->prefix, L, "k_norm.bias"), c->index_dim);
+            REQUIRE_MATRIX(tname(ix, c->prefix, L, "weights_proj.weight"), c->index_heads, hid);
+            REQUIRE_MATRIX(tname(ix, c->prefix, L, "index_kpool_compress_gate"),
+                           c->index_dim, hid);
+            REQUIRE_DATA(tname(ix, c->prefix, L, "index_kpool_compress_ape"),
+                         (size_t)c->index_kpool * c->index_dim);
+        }
+
         if (c->attn_res_block) {
             REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attention_res_norm.weight", c->prefix, L), hid);
             REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attention_res_proj.weight", c->prefix, L), hid);
@@ -1273,6 +1325,28 @@ static int cfg_sane(const waste_config *c)
             (int64_t)c->n_heads * c->v_head > INT_MAX ||
             (int64_t)c->n_heads * (c->qk_nope + c->v_head) > INT_MAX)
             return 0;
+    }
+    /* mHC multiplies the resident residual stream and every buffer sized
+     * from it, so it is bounded like a dimension rather than a flag. */
+    if (c->hc_mult < 0 || c->hc_mult > 16) return 0;
+    if (c->hc_mult) {
+        if (c->hc_iters < 1 || c->hc_iters > 1024) return 0;
+        if (!(c->hc_eps > 0.0f) || !(c->hc_eps < 1.0f)) return 0;
+        if ((int64_t)c->hc_mult * c->hidden > INT_MAX) return 0;
+    }
+    if (!(c->swiglu_limit >= 0.0f)) return 0;              /* also NaN */
+    /* The indexer is all-or-nothing: a container that states a topk without
+     * the shapes to score with would silently attend over nothing. */
+    if (c->index_kpool < 1 || c->index_kpool > 64) return 0;
+    if (c->index_topk < 0 || c->index_topk > (1 << 24)) return 0;
+    if (c->index_heads < 0 || c->index_heads > (1 << 16)) return 0;
+    if (c->index_dim < 0 || c->index_dim > (1 << 20)) return 0;
+    if (c->index_topk) {
+        if (c->index_heads < 1 || c->index_dim < 1) return 0;
+        if (c->index_topk % c->index_kpool) return 0;
+        if ((int64_t)c->index_heads * c->index_dim > INT_MAX) return 0;
+    } else if (c->index_heads || c->index_dim) {
+        return 0;
     }
     if (c->n_experts && c->moe_inter < 1) return 0;
     if ((!c->n_experts || c->first_dense) && c->dense_inter < 1) return 0;
@@ -1433,6 +1507,20 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     }
 
     rope_init(c, d, cfg);
+
+    /* GLM-5.3-Flash: mHC, the clamped SwiGLU and the DSA indexer. Absent on
+     * every Kimi container, where all of these read back 0 and the ordinary
+     * paths run unchanged. */
+    c->hc_mult  = (int)js_int(d, js_get(d, cfg, "hc_mult"), 0);
+    c->hc_iters = (int)js_int(d, js_get(d, cfg, "hc_sinkhorn_iters"), 0);
+    c->hc_eps   = (float)js_num(d, js_get(d, cfg, "hc_eps"), 1e-6);
+    c->swiglu_limit = (float)js_num(d, js_get(d, cfg, "swiglu_limit"), 0.0);
+    c->index_topk  = (int)js_int(d, js_get(d, cfg, "index_topk"), 0);
+    c->index_kpool = (int)js_int(d, js_get(d, cfg, "index_kpool"), 1);
+    c->index_heads = (int)js_int(d, js_get(d, cfg, "index_n_heads"), 0);
+    c->index_dim   = (int)js_int(d, js_get(d, cfg, "index_head_dim"), 0);
+    c->index_tail  = js_get(d, cfg, "index_kpool_always_select_tail") >= 0;
+    c->tok_han_split = js_bool(d, js_get(d, cfg, "tokenizer_han_split"), 1);
 
     int lac = js_get(d, cfg, "linear_attn_config");
     c->full_rank_gate = js_get(d, lac, "use_full_rank_gate") >= 0;
@@ -1788,6 +1876,10 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
 
     /* state + scratch */
     const int H = c->kda_heads, D = c->kda_dim, C = H * D;
+    /* Pools a full context can produce. The +1 is the pool the last token
+     * closes: kv_cap tokens make exactly kv_cap/kpool of them, and rounding
+     * up costs one vector and removes a bound to get wrong. */
+    m->pool_cap = c->index_kpool ? kv_cap / c->index_kpool + 1 : 0;
     for (int L = 0; L < c->n_layers; L++) {
         if (c->kda_layer[L]) {
             m->S[L] = (float *)calloc((size_t)H * D * D, sizeof(float));
@@ -1796,10 +1888,42 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
             m->has_mla = 1;      /* this is what makes kv_cap a real bound */
             m->latcache[L] = (float *)calloc(
                 (size_t)kv_cap * (c->kv_lora + c->qk_rope), sizeof(float));
+            if (c->index_topk) {
+                m->idxpool[L] = (float *)calloc(
+                    (size_t)m->pool_cap * c->index_dim, sizeof(float));
+                m->idxbuf[L] = (float *)calloc(
+                    (size_t)c->index_kpool * 2 * c->index_dim, sizeof(float));
+                if (!m->idxpool[L] || !m->idxbuf[L]) return -1;
+            }
         }
     }
+    if (c->index_topk && m->has_mla) {
+        /* One selection at a time, shared by every layer: it is consumed by
+         * the head loop before the next layer records anything. */
+        m->idxsel = (int *)calloc((size_t)c->index_topk + c->index_kpool,
+                                  sizeof(int));
+        m->idxscore = (float *)calloc((size_t)m->pool_cap, sizeof(float));
+        m->idxrank = (int *)calloc((size_t)m->pool_cap, sizeof(int));
+        m->idxq = (float *)calloc((size_t)c->index_heads * c->index_dim +
+                                  c->index_heads, sizeof(float));
+        if (!m->idxsel || !m->idxscore || !m->idxrank || !m->idxq) return -1;
+    }
     const int big = c->hidden > C ? c->hidden : C;
-    m->x = (float *)calloc((size_t)c->hidden, sizeof(float));
+    /* mHC keeps hc_mult residual streams instead of one. Every other user
+     * of m->x reads stream 0, which is where the single-stream models put
+     * the whole thing, so the multiplier is confined to this allocation
+     * and to the three places that walk the buffer whole. */
+    const int hc = c->hc_mult ? c->hc_mult : 1;
+    m->x = (float *)calloc((size_t)hc * c->hidden, sizeof(float));
+    if (c->hc_mult) {
+        const int nmix = (2 + c->hc_mult) * c->hc_mult;
+        m->hcflat = (float *)calloc((size_t)hc * c->hidden, sizeof(float));
+        m->hccol  = (float *)calloc((size_t)c->hidden, sizeof(float));
+        /* the mapping's outputs, then the `pre` weights hc_collapse keeps
+         * past them rather than on its caller's stack */
+        m->hcmix  = (float *)calloc((size_t)nmix + c->hc_mult, sizeof(float));
+        if (!m->hcflat || !m->hccol || !m->hcmix) return -1;
+    }
     m->h = (float *)calloc((size_t)c->hidden, sizeof(float));
     m->tmp = (float *)calloc((size_t)8 * big + 8 * c->moe_inter + 8 * c->dense_inter
                              + (size_t)4 * c->n_heads * (c->v_head + c->qk_nope + c->qk_rope)
@@ -1817,7 +1941,11 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     }
     {   /* int8 activations for the SMMLA batched matmul: a full chunk of
          * the widest input the trunk has (the dense FFN's 33792) */
-        const int widest = c->dense_inter > c->hidden ? c->dense_inter : c->hidden;
+        int widest = c->dense_inter > c->hidden ? c->dense_inter : c->hidden;
+        /* Same bound as m->xq below, for the same reason: the batched
+         * matmul quantizes rows of whatever width it is handed. */
+        if ((int64_t)(c->hc_mult ? c->hc_mult : 1) * c->hidden > widest)
+            widest = (c->hc_mult ? c->hc_mult : 1) * c->hidden;
         m->mmx_cap = (size_t)WASTE_CHUNK_MAX * widest;
         m->mms_cap = (size_t)WASTE_CHUNK_MAX * ((widest + 127) / 128 + 1);
         m->mmxq = (int8_t *)malloc(m->mmx_cap);
@@ -1864,7 +1992,15 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                                   ? c->latent_dim : c->hidden)), sizeof(float));
     }
     {
-        const int nmax = c->hidden > c->dense_inter ? c->hidden : c->dense_inter;
+        int nmax = c->hidden > c->dense_inter ? c->hidden : c->dense_inter;
+        /* mHC's mapping reads the whole flattened stream vector, which is
+         * hc_mult times the hidden size and on GLM the widest quantized
+         * matvec in the model: 16384 against the dense FFN's 12288. Sized
+         * from the FFN alone this buffer is 4096 activations short of what
+         * hc_collapse quantizes into it, and the 1024 bytes of slack below
+         * hide that at test scale and not at model scale. */
+        const int64_t hcw = (int64_t)(c->hc_mult ? c->hc_mult : 1) * c->hidden;
+        if (hcw > nmax) nmax = (int)hcw;
         /* Two bytes per activation: the i8mm path writes two int8 planes
          * and the SMLAL path writes int16, both over the padded group
          * count rather than over `in`. */
@@ -1981,6 +2117,7 @@ void waste_model_free(waste_model *m)
     free(m->codebooksT);
     for (int L = 0; L < 128; L++) {
         free(m->S[L]); free(m->conv[L]); free(m->latcache[L]);
+        free(m->idxpool[L]); free(m->idxbuf[L]);
         if (m->bank[L].fd >= 0) close(m->bank[L].fd);
     }
     free(m->x); free(m->h); free(m->tmp); free(m->att); free(m->logits);
@@ -1994,6 +2131,8 @@ void waste_model_free(waste_model *m)
     free(m->clat); free(m->cff); free(m->cexp); free(m->cblockres);
     free(m->cprefix); free(m->croute); free(m->crw); free(m->cused);
     free(m->cq8); free(m->cq8_scale);
+    free(m->hcflat); free(m->hccol); free(m->hcmix);
+    free(m->idxsel); free(m->idxscore); free(m->idxrank);
     waste_ecache_free(&m->cache);
     pthread_mutex_destroy(&m->fetch_mu);
 }
@@ -2716,12 +2855,7 @@ static void moe_expert_range(int b, int e, void *p)
                         a->lut_gate, a->q_gate, a->qs_gate);
         vq_apply_serial(m, ub, rec + h->up_off, sc + inter, inter, lat,
                         a->lut_up, a->q_up, a->qs_up);
-        if (c->act_situ)
-            for (int i = 0; i < inter; i++)
-                ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta,
-                                        c->situ_linear_beta);
-        else
-            for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
+        waste_act_pair_range(c, ga, ub, inter);
         vq_matvec_serial(m, acc, rec + h->down_off, sc + 2 * inter, ga, lat,
                          inter, h->codebook_id + 2 * m->stages, ld, qd, qsd);
         /* acc is left unweighted on purpose: the caller applies w[j] in the
@@ -2898,12 +3032,204 @@ static void rope_apply(int half, float *x, const float *cs, const float *sn)
     }
 }
 
+/* ---- DeepSeek Sparse Attention, k-pool flavour (GLM-5.3-Flash) ---------
+ *
+ * An MLA layer here does not attend over the whole context. A small
+ * indexer, with projections of its own, scores *pools* of index_kpool
+ * adjacent cached tokens and keeps the best index_topk / index_kpool of
+ * them; the query then attends over those pools' tokens plus the tail of
+ * the context that has not filled a pool yet.
+ *
+ * Two things make this cheap to keep resident. A pool's compressed key is
+ * one index_dim vector per index_kpool tokens — 32x less than the raw keys
+ * the scores would otherwise need — and it is computed once, when its last
+ * token arrives, never recomputed. So the per-step state is a rolling
+ * buffer of the (key, gate) pairs of the pool being filled, and an
+ * append-only array of finished pool keys.
+ *
+ * Below index_topk tokens of context this is exactly dense attention: every
+ * complete pool is selected and the tail covers the rest. dsa_select says
+ * so by returning -1, and the head loop takes its ordinary path. That is
+ * not an approximation for short prompts — it is what the arithmetic
+ * reduces to, and it is why the selection cost only appears where the
+ * saving does.
+ */
+static void layernorm(float *o, const float *x, const float *w,
+                      const float *b, int n, float eps)
+{
+    float mean = 0;
+    for (int i = 0; i < n; i++) mean += x[i];
+    mean /= (float)n;
+    float var = 0;
+    for (int i = 0; i < n; i++) { const float d = x[i] - mean; var += d * d; }
+    const float inv = 1.0f / sqrtf(var / (float)n + eps);
+    for (int i = 0; i < n; i++) o[i] = (x[i] - mean) * inv * w[i] + b[i];
+}
+
+/* Fold this token into the pool being filled, and close the pool when it is
+ * the last token of one. `in` is the attention input, i.e. the layer's
+ * post-input_layernorm hidden state, which is what the indexer reads. */
+static void dsa_record(waste_model *m, int L, const float *in, int pos)
+{
+    const waste_config *c = &m->cfg;
+    const int D = c->index_dim, P = c->index_kpool, hid = c->hidden;
+    float *slot = m->idxbuf[L] + (size_t)(pos % P) * 2 * D;
+
+    matvec_t(m, slot, waste_find(m, tname(
+                 "%smodel.layers.%d.self_attn.indexer.wk.weight", c->prefix, L)),
+             in, D, hid);
+    /* A LayerNorm, not an RMSNorm: it subtracts the mean and it has a bias.
+     * Everything else in this model normalizes the other way, which is
+     * exactly why it is spelled out here. */
+    layernorm(slot, slot, T(m, "%smodel.layers.%d.self_attn.indexer.k_norm.weight", c->prefix, L),
+              T(m, "%smodel.layers.%d.self_attn.indexer.k_norm.bias", c->prefix, L),
+              D, 1e-6f);
+    matvec_t(m, slot + D, waste_find(m, tname(
+                 "%smodel.layers.%d.self_attn.indexer.index_kpool_compress_gate",
+                 c->prefix, L)), in, D, hid);
+
+    if (pos % P != P - 1) return;                 /* pool still incomplete */
+    if (m->n_pool[L] >= m->pool_cap) return;      /* bounded by kv_cap */
+
+    /* The pooled key is a per-channel weighted average over the pool's
+     * tokens: one softmax of (gate + a learned positional bias) per
+     * channel, across index_kpool tokens. Not one softmax per token. */
+    const float *ape = T(m, "%smodel.layers.%d.self_attn.indexer.index_kpool_compress_ape",
+                         c->prefix, L);
+    float *dst = m->idxpool[L] + (size_t)m->n_pool[L] * D;
+    for (int d = 0; d < D; d++) {
+        float mx = -1e30f;
+        for (int j = 0; j < P; j++) {
+            const float v = m->idxbuf[L][(size_t)j * 2 * D + D + d] + ape[j * D + d];
+            if (v > mx) mx = v;
+        }
+        float sum = 0, acc = 0;
+        for (int j = 0; j < P; j++) {
+            const float e = expf(m->idxbuf[L][(size_t)j * 2 * D + D + d] +
+                                 ape[j * D + d] - mx);
+            sum += e;
+            acc += e * m->idxbuf[L][(size_t)j * 2 * D + d];
+        }
+        dst[d] = acc / sum;
+    }
+    m->n_pool[L]++;
+}
+
+typedef struct {
+    const float *pool, *q, *w;
+    float *score;
+    int D, heads;
+    float scale;
+} dsa_par;
+
+static void dsa_score_range(int lo, int hi, void *ap)
+{
+    const dsa_par *a = (const dsa_par *)ap;
+    for (int p = lo; p < hi; p++) {
+        const float *k = a->pool + (size_t)p * a->D;
+        float acc = 0;
+        for (int h = 0; h < a->heads; h++) {
+            float d = dotf(a->q + (size_t)h * a->D, k, a->D) * a->scale;
+            if (d > 0.0f) acc += a->w[h] * d;      /* relu, then weighted */
+        }
+        a->score[p] = acc;
+    }
+}
+
+/* Keep the `k` highest scores with a size-k min-heap over pool ids. */
+static void dsa_heap_push(int *heap, int *n, int k, const float *score, int p)
+{
+    if (*n < k) {
+        int i = (*n)++;
+        heap[i] = p;
+        while (i) {
+            const int par = (i - 1) / 2;
+            if (score[heap[par]] <= score[heap[i]]) break;
+            const int t = heap[par]; heap[par] = heap[i]; heap[i] = t;
+            i = par;
+        }
+        return;
+    }
+    if (score[p] <= score[heap[0]]) return;
+    heap[0] = p;
+    for (int i = 0;;) {
+        const int l = 2 * i + 1, r = l + 1;
+        int sm = i;
+        if (l < k && score[heap[l]] < score[heap[sm]]) sm = l;
+        if (r < k && score[heap[r]] < score[heap[sm]]) sm = r;
+        if (sm == i) break;
+        const int t = heap[sm]; heap[sm] = heap[i]; heap[i] = t;
+        i = sm;
+    }
+}
+
+static int cmp_int(const void *a, const void *b)
+{
+    const int x = *(const int *)a, y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
+/* Which cached positions this query attends over. Writes them ascending
+ * into m->idxsel and returns how many; -1 means "all of them", which is
+ * both the short-context case and the cheapest one. */
+static int dsa_select(waste_model *m, int L, const float *in,
+                      const float *q_resid, int pos)
+{
+    const waste_config *c = &m->cfg;
+    const int D = c->index_dim, P = c->index_kpool, hid = c->hidden;
+    const int kv_len = pos + 1, npool = m->n_pool[L];
+    int keep = c->index_topk / P;
+    if (keep > npool) keep = npool;
+    if (keep >= npool) return -1;               /* every pool kept: dense */
+
+    float *q = m->idxq;
+    float *w = q + (size_t)c->index_heads * D;
+    matvec_t(m, q, waste_find(m, tname(
+                 "%smodel.layers.%d.self_attn.indexer.wq_b.weight", c->prefix, L)),
+             q_resid, c->index_heads * D, c->q_lora);
+    matvec_t(m, w, waste_find(m, tname(
+                 "%smodel.layers.%d.self_attn.indexer.weights_proj.weight",
+                 c->prefix, L)), in, c->index_heads, hid);
+    const float hs = 1.0f / sqrtf((float)c->index_heads);
+    for (int h = 0; h < c->index_heads; h++) w[h] *= hs;
+
+    {
+        dsa_par a = { m->idxpool[L], q, w, m->idxscore, D, c->index_heads,
+                      1.0f / sqrtf((float)D) };
+        waste_parallel_for(npool, 64, dsa_score_range, &a);
+    }
+
+    /* Ties are possible and mean the same thing: a pool whose every head
+     * scored negative lands at exactly 0 after the relu, and so do all its
+     * neighbours. Which of those the heap keeps is unspecified here and
+     * ordered by index upstream; they contribute the same nothing either
+     * way. */
+    int n = 0;
+    for (int p = 0; p < npool; p++)
+        dsa_heap_push(m->idxrank, &n, keep, m->idxscore, p);
+    qsort(m->idxrank, (size_t)n, sizeof(int), cmp_int);
+
+    int out = 0;
+    for (int i = 0; i < n; i++) {
+        const int base = m->idxrank[i] * P;
+        for (int j = 0; j < P; j++) m->idxsel[out++] = base + j;
+    }
+    /* The tail: the tokens past the last complete pool are always visible,
+     * which is what keeps the most recent context from waiting for a pool
+     * to fill before it can be attended to. */
+    if (c->index_tail)
+        for (int t = npool * P; t < kv_len; t++) m->idxsel[out++] = t;
+    return out;
+}
+
 typedef struct {
     waste_model *m;
     const waste_tensor *kvb;
     const float *q, *lat;
     float *o;
     int S, qd, qk_nope, qk_rope, vh, kv_lora, latd;
+    const int *sel;                  /* NULL = every cached position       */
+    int nsel;
     float scale;
 } mla_par;
 
@@ -2930,18 +3256,23 @@ static void mla_head_range(int lo, int hi, void *ap)
             for (int j = 0; j < kl; j++) qa[j] += qi * rw[j];
         }
 
-        for (int s = 0; s < S; s++) {
-            const float *cs = a->lat + (size_t)s * latd;
+        /* Dense unless the indexer narrowed it: `sel` lists the positions
+         * this query may see, ascending, and everything downstream works in
+         * terms of how many there are rather than of the context length. */
+        const int *sel = a->sel;
+        const int n = sel ? a->nsel : S;
+        for (int t = 0; t < n; t++) {
+            const float *cs = a->lat + (size_t)(sel ? sel[t] : t) * latd;
             float acc = dotf(qa, cs, kl);
             acc += dotf(qh + nope, cs + kl, rope);
-            sc[s] = acc * a->scale;
+            sc[t] = acc * a->scale;
         }
-        softmax(sc, S);
+        softmax(sc, n);
 
         memset(ca, 0, (size_t)kl * sizeof(float));
-        for (int s = 0; s < S; s++) {
-            const float w = sc[s];
-            const float *cs = a->lat + (size_t)s * latd;
+        for (int t = 0; t < n; t++) {
+            const float w = sc[t];
+            const float *cs = a->lat + (size_t)(sel ? sel[t] : t) * latd;
             for (int j = 0; j < kl; j++) ca[j] += w * cs[j];
         }
 
@@ -2962,9 +3293,11 @@ static void mla_layer(waste_model *m, int L, const float *in, float *out, int po
     const int latd = c->kv_lora + c->qk_rope;
     float *q = m->tmp, *ckv = q + nh * qd, *o = ckv + latd;
 
+    float *q_resid = NULL;
     if (c->q_lora) {
         /* K3 LoRAs the query too: q_a -> RMSNorm -> q_b */
         float *qa = o + (size_t)nh * vh;
+        q_resid = qa;
         matvec_t(m, qa, waste_find(m, tname("%smodel.layers.%d.self_attn.q_a_proj.weight",
                                             c->prefix, L)), in, c->q_lora, hid);
         waste_rmsnorm(qa, qa, waste_find(m, tname("%smodel.layers.%d.self_attn.q_a_layernorm.weight",
@@ -3004,9 +3337,20 @@ static void mla_layer(waste_model *m, int L, const float *in, float *out, int po
     }
     m->n_kv[L] = pos + 1;
 
+    /* The indexer runs on the same input the projections did, after this
+     * token is in the cache — so a query always sees itself — and before
+     * the heads, which need its answer. */
+    int nsel = -1;
+    if (c->index_topk) {
+        dsa_record(m, L, in, pos);
+        nsel = dsa_select(m, L, in, q_resid, pos);
+    }
+
     {
         mla_par a;
         a.m = m;
+        a.sel = nsel >= 0 ? m->idxsel : NULL;
+        a.nsel = nsel >= 0 ? nsel : 0;
         a.kvb = waste_find(m, tname("%smodel.layers.%d.self_attn.kv_b_proj.weight",
                                     c->prefix, L));
         a.q = q; a.lat = m->latcache[L]; a.o = o;
@@ -3035,11 +3379,7 @@ static void ffn(waste_model *m, const waste_tensor *W1, const waste_tensor *W3,
     float *a = m->ff, *b = a + inter;
     matvec_t(m, a, W1, in, inter, hid);
     matvec_t(m, b, W3, in, inter, hid);
-    if (m->cfg.act_situ)
-        for (int i = 0; i < inter; i++)
-            a[i] = waste_situ_pair(a[i], b[i], m->cfg.situ_beta, m->cfg.situ_linear_beta);
-    else
-        for (int i = 0; i < inter; i++) a[i] = silu(a[i]) * b[i];
+    waste_act_pair_range(&m->cfg, a, b, inter);
     float *dst = accum ? m->h : out;
     matvec_t(m, dst, W2, a, hid, inter);
     if (accum) for (int i = 0; i < hid; i++) out[i] += w * dst[i];
@@ -3337,12 +3677,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
             for (int j = j0; j < j1; j++) {
                 float *g2 = m->xga + (size_t)j * inter;
                 const float *u2 = m->xub + (size_t)j * inter;
-                if (c->act_situ)
-                    for (int i = 0; i < inter; i++)
-                        g2[i] = waste_situ_pair(g2[i], u2[i], c->situ_beta,
-                                                c->situ_linear_beta);
-                else
-                    for (int i = 0; i < inter; i++) g2[i] = silu(g2[i]) * u2[i];
+                waste_act_pair_range(c, g2, u2, inter);
             }
             PROF_END(P_EMM);
 
@@ -3485,11 +3820,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
                  q_gate, qs_gate);
         vq_apply(m, ub, rec + h->up_off, sc + inter, inter, lat, lut_up,
                  q_up, qs_up);
-        if (c->act_situ)
-            for (int i = 0; i < inter; i++)
-                ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta, c->situ_linear_beta);
-        else
-            for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
+        waste_act_pair_range(c, ga, ub, inter);
         vq_matvec(m, acc, rec + h->down_off, sc + 2 * inter, ga, lat, inter,
                   h->codebook_id + 2 * m->stages, lut_down, q_down, qs_down);
         const float wj = w[j];
@@ -3524,6 +3855,141 @@ moe_done:
         waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight", c->prefix, L)),
         in, tmp, c->moe_inter * (c->n_shared ? c->n_shared : 1), hid, 1.0f, 0);
     for (int i = 0; i < hid; i++) out[i] += tmp[i];
+}
+
+/* ---- Manifold-Constrained Hyper-Connections (GLM-5.3-Flash) ------------
+ *
+ * mHC replaces the single residual stream with `hc_mult` parallel ones.
+ * Before each sublayer a learned mapping reads all of them at once and
+ * produces three things:
+ *
+ *   pre  [H]      collapse weights — the one vector the sublayer runs on
+ *   post [H]      where the sublayer's output lands, per stream
+ *   comb [H][H]   how the streams mix into each other
+ *
+ * comb is then projected onto the doubly-stochastic manifold by
+ * Sinkhorn-Knopp — alternating row and column normalization — which is the
+ * "manifold-constrained" half of the name and what bounds the stream norms
+ * across 45 layers. Twenty iterations on a 4x4 matrix, twice a layer:
+ * nothing beside the 24 x 16384 projection that produced its logits.
+ *
+ * This is the same *kind* of mechanism as K3's Attention Residuals above —
+ * both enrich what a layer sees beyond the immediately preceding one — and
+ * the two are mutually exclusive in practice. Where AttnRes keeps a history
+ * and attends over it, mHC keeps H streams and mixes them.
+ *
+ * The mapping runs in f32 because upstream casts the streams, the weights
+ * and all three outputs to float before touching them; the engine is f32
+ * throughout, so that matches by construction rather than by conversion.
+ */
+static void hc_norm_rows(float *comb, int H, float eps)
+{
+    for (int i = 0; i < H; i++) {
+        float sum = 0;
+        for (int j = 0; j < H; j++) sum += comb[i * H + j];
+        const float inv = 1.0f / (sum + eps);
+        for (int j = 0; j < H; j++) comb[i * H + j] *= inv;
+    }
+}
+
+static void hc_norm_cols(float *comb, int H, float eps)
+{
+    for (int j = 0; j < H; j++) {
+        float sum = 0;
+        for (int i = 0; i < H; i++) sum += comb[i * H + j];
+        const float inv = 1.0f / (sum + eps);
+        for (int i = 0; i < H; i++) comb[i * H + j] *= inv;
+    }
+}
+
+/* One mHC site. `site` is "attn" or "ffn"; the two differ only in which
+ * (fn, base, scale) triple they read. Fills post/comb for hc_scatter and
+ * writes the collapsed stream the sublayer runs on. */
+static void hc_collapse(waste_model *m, int L, const char *site, const float *x,
+                        float *post, float *comb, float *collapsed)
+{
+    const waste_config *c = &m->cfg;
+    const int H = c->hc_mult, hid = c->hidden;
+    const size_t HD = (size_t)H * hid;
+    const int nmix = (2 + H) * H;
+
+    /* Unweighted RMSNorm over the flattened streams — no learned gain, so
+     * this is not waste_rmsnorm with a vector of ones: it is the whole
+     * H * hidden vector normalized as one. */
+    float ss = 0;
+    for (size_t i = 0; i < HD; i++) ss += x[i] * x[i];
+    const float inv = 1.0f / sqrtf(ss / (float)HD + c->eps);
+    for (size_t i = 0; i < HD; i++) m->hcflat[i] = x[i] * inv;
+
+    float *w = m->hcmix;
+    matvec_t(m, w, waste_find(m, tname("%smodel.layers.%d.hc_%s_fn",
+                                       c->prefix, L, site)),
+             m->hcflat, nmix, (int)HD);
+    const float *base = T(m, "%smodel.layers.%d.hc_%s_base", c->prefix, L, site);
+    const float *sc   = T(m, "%smodel.layers.%d.hc_%s_scale", c->prefix, L, site);
+    float *pre = w + nmix;
+
+    for (int i = 0; i < H; i++) {
+        pre[i]  = 1.0f / (1.0f + expf(-(w[i] * sc[0] + base[i]))) + c->hc_eps;
+        post[i] = 2.0f / (1.0f + expf(-(w[H + i] * sc[1] + base[H + i])));
+    }
+    for (int i = 0; i < H; i++) {
+        float *row = comb + (size_t)i * H;
+        for (int j = 0; j < H; j++)
+            row[j] = w[2 * H + i * H + j] * sc[2] + base[2 * H + i * H + j];
+        softmax(row, H);
+        for (int j = 0; j < H; j++) row[j] += c->hc_eps;
+    }
+    /* Columns first, then hc_iters-1 rounds of (rows, columns): the order
+     * upstream uses, and the count is off by one from the obvious reading
+     * of "iterations" because the first column pass happens before the
+     * loop. Sinkhorn does not converge to the same matrix from the other
+     * order in a finite number of steps. */
+    hc_norm_cols(comb, H, c->hc_eps);
+    for (int it = 1; it < c->hc_iters; it++) {
+        hc_norm_rows(comb, H, c->hc_eps);
+        hc_norm_cols(comb, H, c->hc_eps);
+    }
+
+    for (int d = 0; d < hid; d++) {
+        float acc = 0;
+        for (int i = 0; i < H; i++) acc += pre[i] * x[(size_t)i * hid + d];
+        collapsed[d] = acc;
+    }
+}
+
+/* x[i] <- post[i] * y + sum_k comb[k][i] * x[k], the scatter half of a
+ * site. Upstream writes it as matmul(comb.transpose(-1, -2), residual),
+ * which is this indexing read the other way round. */
+static void hc_scatter(waste_model *m, float *x, const float *post,
+                       const float *comb, const float *y)
+{
+    const int H = m->cfg.hc_mult, hid = m->cfg.hidden;
+    float *tmp = m->hcflat;                  /* free again by this point */
+    for (int i = 0; i < H; i++) {
+        float *dst = tmp + (size_t)i * hid;
+        const float pi = post[i];
+        for (int d = 0; d < hid; d++) dst[d] = pi * y[d];
+        for (int k = 0; k < H; k++) {
+            const float ck = comb[(size_t)k * H + i];
+            const float *src = x + (size_t)k * hid;
+            for (int d = 0; d < hid; d++) dst[d] += ck * src[d];
+        }
+    }
+    memcpy(x, tmp, (size_t)H * hid * sizeof(float));
+}
+
+/* The final collapse: GLM's hc_head is an unweighted mean over the streams,
+ * not another learned mapping. */
+static void hc_head(const waste_config *c, float *out, const float *x)
+{
+    const int H = c->hc_mult, hid = c->hidden;
+    const float inv = 1.0f / (float)H;
+    for (int d = 0; d < hid; d++) {
+        float acc = 0;
+        for (int i = 0; i < H; i++) acc += x[(size_t)i * hid + d];
+        out[d] = acc * inv;
+    }
 }
 
 /* ---- Attention Residuals (K3) ------------------------------------------
@@ -3591,7 +4057,11 @@ typedef struct {
     int32_t  n_layers, hidden, kda_heads, kda_dim, conv_k, n_heads;
     int32_t  qk_nope, qk_rope, v_head, attn_res_block;
     int32_t  pos, n_blockres;
-    uint32_t reserved[2];
+    /* hc_mult widens the residual stream this file ends with; index_dim
+     * decides whether it carries indexer pools at all. Both were reserved
+     * words, and both have to be compared: a file written by one and read
+     * by the other is the right length in neither direction. */
+    int32_t  hc_mult, index_dim;
 } waste_state_hdr;
 
 static void state_fill(const waste_model *m, waste_state_hdr *h, int pos)
@@ -3604,6 +4074,7 @@ static void state_fill(const waste_model *m, waste_state_hdr *h, int pos)
     h->kda_heads = c->kda_heads; h->kda_dim = c->kda_dim; h->conv_k = c->conv_k;
     h->n_heads = c->n_heads; h->qk_nope = c->qk_nope; h->qk_rope = c->qk_rope;
     h->v_head = c->v_head; h->attn_res_block = c->attn_res_block;
+    h->hc_mult = c->hc_mult; h->index_dim = c->index_topk ? c->index_dim : 0;
     h->pos = pos; h->n_blockres = m->n_blockres;
 }
 
@@ -3623,7 +4094,9 @@ void waste_model_reset(waste_model *m)
         m->n_kv[L] = 0;
     }
     m->n_blockres = 0;
-    if (m->x) memset(m->x, 0, (size_t)c->hidden * sizeof(float));
+    if (m->x) memset(m->x, 0, (size_t)(c->hc_mult ? c->hc_mult : 1) *
+                              c->hidden * sizeof(float));
+    for (int L = 0; L < c->n_layers; L++) m->n_pool[L] = 0;
     if (m->blockres && c->attn_res_block) {
         const int nb = c->n_layers / c->attn_res_block + 2;
         memset(m->blockres, 0, (size_t)nb * c->hidden * sizeof(float));
@@ -3739,13 +4212,27 @@ int waste_model_state_save(const waste_model *m, const char *path, int pos)
             if (fwrite(&nkv, sizeof nkv, 1, f) != 1) { rc = -1; break; }
             const size_t kn = (size_t)nkv * (c->kv_lora + c->qk_rope);
             if (kn && fwrite(m->latcache[L], sizeof(float), kn, f) != kn) rc = -1;
+            /* The indexer's pools are context, not weights: a session
+             * restored without them attends over a selection made from an
+             * empty history, which is wrong quietly rather than loudly. */
+            if (!rc && c->index_topk) {
+                const int32_t np = m->n_pool[L];
+                const size_t pn = (size_t)np * c->index_dim;
+                const size_t bn = (size_t)c->index_kpool * 2 * c->index_dim;
+                if (fwrite(&np, sizeof np, 1, f) != 1) rc = -1;
+                else if (pn && fwrite(m->idxpool[L], sizeof(float), pn, f) != pn) rc = -1;
+                else if (fwrite(m->idxbuf[L], sizeof(float), bn, f) != bn) rc = -1;
+            }
         }
     }
     if (!rc && c->attn_res_block && m->n_blockres > 0) {
         const size_t n = (size_t)m->n_blockres * c->hidden;
         if (fwrite(m->blockres, sizeof(float), n, f) != n) rc = -1;
     }
-    if (!rc && fwrite(m->x, sizeof(float), (size_t)c->hidden, f) != (size_t)c->hidden) rc = -1;
+    {
+        const size_t xn = (size_t)(c->hc_mult ? c->hc_mult : 1) * c->hidden;
+        if (!rc && fwrite(m->x, sizeof(float), xn, f) != xn) rc = -1;
+    }
     if (!rc && waste_sync_file(f)) rc = -1;
     if (fclose(f)) rc = -1;
     if (!rc && waste_replace_file(tmp, path)) rc = -1;
@@ -3770,7 +4257,8 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
         h.kda_heads != want.kda_heads || h.kda_dim != want.kda_dim ||
         h.conv_k != want.conv_k || h.n_heads != want.n_heads ||
         h.qk_nope != want.qk_nope || h.qk_rope != want.qk_rope ||
-        h.v_head != want.v_head || h.attn_res_block != want.attn_res_block) {
+        h.v_head != want.v_head || h.attn_res_block != want.attn_res_block ||
+        h.hc_mult != want.hc_mult || h.index_dim != want.index_dim) {
         fclose(f);
         return -2;                       /* state does not belong to this model */
     }
@@ -3806,13 +4294,28 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
                 fclose(f); return -2;
             }
             bytes = sizeof nkv + (uint64_t)nkv * (c->kv_lora + c->qk_rope) * 4;
+            if (c->index_topk) {
+                int32_t np = 0;
+                const uint64_t at = off + bytes;
+                if (at > fsize || fsize - at < sizeof np ||
+                    waste_pread(fileno(f), &np, sizeof np, (int64_t)at) != sizeof np) {
+                    fclose(f); return -2;
+                }
+                if (np < 0 || np > m->pool_cap ||
+                    np != (c->index_kpool ? h.pos / c->index_kpool : 0)) {
+                    fclose(f); return -2;
+                }
+                bytes += sizeof np + ((uint64_t)np * c->index_dim +
+                                      (uint64_t)c->index_kpool * 2 * c->index_dim) * 4;
+            }
         }
         if (off > fsize || bytes > fsize - off) { fclose(f); return -2; }
         off += bytes;
     }
     {
         const uint64_t tail = (uint64_t)h.n_blockres * c->hidden * 4 +
-                              (uint64_t)c->hidden * 4;
+                              (uint64_t)(c->hc_mult ? c->hc_mult : 1) *
+                              c->hidden * 4;
         if (off > fsize || tail > fsize - off || off + tail != fsize) {
             fclose(f); return -2;
         }
@@ -3832,6 +4335,16 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
             const size_t kn = (size_t)nkv * (c->kv_lora + c->qk_rope);
             if (kn && fread(m->latcache[L], sizeof(float), kn, f) != kn) rc = -1;
             m->n_kv[L] = nkv;
+            if (!rc && c->index_topk) {
+                int32_t np = 0;
+                const size_t bn = (size_t)c->index_kpool * 2 * c->index_dim;
+                if (fread(&np, sizeof np, 1, f) != 1) { rc = -1; break; }
+                if (np < 0 || np > m->pool_cap) { rc = -1; break; }
+                const size_t pn = (size_t)np * c->index_dim;
+                if (pn && fread(m->idxpool[L], sizeof(float), pn, f) != pn) rc = -1;
+                else if (fread(m->idxbuf[L], sizeof(float), bn, f) != bn) rc = -1;
+                m->n_pool[L] = np;
+            }
         }
     }
     m->n_blockres = h.n_blockres;
@@ -3839,7 +4352,10 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
         const size_t n = (size_t)h.n_blockres * c->hidden;
         if (fread(m->blockres, sizeof(float), n, f) != n) rc = -1;
     }
-    if (!rc && fread(m->x, sizeof(float), (size_t)c->hidden, f) != (size_t)c->hidden) rc = -1;
+    {
+        const size_t xn = (size_t)(c->hc_mult ? c->hc_mult : 1) * c->hidden;
+        if (!rc && fread(m->x, sizeof(float), xn, f) != xn) rc = -1;
+    }
     fclose(f);
     if (!rc && pos) *pos = h.pos;
     /* -3 means the file changed or the device failed after the successful
@@ -4263,11 +4779,7 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
                      lut_gu + (size_t)(2 * t + 1) * lut_sz,
                      q_gu ? q_gu + (size_t)(2 * t + 1) * lut_sz : NULL,
                      qs_gu ? qs_gu + (size_t)(2 * t + 1) * nsc : NULL);
-            if (c->act_situ)
-                for (int i = 0; i < inter; i++)
-                    ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta, c->situ_linear_beta);
-            else
-                for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
+            waste_act_pair_range(c, ga, ub, inter);
             vq_matvec(m, acc, rec + h->down_off, s16 + 2 * inter, ga, lat, inter,
                       h->codebook_id + 2 * m->stages, lut_down,
                       q_down, qs_down);
@@ -4303,9 +4815,7 @@ chunk_lost:
     waste_matmul_t(m, sb, waste_find(m, tname(
                  "%smodel.layers.%d.block_sparse_moe.shared_experts.up_proj.weight",
                  c->prefix, L)), in, si, hid, nT);
-    for (int i = 0; i < nT * si; i++)
-        sa[i] = c->act_situ ? waste_situ_pair(sa[i], sb[i], c->situ_beta, c->situ_linear_beta)
-                            : silu(sa[i]) * sb[i];
+    waste_act_pair_range(c, sa, sb, nT * si);
     waste_matmul_t(m, sh, waste_find(m, tname(
                  "%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight",
                  c->prefix, L)), sa, hid, si, nT);
@@ -4338,6 +4848,21 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     const int hid = c->hidden;
     if (n <= 0) return m->logits;
     if (n == 1) return waste_model_step(m, tokens[0], pos0, NULL);
+    /* The chunked path carries one residual per token and one dense
+     * attention per layer. mHC's parallel streams and the DSA indexer's
+     * per-token pool bookkeeping are neither, and a chunk that quietly ran
+     * without them would differ from the same prompt decoded one token at a
+     * time — the exact failure WASTE_CHUNK exists to be checked against. So
+     * a container with either is prefilled the way it decodes, one token
+     * per call, until the chunked path grows both. */
+    if (c->hc_mult || c->index_topk) {
+        const float *out = NULL;
+        for (int t = 0; t < n; t++) {
+            out = waste_model_step(m, tokens[t], pos0 + t, NULL);
+            if (!out) return NULL;
+        }
+        return out;
+    }
     dump_pos0 = pos0;
     if (n > WASTE_CHUNK_MAX) n = WASTE_CHUNK_MAX;
     /* mla_layer writes one latent per position with no bound of its own,
@@ -4436,9 +4961,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
             float *a = m->cff, *b = a + (size_t)n * inter;
             waste_matmul_t(m, a, waste_find(m, tname("%smodel.layers.%d.mlp.gate_proj.weight", c->prefix, L)), m->cnorm, inter, hid, n);
             waste_matmul_t(m, b, waste_find(m, tname("%smodel.layers.%d.mlp.up_proj.weight", c->prefix, L)), m->cnorm, inter, hid, n);
-            for (int i = 0; i < n * inter; i++)
-                a[i] = c->act_situ ? waste_situ_pair(a[i], b[i], c->situ_beta, c->situ_linear_beta)
-                                   : silu(a[i]) * b[i];
+            waste_act_pair_range(c, a, b, n * inter);
             waste_matmul_t(m, m->cresid, waste_find(m, tname("%smodel.layers.%d.mlp.down_proj.weight", c->prefix, L)), a, hid, inter, n);
         }
 
@@ -4499,11 +5022,17 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     } else {
         waste_embed_row(m, token, m->x);
     }
+    /* mHC: every stream starts as a copy of the embedding — upstream
+     * expands the embedding along a new axis of hc_mult before layer 0. */
+    for (int i = 1; i < c->hc_mult; i++)
+        memcpy(m->x + (size_t)i * hid, m->x, (size_t)hid * sizeof(float));
 
     float *resid = (float *)malloc((size_t)hid * sizeof(float));
     float *norm = (float *)malloc((size_t)hid * sizeof(float));
     if (!resid || !norm) { free(resid); free(norm); return NULL; }
     const int ares_on = c->attn_res_block > 0;
+    const int hc_on = c->hc_mult > 0;
+    float hc_post[WASTE_MAX_HC], hc_comb[WASTE_MAX_HC * WASTE_MAX_HC];
     float *ps = m->prefix_sum;
     int ps_live = 0;
     m->n_blockres = 0;
@@ -4529,11 +5058,15 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         }
 
         snprintf(b, sizeof b, "%smodel.layers.%d.input_layernorm.weight", c->prefix, L);
-        waste_rmsnorm(norm, m->x, waste_find(m, b)->data, hid, c->eps);
+        if (hc_on) hc_collapse(m, L, "attn", m->x, hc_post, hc_comb, m->hccol);
+        waste_rmsnorm(norm, hc_on ? m->hccol : m->x, waste_find(m, b)->data,
+                      hid, c->eps);
         if (c->kda_layer[L]) { PROF_START(P_KDA); kda_layer(m, L, norm, resid); PROF_END(P_KDA); }
         else { PROF_START(P_MLA); mla_layer(m, L, norm, resid, pos); PROF_END(P_MLA); }
 
-        if (ares_on) {
+        if (hc_on) {
+            hc_scatter(m, m->x, hc_post, hc_comb, resid);
+        } else if (ares_on) {
             if (ps_live) for (int i = 0; i < hid; i++) ps[i] += resid[i];
             else { memcpy(ps, resid, (size_t)hid * sizeof(float)); ps_live = 1; }
             waste_apply_attn_res(m, m->blockres, m->n_blockres, ps,
@@ -4545,7 +5078,9 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         }
 
         snprintf(b, sizeof b, "%smodel.layers.%d.post_attention_layernorm.weight", c->prefix, L);
-        waste_rmsnorm(norm, m->x, waste_find(m, b)->data, hid, c->eps);
+        if (hc_on) hc_collapse(m, L, "ffn", m->x, hc_post, hc_comb, m->hccol);
+        waste_rmsnorm(norm, hc_on ? m->hccol : m->x, waste_find(m, b)->data,
+                      hid, c->eps);
         snprintf(b, sizeof b, "%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L);
         if (waste_find(m, b)) {
             PROF_START(P_ROUTE);
@@ -4558,7 +5093,9 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
                 waste_find(m, tname("%smodel.layers.%d.mlp.down_proj.weight", c->prefix, L)),
                 norm, resid, c->dense_inter, hid, 1.0f, 0);
 
-        if (ares_on) {
+        if (hc_on) {
+            hc_scatter(m, m->x, hc_post, hc_comb, resid);
+        } else if (ares_on) {
             for (int i = 0; i < hid; i++) ps[i] += resid[i];
             memcpy(m->x, ps, (size_t)hid * sizeof(float));
         } else {
@@ -4570,7 +5107,9 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         const char *dump_hidden = getenv("WASTE_DUMP_HIDDEN");
         if (dump_hidden) {
             FILE *df = fopen(dump_hidden, L ? "ab" : "wb");
-            if (df) { fwrite(m->x, sizeof(float), (size_t)hid, df); fclose(df); }
+            if (df) { fwrite(m->x, sizeof(float),
+                             (size_t)hid * (hc_on ? c->hc_mult : 1), df);
+                      fclose(df); }
         }
     }
     /* One last AttnRes: the output layer attends over every block
@@ -4581,7 +5120,10 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
             waste_find(m, tname("%smodel.output_attn_res_norm.weight", c->prefix))->data,
             waste_find(m, tname("%smodel.output_attn_res_proj.weight", c->prefix))->data,
             m->x);
-    waste_rmsnorm(norm, m->x, waste_find(m, tname("%smodel.norm.weight", c->prefix))->data, hid, c->eps);
+    if (hc_on) hc_head(c, m->hccol, m->x);
+    waste_rmsnorm(norm, hc_on ? m->hccol : m->x,
+                  waste_find(m, tname("%smodel.norm.weight", c->prefix))->data,
+                  hid, c->eps);
     PROF_START(P_HEAD);
     matvec_t(m, m->logits, waste_find(m, tname("%slm_head.weight", c->prefix)), norm, c->vocab, hid);
     PROF_END(P_HEAD);

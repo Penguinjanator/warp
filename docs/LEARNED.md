@@ -4514,3 +4514,128 @@ or on a machine with room, not on a bare laptop. The estimate that preceded
 it — "20-30 minutes of paging, with a real chance the OS starts killing
 things" — was wrong in kind rather than in degree: macOS grew swap to 40 GB
 and froze instead of killing anything.
+
+## 65. GLM-5.3-Flash is this engine with three things added (2026-08-27)
+
+`zai-org/GLM-5.3-Flash` was published the day before this was written: 313 B
+parameters, 328 GB of fp8, `Glm5NextForConditionalGeneration`. The question
+was how much of it this engine already runs. The answer turned out to be
+most of it, and the interesting part is which of the differences were
+*loud* and which were silent.
+
+### What was already there
+
+Nothing had to be written for any of this. The layer mix is 34 KDA and 11
+MLA, one full-attention layer in four — Kimi-Linear's pattern at K3's
+scale. The KDA is the same recurrence with the same parameterization:
+`f_a`/`f_b` forget gate, per-head `A_log`, `gate_lower_bound` -5.0, short
+conv 4, `g_a`/`g_b` output gate, gated RMSNorm. The router is DeepSeek's,
+which is K3's: sigmoid scores, an `e_score_correction_bias` for selection
+only, renormalized top-8, `routed_scaling_factor` 2.5. The tensors are
+named the way K2 and K3's are, the config nests under `text_config` with a
+`language_model.` prefix exactly as K3's does, and the weights are fp8 with
+block scales, which the converter has read since K2.
+
+Even the MLA needed nothing: `qk_rope_head_dim` is **0** and `mla_use_nope`
+is set, so `mla_layer` runs with a zero-width rope slice and the absorption
+is unchanged. GLM's own positional signal is in the KDA layers and in the
+indexer's rope, not in MLA at all.
+
+### What was new, and what it cost
+
+| | where | resident cost |
+|---|---|---|
+| mHC, 4 residual streams | the layer loop, both sites | 35 B params, 8-bit |
+| clamped SwiGLU, limit 10 | seven activation sites | none |
+| DSA k-pool indexer | `mla_layer` | 128 B/token/layer |
+
+The third is the one worth recording. DeepSeek Sparse Attention here scores
+*pools* of four adjacent tokens rather than tokens, keeps
+`index_topk / index_kpool` = 512 of them, and always appends the tail that
+has not filled a pool. Two consequences fell out of writing it:
+
+- **A pool's compressed key is computed once and is 32x smaller than the
+  keys it summarizes.** One 128-wide vector per four tokens per
+  full-attention layer, appended when the pool's last token arrives. The
+  per-step state is that array plus a four-slot rolling buffer. Against the
+  latents already cached (512 floats per token per layer) it is a
+  fourteenth. The obvious implementation — cache the raw keys and pool them
+  at selection time — would have cost 32x more and recomputed the same
+  softmax every step.
+
+- **Below `index_topk` tokens the sparse path *is* the dense path**, not an
+  approximation of it. With no more complete pools than the query may keep,
+  the selection is every visible token. So the branch costs nothing at
+  short context and the selection arithmetic appears exactly where the
+  saving does. `dsa_select` returns -1 for it and the head loop takes the
+  path it always took.
+
+### The two that were silent, and one that was found by checking
+
+Loud failures need no discipline. These three did:
+
+**`kda_layers` is 0-based on GLM and 1-based in a WASTE manifest.** Copied
+through it puts KDA on the wrong layers. Every tensor is found, every shape
+checks out, `cfg_sane` passes, the container loads, and the model answers
+noise. The converter rebuilds the list from `layer_types` instead, which
+states the same thing without an origin convention.
+
+**`eos_token_id` is a list of three.** Read as an integer it stops on
+nothing.
+
+Neither is visible to the oracle diff, because the oracle reads the same
+manifest and would be wrong in the same direction. That is the general
+shape of a converter bug and the reason `tests/test_convert_glm.py` checks
+against what the *release* says rather than against the container.
+
+**The pre-tokenizer has no Han branch.** This one was not deduced, it was
+measured, and it is the concrete result of this section. Kimi's pattern
+starts with `[\p{Han}]+`; GLM's does not, so on GLM a Han run and the Latin
+run touching it are one pre-token where on Kimi they are two. Sixteen
+tokens in GLM's vocabulary span that boundary and they are ordinary words:
+
+| | with the Han branch | GLM, and the release |
+|---|---|---|
+| `A股` | `32 98963` | `111321` |
+| `维生素C` | `103261 34` | `121569` |
+| `C罗` | `34 99209` | `126152` |
+| `QQ音乐` | `47724 99908` | `126724` |
+
+A tokenizer that is right on 22 English and CJK strings and wrong on `A股`
+is the failure mode this family keeps producing: correct on everything the
+corpus happens to contain. The corpus now contains it, the container states
+which pattern it wants in `tokenizer_han_split`, and `tools/tokdiff.py`
+compares against whichever reference the source actually ships — tiktoken
+for a rank file, `tokenizers` for a `tokenizer.json`. 21 of 21 identical
+against the real GLM vocabulary.
+
+A fourth thing was expected to be silent and was not: the merge list.
+Re-encoding `tokenizer.json` into a tiktoken rank file only reproduces the
+release's encoder if the merge list is ordered by the id of what each merge
+produces — merge-by-rank and merge-by-list-position are otherwise two
+encoders sharing one vocabulary. GLM's is so ordered (0 descents in 321648
+merges), and `hf_tokenizer.py` refuses rather than approximates when a
+release's is not. Its first version demanded something stricter — that both
+halves of every merge rank below the result — and rejected this tokenizer
+over 56373 merges that are simply redundant spellings (`Ġ`+`th` beside
+`Ġt`+`h`, both producing `Ġth`). The check was wrong, not the tokenizer;
+what matters is the order of the results, not the ranks of the inputs.
+
+### The size, which is why this is worth having
+
+Arithmetic from `config.json`, not a conversion:
+
+| | GLM-5.3-Flash | K3 |
+|---|---:|---:|
+| trunk, resident | ~4.8 GiB | 27.3 GiB |
+| experts at VQ3R | ~106.5 GiB | 982 GiB |
+| one token's working set | ~3.2 GB | ~17 GB |
+
+On the 64 GB machine §64 measured K3 at 0.39 tok/s on, GLM's trunk leaves
+room to cache something on the order of 40% of its entire expert set, where
+K3 gets a working set and a half. §63's four-token window and §39's
+hit-rate curve both say what to expect from that, and neither has been run
+here — no GLM container has been converted yet. Everything in this section
+that is not from `config.json` was measured on a synthetic container at
+1/32 scale, whose shapes are the ones the engine branches on and whose
+weights are noise.

@@ -118,6 +118,34 @@ the DeepSeek release's own `modeling_deepseek.py`.
 Kimi K3 and Kimi-Linear are unaffected: their forward pass is byte-identical to
 0.6.7, by construction rather than by a runtime branch.
 
+### GLM-5.3-Flash
+
+`zai-org/GLM-5.3-Flash` — 313 B parameters, 328 GB of fp8 as published — runs
+text-only, and turned out to be mostly this engine already: the same KDA
+recurrence, the same MLA with `kv_b_proj` absorbed, the same router, the same
+fp8 reader and the same nested config layout as K3. Three things are new and
+each is behind a config key that is absent everywhere else: **mHC**, which
+carries four parallel residual streams instead of one and mixes them through a
+Sinkhorn-projected matrix at every sublayer; a **clamped SwiGLU**; and
+**DeepSeek Sparse Attention** in its k-pool form, where a full-attention layer
+scores pools of four cached tokens and attends over the best 512 of them plus
+the tail.
+
+No throughput figures, because no GLM container has been converted here yet.
+From `config.json` the container comes to roughly a 4.8 GiB resident trunk and
+106.5 GiB of experts at VQ3R, against K3's 27.3 GiB and 982 GiB — so on a 64 GB
+machine there is room to cache a large fraction of the whole expert set rather
+than a token's working set and a half. What *has* been measured is the
+arithmetic: the engine agrees with a PyTorch reference to 5.7e-6 on a
+GLM-shaped synthetic container, with the sparse-attention branch really taken,
+and the re-encoded tokenizer agrees with the release's own on 21 of 21 strings.
+
+The vision tower is not implemented — GLM's is not K3's — so the converter
+writes no `vision.json` and the container refuses images by name rather than
+running the wrong tower on them. [docs/GLM.md](docs/GLM.md) has the
+architecture, the two places the release states something differently, and
+what else is left out.
+
 ## What you need
 
 To build and test WARP:

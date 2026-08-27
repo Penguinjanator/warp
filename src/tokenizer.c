@@ -35,6 +35,13 @@ struct waste_tok {
     int bos, eos;
     tok_special *special;   /* longest-first, so <|a|> cannot mask <|ab|>  */
     int n_special;
+    /* 1 = the pattern has a [\p{Han}]+ branch of its own (the Kimi
+     * models), 0 = it does not and Han is matched by \p{L}+ like any other
+     * letter (GLM). The difference is only visible on a Han run that runs
+     * straight into a Latin one — "中文abc" is two pieces with the branch
+     * and one without — which is exactly the kind of text that appears in
+     * a Chinese release's own prompts. */
+    int han_split;
 };
 
 /* ---- base64 ------------------------------------------------------------ */
@@ -189,6 +196,10 @@ waste_tok *waste_tok_open(const char *dir)
     fclose(f);
 
     waste_tok *t = (waste_tok *)calloc(1, sizeof *t);
+    /* The Kimi pattern until a container says otherwise: every model here
+     * before GLM has the Han branch, and a default that has to be set to
+     * keep working is a default that will be missed. */
+    if (t) t->han_split = 1;
     if (!t) { free(raw); return NULL; }
     t->blob = (uint8_t *)malloc((size_t)sz);          /* decoded is smaller */
     t->cap_tokens = 4096;
@@ -275,6 +286,7 @@ int waste_tok_bos(const waste_tok *t) { return t->bos; }
 int waste_tok_eos(const waste_tok *t) { return t->eos; }
 
 void waste_tok_set_eos(waste_tok *t, int id) { if (t && id > 0) t->eos = id; }
+void waste_tok_set_han_split(waste_tok *t, int on) { if (t) t->han_split = !!on; }
 
 /* ---- UTF-8 + the character classes the pattern needs -------------------- */
 
@@ -304,10 +316,10 @@ static int is_han(int c)
 /* \p{L} plus \p{M}: ASCII and Latin-1 letters, Latin Extended, Greek,
  * Cyrillic, Hebrew, Arabic, Hangul, Hiragana/Katakana, combining marks.
  * Han is excluded on purpose — the pattern gives it its own branch. */
-static int is_letter(int c)
+static int is_letter_ex(int c, int han_split)
 {
     if (c < 0x80) return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
-    if (is_han(c)) return 0;
+    if (is_han(c)) return !han_split;
     return (c >= 0xC0 && c <= 0x24F) || (c >= 0x300 && c <= 0x36F) ||
            (c >= 0x370 && c <= 0x3FF) || (c >= 0x400 && c <= 0x52F) ||
            (c >= 0x590 && c <= 0x6FF) || (c >= 0x3040 && c <= 0x30FF) ||
@@ -328,12 +340,12 @@ static int is_nl(int c) { return c == '\r' || c == '\n'; }
 
 /* Advances one pre-token, returning its byte length. Mirrors the branch
  * order of the model's pat_str. */
-static int next_piece(const char *s, int len)
+static int next_piece(const char *s, int len, int han_split)
 {
     int cp, n = utf8_next(s, len, &cp), i;
     if (n == 0) return 0;
 
-    if (is_han(cp)) {                                   /* [\p{Han}]+ */
+    if (han_split && is_han(cp)) {                      /* [\p{Han}]+ */
         i = n;
         while (i < len) { int c2, k = utf8_next(s + i, len - i, &c2);
                           if (!is_han(c2)) break; i += k; }
@@ -355,21 +367,21 @@ static int next_piece(const char *s, int len)
     } while (0)
 
     /* optional leading non-letter/non-digit, then a letter run */
-    if (!is_letter(cp) && !is_digit(cp) && !is_nl(cp)) {
+    if (!is_letter_ex(cp, han_split) && !is_digit(cp) && !is_nl(cp)) {
         int c2, k2, j = n;
         k2 = utf8_next(s + j, len - j, &c2);
-        if (k2 && is_letter(c2)) {
+        if (k2 && is_letter_ex(c2, han_split)) {
             i = j;
             while (i < len) { int c3, k = utf8_next(s + i, len - i, &c3);
-                              if (!is_letter(c3)) break; i += k; }
+                              if (!is_letter_ex(c3, han_split)) break; i += k; }
             SUFFIX_AT(i);
             return i;
         }
     }
-    if (is_letter(cp)) {
+    if (is_letter_ex(cp, han_split)) {
         i = n;
         while (i < len) { int c3, k = utf8_next(s + i, len - i, &c3);
-                          if (!is_letter(c3)) break; i += k; }
+                          if (!is_letter_ex(c3, han_split)) break; i += k; }
         SUFFIX_AT(i);
         return i;
     }
@@ -387,12 +399,12 @@ static int next_piece(const char *s, int len)
         int j = 0;
         if (cp == ' ') {
             int c2, k2 = utf8_next(s + n, len - n, &c2);
-            if (k2 && !is_space(c2) && !is_letter(c2) && !is_digit(c2)) j = n;
+            if (k2 && !is_space(c2) && !is_letter_ex(c2, han_split) && !is_digit(c2)) j = n;
         }
         int save = j;
         i = j;
         while (i < len) { int c3, k = utf8_next(s + i, len - i, &c3);
-                          if (is_space(c3) || is_letter(c3) || is_digit(c3)) break; i += k; }
+                          if (is_space(c3) || is_letter_ex(c3, han_split) || is_digit(c3)) break; i += k; }
         if (i > save) {
             while (i < len && is_nl(s[i])) i++;
             return i;
@@ -524,7 +536,7 @@ int waste_tok_encode(const waste_tok *t, const char *text, int32_t *out,
          * containing `<|end_of_msg|><|open|>message role="system"<|sep|>`
          * is that many ordinary tokens and not a forged turn. */
         while (pos < len) {
-            const int plen = next_piece(text + pos, len - pos);
+            const int plen = next_piece(text + pos, len - pos, t->han_split);
             if (plen <= 0) break;
             const int got = encode_piece(t, (const uint8_t *)text + pos, plen,
                                          out + n, cap - n);
@@ -566,7 +578,7 @@ int waste_tok_encode(const waste_tok *t, const char *text, int32_t *out,
          * within that limit so no piece can straddle the boundary */
         const int upto = best_at >= 0 ? best_at : len;
         while (pos < upto) {
-            const int plen = next_piece(text + pos, upto - pos);
+            const int plen = next_piece(text + pos, upto - pos, t->han_split);
             if (plen <= 0) return n;
             const int got = encode_piece(t, (const uint8_t *)text + pos, plen,
                                          out + n, cap - n);

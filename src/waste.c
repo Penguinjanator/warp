@@ -426,6 +426,18 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
                      + (uint64_t)n_mla * ctx_tokens *
                        ((uint64_t)kv_lora + qk_rope) * 4;                /* KV */
     (void)qk_nope; (void)v_head;
+    {   /* The DSA indexer's pooled keys are session state too: one
+         * index_dim vector per index_kpool tokens per full-attention layer.
+         * Small beside the latents — a 32nd of them on GLM — but it grows
+         * with the context exactly as they do, so it belongs in the same
+         * arithmetic rather than in the flat scratch. */
+        const int itk = (int)js_int(&d, js_get(&d, cfg, "index_topk"), 0);
+        const int ikp = (int)js_int(&d, js_get(&d, cfg, "index_kpool"), 1);
+        const int idm = (int)js_int(&d, js_get(&d, cfg, "index_head_dim"), 0);
+        if (itk > 0 && ikp > 0 && idm > 0)
+            out->state_bytes += (uint64_t)n_mla *
+                ((uint64_t)(ctx_tokens / ikp + 1) * idm + 2ull * ikp * idm) * 4;
+    }
 
     /* Scratch, counted rather than guessed. The old flat 64 MB was out by
      * 4x on the decode buffers alone (e_gate/e_up/e_down are 252 MB on K3)
@@ -471,6 +483,32 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
     sc += ((uint64_t)8 * big + 8 * moe_inter + 8 * dense_inter + 512) * 4;
     sc += (uint64_t)3 * nheads * (kv_lora ? kv_lora : 1) * 4;   /* MLA absorb  */
     sc += (uint64_t)(nb + 4) * hidden * 4;                  /* AttnRes buffers */
+    {   /* mHC: the residual stream is hc_mult copies, hc_collapse keeps a
+         * flattened copy of it beside them, and the activation-quantization
+         * buffers are sized from the widest matvec — which on a mHC model
+         * is that flattened vector, not the dense FFN. */
+        const int hcm = (int)js_int(&d, js_get(&d, cfg, "hc_mult"), 0);
+        if (hcm > 0) {
+            sc += (uint64_t)2 * hcm * hidden * 4;
+            const uint64_t hcw = (uint64_t)hcm * hidden;
+            const uint64_t was = hidden > dense_inter ? hidden : dense_inter;
+            if (hcw > was) {
+                sc += (hcw - was) * 2;                   /* m->xq   */
+                sc += (hcw - was) / 32 * 4;              /* m->xs   */
+                sc += (uint64_t)T * (hcw - was);         /* m->mmxq */
+            }
+        }
+        /* the indexer's per-step buffers: the selection, one score per
+         * candidate pool, its ranking, and the indexer's own query */
+        const int itk = (int)js_int(&d, js_get(&d, cfg, "index_topk"), 0);
+        const int ikp = (int)js_int(&d, js_get(&d, cfg, "index_kpool"), 1);
+        const int idm = (int)js_int(&d, js_get(&d, cfg, "index_head_dim"), 0);
+        const int ihd = (int)js_int(&d, js_get(&d, cfg, "index_n_heads"), 0);
+        if (itk > 0 && ikp > 0)
+            sc += (uint64_t)(itk + ikp) * 4 +
+                  2ull * (ctx_tokens / ikp + 1) * 4 +
+                  (uint64_t)(ihd * idm + ihd) * 4;
+    }
     /* chunked prefill, allocated on first use and never freed */
     sc += (uint64_t)T * hidden * 4 * 3;                     /* cx/cnorm/cresid */
     {   /* Decode keeps three LUTs and chunked prefill keeps 2*T+1.
@@ -714,7 +752,10 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
         snprintf(c->usage, sizeof c->usage, "%s/usage.waste", model_path);
     c->cfg.usage_path = c->usage;
     c->tok = waste_tok_open(model_path);      /* optional */
-    if (c->tok) waste_tok_set_eos(c->tok, c->m.cfg.eos_token_id);
+    if (c->tok) {
+        waste_tok_set_eos(c->tok, c->m.cfg.eos_token_id);
+        waste_tok_set_han_split(c->tok, c->m.cfg.tok_han_split);
+    }
     /* warm the cache from what previous runs learned, if anything */
     c->warmed = waste_model_warm_cache(&c->m, c->usage);
     *out = c;
@@ -1242,6 +1283,7 @@ waste_status waste_model_get_info(const waste_ctx *c, waste_model_info *out)
      * not recognize is reported verbatim rather than guessed at. */
     out->arch = strstr(cf->arch, "KimiK3")     ? "kimi-k3"
               : strstr(cf->arch, "KimiLinear") ? "kimi-linear"
+              : strstr(cf->arch, "Glm5Next")   ? "glm5-next"
               : cf->arch[0]                    ? cf->arch
                                                : "unknown";
     out->quant_summary = c->quant;

@@ -1,0 +1,9 @@
+{
+ "container": "python3 tools/make_test_container.py --glm --seed 0 <dir>",
+ "container_sha256": "83ae251afa470409032d36d7aaa332d48d3da5173920279ff8c6be557311b7f1",
+ "ids": "3,7,11,5,9,13,2,17,4,8,19,23,6,29,12,31",
+ "oracle": "uv run --with torch --with fla-core --no-project python tools/kimi_ref.py --container <dir> --prompt-ids <ids> --tokens 0 --dump tests/fixtures/oracle_glmsynth_16tok.bin",
+ "what": "Last token's logits, f32, vocab 256 \u2014 the layout test_forward writes. Computed by the PyTorch reference, not by the engine, so the diff means something.",
+ "why_the_digest": "The container is generated, not converted, so it is byte-reproducible at seed 0 and the fixture can ship. The digest is over that container: change make_test_container.py's weights and the fixture is stale, which has to read as 'regenerate me' and not as an engine bug.",
+ "why_this_prompt": "16 tokens with index_topk 8 and index_kpool 4: four complete pools of which the indexer may keep two, so the DSA branch is reached rather than degenerating to dense attention. Below 12 tokens every pool is kept and the check would pass with the selection removed."
+}

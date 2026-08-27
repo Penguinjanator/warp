@@ -2,7 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 SQLite Cloud, Inc.
 """
-kimi_ref.py — pure-PyTorch Kimi-Linear, running off a WASTE container.
+kimi_ref.py — pure-PyTorch reference for this family, off a WASTE container.
+
+Kimi-Linear, Kimi K3 and GLM-5.3-Flash: one file, because they share a KDA
+recurrence, an MLA and a sigmoid/top-k router, and three oracles that
+implement the same three things differently is three chances to be wrong in
+a way the diff cannot see.
 
 Purpose: an oracle the C engine can be diffed against, on this Mac. The HF
 modeling code needs fla's Triton kernels, which do not exist on macOS; the
@@ -213,6 +218,12 @@ def situ(g, u, beta, lbeta):
     return a * (lbeta * torch.tanh(u / lbeta) if lbeta else u)
 
 
+def clamped_swiglu(g, u, limit):
+    """GLM's SwiGLU: the gate clamped above, the up half on both sides,
+    before the SiLU rather than after it."""
+    return F.silu(g.clamp(max=limit)) * u.clamp(-limit, limit)
+
+
 def apply_attn_res(prefix_sum, blocks, norm_w, proj_w, eps):
     """_apply_attn_res: softmax attention over the block-residual history."""
     v = torch.cat([blocks, prefix_sum.unsqueeze(-2)], -2)     # [..., nb+1, hid]
@@ -234,6 +245,17 @@ class KimiRef:
         self.gate_lb = (self.cfg.get("linear_attn_config", {})
                         .get("gate_lower_bound"))
         self.situ = self.cfg.get("hidden_act") == "situ"
+        self.swiglu_limit = self.cfg.get("swiglu_limit") or 0.0
+        # GLM-5.3-Flash: mHC streams and the DSA indexer. Both read back
+        # falsy on every Kimi container and cost nothing there.
+        self.hc = self.cfg.get("hc_mult") or 0
+        self.hc_iters = self.cfg.get("hc_sinkhorn_iters") or 0
+        self.hc_eps = self.cfg.get("hc_eps") or 1e-6
+        self.index_topk = self.cfg.get("index_topk") or 0
+        self.index_kpool = self.cfg.get("index_kpool") or 1
+        self.index_heads = self.cfg.get("index_n_heads") or 0
+        self.index_dim = self.cfg.get("index_head_dim") or 0
+        self.index_tail = self.cfg.get("index_kpool_always_select_tail", False)
         self.sb = self.cfg.get("activation_situ_beta", 1.0)
         self.slb = self.cfg.get("activation_situ_linear_beta")
         lac = self.cfg["linear_attn_config"]
@@ -251,6 +273,15 @@ class KimiRef:
         self.S = {}
         self.conv = {}
         self.kv = {}
+        self.ik = {}              # the indexer's per-layer (key, gate) cache
+
+    def act(self, g, u):
+        """SwiGLU in whichever of the family's three forms this model uses."""
+        if self.situ:
+            return situ(g, u, self.sb, self.slb)
+        if self.swiglu_limit:
+            return clamped_swiglu(g, u, self.swiglu_limit)
+        return F.silu(g) * u
 
     def kda(self, L, x):
         p = f"{self.p}model.layers.{L}.self_attn."
@@ -295,6 +326,81 @@ class KimiRef:
         o = rms_norm(o, self.t[p + "o_norm.weight"], self.eps) * torch.sigmoid(gate)
         return o.reshape(T, H * D) @ self.t[p + "o_proj.weight"].T
 
+    def hc_site(self, L, site, x):
+        """One mHC site: the mapping that turns the hc_mult parallel streams
+        into (post, comb) and collapses them into the one sequence the
+        sublayer runs on. x is [T, H, hid]."""
+        p = f"{self.p}model.layers.{L}.hc_{site}_"
+        H = self.hc
+        flat = x.flatten(1).float()
+        flat = flat * torch.rsqrt(flat.pow(2).mean(-1, keepdim=True) + self.eps)
+        mix = flat @ self.t[p + "fn"].float().T
+        pre_w, post_w, comb_w = mix.split([H, H, H * H], dim=-1)
+        pre_b, post_b, comb_b = self.t[p + "base"].float().split([H, H, H * H])
+        pre_s, post_s, comb_s = self.t[p + "scale"].float().unbind(0)
+
+        pre = torch.sigmoid(pre_w * pre_s + pre_b) + self.hc_eps
+        post = 2 * torch.sigmoid(post_w * post_s + post_b)
+        logits = comb_w.view(*comb_w.shape[:-1], H, H) * comb_s + comb_b.view(H, H)
+        comb = logits.softmax(-1) + self.hc_eps
+        # Sinkhorn-Knopp onto the doubly-stochastic manifold: columns once,
+        # then hc_sinkhorn_iters-1 rounds of (rows, columns).
+        comb = comb / (comb.sum(-2, keepdim=True) + self.hc_eps)
+        for _ in range(self.hc_iters - 1):
+            comb = comb / (comb.sum(-1, keepdim=True) + self.hc_eps)
+            comb = comb / (comb.sum(-2, keepdim=True) + self.hc_eps)
+        return post, comb, (pre.unsqueeze(-1) * x).sum(dim=1)
+
+    def dsa_mask(self, L, x, q_resid, T, S):
+        """DeepSeek Sparse Attention with k-pool compression: which of the S
+        cached positions each of the T queries may attend to.
+
+        Pools are index_kpool adjacent tokens compressed to one key by a
+        per-channel softmax over a learned gate; a query keeps the best
+        index_topk/index_kpool of the pools that are entirely behind it, plus
+        the tail that has not filled a pool yet. When a query has no more
+        complete pools than it is allowed to keep, that is every visible
+        token — which is why short contexts are dense and not approximate."""
+        p = f"{self.p}model.layers.{L}.self_attn.indexer."
+        D, P = self.index_dim, self.index_kpool
+        k = x @ self.t[p + "wk.weight"].T
+        # LayerNorm, not RMSNorm, and with a bias — the one place in this
+        # model that centres before it scales.
+        k = F.layer_norm(k, (D,), self.t[p + "k_norm.weight"],
+                         self.t[p + "k_norm.bias"], 1e-6)
+        gate = x @ self.t[p + "index_kpool_compress_gate"].T
+        if L in self.ik:
+            k = torch.cat([self.ik[L][0], k], 0)
+            gate = torch.cat([self.ik[L][1], gate], 0)
+        self.ik[L] = (k, gate)
+
+        npool = S // P
+        ape = self.t[p + "index_kpool_compress_ape"].view(P, D).float()
+        prob = (gate[:npool * P].view(npool, P, D).float() + ape).softmax(dim=1)
+        pool_keys = (prob * k[:npool * P].view(npool, P, D).float()).sum(1)
+
+        q = (q_resid @ self.t[p + "wq_b.weight"].T).view(T, self.index_heads, D)
+        sc = F.relu(torch.einsum("thd,pd->thp", q.float(), pool_keys)
+                    * D ** -0.5)
+        w = (x @ self.t[p + "weights_proj.weight"].T).float() \
+            * self.index_heads ** -0.5
+        index_scores = torch.einsum("th,thp->tp", w, sc)
+
+        mask = torch.zeros(T, S, dtype=torch.bool)
+        pool_end = torch.arange(npool) * P + P - 1
+        for t in range(T):
+            kvl = S - T + t + 1                       # what query t can see
+            visible = pool_end < kvl
+            keep = min(self.index_topk // P, int(visible.sum()))
+            if keep:
+                sel = index_scores[t].masked_fill(
+                    ~visible, float("-inf")).topk(keep).indices
+                for pi in sel.tolist():
+                    mask[t, pi * P:(pi + 1) * P] = True
+            if self.index_tail:
+                mask[t, kvl - kvl % P:kvl] = True
+        return mask
+
     def mla(self, L, x):
         p = f"{self.p}model.layers.{L}.self_attn."
         cfg, T = self.cfg, x.shape[0]
@@ -303,6 +409,7 @@ class KimiRef:
         qd = qk_n + qk_r
         # K3 factorizes the query projection (q_lora_rank 1536); Kimi-Linear
         # does not, and keeps a single q_proj.
+        qa = None
         if cfg.get("q_lora_rank"):
             qa = x @ self.t[p + "q_a_proj.weight"].T
             qa = rms_norm(qa, self.t[p + "q_a_layernorm.weight"], self.eps)
@@ -323,6 +430,11 @@ class KimiRef:
         S = k.shape[0]
         att = torch.einsum("thd,shd->hts", q, k) * (qd ** -0.5)
         mask = torch.full((T, S), float("-inf")).triu(S - T + 1)
+        if self.index_topk:
+            # The indexer runs after the cache update, so a query always
+            # sees itself, and its answer is shared by every head.
+            mask = mask.masked_fill(~self.dsa_mask(L, x, qa, T, S),
+                                    float("-inf"))
         att = (att + mask).softmax(-1)
         o = torch.einsum("hts,shd->thd", att, val).reshape(T, nh * vh)
         if cfg.get("mla_use_output_gate"):
@@ -352,8 +464,7 @@ class KimiRef:
                 e = int(topk_idx[t, j])
                 E = self.c.expert(L, e)
                 a, b = xin[t] @ E["gate"].T, xin[t] @ E["up"].T
-                h = situ(a, b, self.sb, self.slb) if self.situ else F.silu(a) * b
-                y[t] += w[t, j] * (h @ E["down"].T)
+                y[t] += w[t, j] * (self.act(a, b) @ E["down"].T)
         if self.latent:
             if self.latent_norm:
                 y = rms_norm(y, self.t[p + "routed_expert_norm.weight"], self.eps)
@@ -362,20 +473,41 @@ class KimiRef:
         su = self.t[p + "shared_experts.up_proj.weight"]
         sd = self.t[p + "shared_experts.down_proj.weight"]
         sa, sbv = x @ sg.T, x @ su.T
-        sh = situ(sa, sbv, self.sb, self.slb) if self.situ else F.silu(sa) * sbv
-        return y + sh @ sd.T
+        return y + self.act(sa, sbv) @ sd.T
 
     def dense_mlp(self, L, x):
         p = f"{self.p}model.layers.{L}.mlp."
         a, b = x @ self.t[p + "gate_proj.weight"].T, x @ self.t[p + "up_proj.weight"].T
-        h = situ(a, b, self.sb, self.slb) if self.situ else F.silu(a) * b
-        return h @ self.t[p + "down_proj.weight"].T
+        return self.act(a, b) @ self.t[p + "down_proj.weight"].T
 
     def forward(self, ids, trace=None):
         x = self.t[self.p + "model.embed_tokens.weight"][ids]
+        if self.hc:
+            # mHC: every stream starts as a copy of the embedding.
+            x = x.unsqueeze(1).expand(-1, self.hc, -1).contiguous()
         blocks, ps = None, None
         for L in range(self.n_layers):
             pre = f"{self.p}model.layers.{L}."
+            if self.hc:
+                post, comb, col = self.hc_site(L, "attn", x)
+                h = rms_norm(col, self.t[pre + "input_layernorm.weight"], self.eps)
+                att = self.kda(L, h) if self.is_kda(L) else self.mla(L, h)
+                x = (post.unsqueeze(-1) * att.unsqueeze(-2)
+                     + comb.transpose(-1, -2) @ x)
+
+                post, comb, col = self.hc_site(L, "ffn", x)
+                h = rms_norm(col, self.t[pre + "post_attention_layernorm.weight"],
+                             self.eps)
+                has_moe = f"{pre}block_sparse_moe.gate.weight" in self.t
+                ffn = self.moe(L, h, trace) if has_moe else self.dense_mlp(L, h)
+                x = (post.unsqueeze(-1) * ffn.unsqueeze(-2)
+                     + comb.transpose(-1, -2) @ x)
+                if os.environ.get("WASTE_DUMP_HIDDEN"):
+                    with open(os.environ["WASTE_DUMP_HIDDEN"],
+                              "ab" if L else "wb") as f:
+                        v = x[-1].float().flatten().tolist()
+                        f.write(struct.pack(f"<{len(v)}f", *v))
+                continue
             if self.ares:
                 ps = x
                 if blocks is not None and blocks.shape[-2] > 0:
@@ -408,6 +540,8 @@ class KimiRef:
                 with open(os.environ["WASTE_DUMP_HIDDEN"], "ab" if L else "wb") as f:
                     v = x[-1].float().tolist()
                     f.write(struct.pack(f"<{len(v)}f", *v))
+        if self.hc:
+            x = x.mean(1)                 # hc_head: an unweighted mean
         if self.ares and blocks is not None and blocks.shape[-2] > 0:
             x = apply_attn_res(x, blocks,
                                self.t[self.p + "model.output_attn_res_norm.weight"],

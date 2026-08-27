@@ -993,6 +993,130 @@ PY
 fi
 
 # --------------------------------------------------------------- budget ----
+head_ "GLM-5.3-Flash (mHC, clamped SwiGLU, DSA indexer)"
+
+# Same reasoning as the rotary section above: none of the checks that run on
+# a Kimi reach any of these three, and all three fail *quietly*. mHC's
+# parallel residual streams and its Sinkhorn projection produce
+# weight-shaped logits from any mixing matrix; a clamp at 10 that never
+# fires looks like a clamp that works; and an indexer that selects every
+# pool is indistinguishable from one that selects the right ones until the
+# context outgrows index_topk. So this builds its own GLM-shaped container
+# — a few megabytes, seed 0, byte-reproducible — and diffs it against the
+# PyTorch reference.
+#
+# The prompt length is load-bearing. index_topk 8 over pools of 4 means the
+# indexer may keep two pools; sixteen tokens make four, so the selection is
+# real. At twelve tokens or fewer every pool is kept, the branch degenerates
+# to dense attention, and this check would pass with the selection deleted.
+GLMC="$TMP/glm.waste"
+GIDS=3,7,11,5,9,13,2,17,4,8,19,23,6,29,12,31
+if ! python3 tools/make_test_container.py --glm --seed 0 "$GLMC" >/dev/null 2>&1; then
+    sk "GLM checks" "make_test_container.py --glm did not build a container"
+else
+    ./test_forward "$GLMC" "$GIDS" "$TMP/glm_seq.bin" 0 >/dev/null 2>&1
+    if [ ! -s "$TMP/glm_seq.bin" ]; then
+        no "the engine did not run a GLM container"
+    else
+        GGEN=""
+        if command -v uv >/dev/null 2>&1; then
+            run_uv run --no-project --with torch --with fla-core --with einops \
+                python tools/kimi_ref.py --container "$GLMC" \
+                --prompt-ids "$GIDS" --tokens 0 \
+                --dump "$TMP/glm_ref.bin" >/dev/null 2>&1 || true
+            [ -s "$TMP/glm_ref.bin" ] && GGEN="$TMP/glm_ref.bin"
+        fi
+        GFIX=tests/fixtures/oracle_glmsynth_16tok.bin
+        glm_why=""
+        if [ -z "$GGEN" ] && [ -f "${GFIX%.bin}.json" ]; then
+            glm_why=$(python3 - "$GLMC" "${GFIX%.bin}.json" <<'PYA'
+import hashlib, json, os, sys
+h = hashlib.sha256()
+for n in sorted(os.listdir(sys.argv[1])):
+    h.update(n.encode())
+    h.update(open(os.path.join(sys.argv[1], n), "rb").read())
+want = json.load(open(sys.argv[2])).get("container_sha256")
+if want and h.hexdigest() != want:
+    print("no uv to generate one, and make_test_container.py --glm no "
+          "longer builds the container this fixture was made from — "
+          "regenerate it, see " + os.path.basename(sys.argv[2]))
+PYA
+)
+        fi
+        if [ -n "$glm_why" ]; then
+            sk "engine vs the GLM oracle" "$glm_why"
+        elif [ -n "$GGEN" ] || [ -f "$GFIX" ]; then
+            if python3 - "$TMP/glm_seq.bin" "${GGEN:-$GFIX}" <<'PYB'
+import struct, sys
+def L(p):
+    b = open(p, "rb").read()
+    return struct.unpack(f"<{len(b)//4}f", b)
+a, b = L(sys.argv[1]), L(sys.argv[2])
+sys.exit(0 if max(abs(x - y) for x, y in zip(a, b)) < 1e-3 else 1)
+PYB
+            then
+                if [ -n "$GGEN" ]
+                then ok "mHC, the clamped SwiGLU and DSA match a PyTorch oracle built from this container"
+                else ok "mHC, the clamped SwiGLU and DSA match the shipped GLM fixture"
+                fi
+            else no "the GLM path diverges from the oracle"
+            fi
+        else
+            sk "engine vs the GLM oracle" \
+               "no fixture; regenerate with tools/kimi_ref.py --dump"
+        fi
+
+        # The oracle above proves the two implementations agree. It does not
+        # prove either of them *selected* anything: an indexer that keeps
+        # every pool and a reference that keeps every pool agree perfectly.
+        # So raise index_topk past the prompt on the same weights — the only
+        # difference is the config number — and require the answer to move.
+        GDENSE="$TMP/glm-dense.waste"
+        if python3 tools/make_test_container.py --glm --seed 0 --index-topk 64 \
+                "$GDENSE" >/dev/null 2>&1 &&
+           same "$GLMC/trunk.bin" "$GDENSE/trunk.bin"; then
+            ./test_forward "$GDENSE" "$GIDS" "$TMP/glm_dense.bin" 0 >/dev/null 2>&1
+            if [ ! -s "$TMP/glm_dense.bin" ]; then
+                no "the engine did not run the dense-attention GLM container"
+            elif python3 - "$TMP/glm_seq.bin" "$TMP/glm_dense.bin" <<'PYC'
+import struct, sys
+def L(p):
+    b = open(p, "rb").read()
+    return struct.unpack(f"<{len(b)//4}f", b)
+a, b = L(sys.argv[1]), L(sys.argv[2])
+# Anything this side of the oracle's own 1e-3 would mean the sparse path
+# attended over the same positions the dense one did.
+sys.exit(0 if max(abs(x - y) for x, y in zip(a, b)) > 1e-2 else 1)
+PYC
+            then ok "the DSA indexer really narrows attention (same weights, index_topk 8 vs 64)"
+            else no "index_topk 8 and index_topk 64 give the same logits — nothing was selected"
+            fi
+        else
+            sk "DSA indexer narrows attention" "could not build the dense twin"
+        fi
+
+        # mHC keeps hc_mult residual streams and the DSA indexer keeps a
+        # pool history, and both are session state. Neither is covered by
+        # the round-trip above, which runs on a Kimi.
+        if ./test_state "$GLMC" 2>/dev/null | grep -q "^STATE OK"; then
+            ok "a GLM session round-trips its streams and its indexer pools"
+        else
+            no "GLM session state does not round-trip"
+        fi
+
+        # waste_model_prefill routes a GLM container through the per-token
+        # path because the chunked one implements neither mHC nor the
+        # indexer. This is what says the fallback is really taken.
+        WASTE_CHUNK=1 ./test_forward "$GLMC" "$GIDS" "$TMP/glm_chunk.bin" 0 >/dev/null 2>&1
+        same "$TMP/glm_seq.bin" "$TMP/glm_chunk.bin"
+        case $? in
+            0) ok "chunked prefill falls back to the decode path, bit for bit" ;;
+            1) no "chunked prefill on a GLM container differs from decoding it" ;;
+            *) sk "chunked prefill on a GLM container" "$NO_CMP" ;;
+        esac
+    fi
+fi
+
 head_ "RAM budget"
 
 # The default budget is the one path check_budget.sh cannot reach, because
@@ -1425,6 +1549,20 @@ elif out=$(python3 tests/test_convert_resume.py 2>&1); then
     ok "resume keeps finished layers, never renumbers them, and publishes"
 else
     no "convert.py resume"
+    printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5
+fi
+
+# GLM states its layer mix and its eos differently from Kimi, and both
+# differences are silent when a converter copies them through: KDA lands on
+# the wrong layers, generation stops on nothing. Neither is visible to the
+# oracle diff above — the oracle reads the same manifest and would be wrong
+# the same way — so it is checked against what the release says instead.
+if ! command -v python3 >/dev/null 2>&1; then
+    sk "convert.py GLM config" "python3 not installed"
+elif out=$(python3 tests/test_convert_glm.py 2>&1); then
+    ok "GLM's 0-based layer mix, its eos list and its unread tensors are converted"
+else
+    no "convert.py GLM config"
     printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5
 fi
 

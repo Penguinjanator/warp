@@ -8,6 +8,89 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
+## Unreleased
+
+### Added
+
+- **GLM-5.3-Flash, text-only** (`docs/GLM.md`, `docs/LEARNED.md` §65).
+  `zai-org/GLM-5.3-Flash` — 313 B parameters, 328 GB of fp8, published
+  2026-08-26 — converts and runs. Most of it was already here: the KDA
+  recurrence, the absorbed MLA, the sigmoid/top-k router, the fp8 reader and
+  the nested `text_config` layout are K3's, and `qk_rope_head_dim` 0 with
+  `mla_use_nope` means the rotary is not reached at all. Three things are
+  new, each behind a config key absent on every other container:
+
+  - **mHC** (`hc_mult`, `hc_sinkhorn_iters`, `hc_eps`): four parallel
+    residual streams instead of one, collapsed into the sublayer by learned
+    weights and scattered back through a Sinkhorn-projected doubly-stochastic
+    matrix, twice a layer. The final collapse is an unweighted mean.
+  - **A clamped SwiGLU** (`swiglu_limit`): gate clamped above, up on both
+    sides, before the SiLU. The family's three activations are now one
+    function, `waste_act_pair_range`, rather than an if/else repeated at
+    seven call sites.
+  - **DeepSeek Sparse Attention, k-pool** (`index_topk`, `index_kpool`,
+    `index_n_heads`, `index_head_dim`): a full-attention layer scores pools
+    of four cached tokens and attends over the best `index_topk/index_kpool`
+    of them plus the unfilled tail. A pool's compressed key is one vector per
+    four tokens, computed once — 128 B per token per layer, a fourteenth of
+    the latents. Below `index_topk` tokens of context the selection is every
+    visible token, so short prompts take the dense path exactly rather than
+    approximately.
+
+  Measured against a PyTorch oracle on a GLM-shaped synthetic container:
+  **5.7e-6 max abs** on the last token's logits, against the suite's 1e-3
+  threshold and the same order as the Kimi baseline. The sparse branch is
+  really reached — the same weights with `index_topk` raised above the prompt
+  give logits 0.56 apart.
+
+- **`tools/hf_tokenizer.py`**, re-encoding a `tokenizers` `tokenizer.json`
+  into the tiktoken rank file a container carries. GLM ships no rank file.
+  It refuses rather than approximates when the pre-tokenization pattern is
+  not the one `src/tokenizer.c` implements, or when the merge list is not
+  ordered by the id of what it produces — that ordering is what makes
+  merge-by-rank and merge-by-list-position the same encoder.
+
+- **`tokenizer_han_split`**, and `waste_tok_set_han_split` behind it. Kimi's
+  pre-tokenization pattern gives Han its own `[\p{Han}]+` branch and GLM's
+  does not, so a Han run touching a Latin one is two pre-tokens there and one
+  here. Sixteen tokens in GLM's vocabulary cross that boundary and they are
+  ordinary words: `A股` is `111321` on GLM and `32 98963` with the Han
+  branch. Default is the Kimi pattern; `tools/tokdiff.py` now picks its
+  reference from what the source ships (tiktoken or `tokenizers`) and covers
+  the boundary. 21 of 21 identical against the real GLM vocabulary, 21 of 21
+  against Kimi-Linear's.
+
+- **Five checks and one fixture.** `tests/run.sh` builds its own GLM-shaped
+  container — seed 0, byte-reproducible, a few megabytes — because none of
+  the checks that run on a Kimi reach any of the three new things and all
+  three fail quietly. `tests/test_convert_glm.py` covers the converter's
+  config handling separately, against what the release says rather than
+  against the container the converter wrote.
+
+### Fixed in advance
+
+- **GLM's `kda_layers` is 0-based and a WASTE manifest's is 1-based.** Copied
+  through it puts KDA on the wrong layers: every tensor is found, every shape
+  checks out, the container loads, and the model answers noise. `convert.py`
+  rebuilds the list from `layer_types` instead. `eos_token_id` is a list of
+  three on GLM and one id in the engine's config; the first is taken.
+  Neither is visible to an oracle diff, because the oracle reads the same
+  manifest.
+
+### Not implemented
+
+- **GLM's vision tower.** It is not K3's — 24 blocks at 1024 wide, a
+  downsample conv, a gated merger — and `src/vision.c` reads K3's. The
+  converter writes no `vision.json` and drops the tower's tensors rather than
+  keeping them resident, so the container is text-only and refuses images by
+  name.
+- **Chunked prefill on a GLM container**, which falls back to the per-token
+  path: the chunked path implements neither mHC nor the indexer's per-token
+  pool bookkeeping, and a chunk that quietly ran without them would differ
+  from the same prompt decoded a token at a time.
+- **Cross-layer top-k sharing** (`indexer_types` other than `"full"`), the
+  MTP layer, and a `chat.json` for the CLI's declarative chat format.
+
 ## 0.6.9 — 2026-08-24
 
 Almost none of this is the engine. It is the space no CI job could reach —
