@@ -1239,36 +1239,32 @@ PYA
         if [ -n "$glm_why" ]; then
             sk "engine vs the GLM oracle" "$glm_why"
         elif [ -n "$GGEN" ] || [ -f "$GFIX" ]; then
-            if python3 - "$TMP/glm_seq.bin" "${GGEN:-$GFIX}" <<'PYB'
-import struct, sys
-def L(p):
-    b = open(p, "rb").read()
-    return struct.unpack(f"<{len(b)//4}f", b)
-a, b = L(sys.argv[1]), L(sys.argv[2])
-sys.exit(0 if max(abs(x - y) for x, y in zip(a, b)) < 1e-3 else 1)
-PYB
-            then
-                if [ -n "$GGEN" ]
-                then ok "mHC, the clamped SwiGLU and DSA match a PyTorch oracle built from this container"
-                else ok "mHC, the clamped SwiGLU and DSA match the shipped GLM fixture"
-                fi
+            if [ -n "$GGEN" ]
+            then gwhat="a PyTorch oracle built from this container"
+            else gwhat="the shipped GLM fixture"
+            fi
+            logitcmp "$TMP/glm_seq.bin" "${GGEN:-$GFIX}"
+            gc=$?
+            if [ $gc = 0 ]; then
+                ok "mHC, the clamped SwiGLU and DSA match $gwhat"
+            elif [ $gc = 2 ] && [ -s "$TMP/glm_dsa_eng.txt" ] \
+                             && [ -s "$TMP/glm_dsa_ref.txt" ]; then
+                gwhy=$(python3 tests/dsa_diff.py \
+                           --a "$TMP/glm_dsa_eng.txt" \
+                           --b "$TMP/glm_dsa_ref.txt" 2>&1)
+                case $? in
+                    2) ok "mHC, the clamped SwiGLU and DSA vs $gwhat (differs only past a tie in the pool ranking)" ;;
+                    0) no "the GLM path diverges from $gwhat with the pools unchanged"
+                       logit_report "$TMP/glm_seq.bin" "${GGEN:-$GFIX}" ;;
+                    *) no "the GLM path diverges from $gwhat"
+                       logit_report "$TMP/glm_seq.bin" "${GGEN:-$GFIX}" ;;
+                esac
+                printf "        %s\n" "$gwhy"
             else
-                no "the GLM path diverges from the oracle"
+                no "the GLM path diverges from $gwhat"
                 logit_report "$TMP/glm_seq.bin" "${GGEN:-$GFIX}"
-                # Which oracle matters: with uv the reference is generated
-                # from this container and a difference is the engine's;
-                # without it the comparison is against the shipped fixture,
-                # whose provenance check above has already confirmed the
-                # container is byte-identical to the one it was made from.
-                if [ -n "$GGEN" ]
-                then printf "        against an oracle generated from this container\n"
-                else printf "        against the shipped fixture (no uv here to generate one)\n"
-                fi
-                if [ -s "$TMP/glm_dsa_eng.txt" ] && [ -s "$TMP/glm_dsa_ref.txt" ]; then
-                    printf "        %s\n" "$(python3 tests/dsa_diff.py \
-                        --a "$TMP/glm_dsa_eng.txt" \
-                        --b "$TMP/glm_dsa_ref.txt" 2>&1)"
-                fi
+                [ $gc = 1 ] && printf "        the argmax moved, which no tie excuses\n"
+                [ -s "$TMP/glm_dsa_eng.txt" ] || printf "        no DSA trace, so which half moved is unanswered\n"
             fi
         else
             sk "engine vs the GLM oracle" \

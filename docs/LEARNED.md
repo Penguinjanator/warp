@@ -5288,3 +5288,73 @@ selection bug.
 
 Kimi-Linear never tripped any of this. Its router does not tie at 16 tokens,
 which is why the checks looked correct for as long as they did.
+
+## 72. A third tie, and the two bugs it was hiding behind (2026-08-27)
+
+§71 fixed two K3 checks that were measuring the router. Fixing them turned
+CI green enough to reveal that `main` had two further problems, and the
+second turned out to be the same finding a third time.
+
+**0.7.0 did not build on x86_64 Linux, on Windows, or under ASan.**
+`model.c` declared and called `waste_mvq4_rows_i8mm` unguarded, but the
+Makefile adds `src/simd_i8mm.c` to `SRC` only for `arm%|aarch64%`. Three of
+five CI jobs failed at the link, one of them `asan + fuzz` — so the
+sanitizers had never run against anything 0.7.0 added. `simd_i8mm.c` was
+already careful, defining the symbol twice so it exists in every ARM build
+even where `-march` did not take; what was missing is that **a dispatcher
+and the list of files that satisfies it have to be guarded on the same
+predicate**. The Makefile's own comment records the identical failure once
+before from the other direction, a `findstring` that left `kda_neon.c` out
+while `backend.c` still called it. Compiling `model.c` for x86_64 leaves the
+symbol undefined at `c9cd7bb` and unreferenced now; a full x86_64 build
+links.
+
+**The GLM oracle check was failing on both Linux jobs and nowhere else**,
+and had been through 0.7.0, saying only "the GLM path diverges from the
+oracle". Adding four numbers to that verdict answered it in one CI run and
+overturned every guess that preceded it, including two of mine.
+
+linux-x86_64 and linux-arm64 reported max abs 0.105701 and 0.105702, rel L2
+0.00783997 and 0.00783999. **Two different ISAs agreeing to five
+significant figures is not a platform difference**, and the engine was not
+what moved: at the worst logit macOS, both Linux runs and the shipped
+fixture all print -7.3257, and only the freshly generated Linux oracle
+prints -7.43141.
+
+The ruled-out list is worth as much as the finding, because each entry cost
+a measurement: the fixture is not stale (the engine matches it to 5.72e-06);
+macOS is not skipping the real comparison (its line says "a PyTorch oracle
+built from this container"); `uv` resolves the same torch 2.13.0, fla-core
+0.5.2 and einops 0.8.2 on both platforms, differing only in triton, which
+cannot matter because `load_naive_kda()` is never called; `-ffp-contract`
+on/fast/off all agree within 6.7e-06; `WASTE_THREADS` 1 through 18 are
+bit-identical; ASan and UBSan are clean and change no digit. **And it is not
+a router tie**: the tightest top-2-of-8 boundary gap in that prefill is
+9.4e-03, with nothing under 1e-3, so the router cannot flip on noise. §71's
+answer was the wrong answer here, and checking cost one dump.
+
+It is a **DSA** tie. At layer 2, token 15, the four visible pools score 0,
+0, 0 and 0.00164 with `keep=2`: pool 3 wins outright and the second slot is
+an **exact three-way tie**, margin 0.000e+00. The engine takes pool 1;
+`torch.topk`, called in `kimi_ref.py` with `sorted=False` and so free to
+answer in any order, takes pool 2 on Linux and pool 1 on macOS. One pool of
+four tokens attended differently is worth rel L2 0.0078 in the logits, and
+it is a defect in neither implementation.
+
+`kimi_ref.py` already wrote the trace that says this, under the same
+`WASTE_DUMP_DSA` the engine uses, and its own comment says why: so the two
+selections "can be diffed directly rather than inferred from a logit
+difference". **Nothing was diffing them.** The instrument existed, was
+documented, and was never wired to a check — which is its own lesson, and
+cheaper to learn here than at 982 GB.
+
+`tests/dsa_diff.py` reports the same three answers `route_diff.py` does —
+identical, tie, diverged — over the pool ranking instead of the expert
+ranking, and the GLM check now consults it. Three checks on three models now
+share one shape: compare the logits, and where they part, ask which discrete
+decision moved and whether anything could have resolved it.
+
+The general form, and it is not about ties: **a check that reports only a
+verdict makes the next person re-derive the evidence.** Two of these three
+were investigated for hours against a bare FAIL. The fix each time was four
+numbers the check already had in hand.
