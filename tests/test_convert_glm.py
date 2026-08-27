@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 SQLite Cloud, Inc.
-"""test_convert_glm.py — the two places GLM-5.3-Flash states something the
+"""test_convert_glm.py — the three places GLM-5.3-Flash states something the
 engine also states, differently.
 
-Both are silent when wrong. `linear_attn_config.kda_layers` is 0-based on
-GLM and 1-based in a WASTE manifest, so a straight copy puts KDA on the
+All three are silent when wrong. `linear_attn_config.kda_layers` is 0-based
+on GLM and 1-based in a WASTE manifest, so a straight copy puts KDA on the
 wrong layers: every tensor is still found, every shape still checks out,
 and the model answers noise. `eos_token_id` is a list of three, and the
 engine's config holds one id, so a list read as an integer stops on nothing.
+And the text model is nested the other way round from K3 —
+`model.language_model.layers.N` against `language_model.model.layers.N` —
+which no prefix can reconcile, so every tensor reads as absent and the load
+refuses a container that holds every weight.
 
-Neither can be caught by a forward-pass diff against an oracle that reads
-the same manifest — the oracle would be wrong the same way. It has to be
-checked here, against what the release says.
+None of them can be caught by a forward-pass diff against an oracle that
+reads the same manifest — the oracle would be wrong the same way. They have
+to be checked here, against what the release says.
 
 No torch and no source weights: this is convert.py's own decision code.
 
@@ -139,18 +143,39 @@ def main():
           kout["linear_attn_config"]["kda_layers"] == [1, 2, 4] and
           kout["eos_token_id"] == 2)
 
+    # ---- the wrapper, which GLM nests the other way round ---------------
+    #
+    # K3   language_model.model.layers.N.…   language_model.lm_head.weight
+    # GLM  model.language_model.layers.N.…   lm_head.weight
+    #
+    # The engine looks up {tensor_prefix}model.layers.N, so GLM's spelling
+    # is not a prefix away from it — copied through, every tensor reads as
+    # absent and the load refuses a container that holds every weight.
+    check("the wrapper is unnested, so the container is prefix-less",
+          CONV.glm_rename("model.language_model.layers.7.self_attn.o_proj.weight")
+          == "model.layers.7.self_attn.o_proj.weight"
+          and CONV.glm_rename("model.language_model.embed_tokens.weight")
+          == "model.embed_tokens.weight"
+          and CONV.glm_rename("model.language_model.norm.weight")
+          == "model.norm.weight")
+    check("lm_head is already where a prefix-less container wants it",
+          CONV.glm_rename("lm_head.weight") == "lm_head.weight")
+    check("a name that is not under the wrapper is left alone",
+          CONV.glm_rename("model.visual.blocks.0.attn.qkv.weight")
+          == "model.visual.blocks.0.attn.qkv.weight")
+
     # ---- the trunk tensors GLM ships that nothing here reads ------------
-    drop = CONV.glm_drop_trunk("language_model.", 45)
+    drop = CONV.glm_drop_trunk("model.language_model.", 45)
     keep = [
-        "language_model.model.layers.44.self_attn.o_proj.weight",
-        "language_model.model.layers.0.hc_attn_fn",
-        "language_model.model.norm.weight",
-        "language_model.lm_head.weight",
+        "model.language_model.layers.44.self_attn.o_proj.weight",
+        "model.language_model.layers.0.hc_attn_fn",
+        "model.language_model.norm.weight",
+        "lm_head.weight",
     ]
     gone = [
         # the MTP layer sits at index num_hidden_layers
-        "language_model.model.layers.45.eh_proj.weight",
-        "language_model.model.layers.45.shared_head.norm.weight",
+        "model.language_model.layers.45.eh_proj.weight",
+        "model.language_model.layers.45.shared_head.norm.weight",
         # a tower this engine does not have a reader for
         "model.visual.blocks.0.attn.qkv.weight",
         "model.visual.merger.proj.weight",
@@ -163,8 +188,8 @@ def main():
           str([n for n in gone if not drop(n)]))
     # A 10-layer model must not drop layer 4 because "45" contains "4".
     check("the layer index is matched whole",
-          not CONV.glm_drop_trunk("", 10)("model.layers.4.mlp.up_proj.weight")
-          and CONV.glm_drop_trunk("", 10)("model.layers.10.eh_proj.weight"))
+          not CONV.glm_drop_trunk("model.", 10)("model.layers.4.mlp.up_proj.weight")
+          and CONV.glm_drop_trunk("model.", 10)("model.layers.10.eh_proj.weight"))
 
     print(f"\n{len(fails)} failed" if fails else "\nall ok")
     return 1 if fails else 0

@@ -5,7 +5,7 @@
 of this engine already ran it: the same KDA recurrence, the same MLA with
 `kv_b_proj` absorbed, the same sigmoid / top-k router over per-layer expert
 banks, the same expert-per-record container. Three things are new, and this
-document is mostly about those and about the two places the release states
+document is mostly about those and about the three places the release states
 something the engine already states, differently.
 
 ## The shape
@@ -95,11 +95,30 @@ lands at exactly 0 after the relu, and so do its neighbours. Which of those
 the top-k keeps is ordered by index upstream and by heap order here. They
 contribute the same nothing either way.
 
-## The two silent differences
+## The three silent differences
 
-Both are converter-side, both are invisible to a forward-pass diff against
-an oracle that reads the same manifest, and both are covered by
-`tests/test_convert_glm.py`.
+All three are converter-side, all three are invisible to a forward-pass
+diff against an oracle that reads the same manifest — it would be wrong the
+same way — and all three are covered by `tests/test_convert_glm.py`.
+
+**The text model is nested the other way round from K3.**
+
+    K3    language_model.model.layers.N.…    language_model.lm_head.weight
+    GLM   model.language_model.layers.N.…    lm_head.weight
+
+Same two components, opposite order, and `lm_head` inside the wrapper on
+one and outside it on the other. The engine looks up
+`{tensor_prefix}model.layers.N.…`, so K3's spelling is a prefix away from
+it and GLM's is not: nothing is found, every tensor reads as absent, and
+the load refuses a container that in fact holds every weight. GLM's
+container is therefore prefix-less and the wrapper is unnested at
+conversion (`glm_rename`); there is nothing left for a prefix to
+disambiguate, since the vision tower is not carried.
+
+This one was caught before the first conversion rather than after it, by
+checking every name and shape the engine will demand against the
+checkpoint's own index — 1246 tensors, 0 missing, 0 mismatched — which is
+an hour of conversion cheaper than finding out at load.
 
 **`linear_attn_config.kda_layers` is 0-based on GLM and 1-based in a WASTE
 manifest.** Copied through, it puts KDA on the wrong layers and MLA on the

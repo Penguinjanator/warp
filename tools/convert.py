@@ -213,7 +213,28 @@ def glm_normalise(out):
     return out
 
 
-def glm_drop_trunk(prefix, n_layers):
+def glm_rename(name):
+    """GLM wraps the text model the other way round from K3.
+
+        K3    language_model.model.layers.N.…   language_model.lm_head.weight
+        GLM   model.language_model.layers.N.…   lm_head.weight
+
+    Same two components, opposite order, and `lm_head` outside the wrapper
+    on one and inside it on the other. The engine looks up
+    `{tensor_prefix}model.layers.N.…`, so K3's spelling is a prefix away
+    from it and GLM's is not: nothing would be found, every tensor would
+    read as absent, and the load would refuse a container that in fact
+    holds every weight.
+
+    So GLM's container is prefix-less and the wrapper is dropped here.
+    There is nothing left for a prefix to disambiguate — the vision tower
+    is not carried (see glm_drop_trunk) — and `lm_head.weight` is already
+    where a prefix-less container wants it."""
+    pfx = "model.language_model."
+    return "model." + name[len(pfx):] if name.startswith(pfx) else name
+
+
+def glm_drop_trunk(src_pfx, n_layers):
     """Which of GLM's trunk tensors this container has no reader for.
 
     The MTP layer (`num_nextn_predict_layers`) sits at index
@@ -225,7 +246,7 @@ def glm_drop_trunk(prefix, n_layers):
     Dropped rather than carried: the trunk is resident for the life of the
     process, so a tensor nothing reads is RAM taken from the expert cache,
     which is the one thing this engine is short of."""
-    mtp = re.compile(re.escape(prefix) + r"model\.layers\.(\d+)\.")
+    mtp = re.compile(re.escape(src_pfx) + r"layers\.(\d+)\.")
 
     def drop(name):
         if ".visual." in name:
@@ -249,10 +270,14 @@ def normalise_cfg(cfg):
     return out
 
 
-def moe_layout(st, prefix, layer):
-    """Which of MOE_LAYOUTS this checkpoint uses, from what is actually on disk."""
+def moe_layout(st, src_pfx, layer):
+    """Which of MOE_LAYOUTS this checkpoint uses, from what is actually on disk.
+
+    `src_pfx` is everything the checkpoint puts before `layers.N` — which is
+    not the container's tensor_prefix plus "model.", because GLM nests the
+    two the other way round (see glm_rename)."""
     for name, seg, tags in MOE_LAYOUTS:
-        probe = f"{prefix}model.layers.{layer}.{seg}.experts.0.{tags[0]}.weight"
+        probe = f"{src_pfx}layers.{layer}.{seg}.experts.0.{tags[0]}.weight"
         if st.have(probe) or st.have(probe + "_packed"):
             return name, seg, tuple(zip(KIND_ORDER, tags))
     return None, None, None
@@ -767,7 +792,7 @@ def convert_layer(job):
     file and separate codebook file. The parent decides the base — from the
     published manifest, from an existing bank's own records, or new after
     the published record count — and never renumbers a bank that exists."""
-    (L, src, out, prefix, n_exp, stages, entries, index_bits, device,
+    (L, src, out, src_pfx, n_exp, stages, entries, index_bits, device,
      cb_sample, cb_base, cached_ok) = job
     import time as _t
     bank = os.path.join(out, f"experts-L{L}.bin")
@@ -782,12 +807,12 @@ def convert_layer(job):
     st = ST(src)
     dev = torch.device(device)
 
-    lname, seg, kinds = moe_layout(st, prefix, L)
+    lname, seg, kinds = moe_layout(st, src_pfx, L)
     if lname is None:
         return (L, 0, cb_base, "missing")
 
     def ename(e, tag):
-        return f"{prefix}model.layers.{L}.{seg}.experts.{e}.{tag}.weight"
+        return f"{src_pfx}layers.{L}.{seg}.experts.{e}.{tag}.weight"
 
     t0 = _t.time()
     shapes = [tuple(st.tensor(ename(0, tag)).shape) for _, tag in kinds]
@@ -830,7 +855,7 @@ def convert_layer(job):
 
 
 
-def build_trunk(args, sr, st, existing, manifest_path, drop=None):
+def build_trunk(args, sr, st, existing, manifest_path, drop=None, rename=None):
     """Write trunk.bin.tmp and return its index, or None if the run must stop.
 
     A function rather than a stretch of main() because --reclaim has to run
@@ -879,6 +904,8 @@ def build_trunk(args, sr, st, existing, manifest_path, drop=None):
                 if not st.have(name):
                     continue                  # shard not downloaded yet
                 t = st.tensor(name)
+                if rename:
+                    name = rename(name)
                 name = trunk_rename(name, _trunk_seg)
                 off = tf.tell()
                 if t.dim() == 1 or t.numel() < 1 << 16:
@@ -993,11 +1020,20 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     cfg = json.load(open(os.path.join(args.src, "config.json")))
-    prefix = ""
-    if "text_config" in cfg:                     # K3 nests the text model
+    # Two prefixes, because they are two different things and the family
+    # spells them differently. `src_pfx` is what the *checkpoint* puts before
+    # `layers.N`; `prefix` is the container's tensor_prefix, i.e. what the
+    # engine puts before `model.`. On K3 they are "language_model.model."
+    # and "language_model."; on GLM the wrapper is the other way round and
+    # the container carries no prefix at all. See glm_rename.
+    prefix, src_pfx = "", "model."
+    if "text_config" in cfg:                     # K3 and GLM nest the text model
         cfg = {**cfg["text_config"], "_outer": {k: v for k, v in cfg.items()
                                                 if k != "text_config"}}
-        prefix = "language_model."
+        if is_glm(cfg):
+            src_pfx = "model.language_model."
+        else:
+            prefix, src_pfx = "language_model.", "language_model.model."
     st = ST(args.src)
     sr = ShardReader(args.src)
     dev = torch.device(args.device)
@@ -1091,7 +1127,7 @@ def main():
                   file=sys.stderr)
             return 1
 
-        drop_trunk = glm_drop_trunk(prefix, n_layers)
+        drop_trunk = glm_drop_trunk(src_pfx, n_layers)
     first_dense = cfg.get("first_k_dense_replace", 0)
     if args.experts:
         n_exp = min(n_exp, args.experts)
@@ -1130,14 +1166,14 @@ def main():
     # which would be a corrupt source rather than a shape to support.
     _lname, _seg, _kinds = (None, None, None)
     for _L in range(n_layers):
-        _lname, _seg, _kinds = moe_layout(st, prefix, _L)
+        _lname, _seg, _kinds = moe_layout(st, src_pfx, _L)
         if _lname:
             break
     if _lname is None:
         _seg, _kinds = MOE_LAYOUTS[0][1], KINDS
 
     def ename(L, e, tag):
-        return f"{prefix}model.layers.{L}.{_seg}.experts.{e}.{tag}.weight"
+        return f"{src_pfx}layers.{L}.{_seg}.experts.{e}.{tag}.weight"
 
     n_cb_per_layer = 3 * args.stages
     next_base = old_books
@@ -1180,7 +1216,7 @@ def main():
                 next_base += n_cb_per_layer
         elif base + n_cb_per_layer > next_base:
             next_base = base + n_cb_per_layer
-        jobs.append((L, args.src, args.out, prefix, n_exp, args.stages,
+        jobs.append((L, args.src, args.out, src_pfx, n_exp, args.stages,
                      args.entries, args.index_bits, str(dev), args.cb_sample,
                      base, cached_ok))
 
@@ -1191,7 +1227,8 @@ def main():
         # writes trunk.bin.tmp either way and the published trunk.bin is
         # still only replaced together with the manifest, so nothing about
         # what this run can survive changes — only the order.
-        tindex = build_trunk(args, sr, st, existing, manifest_path, drop_trunk)
+        tindex = build_trunk(args, sr, st, existing, manifest_path, drop_trunk,
+                             glm_rename if glm else None)
         if tindex is None:
             return 1
         reclaim(debt, args.reclaim, ShardDebt.TRUNK, "trunk")
@@ -1480,7 +1517,8 @@ def main():
     # --reclaim has already run this, before the experts, so that the shards
     # holding non-expert tensors become deletable at all.
     if tindex is None:
-        tindex = build_trunk(args, sr, st, existing, manifest_path, drop_trunk)
+        tindex = build_trunk(args, sr, st, existing, manifest_path, drop_trunk,
+                             glm_rename if glm else None)
         if tindex is None:
             return 1
     trunk_path = os.path.join(args.out, "trunk.bin")
