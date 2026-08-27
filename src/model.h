@@ -137,6 +137,13 @@ typedef struct {
 } waste_bank;
 
 /* Read from vision.json when the container has a tower. */
+/* Which tower a container carries. They share a block shape and nothing
+ * below it: K3's has a learned position grid, GELU and no biases; GLM's has
+ * 2D rope only, per-head q/k norms, biases everywhere, a clamped SwiGLU, a
+ * two-slot temporal patch and a gated merger. vision.json names it, and a
+ * file without the key is K3's — every container written before this one. */
+typedef enum { WASTE_TOWER_K3 = 0, WASTE_TOWER_GLM = 1 } waste_tower;
+
 typedef struct {
     int hidden, heads, qkv_hidden, inter, layers;
     int pos_h, pos_w, text_hidden, patch;
@@ -144,6 +151,15 @@ typedef struct {
     float mean[3], std[3];       /* pixel normalization — see image.c      */
     int   media_token;           /* the id an image expands from           */
     int   max_patches;
+    /* --- GLM's tower (0 elsewhere) ------------------------------------- */
+    int   tower;                 /* waste_tower                            */
+    int   merge;                 /* spatial_merge_size, 2                  */
+    int   temporal;              /* temporal_patch_size, 2                 */
+    int   out_hidden;            /* what the merger projects into          */
+    int   proj_inter;            /* the merger's SwiGLU width              */
+    float swiglu_limit;
+    int   img_start, img_end;    /* the ids an image block is wrapped in   */
+    int   min_tokens;            /* the release's floor on an image's cost */
 } waste_vision_cfg;
 
 typedef struct {
@@ -389,6 +405,11 @@ int waste_embed_row(waste_model *m, int token, float *dst);
  * tower or it was not loaded. */
 int waste_vision_encode(waste_model *m, const float *pixels, int h, int w,
                         float *out);
+/* GLM-5.3-Flash's tower. Same contract — patches in, one merged embedding
+ * per merge block out — and a different network inside; see vision.c.
+ * `pixels` is [h*w][3 * temporal * patch * patch] in block-major order. */
+int waste_vision_encode_glm(waste_model *m, const float *pixels, int h, int w,
+                            float *out);
 int waste_vision_available(const waste_model *m);
 
 /* Decodes an image and lays it out as [gh*gw][3*14*14], normalized. The
@@ -398,6 +419,11 @@ int waste_vision_available(const waste_model *m);
  * media block as text, so the wrapper needs them before the encode. */
 int waste_image_size(const char *path, int *w, int *h);
 
+/* GLM's preprocessing: a different grid rule and a different patch order,
+ * both stated by the release. Returns [gh*gw][3 * temporal * patch^2] in
+ * block-major order over merge blocks; the caller frees. */
+float *waste_image_load_glm(const char *path, const waste_vision_cfg *v,
+                            int *out_h, int *out_w);
 float *waste_image_load(const char *path, int max_patches,
                         const float *mean, const float *std,
                         int *out_h, int *out_w);

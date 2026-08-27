@@ -233,7 +233,8 @@ waste$(EXE): cli/main.o libwaste.a
 # the two failures tests/run.sh was written to catch, so a binary that
 # `test` builds and `clean` forgets defeats the check meant to notice it.
 TESTNAMES := test_kda test_container test_forward test_tokenizer test_k3parts \
-             test_state test_vision test_image test_memory test_cpus test_lock sweep
+             test_state test_vision test_vision_glm test_image test_memory \
+             test_cpus test_lock sweep
 TESTBINS  := $(addsuffix $(EXE),$(TESTNAMES))
 
 test: $(TESTBINS)
@@ -262,6 +263,9 @@ test_tokenizer$(EXE): tests/test_tokenizer.o libwaste.a
 test_k3parts$(EXE): tests/test_k3parts.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 test_image$(EXE): tests/test_image.o libwaste.a
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test_vision_glm$(EXE): tests/test_vision_glm.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 test_vision$(EXE): tests/test_vision.o libwaste.a

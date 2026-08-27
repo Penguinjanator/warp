@@ -1219,6 +1219,119 @@ PYC
     fi
 fi
 
+head_ "GLM's vision tower"
+
+# Its own container, for the same reason the GLM and rotary sections have
+# one: nothing that runs on a Kimi reaches this tower, and the failure it
+# would hide is the quiet kind. A patch order that disagrees with the
+# rotary indices rotates every patch by someone else's position, and the
+# embeddings stay finite and plausible; a bilinear resize where the release
+# uses bicubic changes every pixel by a little.
+GLMV="$TMP/glmvis.waste"
+if ! python3 tools/make_test_container.py --glm --vision --seed 0 "$GLMV" \
+        >/dev/null 2>&1; then
+    sk "GLM vision checks" "make_test_container.py --glm --vision did not build one"
+else
+    # The patch tensor both sides see, generated once so the comparison is
+    # of the tower and not of two random number generators.
+    python3 - "$TMP/vpix.bin" <<'PYA'
+import struct, sys
+s, vals = 1, []
+for _ in range(4 * 6 * 1176):
+    s = (s * 1103515245 + 12345) % (1 << 32)
+    vals.append(((s >> 16) & 0x7fff) / 32768.0 - 0.5)
+open(sys.argv[1], "wb").write(struct.pack(f"<{len(vals)}f", *vals))
+PYA
+    if ! ./test_vision_glm tower "$GLMV" 4 6 "$TMP/vpix.bin" \
+            "$TMP/vis_eng.bin" >/dev/null 2>&1; then
+        no "the engine did not run GLM's tower"
+    elif ! command -v uv >/dev/null 2>&1; then
+        sk "GLM tower vs the PyTorch oracle" "uv not installed"
+    else
+        run_uv run --no-project --with torch python tools/glm_vision_ref.py \
+            --container "$GLMV" --grid 4 6 --pixels "$TMP/vpix.bin" \
+            --dump "$TMP/vis_ref.bin" >/dev/null 2>&1 || true
+        if [ ! -s "$TMP/vis_ref.bin" ]; then
+            sk "GLM tower vs the PyTorch oracle" "the reference did not run"
+        elif python3 - "$TMP/vis_eng.bin" "$TMP/vis_ref.bin" <<'PYB'
+import struct, sys
+def L(p):
+    b = open(p, "rb").read()
+    return struct.unpack(f"<{len(b)//4}f", b)
+a, b = L(sys.argv[1]), L(sys.argv[2])
+sys.exit(0 if len(a) == len(b) and
+         max(abs(x - y) for x, y in zip(a, b)) < 1e-3 else 1)
+PYB
+        then ok "24 blocks, 2D rope, per-head q/k norms and the gated merger match the oracle"
+        else no "GLM's tower diverges from the oracle"
+        fi
+    fi
+
+    # The preprocessing, separately, because it fails differently. An image
+    # whose dimensions are already a multiple of patch*merge makes the
+    # resize the identity, so what is left to compare is the patch order and
+    # the normalization — and those are exact, not approximate.
+    python3 - "$TMP/aligned.png" <<'PYC'
+import struct, sys, zlib
+W, H = 224, 140                      # both multiples of 28
+raw = bytearray()
+for y in range(H):
+    raw.append(0)
+    for x in range(W):
+        raw += bytes(((x * 7 + y * 3) % 256, (x * x + y) % 256,
+                      (x + y * 11) % 256))
+def chunk(t, d):
+    c = t + d
+    return struct.pack(">I", len(d)) + c + struct.pack(">I", zlib.crc32(c) & 0xffffffff)
+png = (b"\x89PNG\r\n\x1a\n"
+       + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+       + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+       + chunk(b"IEND", b""))
+open(sys.argv[1], "wb").write(png)
+PYC
+    if ! ./test_vision_glm pixels "$GLMV" "$TMP/aligned.png" \
+            "$TMP/vis_px.bin" >"$TMP/vis_px.log" 2>&1; then
+        no "GLM's image preprocessing did not run"
+    elif python3 - "$TMP/vis_px.bin" "$GLMV" <<'PYD'
+import json, os, struct, sys
+# The reference's own reshape/permute/expand, spelled out: reshape to
+# (C, gh/m, m, patch, gw/m, m, patch), permute to block-major, then repeat
+# the patch across the temporal axis. If the engine's order disagrees the
+# difference is not small, it is a different image.
+W, H, patch, merge, T = 224, 140, 14, 2, 2
+gh, gw = H // patch, W // patch
+cfg = json.load(open(os.path.join(sys.argv[2], "vision.json")))
+mean, std = cfg["image_mean"], cfg["image_std"]
+px = [[[0.0] * W for _ in range(H)] for _ in range(3)]
+for y in range(H):
+    for x in range(W):
+        v = ((x * 7 + y * 3) % 256, (x * x + y) % 256, (x + y * 11) % 256)
+        for c in range(3):
+            px[c][y][x] = (v[c] / 255.0 - mean[c]) / std[c]
+want = []
+for by in range(gh // merge):
+    for bx in range(gw // merge):
+        for dy in range(merge):
+            for dx in range(merge):
+                py, pxi = by * merge + dy, bx * merge + dx
+                row = []
+                for c in range(3):
+                    one = [px[c][py * patch + j][pxi * patch + i]
+                           for j in range(patch) for i in range(patch)]
+                    for _ in range(T):
+                        row += one
+                want.append(row)
+b = open(sys.argv[1], "rb").read()
+got = struct.unpack(f"<{len(b)//4}f", b)
+flat = [v for r in want for v in r]
+sys.exit(0 if len(got) == len(flat) and
+         max(abs(a - c) for a, c in zip(got, flat)) < 2e-4 else 1)
+PYD
+    then ok "patches are block-major over merge blocks, with the temporal slot copied"
+    else no "GLM's patch order or normalization is not the release's"
+    fi
+fi
+
 head_ "RAM budget"
 
 # The default budget is the one path check_budget.sh cannot reach, because

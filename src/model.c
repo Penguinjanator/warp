@@ -1055,7 +1055,19 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
 
         const int is_vision = !strncmp(t->name, "vision_tower.", 13) ||
                               !strncmp(t->name, "mm_projector.", 13);
-        if (m->cfg.prefix[0] && !(is_vision && m->want_vision) &&
+        /* The tower is skipped unless it was asked for, and that has to be
+         * its own test rather than a corollary of the prefix one: K3's
+         * container has a prefix and every non-prefixed tensor is the
+         * tower, so the two coincided there. GLM's container has no prefix
+         * at all, and the coincidence made its 282 MB resident on every
+         * open, image or no image. */
+        if (is_vision && !m->want_vision) {
+            t->on_disk = 1;
+            t->file_off = off;
+            t->file_scale_off = soff;
+            continue;
+        }
+        if (m->cfg.prefix[0] && !is_vision &&
             strncmp(t->name, m->cfg.prefix, strlen(m->cfg.prefix)) != 0) {
             t->on_disk = 1;
             t->file_off = off;
@@ -1734,6 +1746,47 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
             js_doc vd;
             if (js_parse(&vd, vs) >= 0) {
                 waste_vision_cfg *v = &m->vcfg;
+                {   /* GLM states its tower under the HF names, K3 under
+                     * the converter's `vt_` ones. Read the tower first and
+                     * then the geometry it implies, rather than defaulting
+                     * every field twice. */
+                    char tw[32];
+                    js_str(&vd, js_get(&vd, 0, "tower"), tw, sizeof tw);
+                    v->tower = strcmp(tw, "glm5-next") == 0
+                             ? WASTE_TOWER_GLM : WASTE_TOWER_K3;
+                }
+                if (v->tower == WASTE_TOWER_GLM) {
+                    v->hidden      = (int)js_int(&vd, js_get(&vd, 0, "hidden_size"), 1024);
+                    v->heads       = (int)js_int(&vd, js_get(&vd, 0, "num_heads"), 16);
+                    v->qkv_hidden  = v->hidden;      /* qkv is 3x hidden   */
+                    v->inter       = (int)js_int(&vd, js_get(&vd, 0, "intermediate_size"), 4096);
+                    v->layers      = (int)js_int(&vd, js_get(&vd, 0, "depth"), 24);
+                    v->merge       = (int)js_int(&vd, js_get(&vd, 0, "spatial_merge_size"), 2);
+                    v->temporal    = (int)js_int(&vd, js_get(&vd, 0, "temporal_patch_size"), 2);
+                    v->out_hidden  = (int)js_int(&vd, js_get(&vd, 0, "out_hidden_size"), c->hidden);
+                    v->proj_inter  = (int)js_int(&vd, js_get(&vd, 0, "projection_intermediate_size"), 10240);
+                    v->swiglu_limit = (float)js_num(&vd, js_get(&vd, 0, "swiglu_limit"), 0.0);
+                    v->img_start   = (int)js_int(&vd, js_get(&vd, 0, "image_start_token_id"), -1);
+                    v->img_end     = (int)js_int(&vd, js_get(&vd, 0, "image_end_token_id"), -1);
+                    v->text_hidden = v->out_hidden;
+                    v->patch       = (int)js_int(&vd, js_get(&vd, 0, "patch_size"), 14);
+                    /* Its norms are Glm5NextRMSNorm(dim, eps=rms_norm_eps),
+                     * so unlike K3's the eps is stated and is not float
+                     * epsilon. The merger's is a LayerNorm at torch's
+                     * default. */
+                    v->eps         = (float)js_num(&vd, js_get(&vd, 0, "rms_norm_eps"), 1e-5);
+                    v->proj_eps    = 1e-5f;
+                    /* pos_h/pos_w belong to K3's learned grid and are not
+                     * read; keep them in range for cfg_sane. */
+                    v->pos_h = v->pos_w = 1;
+                    v->media_token = (int)js_int(&vd, js_get(&vd, 0,
+                                         "media_placeholder_token_id"), -1);
+                    v->max_patches = (int)js_int(&vd, js_get(&vd, 0,
+                                         "max_patches"), 1024);
+                    v->min_tokens  = (int)js_int(&vd, js_get(&vd, 0,
+                                         "min_image_tokens"), 1);
+                    goto vision_pixels;
+                }
                 v->hidden      = (int)js_int(&vd, js_get(&vd, 0, "vt_hidden_size"), 1024);
                 v->heads       = (int)js_int(&vd, js_get(&vd, 0, "vt_num_attention_heads"), 12);
                 v->qkv_hidden  = (int)js_int(&vd, js_get(&vd, 0, "qkv_hidden_size"), 1536);
@@ -1751,6 +1804,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                                      "media_placeholder_token_id"), -1);
                 v->max_patches = (int)js_int(&vd, js_get(&vd, 0,
                                      "max_patches"), 1024);
+            vision_pixels:
                 {   /* K3 normalizes to [-1, 1]: preprocessor_config.json
                      * carries mean = std = 0.5 under `media_proc_cfg`, and
                      * kimi_k3_vision_processing.py applies exactly those.
@@ -1784,6 +1838,13 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                    v->pos_h > 0 && v->pos_h <= (1 << 16) &&
                    v->pos_w > 0 && v->pos_w <= (1 << 16) &&
                    v->text_hidden == c->hidden && v->patch == 14 &&
+                   (v->tower != WASTE_TOWER_GLM ||
+                    (v->merge >= 1 && v->merge <= 8 &&
+                     v->temporal >= 1 && v->temporal <= 8 &&
+                     v->out_hidden > 0 && v->out_hidden <= (1 << 20) &&
+                     v->proj_inter > 0 && v->proj_inter <= (1 << 22) &&
+                     v->hidden % v->heads == 0 &&
+                     isfinite(v->swiglu_limit) && v->swiglu_limit >= 0.0f)) &&
                    v->media_token >= 0 && v->media_token < c->vocab &&
                    v->max_patches >= 4 && v->max_patches <= (1 << 20) &&
                    isfinite(v->eps) && v->eps > 0.0f &&

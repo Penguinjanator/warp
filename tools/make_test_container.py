@@ -82,6 +82,29 @@ CFG = {
 }
 C_KDA = H_KDA * D_KDA
 
+# GLM's tower at 1/32 scale. Every field the engine reads, and the ratios
+# that matter kept: head_dim 16 so the rotary table has something to
+# interleave, merge 2 so the downsample is a real reshape, and two blocks
+# rather than one so a residual has somewhere to accumulate.
+VISION = {
+    "model_type": "glm5_next_vision",
+    "depth": 2,
+    "hidden_size": 32,
+    "num_heads": 2,
+    "intermediate_size": 64,
+    "out_hidden_size": 128,          # = CFG hidden_size
+    "projection_intermediate_size": 96,
+    "patch_size": 14,
+    "spatial_merge_size": 2,
+    "merge_size": 2,
+    "temporal_patch_size": 2,
+    "in_channels": 3,
+    "rms_norm_eps": 1e-5,
+    "swiglu_limit": 10.0,
+    "attention_bias": True,
+    "hidden_act": "silu",
+}
+
 # --glm turns the above into a GLM-5.3-Flash at the same scale. Three things
 # are new and none of them exist on any Kimi container, so this is the only
 # shape that reaches them:
@@ -150,13 +173,14 @@ class Trunk:
         self.rng = rng
         self.prefix = prefix
 
-    def f32(self, name, shape):
+    def f32(self, name, shape, prefixed=True):
         n = 1
         for s in shape:
             n *= s
         off = len(self.buf)
         self.buf += f32([self.rng.uniform(-0.5, 0.5) for _ in range(n)])
-        self.index.append({"name": self.prefix + name, "fmt": FMT_F32,
+        self.index.append({"name": (self.prefix if prefixed else "") + name,
+                           "fmt": FMT_F32,
                            "off": off, "shape": list(shape),
                            "bytes": len(self.buf) - off})
 
@@ -320,6 +344,10 @@ def main():
                     help="a GLM-5.3-Flash instead of a Kimi-Linear: mHC "
                          "residual streams, a clamped SwiGLU and the DSA "
                          "indexer on the full-attention layers")
+    ap.add_argument("--vision", action="store_true",
+                    help="--glm only: add a GLM vision tower at test scale, "
+                         "so src/vision.c's second tower has a container CI "
+                         "can reach")
     ap.add_argument("--index-topk", type=int, metavar="N",
                     help="--glm only: override index_topk. The default 8 puts "
                          "the sparse branch two pools in, so a 12-token "
@@ -366,6 +394,8 @@ def main():
             cfg["index_topk"] = args.index_topk
     elif args.index_topk:
         ap.error("--index-topk needs --glm")
+    if args.vision and not args.glm:
+        ap.error("--vision is GLM's tower; K3's is not generated here")
     if args.rope:
         # Dropping linear_attn_config is what makes every layer MLA, so the
         # rotation is exercised at depth rather than in the one full-attention
@@ -475,6 +505,44 @@ def main():
             t.quant(m + "shared_experts.gate_proj.weight", [sh, hid])
             t.quant(m + "shared_experts.up_proj.weight", [sh, hid])
             t.quant(m + "shared_experts.down_proj.weight", [hid, sh])
+    if args.vision:
+        # A GLM tower at test scale: the same 25 tensor kinds the release
+        # has, at dimensions that make an encode take milliseconds. The
+        # shapes are what the engine branches on — a bias where the release
+        # has one, a per-head q/k norm, a Conv3d patch embed flattened to
+        # two dimensions as the converter flattens it — and the weights are
+        # noise, exactly as everywhere else here.
+        v = VISION
+        vd, vh_, vi = v["hidden_size"], v["num_heads"], v["intermediate_size"]
+        vo, vp = v["out_hidden_size"], v["projection_intermediate_size"]
+        npix = 3 * v["temporal_patch_size"] * v["patch_size"] ** 2
+        t.f32("vision_tower.patch_embed.proj.weight", [vd, npix], prefixed=False)
+        t.f32("vision_tower.patch_embed.proj.bias", [vd], prefixed=False)
+        for b in range(v["depth"]):
+            a = f"vision_tower.blocks.{b}."
+            t.f32(a + "norm1.weight", [vd], prefixed=False)
+            t.f32(a + "norm2.weight", [vd], prefixed=False)
+            t.f32(a + "attn.qkv.weight", [3 * vd, vd], prefixed=False)
+            t.f32(a + "attn.qkv.bias", [3 * vd], prefixed=False)
+            t.f32(a + "attn.q_norm.weight", [vd // vh_], prefixed=False)
+            t.f32(a + "attn.k_norm.weight", [vd // vh_], prefixed=False)
+            t.f32(a + "attn.proj.weight", [vd, vd], prefixed=False)
+            t.f32(a + "attn.proj.bias", [vd], prefixed=False)
+            for w in ("gate_proj", "up_proj"):
+                t.f32(a + f"mlp.{w}.weight", [vi, vd], prefixed=False)
+                t.f32(a + f"mlp.{w}.bias", [vi], prefixed=False)
+            t.f32(a + "mlp.down_proj.weight", [vd, vi], prefixed=False)
+            t.f32(a + "mlp.down_proj.bias", [vd], prefixed=False)
+        t.f32("vision_tower.post_layernorm.weight", [vd], prefixed=False)
+        m2 = v["spatial_merge_size"]
+        t.f32("vision_tower.downsample.weight", [vo, vd * m2 * m2], prefixed=False)
+        t.f32("vision_tower.downsample.bias", [vo], prefixed=False)
+        t.f32("vision_tower.merger.proj.weight", [vo, vo], prefixed=False)
+        t.f32("vision_tower.merger.post_projection_norm.weight", [vo], prefixed=False)
+        t.f32("vision_tower.merger.post_projection_norm.bias", [vo], prefixed=False)
+        t.f32("vision_tower.merger.gate_proj.weight", [vp, vo], prefixed=False)
+        t.f32("vision_tower.merger.up_proj.weight", [vp, vo], prefixed=False)
+        t.f32("vision_tower.merger.down_proj.weight", [vo, vp], prefixed=False)
     t.f32("model.norm.weight", [hid])
     t.quant("lm_head.weight", [cfg["vocab_size"], hid])
     if args.prefix:
@@ -531,6 +599,18 @@ def main():
     with open(os.path.join(args.out, "manifest.json"), "w",
               newline="\n") as f:
         json.dump(manifest, f, indent=1)
+
+    if args.vision:
+        vj = dict(VISION)
+        vj["tower"] = "glm5-next"
+        vj["media_placeholder_token_id"] = cfg["vocab_size"] - 1
+        vj["max_patches"] = 64
+        vj["min_image_tokens"] = 1
+        vj["image_mean"] = [0.48145466, 0.4578275, 0.40821073]
+        vj["image_std"] = [0.26862954, 0.26130258, 0.27577711]
+        with open(os.path.join(args.out, "vision.json"), "w",
+                  newline="\n") as f:
+            json.dump(vj, f, indent=1)
 
     total = sum(os.path.getsize(os.path.join(args.out, f))
                 for f in os.listdir(args.out))

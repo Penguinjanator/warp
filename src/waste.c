@@ -342,11 +342,20 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
         const int fmt = (int)js_int(&d, js_get(&d, e, "fmt"), 0);
         if (fmt != 0 && strstr(nm, "embed_tokens.weight")) continue;
         const uint64_t nb = (uint64_t)js_int(&d, js_get(&d, e, "bytes"), 0);
-        /* The vision tower and projector sit outside tensor_prefix. They
-         * are loaded only when a caller asks for images, so they are
-         * counted apart and folded in by waste_open — counting them here
+        /* The tower is loaded only when a caller asks for images, so it is
+         * counted apart and folded in by waste_open — counting it here
          * would overstate the floor for every text-only run, and leaving
-         * them out entirely understated it for every run with one. */
+         * it out entirely understated it for every run with one.
+         *
+         * By name, not by "outside tensor_prefix". On K3 the two coincide
+         * and on GLM they do not: its container has no prefix at all, so
+         * the old test put its 282 MB tower in the floor of every text-only
+         * plan. The loader makes the same distinction, in the same terms. */
+        if (!strncmp(nm, "vision_tower.", 13) ||
+            !strncmp(nm, "mm_projector.", 13)) {
+            out->vision_bytes += nb;
+            continue;
+        }
         if (prefix[0] && strncmp(nm, prefix, strlen(prefix)) != 0) {
             out->vision_bytes += nb;
             continue;
@@ -902,19 +911,24 @@ waste_status waste_image_add(waste_ctx *c, const char *path, size_t *n_out)
     if (!c->m.want_vision || !c->m.vcfg.layers) return WASTE_E_UNSUPPORTED;
     if (c->img_n >= WASTE_MAX_IMAGES) return WASTE_E_ARG;
 
+    const int glm = c->m.vcfg.tower == WASTE_TOWER_GLM;
+    const int mg = glm ? c->m.vcfg.merge : 2;
     int gh = 0, gw = 0;
-    float *px = waste_image_load(path, c->m.vcfg.max_patches,
-                                 c->m.vcfg.mean, c->m.vcfg.std, &gh, &gw);
+    float *px = glm
+        ? waste_image_load_glm(path, &c->m.vcfg, &gh, &gw)
+        : waste_image_load(path, c->m.vcfg.max_patches,
+                           c->m.vcfg.mean, c->m.vcfg.std, &gh, &gw);
     if (!px) return WASTE_E_IO;
 
-    const size_t rows = (size_t)(gh / 2) * (size_t)(gw / 2);
+    const size_t rows = (size_t)(gh / mg) * (size_t)(gw / mg);
     const size_t th = (size_t)c->m.vcfg.text_hidden;
     float *nb = (float *)realloc(c->img, (c->img_rows + rows) * th * sizeof(float));
     if (!nb) { free(px); return WASTE_E_OOM; }
     c->img = nb;
 
-    const int rc = waste_vision_encode(&c->m, px, gh, gw,
-                                       c->img + c->img_rows * th);
+    const int rc = glm
+        ? waste_vision_encode_glm(&c->m, px, gh, gw, c->img + c->img_rows * th)
+        : waste_vision_encode(&c->m, px, gh, gw, c->img + c->img_rows * th);
     free(px);
     if (rc) return WASTE_E_IO;
 

@@ -335,3 +335,350 @@ fail:
     free(x); free(y); free(pos); free(qkvb); free(ob); free(ff); free(att);
     return -1;
 }
+
+/* ---- GLM-5.3-Flash's tower ---------------------------------------------
+ *
+ * A second tower rather than a branch inside the one above, because the two
+ * agree on the block *shape* and on nothing inside it. K3 has a learned
+ * 64x64 position grid, GELU, and no biases; GLM has 2D rope only, per-head
+ * RMSNorms on q and k, biases on every projection, a clamped SwiGLU, a
+ * patch that spans two temporal slots, and a gated merger where K3 has a
+ * two-layer projector.
+ *
+ * Four things are easy to get wrong here, and each is why this was written
+ * against tools/glm_vision_ref.py rather than against the config:
+ *
+ *   - **Patch order is block-major.** Rows arrive so that each consecutive
+ *     merge*merge of them is one spatial block, which is what lets the
+ *     downsample be a reshape. The rotary indices are built the same way;
+ *     a row order that disagrees rotates every patch by someone else's
+ *     position, and the output stays finite and plausible.
+ *   - **The rotation is rotate_half over a doubled table**, not the
+ *     interleaved pairing K3's tower uses.
+ *   - **q and k are RMSNormed per head**, over head_dim, before rotating.
+ *   - **The SwiGLU is clamped** in the encoder MLP and again in the merger,
+ *     and the merger's first activation is the exact GELU.
+ */
+
+/* gate <- silu(clamp(gate)) * clamp(up), the activation both the encoder
+ * MLP and the merger use. The same clamp the language model's experts get,
+ * and the same reason: at limit 10 it fires on real activations. */
+static void vt_swiglu(float *gate, const float *up, size_t n, float limit)
+{
+    for (size_t i = 0; i < n; i++) {
+        float g = gate[i], u = up[i];
+        if (limit > 0.0f) {
+            if (g > limit) g = limit;
+            u = u > limit ? limit : (u < -limit ? -limit : u);
+        }
+        gate[i] = (g / (1.0f + expf(-g))) * u;
+    }
+}
+
+/* One row of a bias vector that may have been quantized like everything
+ * else. Small enough that materializing it per call costs nothing. */
+static const float *vt_bias(waste_model *m, const char *name, float *tmp, int n)
+{
+    const waste_tensor *t = waste_find(m, name);
+    if (!t) return NULL;
+    if (t->data) return t->data;
+    waste_deq_row(t, 0, n, tmp);
+    return tmp;
+}
+
+/* cos/sin for one patch's head_dim-wide rotary table.
+ *
+ * dim = head_dim/2 frequencies, each axis contributing dim/2 of them:
+ * inv_freq[j] = theta^(-2j/dim), the row index scaling the first half and
+ * the column index the second, then the whole thing doubled so that
+ * rotate_half pairs component i with component i + head_dim/2. */
+static void glm_rope_row(int row, int col, int hd, float *cs, float *sn)
+{
+    const int dim = hd / 2, nf = dim / 2;
+    for (int j = 0; j < nf; j++) {
+        const float inv = powf(10000.0f, -(float)(2 * j) / (float)dim);
+        const float a = (float)row * inv, b = (float)col * inv;
+        cs[j] = cosf(a);           sn[j] = sinf(a);
+        cs[nf + j] = cosf(b);      sn[nf + j] = sinf(b);
+    }
+    for (int j = 0; j < dim; j++) { cs[dim + j] = cs[j]; sn[dim + j] = sn[j]; }
+}
+
+/* v[0..hd) <- v*cos + rotate_half(v)*sin */
+static void glm_rope_apply(float *v, int hd, const float *cs, const float *sn)
+{
+    float t[256];
+    const int h = hd / 2;
+    for (int i = 0; i < hd; i++) t[i] = v[i];
+    for (int i = 0; i < h; i++) {
+        v[i]     = t[i]     * cs[i]     + (-t[h + i]) * sn[i];
+        v[h + i] = t[h + i] * cs[h + i] + ( t[i]    ) * sn[h + i];
+    }
+}
+
+static void rmsnorm_rows(float *dst, const float *src, const float *w,
+                         int rows, int n, float eps)
+{
+    for (int r = 0; r < rows; r++) {
+        const float *x = src + (size_t)r * n;
+        float ss = 0;
+        for (int i = 0; i < n; i++) ss += x[i] * x[i];
+        const float inv = 1.0f / sqrtf(ss / (float)n + eps);
+        float *o = dst + (size_t)r * n;
+        for (int i = 0; i < n; i++) o[i] = x[i] * inv * w[i];
+    }
+}
+
+int waste_vision_encode_glm(waste_model *m, const float *pixels, int h, int w,
+                            float *out)
+{
+    const waste_vision_cfg *c = &m->vcfg;
+    const int D = c->hidden, heads = c->heads, hd = D / heads;
+    const int L = h * w, mg = c->merge, OD = c->out_hidden;
+    const int npix = 3 * c->temporal * c->patch * c->patch;
+    if (h <= 0 || w <= 0 || h % mg || w % mg) {
+        fprintf(stderr, "waste: vision grid must be a multiple of %d\n", mg);
+        return -1;
+    }
+    if (hd > 256) { fprintf(stderr, "waste: vision head_dim %d too wide\n", hd); return -1; }
+
+    float *x   = (float *)malloc((size_t)L * D * sizeof(float));
+    float *y   = (float *)malloc((size_t)L * D * sizeof(float));
+    float *qkv = (float *)malloc((size_t)L * 3 * D * sizeof(float));
+    float *ob  = (float *)malloc((size_t)L * D * sizeof(float));
+    float *ff  = (float *)malloc((size_t)2 * L * c->inter * sizeof(float));
+    float *att = (float *)malloc((size_t)L * sizeof(float));
+    float *cs  = (float *)malloc((size_t)L * hd * sizeof(float));
+    float *sn  = (float *)malloc((size_t)L * hd * sizeof(float));
+    float *bias = (float *)malloc((size_t)(c->inter > OD ? c->inter : OD) * sizeof(float));
+    if (!x || !y || !qkv || !ob || !ff || !att || !cs || !sn || !bias) goto oom;
+
+    /* --- patch embedding: the Conv3d is a matmul over 3*T*14*14 --------- */
+    {
+        const waste_tensor *pw = waste_find(m, "vision_tower.patch_embed.proj.weight");
+        if (!pw) goto fail;
+        waste_matmul_t(m, x, pw, pixels, D, npix, L);
+        const float *pb = vt_bias(m, "vision_tower.patch_embed.proj.bias", bias, D);
+        if (pb) for (int r = 0; r < L; r++)
+            for (int i = 0; i < D; i++) x[(size_t)r * D + i] += pb[i];
+    }
+    if (getenv("WASTE_VIS_STAGE") &&
+        strcmp(getenv("WASTE_VIS_STAGE"), "embed") == 0) {
+        memcpy(out, x, (size_t)L * D * sizeof(float));
+        goto done;
+    }
+
+    /* --- the rotary tables, block-major over merge blocks --------------- */
+    {
+        int r = 0;
+        for (int by = 0; by < h / mg; by++)
+            for (int bx = 0; bx < w / mg; bx++)
+                for (int dy = 0; dy < mg; dy++)
+                    for (int dx = 0; dx < mg; dx++, r++)
+                        glm_rope_row(by * mg + dy, bx * mg + dx, hd,
+                                     cs + (size_t)r * hd, sn + (size_t)r * hd);
+    }
+
+    /* --- encoder -------------------------------------------------------- */
+    {
+    const float scale = 1.0f / sqrtf((float)hd);
+    for (int b = 0; b < c->layers; b++) {
+        char nm[160];
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.norm1.weight", b);
+        const waste_tensor *n1 = waste_find(m, nm);
+        if (!n1 || !n1->data) goto fail;
+        rmsnorm_rows(y, x, n1->data, L, D, c->eps);
+
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.attn.qkv.weight", b);
+        const waste_tensor *wq = waste_find(m, nm);
+        if (!wq) goto fail;
+        waste_matmul_t(m, qkv, wq, y, 3 * D, D, L);
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.attn.qkv.bias", b);
+        {
+            float qb[3 * 4096];
+            const float *pb = vt_bias(m, nm, qb, 3 * D);
+            if (pb) for (int r = 0; r < L; r++)
+                for (int i = 0; i < 3 * D; i++) qkv[(size_t)r * 3 * D + i] += pb[i];
+        }
+
+        /* q and k are normalized per head and then rotated; v is neither. */
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.attn.q_norm.weight", b);
+        const waste_tensor *qn = waste_find(m, nm);
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.attn.k_norm.weight", b);
+        const waste_tensor *kn = waste_find(m, nm);
+        if (!qn || !kn || !qn->data || !kn->data) goto fail;
+        for (int r = 0; r < L; r++) {
+            float *row = qkv + (size_t)r * 3 * D;
+            for (int hh = 0; hh < heads; hh++) {
+                float *q = row + (size_t)hh * hd;
+                float *k = row + D + (size_t)hh * hd;
+                rmsnorm_rows(q, q, qn->data, 1, hd, c->eps);
+                rmsnorm_rows(k, k, kn->data, 1, hd, c->eps);
+                glm_rope_apply(q, hd, cs + (size_t)r * hd, sn + (size_t)r * hd);
+                glm_rope_apply(k, hd, cs + (size_t)r * hd, sn + (size_t)r * hd);
+            }
+        }
+
+        /* full attention over the image, one head at a time */
+        for (int hh = 0; hh < heads; hh++) {
+            for (int i = 0; i < L; i++) {
+                const float *q = qkv + (size_t)i * 3 * D + (size_t)hh * hd;
+                for (int j = 0; j < L; j++) {
+                    const float *k = qkv + (size_t)j * 3 * D + D + (size_t)hh * hd;
+                    float acc = 0;
+                    for (int t = 0; t < hd; t++) acc += q[t] * k[t];
+                    att[j] = acc * scale;
+                }
+                softmax_row(att, L);
+                float *o = ob + (size_t)i * D + (size_t)hh * hd;
+                for (int t = 0; t < hd; t++) o[t] = 0;
+                for (int j = 0; j < L; j++) {
+                    const float a = att[j];
+                    const float *v = qkv + (size_t)j * 3 * D + 2 * D + (size_t)hh * hd;
+                    for (int t = 0; t < hd; t++) o[t] += a * v[t];
+                }
+            }
+        }
+
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.attn.proj.weight", b);
+        const waste_tensor *wo = waste_find(m, nm);
+        if (!wo) goto fail;
+        waste_matmul_t(m, y, wo, ob, D, D, L);
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.attn.proj.bias", b);
+        {
+            const float *pb = vt_bias(m, nm, bias, D);
+            for (int r = 0; r < L; r++)
+                for (int i = 0; i < D; i++)
+                    x[(size_t)r * D + i] += y[(size_t)r * D + i] + (pb ? pb[i] : 0.0f);
+        }
+
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.norm2.weight", b);
+        const waste_tensor *n2 = waste_find(m, nm);
+        if (!n2 || !n2->data) goto fail;
+        rmsnorm_rows(y, x, n2->data, L, D, c->eps);
+
+        float *gate = ff, *up = ff + (size_t)L * c->inter;
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.mlp.gate_proj.weight", b);
+        const waste_tensor *wg = waste_find(m, nm);
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.mlp.up_proj.weight", b);
+        const waste_tensor *wu = waste_find(m, nm);
+        if (!wg || !wu) goto fail;
+        waste_matmul_t(m, gate, wg, y, c->inter, D, L);
+        waste_matmul_t(m, up, wu, y, c->inter, D, L);
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.mlp.gate_proj.bias", b);
+        {
+            const float *gb = vt_bias(m, nm, bias, c->inter);
+            if (gb) for (int r = 0; r < L; r++)
+                for (int i = 0; i < c->inter; i++) gate[(size_t)r * c->inter + i] += gb[i];
+        }
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.mlp.up_proj.bias", b);
+        {
+            const float *ub = vt_bias(m, nm, bias, c->inter);
+            if (ub) for (int r = 0; r < L; r++)
+                for (int i = 0; i < c->inter; i++) up[(size_t)r * c->inter + i] += ub[i];
+        }
+        vt_swiglu(gate, up, (size_t)L * c->inter, c->swiglu_limit);
+
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.mlp.down_proj.weight", b);
+        const waste_tensor *wd = waste_find(m, nm);
+        if (!wd) goto fail;
+        waste_matmul_t(m, y, wd, gate, D, c->inter, L);
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.mlp.down_proj.bias", b);
+        {
+            const float *db = vt_bias(m, nm, bias, D);
+            for (int r = 0; r < L; r++)
+                for (int i = 0; i < D; i++)
+                    x[(size_t)r * D + i] += y[(size_t)r * D + i] + (db ? db[i] : 0.0f);
+        }
+        {
+            const char *st = getenv("WASTE_VIS_STAGE");
+            char want[32];
+            snprintf(want, sizeof want, "block%d", b);
+            if (st && strcmp(st, want) == 0) {
+                memcpy(out, x, (size_t)L * D * sizeof(float));
+                goto done;
+            }
+        }
+    }
+    }
+
+    {
+        const waste_tensor *pn = waste_find(m, "vision_tower.post_layernorm.weight");
+        if (!pn || !pn->data) goto fail;
+        rmsnorm_rows(x, x, pn->data, L, D, c->eps);
+    }
+    if (getenv("WASTE_VIS_STAGE") &&
+        strcmp(getenv("WASTE_VIS_STAGE"), "post") == 0) {
+        memcpy(out, x, (size_t)L * D * sizeof(float));
+        goto done;
+    }
+
+    /* --- downsample: the Conv2d over a merge block is a matmul over
+     * (channel, dy, dx) — the weight's own axis order, and not the
+     * (dy, dx, channel) a reader of the reshape above would assume. */
+    {
+        const int nb = L / (mg * mg), win = D * mg * mg;
+        float *blk = (float *)malloc((size_t)nb * win * sizeof(float));
+        if (!blk) goto oom;
+        for (int b2 = 0; b2 < nb; b2++)
+            for (int ch = 0; ch < D; ch++)
+                for (int dy = 0; dy < mg; dy++)
+                    for (int dx = 0; dx < mg; dx++)
+                        blk[(size_t)b2 * win + ((size_t)ch * mg + dy) * mg + dx] =
+                            x[((size_t)b2 * mg * mg + (size_t)dy * mg + dx) * D + ch];
+        const waste_tensor *dw = waste_find(m, "vision_tower.downsample.weight");
+        if (!dw) { free(blk); goto fail; }
+        waste_matmul_t(m, y, dw, blk, OD, win, nb);
+        free(blk);
+        const float *db = vt_bias(m, "vision_tower.downsample.bias", bias, OD);
+        if (db) for (int r = 0; r < nb; r++)
+            for (int i = 0; i < OD; i++) y[(size_t)r * OD + i] += db[i];
+        if (getenv("WASTE_VIS_STAGE") &&
+            strcmp(getenv("WASTE_VIS_STAGE"), "downsample") == 0) {
+            memcpy(out, y, (size_t)nb * OD * sizeof(float));
+            goto done;
+        }
+
+        /* --- merger: proj -> LayerNorm -> GELU -> clamped SwiGLU -------- */
+        const waste_tensor *pj = waste_find(m, "vision_tower.merger.proj.weight");
+        if (!pj) goto fail;
+        waste_matmul_t(m, x, pj, y, OD, OD, nb);
+        {
+            const waste_tensor *lw = waste_find(m, "vision_tower.merger.post_projection_norm.weight");
+            float lb[4096];
+            const float *lbias = vt_bias(m, "vision_tower.merger.post_projection_norm.bias", lb, OD);
+            if (!lw || !lw->data) goto fail;
+            for (int r = 0; r < nb; r++) {
+                float *row = x + (size_t)r * OD;
+                float mean = 0;
+                for (int i = 0; i < OD; i++) mean += row[i];
+                mean /= (float)OD;
+                float var = 0;
+                for (int i = 0; i < OD; i++) { const float d = row[i] - mean; var += d * d; }
+                const float inv = 1.0f / sqrtf(var / (float)OD + c->proj_eps);
+                for (int i = 0; i < OD; i++)
+                    row[i] = gelu_erf((row[i] - mean) * inv * lw->data[i]
+                                            + (lbias ? lbias[i] : 0.0f));
+            }
+        }
+        float *gate = ff, *up = ff + (size_t)nb * c->proj_inter;
+        const waste_tensor *mg1 = waste_find(m, "vision_tower.merger.gate_proj.weight");
+        const waste_tensor *mu1 = waste_find(m, "vision_tower.merger.up_proj.weight");
+        const waste_tensor *md1 = waste_find(m, "vision_tower.merger.down_proj.weight");
+        if (!mg1 || !mu1 || !md1) goto fail;
+        waste_matmul_t(m, gate, mg1, x, c->proj_inter, OD, nb);
+        waste_matmul_t(m, up, mu1, x, c->proj_inter, OD, nb);
+        vt_swiglu(gate, up, (size_t)nb * c->proj_inter, c->swiglu_limit);
+        waste_matmul_t(m, out, md1, gate, OD, c->proj_inter, nb);
+    }
+
+done:
+    free(x); free(y); free(qkv); free(ob); free(ff); free(att);
+    free(cs); free(sn); free(bias);
+    return 0;
+oom:
+fail:
+    free(x); free(y); free(qkv); free(ob); free(ff); free(att);
+    free(cs); free(sn); free(bias);
+    return -1;
+}

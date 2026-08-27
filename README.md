@@ -123,7 +123,7 @@ Kimi K3 and Kimi-Linear are unaffected: their forward pass is byte-identical to
 ### GLM-5.3-Flash
 
 `zai-org/GLM-5.3-Flash` — 313 B parameters, 328 GB of fp8 as published — is
-converted, running and text-only. On the 64 GB machine above:
+converted and running, text and images. On the 64 GB machine above:
 
 | | |
 |---|---:|
@@ -158,11 +158,19 @@ gets a token's working set and a half. The re-encoded tokenizer agrees with
 the release's own on 21 of 21 strings, and VQ3R lands at the same 0.195
 relative error on GLM's experts as on K3's.
 
-The vision tower is not implemented — GLM's is not K3's — so the converter
-writes no `vision.json` and the container refuses images by name rather than
-running the wrong tower on them. [docs/GLM.md](docs/GLM.md) has the
-architecture, the two places the release states something differently, and
-what else is left out.
+Its vision tower is a second one — 24 blocks with 2D rope, per-head q/k
+norms, a gated merger — and matches its own PyTorch oracle to rel L2 3.3e-5:
+
+```
+$ waste run ~/models/glm53.waste "What does this image look like?" --image x.png
+[x.png: 40 image tokens]
+This image displays a vibrant, abstract pattern of diagonal stripes in
+various colors like green, blue, purple, and pink, overlaid with fine
+vertical lines.
+```
+
+[docs/GLM.md](docs/GLM.md) has the architecture, the three places the
+release states something differently, and what is still left out.
 
 ## What you need
 

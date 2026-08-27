@@ -200,7 +200,7 @@ class TestRender(Base):
                                                   "arguments": "{}"}}]}])
 
     def test_an_image_part(self):
-        self.refuses("cannot place one", [{"role": "user", "content": [
+        self.refuses("does not say how to place one", [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": "data:,"}}]}])
 
     def test_a_role_the_template_does_not_describe(self):
@@ -356,6 +356,28 @@ class TestThinkChannel(Base):
         d = p.feed_token(fmt.think_close_id, "<|im_end|>")
         self.assertEqual((d.reasoning, d.content), ("", ""))
         self.assertFalse(p.finished)
+
+    def test_an_image_is_placed_when_the_format_names_a_block(self):
+        """The block is markup and the caller's bytes went to the tower, so
+        nothing of the image reaches the tokenizer as text."""
+        fmt = self.fmt(image="<|im_middle|>")
+        segs = fmt.build_chat_segments(
+            [{"role": "user", "content": [
+                {"type": "text", "text": "what is this"},
+                {"type": "image_url", "image_url": {"url": "data:,"}}]}],
+            thinking=True, image_prompts=["<|im_middle|>"])
+        img = [s for s in segs if s.text == "<|im_middle|>" and s.markup]
+        self.assertEqual(len(img), 2)      # the block, and the think opener
+        self.assertIn("what is this", "".join(s.text for s in segs))
+
+    def test_more_images_encoded_than_placed_is_refused(self):
+        fmt = self.fmt(image="<|im_middle|>")
+        with self.assertRaises(ChatFormatError) as cm:
+            fmt.build_chat_segments(
+                [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "data:,"}}]}],
+                thinking=True, image_prompts=["<|im_middle|>", "<|im_middle|>"])
+        self.assertIn("more images were encoded", str(cm.exception))
 
     def test_the_stop_still_ends_the_turn_from_inside_the_channel(self):
         """A reply that hits the stop before closing its reasoning is

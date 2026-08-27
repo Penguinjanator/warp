@@ -182,9 +182,16 @@ def main():
           == "model.norm.weight")
     check("lm_head is already where a prefix-less container wants it",
           CONV.glm_rename("lm_head.weight") == "lm_head.weight")
-    check("a name that is not under the wrapper is left alone",
+    # src/vision.c looks the tower up by a fixed string, the one K3
+    # established. A container that spells it `model.visual.` holds weights
+    # nothing will ever ask for.
+    check("the tower goes under the name the engine looks it up by",
           CONV.glm_rename("model.visual.blocks.0.attn.qkv.weight")
-          == "model.visual.blocks.0.attn.qkv.weight")
+          == "vision_tower.blocks.0.attn.qkv.weight"
+          and CONV.glm_rename("model.visual.merger.proj.weight")
+          == "vision_tower.merger.proj.weight")
+    check("a name under neither is left alone",
+          CONV.glm_rename("lm_head.bias") == "lm_head.bias")
 
     # ---- the trunk tensors GLM ships that nothing here reads ------------
     drop = CONV.glm_drop_trunk("model.language_model.", 45)
@@ -194,18 +201,21 @@ def main():
         "model.language_model.norm.weight",
         "lm_head.weight",
     ]
+    keep += [
+        # the tower is carried now: it has a reader, and it is loaded only
+        # when a caller asks for it
+        "model.visual.blocks.0.attn.qkv.weight",
+        "model.visual.merger.proj.weight",
+    ]
     gone = [
         # the MTP layer sits at index num_hidden_layers
         "model.language_model.layers.45.eh_proj.weight",
         "model.language_model.layers.45.shared_head.norm.weight",
-        # a tower this engine does not have a reader for
-        "model.visual.blocks.0.attn.qkv.weight",
-        "model.visual.merger.proj.weight",
     ]
     check("the layers of the forward pass are kept",
           all(not drop(n) for n in keep),
           str([n for n in keep if drop(n)]))
-    check("the MTP layer and the vision tower are dropped",
+    check("the MTP layer is dropped",
           all(drop(n) for n in gone),
           str([n for n in gone if not drop(n)]))
     # A 10-layer model must not drop layer 4 because "45" contains "4".

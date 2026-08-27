@@ -136,14 +136,15 @@ startup the server asks for the richer format first and falls back:
 
 ```
 chat     from ~/models/kimi-linear.waste/chat.json — plain conversation, no reasoning channel,
-         no tools, no images
+         no images, no tools
 chat     from ~/models/glm53.waste/chat.json — plain conversation, a reasoning channel,
-         no tools, no images
+         images, no tools
 ```
 
 Plain means plain: system / user / assistant turns, blocking and streaming.
 Everything the format cannot express is refused with a 400 that names the
-field — `tools`, an image part, a tool result turn. None of it is silently
+field — `tools`, a tool result turn, an image part on a format with no
+`image` block. None of it is silently
 dropped; a server that ignores `reasoning_effort` reports a different
 amount of reasoning than it did.
 
@@ -156,6 +157,7 @@ them, and each is optional and absent on both Kimi formats:
 | `stop` | what ends a generated turn, for a format where that is not the assistant suffix |
 | `think` | the reasoning channel's `[open, close]` pair |
 | `effort` | how the format asks for a reasoning effort, e.g. `"<\|system\|>Reasoning Effort: {}"` |
+| `image` | the block one image expands into, holding exactly one placeholder |
 
 `stop` is the one that fails quietly without it. A GLM turn ends because
 the *next* role marker begins — `<|assistant|>answer` then

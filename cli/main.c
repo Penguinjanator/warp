@@ -415,6 +415,10 @@ static int on_token(const waste_token_info *i, const char *piece, void *user)
  *              and the history must not carry one. Without a stop of its
  *              own the CLI ran on and kept answering questions nobody
  *              asked. Defaults to the assistant suffix.
+ *   `image`    the block one image expands into, holding exactly one
+ *              placeholder for the engine to repeat — GLM's is
+ *              `<|begin_of_image|><|image|><|end_of_image|>`. Absent, the
+ *              K3 block is used, which is the only one this CLI knew.
  *
  * Without one the CLI says so and continues raw, which is honest: a
  * guessed format is worse than a visible absence. --raw forces it. */
@@ -426,6 +430,7 @@ typedef struct {
     char prelude[128];
     char think_o[64], think_c[64];
     char stop[128];
+    char image[128];
     int  have;
 } chatfmt;
 
@@ -521,6 +526,7 @@ static int load_chatfmt(const char *model, chatfmt *f)
     jstr_bare(buf, "\"open\"", f->open, sizeof f->open);
     jstr_bare(buf, "\"prelude\"", f->prelude, sizeof f->prelude);
     jstr_bare(buf, "\"stop\"", f->stop, sizeof f->stop);
+    jstr_bare(buf, "\"image\"", f->image, sizeof f->image);
     jstr_field(buf, "\"think\"", 0, f->think_o, sizeof f->think_o);
     jstr_field(buf, "\"think\"", 1, f->think_c, sizeof f->think_c);
     /* A format that does not name one ends its turn with the assistant
@@ -707,7 +713,8 @@ static int cmd_info(int argc, char **argv)
  * another 17, so 64 was exactly too small once the dimensions went in. */
 #define MEDIA_HEAD_CAP (WASTE_MAX_IMAGES_CLI * 128 + 1)
 
-static int prefix_images(waste_ctx *c, const opts *o, char *buf, size_t cap)
+static int prefix_images(waste_ctx *c, const opts *o, char *buf, size_t cap,
+                         const chatfmt *fmt)
 {
     size_t k = 0;
     for (int i = 0; i < o->n_image; i++) {
@@ -733,9 +740,14 @@ static int prefix_images(waste_ctx *c, const opts *o, char *buf, size_t cap)
         char dims[48] = "";
         if (waste_image_dimensions(o->image[i], &iw, &ih) == WASTE_OK)
             snprintf(dims, sizeof dims, "image %dx%d", iw, ih);
-        const int w = snprintf(buf + k, cap - k, "%s%s%s%s%s",
-                               "<|media_begin|>", dims, "<|media_content|>",
-                               "<|media_pad|>", "<|media_end|>");
+        /* A format that states its own block gets it verbatim: GLM's is
+         * `<|begin_of_image|><|image|><|end_of_image|>` and carries no
+         * dimensions, because its processor does not tell the model them. */
+        const int w = fmt && fmt->image[0]
+            ? snprintf(buf + k, cap - k, "%s", fmt->image)
+            : snprintf(buf + k, cap - k, "%s%s%s%s%s",
+                       "<|media_begin|>", dims, "<|media_content|>",
+                       "<|media_pad|>", "<|media_end|>");
         if (w < 0 || (size_t)w >= cap - k) {
             fprintf(stderr, "prompt too long\n");
             return 1;
@@ -801,7 +813,7 @@ static int build_prompt(waste_ctx *c, const opts *o, const char *prompt,
     char head[MEDIA_HEAD_CAP];
     head[0] = 0;
     if (o->n_image && !o->media_inlined &&
-        prefix_images(c, o, head, sizeof head)) return 1;
+        prefix_images(c, o, head, sizeof head, NULL)) return 1;
     const seg s[2] = { { head, 1 }, { prompt, 1 } };
     return build_prompt_segs(c, o, s, 2, ids, cap, n);
 }
@@ -814,7 +826,7 @@ static int run_prompt(waste_ctx *c, const opts *o, const char *prompt, int show_
     char head[MEDIA_HEAD_CAP];
     head[0] = 0;
     if (o->n_image && !o->media_inlined &&
-        prefix_images(c, o, head, sizeof head)) return 1;
+        prefix_images(c, o, head, sizeof head, NULL)) return 1;
     const seg s[2] = { { head, 1 }, { prompt, 1 } };
     opts q = *o;
     q.media_inlined = 1;          /* prefix_images already ran, above */
@@ -932,7 +944,7 @@ static int cmd_run(int argc, char **argv)
         char head[MEDIA_HEAD_CAP];
         head[0] = 0;
         if (o.n_image) {
-            if (prefix_images(c, &o, head, sizeof head)) {
+            if (prefix_images(c, &o, head, sizeof head, &fmt)) {
                 waste_close(c); free(prompt); return 1;
             }
             o.media_inlined = 1;
@@ -1087,7 +1099,7 @@ static int cmd_chat(int argc, char **argv)
             char head[MEDIA_HEAD_CAP];
             head[0] = 0;
             if (t.n_image) {
-                if (prefix_images(c, &t, head, sizeof head)) { o.n_image = 0; continue; }
+                if (prefix_images(c, &t, head, sizeof head, &fmt)) { o.n_image = 0; continue; }
                 t.media_inlined = 1;
             }
             /* `line` is what the user typed: plain, so a marker pasted

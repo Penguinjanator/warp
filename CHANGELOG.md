@@ -94,6 +94,32 @@ field — has to be rebuilt against the new header.
 
 ### Added
 
+- **GLM-5.3-Flash's vision tower** (`docs/GLM.md`, `docs/LEARNED.md` §70).
+  `src/vision.c` holds two towers now, dispatched on `tower` in
+  `vision.json`; a file without the key is K3's. GLM's is 24 blocks with 2D
+  rope instead of a learned grid, per-head RMSNorms on q and k, biases
+  everywhere, a clamped SwiGLU, a two-slot temporal patch and a gated
+  merger. **Against a new `tools/glm_vision_ref.py`: rel L2 3.3e-5** on the
+  real 563.6 M tower and 7.7e-7 on the synthetic one `tests/run.sh` now
+  builds, so the tower is in CI.
+
+  Its preprocessing needed two things exactly right. The patch order is
+  block-major over merge blocks, not raster — raster rotates every patch by
+  someone else's position and leaves the output plausible — and is checked
+  against the reference's own reshape at **max abs difference 0**. And the
+  resize is antialiased bicubic: a bilinear sample matched torch's bilinear
+  to the bit and the release's kernel to only **7.7% relative**, which is a
+  different image rather than a noisier one, so the kernel is implemented
+  (separable, cubic a = -0.5, support widened on a downsample) and lands at
+  max abs 4e-5 against torch.
+
+  `chat.json` gained an `image` block, so `waste run --image` and
+  `/v1/chat/completions` with an image part both work. The tower is 282 MB
+  at 4 bits and loads only when a caller asks for images — which needed its
+  own fix: the skip was written as "outside `tensor_prefix`", the same set
+  as "the tower" on K3 and the empty set on GLM, so its 282 MB were
+  resident on every text-only open and counted in the floor.
+
 - **`chat.json` gained `prelude`, `think` and `stop`, and GLM is now usable
   as an instruct model** (`docs/GLM.md`, `docs/LEARNED.md` §69). Each field
   exists because GLM's format cannot be written without it: it opens every

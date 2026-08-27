@@ -5115,3 +5115,100 @@ per full-attention layer, which is a fourteenth of the latents beside them.
 Nothing else in the engine grows with context. At 1M — the release's
 figure — the state would be around 25 GB, which is a machine question and
 not an engine one.
+
+
+## 70. GLM's vision tower, and the resize that was not a rounding error (2026-08-27)
+
+§65 listed the tower as not implemented and said why: GLM's is not K3's.
+It is now, and the interesting parts are the two places where "close
+enough" would have been wrong in a way nothing would have reported.
+
+### What it is, against what K3's is
+
+| | K3 | GLM-5.3-Flash |
+|---|---|---|
+| blocks | 27 x 1024, 12 heads | 24 x 1024, 16 heads |
+| position | learned 64x64 grid, bilinearly resized | 2D rope only |
+| q/k | as projected | RMSNormed per head, then rotated |
+| biases | none | on every projection |
+| MLP | GELU (tanh) | clamped SwiGLU |
+| patch | Conv2d over 3x14x14 | Conv3d over 3x2x14x14, the temporal slot a copy |
+| merge | 2x2 reshape, two-layer projector | Conv2d downsample, gated merger with a LayerNorm and an exact GELU |
+
+Two towers in one file rather than a branch inside one, for the reason a
+`if tower == ...` in every function is harder to check than two functions
+that each say one thing.
+
+**It matched the oracle on the first run: rel L2 3.3e-5** on the real 563.6 M
+tower, 7.7e-7 on the synthetic one CI builds. Which is less a statement
+about the code than about writing `tools/glm_vision_ref.py` first and the C
+against it — the four details that are easy to get wrong were wrong in the
+reference too, once each, and were found there.
+
+### The patch order is not a detail
+
+The rows arrive **block-major over merge blocks** — block row, block
+column, then the 2x2 inside it — which is what lets the tower's downsample
+be a reshape, and what `get_vision_position_ids` assumes when it builds the
+rotary indices. Raster order, the obvious reading and what K3 uses, rotates
+every patch by someone else's position. The output stays finite, the norms
+stay plausible, and the model describes a different picture.
+
+It is checked against the reference's own reshape/permute/expand, on an
+image whose dimensions are already a multiple of `patch * merge` so that
+the resize is the identity and only the ordering is under test: **max abs
+difference exactly 0**.
+
+### The resize was 7.7%, and that is not a rounding error
+
+K3's loader samples bilinearly, and the first version of GLM's did too —
+it was the same code and the release's config does not shout about
+resampling. Measured against the processor's own choice:
+
+| the engine's pixels vs | max abs | rel |
+|---|---:|---:|
+| torch bilinear | 0.0000 | **0.0000** |
+| torch bicubic | 0.4172 | 0.0986 |
+| torch bicubic + antialias (what the release does) | 0.2879 | **0.0773** |
+
+The first row is the useful one: the sampling *convention* was already
+exact, half-pixel centres and all. What differed was the kernel, and 7.7%
+relative on the tower's input is a different image, not a noisier one.
+
+So the kernel is implemented — separable, cubic with a = -0.5, support
+widened by the scale factor on a downsample, which is what PIL does and
+what torch ported. **Engine against torch's antialiased bicubic: max abs
+4e-5, rel 0.00000.**
+
+The temptation was to write "the resampling is bilinear where the release
+is bicubic; see the docs" and move on. The number is what made that
+untenable: a documented 7.7% is still a tower being shown something the
+model was not trained on.
+
+### What it costs, and what it does
+
+The tower is 563.6 M parameters, 282 MB at 4 bits, and it is **loaded only
+when a caller asks for images**. That needed its own fix: the skip was
+written as "outside `tensor_prefix`", which on K3 is the same set as "the
+tower" and on GLM — whose container has no prefix at all — is the empty
+set. Its 282 MB were resident on every text-only open, and the memory plan
+counted them in the floor. Both now say `vision_tower.` in as many words.
+
+    $ waste run glm53.waste "What does this image look like?" --image x.png
+    [x.png: 40 image tokens]
+    This image displays a vibrant, abstract pattern of diagonal stripes in
+    various colors like green, blue, purple, and pink, overlaid with fine
+    vertical lines.
+
+which is what the file actually contains. `waste plan` prices it at 805 MB
+more with `--image`, against K3's 1.12 GB.
+
+### The grid rule, transcribed rather than invented
+
+GLM aligns to `patch * merge` = 28 pixels and then fits the result into a
+budget expressed in *merged tokens*, with a binary search over the content
+height when it does not fit. Two things in `smart_resize` look like
+accidents and are not: the frame count rounds to a multiple of the temporal
+factor before it multiplies the budget, and the search advances `low` to
+`content_height + 1` rather than to the aligned height. Both are
+transcribed.

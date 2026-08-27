@@ -260,26 +260,32 @@ def glm_rename(name):
     is not carried (see glm_drop_trunk) — and `lm_head.weight` is already
     where a prefix-less container wants it."""
     pfx = "model.language_model."
-    return "model." + name[len(pfx):] if name.startswith(pfx) else name
+    if name.startswith(pfx):
+        return "model." + name[len(pfx):]
+    # The tower goes under the name src/vision.c looks it up by, which is
+    # the one K3 established. Same reason as above: the engine's lookup is a
+    # fixed string, and a container that spells it differently holds weights
+    # nothing will ever ask for.
+    vis = "model.visual."
+    if name.startswith(vis):
+        return "vision_tower." + name[len(vis):]
+    return name
 
 
 def glm_drop_trunk(src_pfx, n_layers):
     """Which of GLM's trunk tensors this container has no reader for.
 
-    The MTP layer (`num_nextn_predict_layers`) sits at index
-    num_hidden_layers and is a speculative-decoding head, not part of the
-    forward pass. The vision tower is not K3's — 24 blocks, a downsample
-    conv, a gated merger — and src/vision.c reads K3's, so the container is
-    text-only and says so by not carrying it.
+    Only the MTP layer, now: `num_nextn_predict_layers` puts one at index
+    num_hidden_layers, and it is a speculative-decoding head rather than
+    part of the forward pass.
 
-    Dropped rather than carried: the trunk is resident for the life of the
-    process, so a tensor nothing reads is RAM taken from the expert cache,
-    which is the one thing this engine is short of."""
+    Dropped rather than carried, because the trunk is resident for the life
+    of the process and a tensor nothing reads is RAM taken from the expert
+    cache. The vision tower is carried — it has a reader now — and is
+    loaded only when a caller asks for it, on the same terms as K3's."""
     mtp = re.compile(re.escape(src_pfx) + r"layers\.(\d+)\.")
 
     def drop(name):
-        if ".visual." in name:
-            return True
         m = mtp.match(name)
         return bool(m) and int(m.group(1)) >= n_layers
     return drop
@@ -884,7 +890,23 @@ def convert_layer(job):
 
 
 
-def build_trunk(args, sr, st, existing, manifest_path, drop=None, rename=None):
+def glm_flatten(name, t):
+    """The tower's convolutions, as the matrices the engine reads.
+
+    `patch_embed.proj` is a Conv3d and ships as [1024, 3, 2, 14, 14];
+    `downsample` is a Conv2d at [4096, 1024, 2, 2]. Both are applied as a
+    matmul over everything but the first axis, and the container's tensor
+    header holds four dimensions — a five-dimensional shape is refused at
+    load, with an I/O error and no clue as to which tensor. So they are
+    written flat, in the weight's own axis order, which is the order both
+    src/vision.c and tools/glm_vision_ref.py flatten to."""
+    if name.startswith("vision_tower.") and t.dim() > 2:
+        return t.reshape(t.shape[0], -1)
+    return t
+
+
+def build_trunk(args, sr, st, existing, manifest_path, drop=None, rename=None,
+                reshape=None):
     """Write trunk.bin.tmp and return its index, or None if the run must stop.
 
     A function rather than a stretch of main() because --reclaim has to run
@@ -945,6 +967,8 @@ def build_trunk(args, sr, st, existing, manifest_path, drop=None, rename=None):
                 if rename:
                     name = rename(name)
                 name = trunk_rename(name, _trunk_seg)
+                if reshape:
+                    t = reshape(name, t)
                 off = tf.tell()
                 if t.dim() == 1 or t.numel() < 1 << 16:
                     tf.write(raw_bytes(t.float()))
@@ -1253,7 +1277,8 @@ def main():
         # still only replaced together with the manifest, so nothing about
         # what this run can survive changes — only the order.
         tindex = build_trunk(args, sr, st, existing, manifest_path, drop_trunk,
-                             glm_rename if glm else None)
+                             glm_rename if glm else None,
+                             glm_flatten if glm else None)
         if tindex is None:
             return 1
         reclaim(debt, args.reclaim, ShardDebt.TRUNK, "trunk")
@@ -1505,11 +1530,47 @@ def main():
     # not what CLIP does. Guess nothing that the release states.
     vc = cfg.get("_outer", {}).get("vision_config")
     if vc and glm:
-        # GLM's tower is not K3's and src/vision.c reads K3's. Writing a
-        # vision.json from it would make the engine accept images and then
-        # run the wrong tower, which is worse than refusing them.
-        print("vision: GLM's tower is not implemented; the container is "
-              "text-only and waste_image_add will refuse images")
+        # Two towers, and the engine has to be told which. They agree on
+        # almost nothing below the block level: GLM has no learned position
+        # grid (2D rope only), q/k norms and biases the K3 tower does not,
+        # a clamped SwiGLU where K3 has GELU, a Conv3d patch embed over two
+        # temporal slots, and a Conv2d downsample into a gated merger where
+        # K3 has a 2x2 reshape and a two-layer projector. `tower` names it;
+        # a container without the key is K3's, which is every container
+        # written before this one.
+        vj = {k: v for k, v in vc.items() if not k.startswith("_")}
+        vj["tower"] = "glm5-next"
+        vj["media_placeholder_token_id"] = \
+            cfg.get("_outer", {}).get("image_token_id")
+        for k in ("image_start_token_id", "image_end_token_id"):
+            if cfg.get("_outer", {}).get(k) is not None:
+                vj[k] = cfg["_outer"][k]
+        # The release states its preprocessing and it is not K3's: CLIP's
+        # normalization rather than [-1, 1], and a token budget rather than
+        # a fixed grid. Read, never assumed — a tower fed the wrong
+        # normalization still matches its own oracle, because the oracle
+        # reads the same file.
+        p_proc = os.path.join(args.src, "processor_config.json")
+        if os.path.exists(p_proc):
+            ip = (json.load(open(p_proc)).get("image_processor") or {})
+            for k in ("image_mean", "image_std", "patch_size", "merge_size",
+                      "temporal_patch_size", "min_image_tokens",
+                      "max_image_tokens"):
+                if ip.get(k) is not None:
+                    vj[k] = ip[k]
+            print(f"vision: normalization from processor_config.json, "
+                  f"mean {vj.get('image_mean')}")
+        else:
+            print("vision: WARNING no processor_config.json in --src; the "
+                  "tower will run on unstated normalization", file=sys.stderr)
+        # Our cap on what an image costs the context, as on K3: an image is
+        # priced as text of the same length. The release's own ceiling is
+        # 8000 merged tokens, which is most of a conversation.
+        vj["max_patches"] = min(int(vj.get("max_image_tokens") or 1024), 1024)
+        atomic_json(os.path.join(args.out, "vision.json"), vj)
+        print(f"vision: {vj.get('depth', '?')}-layer GLM tower, patch "
+              f"{vj.get('patch_size', '?')}, merge {vj.get('merge_size', '?')}, "
+              f"max_patches {vj['max_patches']}")
         vc = None
     if vc:
         vj = {k: v for k, v in vc.items() if not k.startswith("_")}
@@ -1549,7 +1610,8 @@ def main():
     # holding non-expert tensors become deletable at all.
     if tindex is None:
         tindex = build_trunk(args, sr, st, existing, manifest_path, drop_trunk,
-                             glm_rename if glm else None)
+                             glm_rename if glm else None,
+                             glm_flatten if glm else None)
         if tindex is None:
             return 1
     trunk_path = os.path.join(args.out, "trunk.bin")

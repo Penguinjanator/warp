@@ -231,10 +231,13 @@ and each is there because the format cannot be written without it:
  "assistant": ["<|assistant|>", ""],
  "open": "<|assistant|>",
  "think": ["<think>", "</think>"],
- "stop": "<|user|>"}
+ "stop": "<|user|>",
+ "image": "<|begin_of_image|><|image|><|end_of_image|>"}
 ```
 
-`prelude` opens every conversation and belongs to no role. `stop` exists
+`image` is the block one picture expands into, holding exactly one
+placeholder the engine repeats into as many positions as the tower
+produced. `prelude` opens every conversation and belongs to no role. `stop` exists
 because a GLM turn ends when the *next role marker* begins — there is no
 suffix to close it with, so the history must not carry one, and without it
 the CLI ran on and kept answering questions nobody asked. `think` is the
@@ -256,13 +259,65 @@ a system turn, `<|system|>Reasoning Effort: High` — through the optional
 that leaves the channel closed, and answering with it closed puts a stray
 `</think>` in the reply.
 
-## Not implemented
+## The vision tower
 
-- **The vision tower.** GLM's is not K3's — 24 blocks at 1024 wide, a
-  downsample conv, a gated merger, 2D rope — and `src/vision.c` reads K3's.
-  `convert.py` therefore writes no `vision.json`, so the container is
-  text-only and `waste_image_add` refuses images by name rather than running
-  the wrong tower on them.
+GLM's is not K3's, so `src/vision.c` holds two — dispatched on `tower` in
+`vision.json`, and a file without the key is K3's, which is every container
+written before this one.
+
+| | K3 | GLM-5.3-Flash |
+|---|---|---|
+| blocks | 27 x 1024, 12 heads | 24 x 1024, 16 heads |
+| position | learned 64x64 grid, bilinearly resized | 2D rope only |
+| q/k | as projected | RMSNormed per head, then rotated |
+| biases | none | on every projection |
+| MLP | GELU (tanh) | clamped SwiGLU |
+| patch | Conv2d over 3x14x14 | Conv3d over 3x2x14x14, the temporal slot a copy |
+| merge | 2x2 reshape, two-layer projector | Conv2d downsample, gated merger with a LayerNorm and an exact GELU |
+
+**Against `tools/glm_vision_ref.py`: rel L2 3.3e-5** on the real 563.6 M
+tower, 7.7e-7 on the synthetic one `tests/run.sh` builds.
+
+```
+$ waste run glm53.waste "What does this image look like?" --image x.png
+[x.png: 40 image tokens]
+This image displays a vibrant, abstract pattern of diagonal stripes in
+various colors like green, blue, purple, and pink, overlaid with fine
+vertical lines.
+```
+
+The tower is 282 MB at 4 bits and is loaded only when a caller asks for
+images; `waste plan` prices it at 805 MB more with `--image`.
+
+### Two things the preprocessing had to get exactly right
+
+**The patch order is block-major over merge blocks** — block row, block
+column, then the 2x2 inside it — which is what lets the downsample be a
+reshape and what the rotary indices assume. Raster order, the obvious
+reading and what K3 uses, rotates every patch by someone else's position:
+the output stays finite and the model describes a different picture.
+Checked against the reference's own reshape on an image already aligned to
+`patch * merge`, so only the ordering is under test: **max abs difference
+exactly 0**.
+
+**The resize is antialiased bicubic**, because bilinear is not close
+enough. Measured on the tower's input:
+
+| the engine's pixels vs | rel |
+|---|---:|
+| torch bilinear | 0.0000 |
+| torch bicubic + antialias (the release's) | **0.0773** |
+
+The convention was already exact — half-pixel centres, matching torch's
+bilinear to the bit — and the *kernel* was 7.7% off, which is a different
+image rather than a noisier one. So the kernel is implemented: separable,
+cubic with a = -0.5, support widened by the scale factor on a downsample.
+Against torch's antialiased bicubic: **max abs 4e-5**.
+
+The grid rule is transcribed from `smart_resize`, including the two things
+in it that look like accidents: the frame count rounds to a multiple of the
+temporal factor before it multiplies the budget, and the binary search
+advances `low` to `content_height + 1` rather than to the aligned height.
 - **Chunked prefill**, and measured not to matter. `waste_model_prefill`
   routes a GLM container through the per-token path, because the chunked
   one implements neither mHC nor the indexer's per-token pool bookkeeping.
