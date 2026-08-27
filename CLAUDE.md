@@ -104,7 +104,10 @@ fast group rather than waking the whole pool — 4 MB, measured; see
 docs/LEARNED.md §67),
 `WASTE_Q8=0` (dequantize the trunk to f32 at load, any width — 8x the RAM
 on a 4-bit trunk, so it is out of reach on K3), `WASTE_I8MM=1`,
-`WASTE_TOK_PLAIN=1`, `WASTE_VIS_STAGE`, `WASTE_DUMP_LATENT/HIDDEN`.
+`WASTE_TOK_PLAIN=1`, `WASTE_VIS_STAGE`, `WASTE_DUMP_LATENT/HIDDEN`,
+`WASTE_DUMP_DSA` (the sparse-attention selection: which pools won and on
+what scores, so two implementations can be diffed on the decision rather
+than on the logits it produced).
 
 MoE scheduling and the VQ4P kernel: `WASTE_XPAR=1` (one task per routed
 expert instead of one per row range — **off by default**: worth ~1.18x on

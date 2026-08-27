@@ -124,10 +124,12 @@ class ChatServer(ThreadingHTTPServer):
                 self.chat_format = fmt
                 self.chat_error = None
                 self.stop_tokens = [fmt.stop_id]
-                # No think markup in such a container, so the channel does
-                # not exist to default on. A request that asks for it is
-                # refused by the renderer rather than answered without it.
-                self.default_thinking = False
+                # On by default only when the format names a channel. A
+                # container without one refuses a request that asks for it
+                # rather than answering without it; a container whose
+                # generation prompt always opens one — GLM's does — cannot
+                # be asked to answer without it either.
+                self.default_thinking = fmt.think is not None
 
     def new_parser(self, thinking: bool):
         """The reply reader for whichever format this container speaks.
@@ -138,7 +140,11 @@ class ChatServer(ThreadingHTTPServer):
         if self.chat_format is xtml:
             return RegionParser(in_think=thinking, in_response=not thinking,
                                 markers=self.markers)
-        return PlainParser(markers=self.markers)
+        fmt = self.chat_format
+        return PlainParser(markers=self.markers,
+                           think_close_id=getattr(fmt, "think_close_id", -1),
+                           in_think=thinking and getattr(fmt, "think", None)
+                           is not None)
 
     def handle_error(self, request, client_address):
         """A client hanging up is not an error worth a traceback.

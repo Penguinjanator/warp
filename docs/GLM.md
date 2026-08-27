@@ -219,6 +219,43 @@ throughput on this NVMe — the same 200 tokens at the pre-§66 budget run at
 3.16 tok/s and read **481 GB** — which is a three-fold difference on a disk
 slow enough for it to show.
 
+## The chat format
+
+GLM's format needs three things the four-string `chat.json` did not have,
+and each is there because the format cannot be written without it:
+
+```json
+{"prelude": "[gMASK]<sop>",
+ "system": ["<|system|>", ""],
+ "user": ["<|user|>", ""],
+ "assistant": ["<|assistant|>", ""],
+ "open": "<|assistant|>",
+ "think": ["<think>", "</think>"],
+ "stop": "<|user|>"}
+```
+
+`prelude` opens every conversation and belongs to no role. `stop` exists
+because a GLM turn ends when the *next role marker* begins — there is no
+suffix to close it with, so the history must not carry one, and without it
+the CLI ran on and kept answering questions nobody asked. `think` is the
+reasoning channel: the generation prompt opens it, the model closes it
+itself, and naming the pair is what lets a reader separate the reasoning
+from the answer instead of returning the model's scratch work as the reply.
+
+`examples/chat-glm53.json` is that file and the converter installs it.
+Over HTTP the two come back separately:
+
+```json
+"content": "The capital of Italy is Rome.",
+"reasoning_content": "The user is asking a simple factual question..."
+```
+
+streaming included. `reasoning_effort` maps to GLM's own spelling of it —
+a system turn, `<|system|>Reasoning Effort: High` — through the optional
+`effort` field. `thinking: false` is refused: GLM's template has no path
+that leaves the channel closed, and answering with it closed puts a stray
+`</think>` in the reply.
+
 ## Not implemented
 
 - **The vision tower.** GLM's is not K3's — 24 blocks at 1024 wide, a
@@ -226,20 +263,23 @@ slow enough for it to show.
   `convert.py` therefore writes no `vision.json`, so the container is
   text-only and `waste_image_add` refuses images by name rather than running
   the wrong tower on them.
-- **Chunked prefill.** `waste_model_prefill` routes a GLM container through
-  the per-token path. The chunked path carries one residual per token and
-  one dense attention per layer, and mHC's parallel streams and the
-  indexer's per-token pool bookkeeping are neither; a chunk that quietly ran
-  without them would differ from the same prompt decoded one token at a
-  time, which is the exact failure `WASTE_CHUNK` exists to be checked
-  against.
+- **Chunked prefill**, and measured not to matter. `waste_model_prefill`
+  routes a GLM container through the per-token path, because the chunked
+  one implements neither mHC nor the indexer's per-token pool bookkeeping.
+  On the model that *does* have that path, warm cache, it is worth nothing
+  at either length tried — 4063 ms against 4075 for 64 tokens, 27067
+  against 27231 for 512 — because 82.8% of a chunked prefill is the VQ
+  apply and a chunk expands nearly the whole bank. Prefill runs at decode
+  speed here (266 tokens in 69 s) and chunking is not what would change
+  that. LEARNED §69.
 - **Cross-layer top-k sharing.** `indexer_types` is all `"full"` on this
   release. A container converted from a release that shares a selection
   across layers is refused rather than produced.
 - **MTP.** The extra prediction layer is dropped, as above.
-- **`chat.json`.** The release ships a Jinja template, which `convert.py`
-  copies, but the CLI reads the declarative form in `examples/`. Until one
-  is transcribed the CLI says so and falls back to raw continuation.
+- **Tools.** GLM's template carries a full tool-call protocol; the
+  declarative `chat.json` cannot express one and refuses by name rather
+  than half-rendering it. The raw `.jinja` is in the container for a host
+  that does interpret Jinja.
 
 ## What is checked
 
@@ -261,10 +301,25 @@ outgrows `index_topk`.
 
   **And on the real container**: 4 tokens of the converted 313 B model
   against the same reference, **rel L2 2.41e-5**, max abs 2.39e-4, argmax
-  and top-10 identical in the same order. The branch exercised there is the
-  dense one — `index_topk` is 2048 and the prompt is four tokens — so the
-  sparse selection stays verified on the synthetic container and not on
-  this one.
+  and top-10 identical in the same order.
+
+- **the sparse selection, on real weights.** The run above exercises the
+  dense branch — `index_topk` is 2048 and the prompt is four tokens. To
+  reach the other one without an hours-long oracle run, the container is
+  cloned with symlinks and a manifest whose `index_topk` is 16: the same
+  112 GB of weights, four pools kept instead of 512, and the branch reached
+  at 24 tokens. **The selections are identical, 55 of 55** — the pools
+  themselves, compared through a `WASTE_DUMP_DSA` trace against the same
+  line format from the reference, not inferred from a logit difference.
+
+  The logits in that run differ by 1.95e-3 rather than 2.41e-5, and the
+  control says why: the same 24 tokens through the dense path give
+  1.74e-3. It is the KDA recurrence over 24 steps, not the selection.
+
+  At the real setting, 2100 tokens: the branch fires on all 11 MLA layers
+  for positions 2051-2099, keeping 512 pools of 513 — 2048 pooled positions
+  plus the tail, of 2052 cached. Against the same prompt with the selection
+  off, rel L2 0.0909 with argmax and top-10 unchanged.
 - **that the indexer selects.** The same weights with `index_topk` raised
   above the prompt length, which is one number in the config and nothing
   else. The two must differ; measured 0.56 max abs.
@@ -277,8 +332,8 @@ outgrows `index_topk`.
   the real `tokenizer.json`: 21 of 21 identical, including the Han/Latin
   boundary.
 
-The synthetic container remains the only place the *sparse* DSA branch is
-exercised, and the only place any of this runs in CI: 1/32 scale, shapes the
-engine branches on, weights that are noise. What the real conversion adds is
-that the same code, on 313 B real parameters, agrees with an independent
-PyTorch implementation and answers questions in English.
+The synthetic container remains the only place any of this runs in CI:
+1/32 scale, shapes the engine branches on, weights that are noise. What the
+real conversion adds is that the same code, on 313 B real parameters, makes
+the same selections as an independent PyTorch implementation, agrees with
+it on the logits, and answers questions in English.

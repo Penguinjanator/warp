@@ -4984,3 +4984,134 @@ check opens at a hardcoded `--budget 5G`, which is below K3's 29.19 GB
 floor, so the engine refused, no cache line was printed, and that read as
 "the hotlist did nothing". Both are SKIPs now, with the reason. With the
 right source, K3 round-trips: 19.58-19.80% relative error, PASS.
+
+
+## 69. What GLM needed to be usable, and what it did not (2026-08-27)
+
+§68 converted GLM-5.3-Flash and showed it answering a question. That is not
+the same as being usable, and the gap between the two turned out to be four
+things — of which two were a format nobody had written down, one was a
+verification, and one was a measurement that killed the work it was meant
+to justify.
+
+### The chat format could not be written down
+
+`waste chat` on the fresh container did raw continuation, because a
+container with no `chat.json` has no format and the CLI says so rather than
+guessing. Writing one took three fields the four-string format did not
+have, and each was needed because GLM's format cannot be expressed without
+it:
+
+| field | why |
+|---|---|
+| `prelude` | GLM opens every conversation `[gMASK]<sop>`, which belongs to no role |
+| `stop` | a turn ends when the *next role marker* begins, so there is no suffix to close it with |
+| `think` | the generation prompt is `<|assistant|><think>`; the model closes the channel itself |
+
+The `stop` one is the instructive failure. Written without it, the format
+loads and answers correctly and then **keeps going**:
+
+    The capital of Italy is Rome.<|user|>What is the capital of Italy?
+    Answer in one sentence.</think>The capital of Italy is Rome.<|user|>...
+
+because the CLI took its stop from the assistant suffix, GLM has none, and
+the container's `eos_token_id` is `<|endoftext|>` — which is right for a
+raw continuation and is not what ends a chat turn. The release declares
+three eos ids for exactly this reason and the container holds one.
+
+With all three:
+
+    > What is the capital of Italy? One sentence.
+    The user is asking a simple factual question... </think>The capital of
+    Italy is Rome.
+
+### The reasoning channel was refused rather than parsed
+
+`serve/chatfmt.py` said, in as many words, that a chat.json container has no
+think markup and a request asking for one is refused. True of both Kimi
+containers and false of GLM, whose channel is in its specials and whose
+generation prompt always opens it. So `think` is now part of the format,
+`PlainParser` splits on its close marker, and the server returns the two
+separately:
+
+    "content": "The capital of Italy is Rome.",
+    "reasoning_content": "The user is asking a simple factual question..."
+
+streaming included — `reasoning_content` deltas first, then `content`.
+`reasoning_effort` maps to GLM's own spelling of it, a system turn
+(`<|system|>Reasoning Effort: High`), through an optional `effort` field;
+a format that does not say how to ask still refuses rather than dropping
+it silently.
+
+`thinking: false` is **refused** for GLM. Its template has no path that
+leaves the channel closed, and answering with it closed puts a stray
+`</think>` in the reply — measured, not assumed.
+
+### The sparse attention branch, verified on real weights
+
+§68 verified GLM against the oracle at four tokens, where `index_topk` is
+2048 and the selection is therefore every visible token: the dense path.
+The sparse one was verified only on a synthetic container at 1/32 scale.
+
+Closing that needed the sparse branch reached on *real* weights, and a
+2048-token oracle run is hours. So the container was cloned with symlinks
+and a manifest whose `index_topk` is 16 — same 112 GB of weights, four
+pools kept instead of 512 — which reaches the branch at 24 tokens.
+
+**The selections are identical, 55 of 55**, at every (layer, position)
+where the branch fires. Not "the logits are close": the engine's chosen
+pools and the reference's chosen pools, compared directly through a
+`WASTE_DUMP_DSA` trace on one side and the same line format on the other.
+The scores agree to a median 8.4e-4 absolute, and the one 48% relative
+outlier is a score of 0.0198 — cancellation, not disagreement.
+
+The logit difference in that run is 1.95e-3, two orders above §68's
+2.41e-5, and the control says sparsity is not why: **the same 24 tokens
+through the dense path give 1.74e-3.** It is the KDA recurrence
+accumulating over 24 steps in a different summation order, and it grows
+with prompt length whether the attention is sparse or not.
+
+And at the real setting, 2100 tokens: the branch fires on all 11 MLA
+layers for positions 2051-2099, keeping 512 pools of 513 — 2048 pooled
+positions plus the tail, of 2052 cached, which is what the config says it
+should do. Against the same prompt with the selection disabled: rel L2
+0.0909, argmax and top-10 identical. The selection is doing something and
+it is not breaking the answer.
+
+### Chunked prefill would have bought nothing, and here is why
+
+GLM's prefill runs at decode speed — 266 tokens in 69 s — because
+`waste_model_prefill` routes an mHC container through the per-token path.
+The obvious fix is to teach the chunked path mHC. Measured first, on the
+model that already has that path, warm cache:
+
+| prompt | per token | chunked |
+|---:|---:|---:|
+| 64 tokens | 4063 ms | 4075 ms |
+| 512 tokens | 27067 ms | 27231 ms |
+
+Nothing, at either length. The profile says why: in a chunked prefill
+**82.8% of the time is the VQ apply**, and the chunk expands nearly the
+whole bank because 64 tokens at top-8 over 256 experts route almost
+everywhere. Chunking trades disk reads for VQ decode, and on a machine
+where the reads were already cached that is a pure loss.
+
+So prefill is not slow because it is not chunked. It is slow because the
+expert kernel costs the same per (token, expert) either way, and that is
+§43's problem and not this one. The fallback GLM takes costs nothing
+measurable, and building the chunked path for it would have been a day
+spent on a 0.3% regression.
+
+### What long context needs, and what it costs
+
+| ctx | floor | state |
+|---:|---:|---:|
+| 4096 | 5.14 GB | 0.23 GB |
+| 32768 | 5.79 GB | 0.87 GB |
+| 131072 | **8.00 GB** | 3.06 GB |
+
+The indexer's pooled keys are in that: one 128-wide vector per four tokens
+per full-attention layer, which is a fourteenth of the latents beside them.
+Nothing else in the engine grows with context. At 1M — the release's
+figure — the state would be around 25 GB, which is a machine question and
+not an engine one.

@@ -388,10 +388,12 @@ class KimiRef:
 
         mask = torch.zeros(T, S, dtype=torch.bool)
         pool_end = torch.arange(npool) * P + P - 1
+        dump = os.environ.get("WASTE_DUMP_DSA")
         for t in range(T):
             kvl = S - T + t + 1                       # what query t can see
             visible = pool_end < kvl
-            keep = min(self.index_topk // P, int(visible.sum()))
+            nvis = int(visible.sum())
+            keep = min(self.index_topk // P, nvis)
             if keep:
                 sel = index_scores[t].masked_fill(
                     ~visible, float("-inf")).topk(keep).indices
@@ -399,6 +401,16 @@ class KimiRef:
                     mask[t, pi * P:(pi + 1) * P] = True
             if self.index_tail:
                 mask[t, kvl - kvl % P:kvl] = True
+            # Same line the engine's WASTE_DUMP_DSA writes, so the two
+            # selections can be diffed directly rather than inferred from a
+            # logit difference — which cannot tell a different ranking from
+            # a tie broken the other way.
+            if dump and keep < nvis:
+                with open(dump, "a") as f:
+                    ids = ",".join(str(i) for i in sorted(sel.tolist())) + ","
+                    sc = " ".join(f"{v:.9g}" for v in
+                                  index_scores[t][:nvis].tolist())
+                    f.write(f"{L} {S - T + t} {nvis} {keep} {ids} : {sc}\n")
         return mask
 
     def mla(self, L, x):

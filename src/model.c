@@ -187,6 +187,7 @@ static int trunk_kern = TK_F32;   /* WASTE_TRUNK_KERNEL                   */
 static int sdot4_sg = 32;  /* TK_SDOT only: activations per int8 scale    */
 static int i8mm_on = 0;    /* SMMLA batched matmul; costs activation int8 */
 static const char *dump_route = NULL;  /* WASTE_DUMP_ROUTE, see moe_layer */
+static const char *dump_dsa = NULL;    /* WASTE_DUMP_DSA, see dsa_select   */
 static const char *dump_scores = NULL; /* WASTE_DUMP_SCORES, see moe_layer */
 static float ccr_lambda = 0.0f;        /* WASTE_CCR_LAMBDA, see moe_layer */
 /* Absolute position of the first token of the pass being routed. The dump
@@ -290,6 +291,8 @@ static void model_opts_init(void)
     if (i8mm_on && !(waste_cpu_features() & WASTE_CPU_I8MM)) i8mm_on = 0;
     /* Read once rather than per layer per token: moe_layer runs 92
      * times a token and getenv is not free. */
+    dump_dsa = getenv("WASTE_DUMP_DSA");
+    if (dump_dsa && !*dump_dsa) dump_dsa = NULL;
     dump_route = getenv("WASTE_DUMP_ROUTE");
     dump_scores = getenv("WASTE_DUMP_SCORES");
     { const char *s = getenv("WASTE_CCR_LAMBDA");
@@ -3227,6 +3230,27 @@ static int dsa_select(waste_model *m, int L, const float *in,
     for (int i = 0; i < n; i++) {
         const int base = m->idxrank[i] * P;
         for (int j = 0; j < P; j++) m->idxsel[out++] = base + j;
+    }
+    /* WASTE_DUMP_DSA=path records the selection itself, one line per
+     * (layer, position):
+     *
+     *     L pos npool keep  p0,p1,... : score0 score1 ...
+     *
+     * the pools that won and the scores they won on. A logit diff can say
+     * that two implementations disagree; only this can say whether they
+     * disagree about the *ranking* or about a tie, and that is the
+     * difference between a bug and float noise. */
+    if (dump_dsa) {
+        FILE *df = fopen(dump_dsa, "a");
+        if (df) {
+            fprintf(df, "%d %d %d %d ", L, pos, npool, n);
+            for (int i = 0; i < n; i++) fprintf(df, "%d,", m->idxrank[i]);
+            fprintf(df, " :");
+            for (int p2 = 0; p2 < npool; p2++)
+                fprintf(df, " %.9g", m->idxscore[p2]);
+            fputc('\n', df);
+            fclose(df);
+        }
     }
     /* The tail: the tokens past the last complete pool are always visible,
      * which is what keeps the most recent context from waiting for a pool

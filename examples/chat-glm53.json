@@ -1,0 +1,9 @@
+{
+ "prelude": "[gMASK]<sop>",
+ "system": ["<|system|>", ""],
+ "user": ["<|user|>", ""],
+ "assistant": ["<|assistant|>", ""],
+ "open": "<|assistant|>",
+ "think": ["<think>", "</think>"],
+ "stop": "<|user|>"
+}

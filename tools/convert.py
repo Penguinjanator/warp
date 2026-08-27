@@ -1437,11 +1437,13 @@ def main():
     # model reads its own turn structure as prose. That is what the marker
     # check below refuses, and it also catches a release that renames them.
     _tmpl_for = {"kimi-k3": "chat-k3.json",
-                 "kimi-linear": "chat-kimi-linear.json"}
+                 "kimi-linear": "chat-kimi-linear.json",
+                 "glm5-next": "chat-glm53.json"}
     _hf0 = ((cfg.get("_outer", {}).get("architectures")
              or cfg.get("architectures") or [""]))[0]
     _arch0 = ("kimi-k3" if "KimiK3" in _hf0 else
-              "kimi-linear" if "KimiLinear" in _hf0 else "")
+              "kimi-linear" if "KimiLinear" in _hf0 else
+              "glm5-next" if "Glm5Next" in _hf0 else "")
     _dst = os.path.join(args.out, "chat.json")
     _name = _tmpl_for.get(_arch0)
     if _name and not os.path.exists(_dst):
@@ -1454,9 +1456,13 @@ def main():
             # Only when we have a specials list to check against: a release
             # without tokenizer_config.json tells us nothing, and refusing on
             # no evidence would be worse than the old unconditional copy.
+            # Both spellings this family uses for a control token: K3 and
+            # Kimi write <|...|>, GLM's think markers are bare <think> and
+            # </think>. A template checked for one and not the other passes
+            # while carrying a marker the tokenizer will emit as text.
             _absent = sorted({
                 m for m in re.findall(
-                    r"<\|[^|>]*\|>",
+                    r"<\|[^|>]*\|>|</?think>",
                     io.open(_src_tmpl, encoding="utf-8").read())
                 if m not in special_texts}) if special_texts else []
             if _absent:

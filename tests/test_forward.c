@@ -34,8 +34,14 @@ int main(int argc, char **argv)
         return 2;
     }
     const char *dir = argv[1];
-    int ids[512], n = 0;
-    for (char *p = strtok(argv[2], ","); p && n < 512; p = strtok(NULL, ","))
+    /* Enough to reach a sparse-attention branch. GLM's index_topk is 2048,
+     * so the selection only starts choosing past 2048 cached tokens, and a
+     * 512-id cap meant the only prompt this harness could build ran the
+     * dense path and reported it as if it had tested the other one. */
+    enum { MAXIDS = 8192 };
+    static int ids[MAXIDS];
+    int n = 0;
+    for (char *p = strtok(argv[2], ","); p && n < MAXIDS; p = strtok(NULL, ","))
         ids[n++] = atoi(p);
     const char *out = argc > 3 ? argv[3] : NULL;
     const int n_gen = argc > 4 ? atoi(argv[4]) : 0;

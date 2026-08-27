@@ -94,6 +94,50 @@ field — has to be rebuilt against the new header.
 
 ### Added
 
+- **`chat.json` gained `prelude`, `think` and `stop`, and GLM is now usable
+  as an instruct model** (`docs/GLM.md`, `docs/LEARNED.md` §69). Each field
+  exists because GLM's format cannot be written without it: it opens every
+  conversation `[gMASK]<sop>` (belonging to no role), its turns end when the
+  *next role marker* begins rather than with a suffix, and its generation
+  prompt always opens a reasoning channel the model closes itself. Written
+  without `stop`, the format answers correctly and then runs on into the
+  next turn, answering questions nobody asked — the container's
+  `eos_token_id` is `<|endoftext|>`, which is right for a raw continuation
+  and is not what ends a chat turn.
+
+  `examples/chat-glm53.json` is that file and the converter installs it.
+  Both Kimi formats are unchanged: `stop` defaults to the assistant suffix,
+  which is what they have always used.
+
+- **The server serves a reasoning channel.** `serve/chatfmt.py` said a
+  chat.json container has no think markup and refused a request that asked
+  for one — true of both Kimi containers, false of GLM. `PlainParser` now
+  splits on the channel's close marker and `/v1/chat/completions` returns
+  `content` and `reasoning_content` separately, streaming included.
+  `reasoning_effort` maps to GLM's own spelling of it, a system turn, via
+  an optional `effort` field; a format that does not say how still refuses
+  rather than dropping it. `thinking: false` is refused for GLM, whose
+  template has no path that leaves the channel closed.
+
+- **The DSA sparse branch, verified on real weights.** The oracle run in
+  §68 exercised the dense branch — `index_topk` is 2048 and the prompt was
+  four tokens. Cloning the container with symlinks and an `index_topk` of
+  16 reaches the sparse one at 24 tokens on the same 112 GB of weights:
+  **the selections are identical, 55 of 55**, compared directly through a
+  new `WASTE_DUMP_DSA` trace rather than inferred from a logit difference.
+  At the real setting and 2100 tokens the branch fires on all 11 MLA layers
+  for positions 2051-2099, keeping 512 pools of 513.
+
+### Measured and not built
+
+- **Chunked prefill for mHC containers.** GLM's prefill runs at decode
+  speed because it takes the per-token path, and teaching the chunked path
+  mHC looked like the fix. On the model that already has that path, warm
+  cache: 4063 ms against 4075 for 64 tokens, 27067 against 27231 for 512.
+  Nothing, at either length — 82.8% of a chunked prefill is the VQ apply,
+  and a chunk expands nearly the whole bank. Chunking trades disk reads for
+  VQ decode, which is a loss when the reads were already cached.
+
 - **GLM-5.3-Flash converted and run for real** (`docs/GLM.md`,
   `docs/LEARNED.md` §68). 306 GiB of shards down, ~45 minutes of conversion
   at `--jobs 3`, and a **112 GB container** — 5022 MB of trunk and 42 expert
