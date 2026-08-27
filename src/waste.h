@@ -107,6 +107,19 @@ typedef struct {
      * cannot be: recommended is capped at the container's whole expert set, so
      * on a merged container the two stop being three times apart. */
     uint64_t working_set_bytes;
+    /* Every expert byte the container holds, across all its banks. It is
+     * the point beyond which more cache cannot help: a cache this size
+     * never reads the same record twice, and one byte larger is a slot
+     * nothing will ever fill.
+     *
+     * Reported because it is what a machine with room should be sized
+     * against. `recommended_bytes` deliberately is not — it answers "what
+     * is worth having" without knowing the machine, and stops at three
+     * working sets. The automatic budget climbs from there to
+     * floor_bytes + bank_bytes when the machine allows it, which on a
+     * container smaller than RAM means every expert resident and no disk
+     * read after the first pass. 0 when the manifest lists no banks. */
+    uint64_t bank_bytes;
 } waste_memplan;
 
 /* Compute the memory floor without loading weights. ctx_tokens sizes the

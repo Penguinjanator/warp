@@ -493,14 +493,15 @@ static int cmd_plan(int argc, char **argv)
         printf("{\"ctx\":%u,\"trunk_bytes\":%llu,\"state_bytes\":%llu,"
                "\"scratch_bytes\":%llu,\"min_expert_cache\":%llu,"
                "\"floor_bytes\":%llu,\"recommended_bytes\":%llu,"
-               "\"working_set_bytes\":%llu",
+               "\"working_set_bytes\":%llu,\"bank_bytes\":%llu",
                o.ctx, (unsigned long long)p.trunk_bytes,
                (unsigned long long)p.state_bytes,
                (unsigned long long)p.scratch_bytes,
                (unsigned long long)p.min_expert_cache,
                (unsigned long long)p.floor_bytes,
                (unsigned long long)p.recommended_bytes,
-               (unsigned long long)p.working_set_bytes);
+               (unsigned long long)p.working_set_bytes,
+               (unsigned long long)p.bank_bytes);
         /* The human form already says "machine N GB" and the JSON did not,
          * so anything reading this had to work out physical RAM for itself
          * — which on Windows means neither sysconf nor /proc exists and the
@@ -560,6 +561,22 @@ static int cmd_plan(int argc, char **argv)
            "                                      container holds; below one\n"
            "                                      working set the cache keeps\n"
            "                                      nothing alive between tokens)\n", b[0]);
+    /* What a machine with room should be sized against, and the line
+     * `recommended` cannot be: recommended answers "worth having" without
+     * knowing the machine and stops at three working sets, which on a
+     * container smaller than RAM leaves most of the machine unused. This is
+     * the budget at which no expert is ever read twice. */
+    if (p.bank_bytes) {
+        char rb[32], kb[32];
+        human(p.floor_bytes + p.bank_bytes, rb, 32);
+        human(p.bank_bytes, kb, 32);
+        printf("  fully resident        %12s   (floor + every expert the\n"
+               "                                      container holds, %s;\n"
+               "                                      no record is read twice.\n"
+               "                                      The automatic budget\n"
+               "                                      climbs to this when the\n"
+               "                                      machine has the room)\n", rb, kb);
+    }
     if (p.vision_bytes) {
         char vb[32];
         human(p.vision_bytes, vb, 32);

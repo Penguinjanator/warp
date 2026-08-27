@@ -10,6 +10,59 @@ changed. Each entry names the section to read for the numbers behind it.
 
 ## Unreleased
 
+**ABI move.** `waste_memplan` gained `bank_bytes` at the end of the struct,
+so anything that allocates one — `serve/engine.py` mirrors it field for
+field — has to be rebuilt against the new header.
+
+### Added
+
+- **The automatic budget climbs to the whole expert set** (`docs/ENGINE.md`
+  §3, `docs/LEARNED.md` §66). The ladder's top rung was `floor + 3x` a
+  token's working set, which is what `recommended_bytes` means and the wrong
+  ceiling once the machine is known: on a 64 GB laptop Kimi-Linear's entire
+  17.17 GB expert set fits and the default gave it 1.65 GB of cache. It now
+  starts at however many working sets cover the container's bank — the point
+  past which a cache cannot be improved by making it larger — and walks
+  down, capped at the bank. `waste plan` reports that budget as **fully
+  resident** and `bank_bytes` is published in the plan.
+
+  Kimi-Linear, `waste bench`, defaults, 200 tokens: **12.67 -> 14.81 tok/s**,
+  hit rate 70.7% -> 96.3%, **66.27 GB -> 17.75 GB read**. K3 is byte-for-byte
+  unchanged (0.3251 tok/s, 465 GB) — its bank is 962.83 GB and no rung above
+  `floor + 1x` fits under the cap, which is still three quarters of what the
+  process may use.
+
+- **`moe_layer` picks its parallel path from the cache, not from a flag.**
+  §44 measured one task per routed expert at 1.18x on Kimi-Linear and a
+  regression on K3, and the reason it gave was the answer: holding K records
+  before doing any arithmetic is a barrier against the read-ahead — free
+  parallelism when they are resident, a stall when they are not. The layer
+  now asks (`waste_ecache_resident_all`, top_k hash lookups). Kimi-Linear
+  12.18 / 14.51 / **14.25** for XPAR=0 / XPAR=1 / automatic; K3 0.3251 /
+  0.1729 / **0.3251**. `WASTE_XPAR=0/1` still forces it.
+
+  The two paths are bit-identical and `tests/run.sh` now asserts it: a
+  scheduling choice made from cache state that also moved the numbers would
+  make an answer depend on how warm the cache happened to be.
+
+- **A background fill for a cache that can hold everything.** With the bank
+  resident, 200 tokens still discovered 13.2 GB of it as 3443 separate
+  demand misses. A thread now walks the banks in file order and fills empty
+  slots (`waste_ecache_admit`: never evicts, never counts a hit or a miss,
+  counts its bytes). It starts only when every record fits — below that,
+  file order is a worse judge of what belongs in a slot than LFRU is — and
+  it is a win at every length measured, including 16 tokens, where it reads
+  three times the bytes and still comes out ahead. `WASTE_PRELOAD=0` turns
+  it off.
+
+### Measured and not adopted
+
+- **An f32 trunk.** With the experts resident the profile is 49.7% trunk
+  matvec, so the obvious next thought is to spend the spare RAM there too.
+  `WASTE_Q8=0` on Kimi-Linear: **12.74 tok/s against 15.02**, eight times
+  the trunk RAM for a 15% loss. The quantized matvec is memory-bandwidth
+  bound and dequantizing makes it worse.
+
 ### Added
 
 - **GLM-5.3-Flash, text-only** (`docs/GLM.md`, `docs/LEARNED.md` §65).

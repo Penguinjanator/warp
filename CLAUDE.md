@@ -186,15 +186,29 @@ file present, or the build stops with a message (CI checks that).
 `waste_plan_memory` computes a floor (resident trunk + state + scratch +
 minimum cache). A budget under the floor is **refused** with
 `WASTE_E_RAM_BUDGET` rather than swapping. A budget of 0 means the engine
-chooses: it starts from the container's recommendation and steps down a
-whole *token working set* at a time (`floor + 3x`, `2x`, `1x`, floor) until
-it fits under 7/8 of physical RAM, then says on stderr what it picked.
+chooses: it steps down a whole *token working set* at a time from however
+many of them cover the container's **entire expert set** (`plan.bank_bytes`,
+the point past which a bigger cache cannot help) until it fits under 3/4 of
+`waste_usable_ram()`, then says on stderr what it picked. On a container
+smaller than the machine that lands on every expert resident — `waste plan`
+calls it **fully resident** — and a background thread then reads the bank in
+so the demand stream does not have to discover it a miss at a time
+(`WASTE_PRELOAD=0` turns that off).
 
 Cache size is only meaningful in whole multiples of one token's working set
 (K3: 16 experts × 92 layers ≈ 17 GB). Below one multiple the hit rate is
 zero, not low. Above the machine's comfort it is worse than useless — 58 GB
-measured 8× slower than 46 GB on a 64 GB machine. `tests/check_budget.sh`
-verifies peak RSS actually stays inside the ceiling.
+measured 8× slower than 46 GB on a 64 GB machine, which is why the ceiling
+is a fraction of RAM and not the bank. `tests/check_budget.sh` verifies peak
+RSS actually stays inside the ceiling.
+
+Residency also decides *scheduling*: `moe_layer` runs one task per routed
+expert when the layer's experts are already cached and one per row range
+when they are not, because holding K records before doing any arithmetic is
+a barrier against the read-ahead. `WASTE_XPAR=0/1` forces it; the default
+asks the cache. The two paths are **bit-identical** and `tests/run.sh`
+asserts it — an automatic choice that changed the numbers would make results
+depend on how warm the cache happened to be.
 
 ### Prompt safety: markup vs content
 

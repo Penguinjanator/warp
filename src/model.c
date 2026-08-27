@@ -196,7 +196,10 @@ static float ccr_lambda = 0.0f;        /* WASTE_CCR_LAMBDA, see moe_layer */
 static int dump_pos0 = 0;
 static int lookahead_n = 0;            /* WASTE_LOOKAHEAD, see moe_layer  */
 static int p6_chunk = 4;               /* WASTE_P6_CHUNK, see vq_apply    */
-static int xpar_on = 0;                /* WASTE_XPAR=1 opts in; see below   */
+/* -1 = decide per layer from what is already in the cache, 0 = never,
+ * 1 = always. WASTE_XPAR sets the last two; the default is the first, and
+ * moe_layer explains what it decides on. */
+static int xpar_on = -1;
 static int metal_moe = 0;              /* WASTE_METAL_MOE, see moe_layer    */
 static int vq8_on = 0;                 /* WASTE_VQ8: int8 VQ3R table        */
 /* Which kernels are cut for the performance cores rather than the whole
@@ -330,7 +333,7 @@ static void model_opts_init(void)
     { const char *e2 = getenv("WASTE_METAL_MOE");
       metal_moe = e2 && *e2 != '0'; }
     { const char *e2 = getenv("WASTE_XPAR");
-      xpar_on = e2 && *e2 != '0'; }
+      xpar_on = e2 ? (*e2 != '0') : -1; }
     /* Experts held — and so barriered — at a time. Small keeps the reads
      * overlapping the arithmetic; large gives the pool more to chew on. */
     { const char *e2 = getenv("WASTE_XPAR_BATCH");
@@ -1539,6 +1542,8 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
 /* Defined below, next to record_check; the cache needs it at load. */
 static int bank_fetch(void *user, int layer, int expert, uint8_t *dst);
 static void start_readers(waste_model *m);
+static void start_fill(waste_model *m);
+static void stop_fill(waste_model *m);
 
 /* Wire the resident trunk. The cache is the cold part of this engine —
  * 19 to 30% hit — and this is the hot one: 27.5 GB on K3, read in full
@@ -2086,6 +2091,9 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         else if (!m->latcache[L]) return -1;
     }
     if (c->attn_res_block && !m->blockres) return -1;
+    /* Last, so a load that fails leaves no thread reading a model nobody
+     * owns — every return above this line is a failure. */
+    start_fill(m);
     return 0;
 }
 
@@ -2096,6 +2104,9 @@ void waste_model_free(waste_model *m)
      * waste_ecache_free — which runs last — is the difference between a
      * clean shutdown and a read on a descriptor that has been closed and
      * possibly reused. */
+    /* Before the readers stop and before the bank descriptors close: the
+     * fill thread preads on both. */
+    stop_fill(m);
     waste_ecache_io_stop(&m->cache);
 
     /* Reachable on a partially-built model now that waste_open frees what
@@ -3732,8 +3743,27 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     /* Expert-parallel path. Needs the per-expert scratch, and needs the
      * cache to be able to hold all K records at once — the held set is
      * unevictable, so a cache that is not comfortably larger than K would
-     * be asked to find a victim among slots that are all pinned. */
-    if (xpar_on && m->xga && K > 1 && K <= WASTE_PF_MAX &&
+     * be asked to find a victim among slots that are all pinned.
+     *
+     * And, by default, it needs this layer's K experts to be in the cache
+     * already. That is the whole of §44's finding read the other way round:
+     * one task per expert is a barrier against the read-ahead, worth 1.18x
+     * when there is nothing to read and a regression when there is. The
+     * env var used to be the only way to say which, and the right value
+     * inverted between models — because what it was really standing in for
+     * was whether the experts were resident, and that is a question the
+     * cache can answer in K hash lookups.
+     *
+     * So it is asked here instead, per layer and per token. A run whose
+     * budget holds the whole bank takes this path on every layer after the
+     * first pass; a K3 run that streams takes it on the layers that happen
+     * to be warm and leaves the reads overlapping everywhere else. Neither
+     * needs a flag, and the answer follows the cache rather than the
+     * container. WASTE_XPAR=0/1 still forces it either way. */
+    const int xpar_here = xpar_on >= 0
+        ? xpar_on
+        : waste_ecache_resident_all(&m->cache, L, idx, K);
+    if (xpar_here && m->xga && K > 1 && K <= WASTE_PF_MAX &&
         m->cache.n_slots >= 4 * K) {
         /* In batches, not all K at once. Holding every record before doing
          * any arithmetic is a barrier against the read-ahead: the hint has
@@ -4163,6 +4193,70 @@ static void start_readers(waste_model *m)
     waste_ecache_io_start(&m->cache, bank_fetch, m, nio, depth);
 }
 
+/* ---- background fill ----------------------------------------------------
+ *
+ * When the resolved cache can hold every record the container has, the
+ * demand stream still discovers them one miss at a time — 200 tokens of
+ * Kimi-Linear read 13.2 GB of a 16.5 GB bank as 3443 separate misses, and
+ * until a record has been asked for once it is not there. This reads the
+ * rest, in bank order, on one thread, while the model runs.
+ *
+ * It is not a preload: nothing waits for it. A run that generates four
+ * tokens gets whatever landed in the meantime and pays for the reads it
+ * would have paid for anyway, spread differently; a run that generates
+ * hundreds finds every layer resident well before it would have. The
+ * second-order effect is the larger one — a fully resident layer is what
+ * lets moe_layer take the expert-parallel path (see xpar_here), which is
+ * worth 1.17x on Kimi-Linear and cannot be taken while records are still
+ * arriving.
+ *
+ * Only when everything fits. Below that, "put anything in an empty slot"
+ * competes with the demand stream for the slots it is about to need, and
+ * LFRU is a better judge of what belongs there than file order is.
+ *
+ * WASTE_PRELOAD=0 turns it off; it is not otherwise configurable, because
+ * the condition that gates it is not a preference.
+ */
+static void *fill_worker(void *p)
+{
+    waste_model *m = (waste_model *)p;
+    for (int L = 0; L < m->cfg.n_layers; L++) {
+        if (m->bank[L].fd < 0) continue;
+        for (int e = 0; e < m->bank[L].n_experts; e++) {
+            if (atomic_load(&m->fill_stop)) return NULL;
+            /* 0 means "already here, or no empty slot left". The second is
+             * the end of the sweep and the first is not, so it cannot stop
+             * on it — but the cursor makes a full cache cheap to discover,
+             * one lock and no read. */
+            if (waste_ecache_admit(&m->cache, L, e, bank_fetch, m) < 0)
+                return NULL;            /* a bad read; the demand path reports it */
+        }
+    }
+    return NULL;
+}
+
+static void start_fill(waste_model *m)
+{
+    m->fill_records = 0;
+    for (int L = 0; L < m->cfg.n_layers; L++)
+        if (m->bank[L].fd >= 0)
+            m->fill_records += (uint64_t)m->bank[L].n_experts;
+    if (!m->fill_records || !m->cache.io) return;
+    if ((uint64_t)m->cache.n_slots < m->fill_records) return;
+    { const char *e = getenv("WASTE_PRELOAD"); if (e && *e == '0') return; }
+    atomic_store(&m->fill_stop, 0);
+    if (pthread_create(&m->fill_th, NULL, fill_worker, m) == 0)
+        m->fill_running = 1;
+}
+
+static void stop_fill(waste_model *m)
+{
+    if (!m->fill_running) return;
+    atomic_store(&m->fill_stop, 1);
+    pthread_join(m->fill_th, NULL);
+    m->fill_running = 0;
+}
+
 /* Give the cache a different size without touching the trunk.
  *
  * A budget sweep used to need one process per budget, because the cache is
@@ -4178,9 +4272,11 @@ int waste_model_resize_cache(waste_model *m, size_t cache_bytes)
     for (int L = 0; L < m->cfg.n_layers; L++)
         if (m->bank[L].rec_bytes > rec) rec = m->bank[L].rec_bytes;
     if (rec <= 0) return -1;
+    stop_fill(m);                          /* it holds slots of this cache */
     waste_ecache_free(&m->cache);          /* stops the readers first */
     if (waste_ecache_init(&m->cache, cache_bytes, (size_t)rec, policy)) return -1;
     start_readers(m);
+    start_fill(m);
     return 0;
 }
 

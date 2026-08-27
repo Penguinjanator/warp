@@ -562,6 +562,7 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
          * and changing it would move a figure tests/run.sh asserts. */
         bank_total = bytes * (uint64_t)layers;
     }
+    out->bank_bytes = bank_total;
     out->min_expert_cache = rec * (uint64_t)top_k * 2;
     out->floor_bytes = out->trunk_bytes + out->state_bytes +
                        out->scratch_bytes + out->min_expert_cache;
@@ -687,9 +688,39 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
 
     if (!budget) {
         const uint64_t ws = c->plan.working_set_bytes;
+        const uint64_t bank = c->plan.bank_bytes;
         budget = c->plan.floor_bytes;
-        for (int k = 3; k >= 1; k--) {
-            const uint64_t b = c->plan.floor_bytes + ws * (uint64_t)k;
+        /* How many working sets to try for, from the top down.
+         *
+         * Three used to be the top of this ladder, and on a machine with
+         * room that left the rest of it unused: Kimi-Linear's whole expert
+         * set is 16.5 GB and the default took 1.6 GB of cache on a 64 GB
+         * laptop; K3 on a 256 GB host took the same 51.6 GB it takes on
+         * this one. Three working sets is what `recommended_bytes` means —
+         * "worth having, without knowing the machine" — and it is the wrong
+         * ceiling once the machine is known.
+         *
+         * The real ceiling is the bank. A cache that holds every expert
+         * never reads one twice, and a byte more than that is a slot
+         * nothing will ever fill, so the ladder now starts at whatever
+         * number of working sets covers the bank and walks down from there.
+         * On a container smaller than the machine it lands on "all of it".
+         *
+         * What makes this safe is not new: the cap below it is still three
+         * quarters of what this process may use, and the cliff §39 and §56
+         * measured lives above that, not below. And an unfilled slot is
+         * address space, not memory — the pages fault in as records arrive,
+         * and the records that arrive are the ones the run would otherwise
+         * have read from disk again. */
+        uint64_t kmax = 3;
+        if (ws && bank) {
+            const uint64_t whole = (bank + ws - 1) / ws;
+            if (whole > kmax) kmax = whole;
+        }
+        for (uint64_t k = kmax; ws && k >= 1; k--) {
+            uint64_t want = ws * k;
+            if (bank && want > bank) want = bank;
+            const uint64_t b = c->plan.floor_bytes + want;
             if (!cap || b <= cap) { budget = b; break; }
         }
     }

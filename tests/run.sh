@@ -674,6 +674,37 @@ import sys; sys.exit(0 if abs($eng - $sim) <= 5 else 1)" 2>/dev/null; then
         *) sk "purgeable slots are bit-identical to ordinary ones" "$NO_CMP" ;;
     esac
 
+    # The scheduling decision moe_layer now makes from cache state, and the
+    # background fill that changes that state, must both be invisible in the
+    # output. They are not a numerical choice — the expert-parallel path
+    # sums its per-expert results in j order exactly as the row split does —
+    # but "not a numerical choice" is a property of the kernels, and the
+    # moment it stops being true the engine starts giving different answers
+    # depending on how warm the cache happened to be. That failure would be
+    # unreproducible by construction, so it is pinned here.
+    WASTE_XPAR=0 ./test_forward "$MODEL" "$IDS" "$TMP/xpar0.bin" 0 >/dev/null 2>&1
+    WASTE_XPAR=1 ./test_forward "$MODEL" "$IDS" "$TMP/xpar1.bin" 0 >/dev/null 2>&1
+    same "$TMP/xpar0.bin" "$TMP/xpar1.bin"
+    case $? in
+        0) ok "the expert-parallel path is bit-identical to the row split" ;;
+        1) no "WASTE_XPAR changes the logits — the automatic choice cannot stand" ;;
+        *) sk "expert-parallel bit-identity" "$NO_CMP" ;;
+    esac
+    same "$TMP/seq.bin" "$TMP/xpar0.bin"
+    case $? in
+        0) ok "and so is whichever of the two the cache state selects" ;;
+        1) no "the default path matches neither WASTE_XPAR setting" ;;
+        *) sk "automatic expert-parallel choice" "$NO_CMP" ;;
+    esac
+
+    WASTE_PRELOAD=0 ./test_forward "$MODEL" "$IDS" "$TMP/nofill.bin" 0 >/dev/null 2>&1
+    same "$TMP/seq.bin" "$TMP/nofill.bin"
+    case $? in
+        0) ok "the background fill changes what is resident, not what is computed" ;;
+        1) no "WASTE_PRELOAD changes the logits" ;;
+        *) sk "background fill bit-identity" "$NO_CMP" ;;
+    esac
+
     # kimi_ref.py computes its logits *from* a WASTE container, so an oracle
     # is only comparable against the container that produced it — and not
     # merely against its trunk width. The expert codebooks are k-means, and
@@ -1162,10 +1193,18 @@ held = plan["floor_bytes"] - plan["min_expert_cache"] + info["expert_cache_bytes
 # the engine reports it: recommended_bytes is capped at the container's whole
 # expert set, so on a merged container it is no longer floor + 3 * this
 ws = plan["working_set_bytes"]
+bank = plan.get("bank_bytes", 0)
 want = plan["floor_bytes"]
-for k in (3, 2, 1):
-    if plan["floor_bytes"] + ws * k <= cap:
-        want = plan["floor_bytes"] + ws * k
+# The ladder the engine walks: as many whole working sets as the machine
+# allows, starting from however many cover the container's entire expert set
+# — beyond which a cache cannot be improved by making it larger — and never
+# a cache bigger than that set. Three used to be the top rung, and on a
+# machine with room it left the rest of it unused.
+kmax = max(3, -(-bank // ws) if (bank and ws) else 3)
+for k in range(kmax, 0, -1):
+    got = min(ws * k, bank) if bank else ws * k
+    if plan["floor_bytes"] + got <= cap:
+        want = plan["floor_bytes"] + got
         break
 rec = plan["min_expert_cache"] // (2 * info["top_k"]) if info["top_k"] else 0
 G = 1 << 30

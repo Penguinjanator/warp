@@ -4639,3 +4639,113 @@ here — no GLM container has been converted yet. Everything in this section
 that is not from `config.json` was measured on a synthetic container at
 1/32 scale, whose shapes are the ones the engine branches on and whose
 weights are noise.
+
+## 66. The budget stopped three working sets short of the machine (2026-08-27)
+
+The automatic budget walked a ladder whose top rung was `floor + 3x` a
+token's working set. That is what `recommended_bytes` means — "worth
+having, without knowing the machine" — and it is the wrong ceiling once the
+machine is known. On this 64 GB laptop Kimi-Linear's **entire** expert set
+is 17.17 GB and the default gave it **1.65 GB** of cache; K3 on a 256 GB
+host would take the same 51.6 GB of cache it takes here.
+
+The real ceiling is the container's own bank: a cache that holds every
+expert never reads one twice, and a byte past that is a slot nothing will
+ever fill. So the ladder now starts at however many working sets cover
+`bank_bytes` and walks down, and the cache never exceeds the bank. Nothing
+about §39's and §56's cliff changes, because the cap that guards it does
+not — three quarters of what the process may use, with the cliff above it —
+and an unfilled slot is address space, not memory.
+
+Three things came out of that, and only the first was the plan.
+
+### 1. The RAM, on a container that fits
+
+Kimi-Linear, `waste bench`, defaults, this machine:
+
+| | before | after |
+|---|---:|---:|
+| resolved budget | 3.07 GB | **18.48 GB** |
+| expert cache | 1.65 GB | 17.20 GB |
+| hit rate, 200 tok | 70.7% | **96.3%** |
+| bytes read, 200 tok | 66.27 GB | **17.75 GB** |
+| tok/s, 64 tok | 11.13 | **12.60** |
+| tok/s, 200 tok | 12.67 | **14.81** |
+
+K3 is untouched — 0.3251 tok/s before and after, byte for byte the same
+465 GB read — because its bank is 962.83 GB and no rung above `floor + 1x`
+fits under the cap. The change is only visible where the container is
+smaller than the machine, which is exactly where it was meant to be.
+
+### 2. Residency is what WASTE_XPAR was really asking about
+
+§44 measured one task per routed expert at 1.18x on Kimi-Linear and a
+regression on K3, and the reason it gave was already the answer: holding K
+records before doing any arithmetic is *a barrier against the read-ahead*.
+It is free parallelism when the records are in RAM and a stall when they
+are on their way. The flag was standing in for a fact the cache can state.
+
+So `moe_layer` asks it, per layer and per token, in `top_k` hash lookups
+(`waste_ecache_resident_all`). Measured, same build, same container:
+
+| | XPAR=0 | XPAR=1 | default (asks the cache) |
+|---|---:|---:|---:|
+| Kimi-Linear, 200 tok | 12.18 | 14.51 | **14.25** |
+| K3, 20 tok | 0.3251 | 0.1729 | **0.3251** |
+
+The automatic choice takes 89% of the forced win where forcing is right and
+**all** of the loss where it is wrong. `WASTE_XPAR=0/1` still overrides.
+
+What makes this admissible at all is that the two paths are bit-identical —
+both sum per-expert results in `j` order — and that is now asserted in
+`tests/run.sh` rather than believed. A scheduling choice made from cache
+state that also moved the numbers would make an answer depend on how warm
+the cache happened to be, which is unreproducible by construction.
+
+### 3. A cache that can hold everything should not discover it by missing
+
+With the bank resident, 200 tokens still read 13.2 GB of it as **3443
+separate demand misses**. The slots were already allocated and the reads
+were going to happen; what the demand stream adds is that they happen late,
+one at a time, and that a layer is not fully resident — and so cannot take
+the path above — until every one of its experts has been asked for once.
+
+A background thread now walks the banks in file order and fills empty slots
+(`waste_ecache_admit`: never evicts, never counts a hit or a miss, counts
+its bytes). It starts only when every record fits, because below that
+"put anything in an empty slot" competes with the demand stream for slots
+it is about to need, and LFRU is a better judge than file order.
+
+It is a win at every length measured, including the short ones that read
+three times the bytes:
+
+| tokens | fill off | fill on |
+|---:|---:|---:|
+| 16 | 7.19 | **7.24** |
+| 32 | 9.64 | **10.02** |
+| 64 | 11.79 | **12.50** |
+| 200 | 14.21 | **14.98** |
+
+### What this does not do, and one thing it is not
+
+**It is not throughput on a machine that was already fast enough.** On this
+NVMe the read-ahead was hiding almost all of Kimi-Linear's I/O: expert I/O
+was 0.8% of a step at a 19 GB cache and the whole gain above comes from the
+scheduling change residency enables, not from the reads themselves. The
+reads matter where the disk is slower — the tested USB enclosure at
+0.94 GB/s would spend 70 s on 66 GB and 19 s on 17.7 — and on K3, where
+17 GB a token cannot be hidden at any queue depth.
+
+**Where it should pay is a machine this project does not have.** GLM-5.3-
+Flash (§65) is ~4.8 GiB of trunk and ~106.5 GiB of experts: on a 128 or
+256 GB host the new ladder makes it fully resident and the fill reads it in
+once, where the old one gave it a 9.6 GB cache. Nobody here can run that,
+and this section says so rather than estimating it.
+
+**An f32 trunk is not the next lever.** With the experts resident the
+profile is 49.7% trunk matvec and 30.8% KDA, so the obvious thought is to
+spend the spare RAM on the trunk too. Measured: `WASTE_Q8=0` on
+Kimi-Linear is **12.74 tok/s against 15.02** — 8x the trunk RAM for a 15%
+loss, because the quantized matvec is memory-bandwidth bound and dequantizing
+makes it worse. The remaining time is arithmetic, and arithmetic is not
+where more RAM helps.

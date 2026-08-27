@@ -77,7 +77,8 @@ class MemPlan(C.Structure):
                 ("floor_bytes", C.c_uint64),
                 ("recommended_bytes", C.c_uint64),
                 ("vision_bytes", C.c_uint64),
-                ("working_set_bytes", C.c_uint64)]
+                ("working_set_bytes", C.c_uint64),
+                ("bank_bytes", C.c_uint64)]
 
 
 class Cfg(C.Structure):

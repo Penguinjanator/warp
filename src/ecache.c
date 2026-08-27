@@ -632,6 +632,64 @@ void waste_ecache_resident_mask(waste_ecache *c, int layer, int n, uint8_t *out)
     ec_unlock(c);
 }
 
+int waste_ecache_admit(waste_ecache *c, int layer, int expert,
+                       waste_fetch_fn fetch, void *user)
+{
+    if (!c || c->n_slots <= 0 || !c->io || !fetch) return 0;
+    const int32_t key = ec_key(layer, expert);
+
+    ec_lock(c);
+    if (ec_lookup(c, key) >= 0) { ec_unlock(c); return 0; }
+    /* A monotone cursor rather than a scan. Nothing is evicted while this
+     * runs — it only ever runs when every record fits — so a slot the
+     * cursor has passed is a slot that is taken for good, and the whole
+     * sweep costs one pass over the slot array instead of one per record. */
+    int si = -1;
+    while (c->fill_cursor < c->n_slots) {
+        const int i = c->fill_cursor++;
+        if (c->slot[i].key < 0) { si = i; break; }
+    }
+    if (si < 0) { ec_unlock(c); return 0; }
+    ec_nonvolatile(c, si);
+    c->slot[si].key = key;
+    c->slot[si].state = EC_INFLIGHT;
+    c->slot[si].fresh = 0;          /* a demand read on it is a real hit  */
+    c->slot[si].pin = 0;
+    c->slot[si].hits = 1;
+    c->slot[si].last = c->clock;
+    ec_insert(c, key, si);
+    c->bytes_read += c->rec_bytes;
+    ec_unlock(c);
+
+    const int rc = fetch(user, layer, expert, c->slot[si].data);
+
+    ec_lock(c);
+    if (rc == 0) {
+        c->slot[si].state = EC_READY;
+        c->filled++;
+    } else {
+        /* Leave no INFLIGHT slot behind for a demand read to wait on: drop
+         * it and let the ordinary path re-read and report the reason. */
+        ec_drop(c, si);
+    }
+    pthread_cond_broadcast(&c->io->done);
+    ec_unlock(c);
+    return rc == 0 ? 1 : -1;
+}
+
+int waste_ecache_resident_all(waste_ecache *c, int layer, const int *ids, int n)
+{
+    if (!c || c->n_slots <= 0 || n <= 0) return 0;
+    int all = 1;
+    ec_lock(c);
+    for (int i = 0; i < n && all; i++) {
+        const int si = ec_lookup(c, ec_key(layer, ids[i]));
+        if (si < 0 || c->slot[si].state != EC_READY) all = 0;
+    }
+    ec_unlock(c);
+    return all;
+}
+
 const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
                                 waste_fetch_fn fetch, void *user)
 {

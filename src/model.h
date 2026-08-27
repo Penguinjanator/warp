@@ -13,6 +13,7 @@
 #define WASTE_MODEL_H
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -248,6 +249,14 @@ typedef struct {
     int8_t *xq;
     uint64_t expert_reads;
     waste_ecache cache;
+    /* Background fill. Runs only when the resolved cache can hold every
+     * record the container has, walks the banks in file order, and stops on
+     * its own when the cache is full or when the model is freed. See
+     * waste_ecache_admit and start_fill. */
+    pthread_t fill_th;
+    int       fill_running;
+    _Atomic int fill_stop;
+    uint64_t  fill_records;          /* how many there are to read at all  */
     uint8_t *miss_buf;               /* used when the cache is disabled     */
     int      want_direct;            /* the caller asked for the bypass     */
     int      direct_io;              /* 0 = a bank fell back to page cache  */
