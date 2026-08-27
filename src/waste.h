@@ -47,9 +47,9 @@ extern "C" {
  * for an embeddable engine that may be updated independently.
  */
 #define WASTE_VERSION_MAJOR  0
-#define WASTE_VERSION_MINOR  6
-#define WASTE_VERSION_PATCH  9
-#define WASTE_VERSION_STRING "0.6.9"
+#define WASTE_VERSION_MINOR  7
+#define WASTE_VERSION_PATCH  0
+#define WASTE_VERSION_STRING "0.7.0"
 #define WASTE_VERSION_NUMBER (WASTE_VERSION_MAJOR * 10000 + \
                               WASTE_VERSION_MINOR * 100 + \
                               WASTE_VERSION_PATCH)
