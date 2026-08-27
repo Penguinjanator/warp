@@ -50,6 +50,7 @@ typedef struct {
     int kv_lora, q_lora, qk_nope, qk_rope, v_head;
     int kda_heads, kda_dim, conv_k;
 #define WASTE_MAX_LAYERS 128
+#define WASTE_MAX_SHARDS 16
 
 /* Vector positions sharing one fp32 scale in the int8 LUT (WQ_VQ4P).
  * Bounds the int16 accumulator: 4 stages x 32 positions x 127 = 16256, so
@@ -103,7 +104,12 @@ typedef struct {
 } waste_config;
 
 typedef struct {
-    int fd;                          /* positional reads, no page cache     */
+    /* Positional reads, no page cache. With N>1 shards the bank's experts are
+     * round-robin split across devices: expert e lives on shard e % n_shards
+     * at offset (e / n_shards) * rec_bytes. fd[0] is the unstriped fd when
+     * n_shards == 1, so the unstriped path is the same code with N=1. */
+    int fd[WASTE_MAX_SHARDS];
+    int n_shards;
     int64_t rec_bytes;
     int n_experts, cb_base;
 } waste_bank;
