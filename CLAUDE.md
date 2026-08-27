@@ -98,6 +98,10 @@ read path), `WASTE_THREADS`, `WASTE_CPUS` (cpu list the pool binds to —
 `--cpus` on the CLI and the server, Linux and Windows; refused rather than
 ignored elsewhere, see docs/ENGINE.md "Thread placement"),
 `WASTE_DIRECT=0` (keep the page cache),
+`WASTE_SPIN` (iterations a pool worker spins before parking; 0 = the pure
+condvar pool), `WASTE_WIDE_MIN` (bytes below which a dispatch goes to the
+fast group rather than waking the whole pool — 4 MB, measured; see
+docs/LEARNED.md §67),
 `WASTE_Q8=0` (dequantize the trunk to f32 at load, any width — 8x the RAM
 on a 4-bit trunk, so it is out of reach on K3), `WASTE_I8MM=1`,
 `WASTE_TOK_PLAIN=1`, `WASTE_VIS_STAGE`, `WASTE_DUMP_LATENT/HIDDEN`.

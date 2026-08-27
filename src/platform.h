@@ -430,4 +430,16 @@ static inline int waste_replace_file(const char *src, const char *dst)
 
 #endif /* _WIN32 */
 
+/* A pause hint for a bounded spin: yields the pipeline to the other SMT
+ * thread on x86 and is a scheduling hint on arm64. Not a barrier, not a
+ * syscall — the loop around it does the ordering. */
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+#  include <immintrin.h>
+#  define waste_cpu_relax() _mm_pause()
+#elif defined(__aarch64__) || defined(__arm__)
+#  define waste_cpu_relax() __asm__ __volatile__("yield" ::: "memory")
+#else
+#  define waste_cpu_relax() __asm__ __volatile__("" ::: "memory")
+#endif
+
 #endif /* WASTE_PLATFORM_H */

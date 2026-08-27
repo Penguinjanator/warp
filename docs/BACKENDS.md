@@ -189,6 +189,33 @@ The two that mattered:
 with a workload that is becoming memory-bound. The pool splits by row, so
 results are bit-identical at any thread count; `WASTE_THREADS` overrides.
 
+**What that table was hiding.** The flattening is real, but part of it was
+not the work — it was the dispatch. Measured directly with an empty kernel
+on the same machine:
+
+| pool | empty dispatch |
+|---|---:|
+| 18 threads (6 performance + 12 efficiency, parked) | **54.1 us** |
+| 6 threads, all performance, spinning | **1.5 us** |
+
+A decode step dispatches on the order of 150 times, so 54 us is not a
+detail. Two things cause it: the pool's workers park on a condvar, and the
+barrier at the end of a job waits for the slowest of them — which on this
+machine is an efficiency-core thread the scheduler takes ~50 us to run.
+
+So the pool now spins briefly before parking (`WASTE_SPIN`, iterations;
+0 restores the pure condvar), and a dispatch only reaches for the slow
+group when the job is big enough to hide waking it — 4 MB of weights
+touched by default, `WASTE_WIDE_MIN`. Below that it goes to the fast group,
+which is already awake. On a machine with one kind of core `n_fast` is 0,
+`waste_pool_fast()` is the whole pool, and the threshold changes nothing.
+
+Kimi-Linear, `waste bench`, 150 tokens: **14.41 -> 16.74 tok/s**, and the
+inversion §47 recorded — six threads beating eighteen — is gone with it:
+16.97 at eighteen against 15.35 at six, where before it was 14.46 against
+14.49. The E-cores were never the problem; waking them 150 times a token
+was. LEARNED.md §67.
+
 ### int8 and SDOT: where the instruction actually fits
 
 The expert matmul's inner loop is a **gather** (`acc += lut[block + s*256 +

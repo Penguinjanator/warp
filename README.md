@@ -37,11 +37,11 @@ internal SSD:
 | Model | Container | Minimum RAM | Decode speed |
 |---|---:|---:|---:|
 | Kimi K3 2.78T | 982 GB | 29.19 GB | 0.45–0.62 tok/s |
-| Kimi-Linear 48B | 19 GB | 1.32 GB | 12.60 tok/s |
+| Kimi-Linear 48B | 19 GB | 1.32 GB | 14.40 tok/s |
 
 For K3, 64 GB is the practical minimum. A 32 GB machine can open the model but will page heavily. The default memory budget on the test machine is 46.39 GB, including a 17.56 GB expert cache.
 
-Kimi-Linear's figure is the one that moved: the automatic budget used to stop three working sets short of the machine, so a 19 GB container got a 1.65 GB cache on a 64 GB laptop. It now climbs to the container's whole expert set when the machine has the room — 18.48 GB resolved, every expert resident — and that is worth 11.13 → 12.60 tok/s over 64 tokens, 12.67 → 14.81 over 200, with the bytes read falling from 66.3 GB to 17.7. K3 is unchanged: its 962.83 GB of experts do not fit on any machine here, and the ceiling that guards the paging cliff below is still three quarters of RAM. [docs/LEARNED.md](docs/LEARNED.md) §66.
+Kimi-Linear's figure is the one that moved: the automatic budget used to stop three working sets short of the machine, so a 19 GB container got a 1.65 GB cache on a 64 GB laptop. It now climbs to the container's whole expert set when the machine has the room — 18.48 GB resolved, every expert resident — and that is worth 11.13 → 12.60 tok/s over 64 tokens, with the bytes read falling from 66.3 GB to 17.7. On top of it the thread pool stopped waking its efficiency cores for jobs too small to hide the ~54 µs that costs, which is another 14.41 → 16.74 over 150 tokens. K3 is unchanged by both: its 962.83 GB of experts do not fit on any machine here, and at 465 GB read per 20 tokens neither residency nor dispatch is where its time goes. [docs/LEARNED.md](docs/LEARNED.md) §66, §67.
 
 Most of that requirement is the 27.28 GB resident trunk rather than the cache. Shrinking the expert cache from 17.32 GB to 3.32 GB costs about 10% of throughput; enlarging it past the default costs everything. Measured across four cache sizes in one process:
 

@@ -55,6 +55,35 @@ field — has to be rebuilt against the new header.
   three times the bytes and still comes out ahead. `WASTE_PRELOAD=0` turns
   it off.
 
+- **The thread pool spins before it parks, and small jobs stop waking the
+  slow cores** (`docs/BACKENDS.md`, `docs/LEARNED.md` §67). With the expert
+  set resident a Kimi-Linear step profiles as arithmetic — and a third of
+  its dispatches were going into thread wake-ups. Measured with an empty
+  kernel on this 18-core machine (6 performance, 12 efficiency): **54.1 us**
+  to dispatch to the parked full pool, **1.5 us** to the spinning fast
+  group. A decode step dispatches ~150 times.
+
+  Workers now spin on a packed (epoch, workers) word before falling back to
+  the condvar (`WASTE_SPIN`, 0 restores the old pool), the chunk cursor and
+  completion count are atomics, and a dispatch only reaches for the slow
+  group when the weights it touches exceed `WASTE_WIDE_MIN` — 4 MB by
+  default, a measured optimum rather than a trend (0 gives 14.86, 2 MB
+  16.56, 4 MB 16.62, 8 MB 15.84, infinite 14.91).
+
+  Kimi-Linear, 150 tokens: **14.41 -> 16.74 tok/s**, three runs each. K3 is
+  neutral inside its +-9% spread — it reads 465 GB for 20 tokens and 8 ms a
+  token of dispatch is not where its time goes. On a machine with one kind
+  of core the threshold selects between the pool and itself, so nothing
+  changes.
+
+  **§47's inversion is gone with it.** Six threads used to beat eighteen on
+  Kimi-Linear (14.49 against 14.46) and now eighteen wins, 16.97 against
+  15.35. Capping the pool was buying "no parked threads to wake", not
+  "fewer, faster cores".
+
+  The logits are bit-identical across every combination of `WASTE_SPIN`,
+  `WASTE_WIDE_MIN` and `WASTE_THREADS`, and `tests/run.sh` asserts it.
+
 ### Measured and not adopted
 
 - **An f32 trunk.** With the experts resident the profile is 49.7% trunk

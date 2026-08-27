@@ -4749,3 +4749,108 @@ Kimi-Linear is **12.74 tok/s against 15.02** — 8x the trunk RAM for a 15%
 loss, because the quantized matvec is memory-bandwidth bound and dequantizing
 makes it worse. The remaining time is arithmetic, and arithmetic is not
 where more RAM helps.
+
+## 67. Waking the pool cost 54 us, 150 times a token (2026-08-27)
+
+With §66's expert set resident, a Kimi-Linear decode step profiles as 49.7%
+trunk matvec and 30.8% KDA — arithmetic, not I/O. The obvious reading is
+that the kernels are the wall. They are not, or not yet: **a third of the
+dispatches in a step were spent waking threads.**
+
+### The measurement that settles it
+
+An empty kernel, dispatched in a loop, on this 18-core machine (6
+performance, 12 efficiency):
+
+| pool | empty dispatch, 4096 rows | over 128 rows |
+|---|---:|---:|
+| 18 threads (12 of them parked E-core workers) | **54.06 us** | 53.36 us |
+| 6 threads, all performance | **1.63 us** | 1.38 us |
+
+The row count does not matter, which is the whole point: this is not work,
+it is the cost of starting one. Two causes, and they compound:
+
+- Workers park on a condvar. Waking one is a scheduler round trip.
+- The barrier at the end waits for the *slowest* participant, and on this
+  machine that is an efficiency-core thread the scheduler takes tens of
+  microseconds to run. It contributes nothing to a short job and delays
+  every one of them.
+
+A decode step dispatches about 150 times — nine matvecs per KDA layer, the
+router, the shared experts, the recurrence, the VQ kernels. At 54 us that
+is 8 ms of a 67 ms token.
+
+### Two changes, and which one mattered
+
+**Spin before parking.** Workers spin on the job word for a bounded number
+of iterations before falling back to the condvar; the caller publishes with
+a release store, the chunk cursor and the completion count became atomics,
+and the condvars stayed for whoever did park. Worth about **2.4%** on its
+own (14.46 -> 14.80) — because a full-pool dispatch still had to wake the
+twelve parked E-core workers, and they still set the barrier.
+
+**Do not reach for the slow group unless the job can hide the wake.** A
+dispatch now goes to the fast group — which spins, so ~1.5 us — unless the
+weights it touches exceed `WASTE_WIDE_MIN`, 4 MB by default. Swept on
+Kimi-Linear, 150 tokens:
+
+| threshold | tok/s |
+|---|---:|
+| 0 (fast group always) | 14.86 |
+| 2 MB | 16.56 |
+| **4 MB** | **16.62** |
+| 6 MB | 15.89 |
+| 8 MB | 15.84 |
+| infinite (whole pool always, the old behaviour) | 14.91 |
+
+A real optimum rather than a trend, which is what the mechanism predicts:
+below it the dispatch dominates and the fast group wins, above it the work
+dominates and the extra cores do. Kimi-Linear's q/k/v/o projections are
+4.7 MB and sit just above the line; its low-rank KDA projections
+(`f_a`, `g_a`, `b_proj`) are 37-262 KB and sit far below it.
+
+Together: **14.41 -> 16.74 tok/s, +16.2%**, three runs each, spread 0.02
+and 0.11.
+
+### The inversion in §47 was this all along
+
+§47 recorded that six threads beat eighteen on Kimi-Linear and that
+eighteen beat six on K3, and CLAUDE.md warns not to carry the setting from
+one model to the other. Measured again on this build:
+
+| | before | after |
+|---|---:|---:|
+| 18 threads | 14.46 | **16.97** |
+| 6 threads | 14.49 | 15.35 |
+
+The inversion is gone, and eighteen is now the better answer on the model
+that used to prefer six. Capping the pool was never buying "fewer, faster
+cores"; it was buying "no parked threads to wake". Now that short jobs do
+not wake them, the long jobs get to use them.
+
+### What did not change, and what is still true
+
+**K3 is neutral.** 0.3389 / 0.3166 / 0.2835 against 0.2955 / 0.3251 /
+0.3233 — the same mean inside a +-9% run-to-run spread. It reads 465 GB
+for 20 tokens; 8 ms a token of dispatch is not where its time goes. §66
+said the same thing about residency, and for the same reason.
+
+**Nothing about the numbers moved.** The split is by row, so the logits are
+bit-identical across every combination of `WASTE_SPIN`, `WASTE_WIDE_MIN`
+and `WASTE_THREADS` — checked, and now asserted in `tests/run.sh`.
+
+**On a machine with one kind of core this is inert.** `n_fast` is 0 there,
+`waste_pool_fast()` is the whole pool, and the threshold selects between
+the pool and itself.
+
+### One bug worth recording, because it looked like a data race
+
+The first version seeded the job word with epoch 1 while workers start at
+`seen = 0`. Every worker therefore woke immediately on creation, read `n`
+and `chunk` before anything had written them, and decremented `active`
+below zero — which the first real dispatch then inherited, so it could
+return while its workers were still running. It showed up as two
+ThreadSanitizer reports on `g_pool.n` and `g_pool.chunk` and read like a
+missing barrier. It was not: it was a job that never existed. The pool is
+now clean under TSan across the forward pass, chunked prefill, session
+state, the ownership lock and every option combination above.

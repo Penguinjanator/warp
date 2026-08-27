@@ -705,6 +705,29 @@ import sys; sys.exit(0 if abs($eng - $sim) <= 5 else 1)" 2>/dev/null; then
         *) sk "background fill bit-identity" "$NO_CMP" ;;
     esac
 
+    # The pool decides how many threads to wake from how big the job is, and
+    # spins before parking. Neither may touch the arithmetic: the split is
+    # by row. Pinned across the extremes of both knobs, because a kernel
+    # that ever became order-dependent would make the answer depend on how
+    # busy the machine was when it ran.
+    pool_same=1
+    for pcfg in "WASTE_WIDE_MIN=0" "WASTE_WIDE_MIN=1099511627776" \
+                "WASTE_SPIN=0" "WASTE_SPIN_SLOW=1" "WASTE_THREADS=1" \
+                "WASTE_THREADS=3"; do
+        env $pcfg ./test_forward "$MODEL" "$IDS" "$TMP/pool.bin" 0 \
+            >/dev/null 2>&1
+        same "$TMP/seq.bin" "$TMP/pool.bin"
+        case $? in
+            0) ;;
+            1) pool_same=0; no "$pcfg changes the logits" ;;
+            *) pool_same=2 ;;
+        esac
+    done
+    case $pool_same in
+        1) ok "the thread pool's dispatch choices are bit-identical (6 combinations)" ;;
+        2) sk "thread pool bit-identity" "$NO_CMP" ;;
+    esac
+
     # kimi_ref.py computes its logits *from* a WASTE container, so an oracle
     # is only comparable against the container that produced it — and not
     # merely against its trunk width. The expert codebooks are k-means, and

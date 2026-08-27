@@ -728,8 +728,9 @@ static inline void run_rows(int n, int min_chunk, waste_range_fn fn, void *arg,
                             size_t bytes)
 {
     if (waste_k.on_device && bytes >= waste_k.device_min_bytes) { fn(0, n, arg); return; }
-    waste_parallel_for(n, min_chunk,
-                       waste_k.on_device ? waste_k.mvq_rows_cpu : fn, arg);
+    waste_parallel_for_work(n, min_chunk,
+                            waste_k.on_device ? waste_k.mvq_rows_cpu : fn, arg,
+                            bytes);
 }
 
 /* Quantize x into per-group int8 (same grouping as the weights). */
@@ -799,7 +800,8 @@ static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
             fn = mvq4_rows_smlal;
         }
         if (fn) {
-            waste_parallel_for(out, 64, fn, &a);
+            waste_parallel_for_work(out, 64, fn, &a,
+                                    (size_t)out * t->rowbytes);
             if (trunk_check) {
                 float *ref = (float *)malloc((size_t)out * sizeof(float));
                 if (ref) {
@@ -826,7 +828,8 @@ static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
     if (sdot_on && t->bits == 8) {
         quant_act(x, in, g, m->xq, m->xs);
         mvq_arg a = { y, t->q, t->qs, m->xq, m->xs, in, ng, g, 8, (size_t)ng * g };
-        waste_parallel_for(out, 64, mvq_rows, &a);
+        waste_parallel_for_work(out, 64, mvq_rows, &a,
+                                (size_t)out * t->rowbytes);
     } else {
         mvq_arg a = { y, t->q, t->qs, NULL, x, in, ng, g, t->bits, t->rowbytes };
         run_rows(out, 64, waste_k.mvq_rows_f32, &a,
