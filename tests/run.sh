@@ -1157,11 +1157,19 @@ PY
         # Read into a variable rather than piping: a refused load is a
         # non-zero exit, which is the point, and under `set -o pipefail` that
         # would sink the pipeline no matter what grep found.
-        elif printf '%s' "$(./test_forward "$dir" 3,7,11 "$TMP/bad.bin" 0 2>&1 || true)" \
-             | grep -q "$want"; then
-            ok "$what is refused at load"
         else
-            no "$what loaded instead of being refused"
+            got=$(./test_forward "$dir" 3,7,11 "$TMP/bad.bin" 0 2>&1 || true)
+            if printf '%s' "$got" | grep -q "$want"; then
+                ok "$what is refused at load"
+            elif [ -z "$got" ]; then
+                no "$what: test_forward produced no output at all"
+                printf "        expected a refusal naming %s; the process \
+said nothing, which is not the same as loading it\n" "\"$want\""
+            else
+                no "$what loaded instead of being refused"
+                printf "        expected a refusal naming %s, got: %s\n" \
+                       "\"$want\"" "$(printf '%s' "$got" | head -1)"
+            fi
         fi
     }
 
