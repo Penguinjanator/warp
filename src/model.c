@@ -2014,9 +2014,30 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                 /* Experts round-robin, so shard s holds ids s, s+N, s+2N ...
                  * and that is ceil((n_experts - s) / N) records.
                  *
+                 * Two things can be wrong with a shard, and they need
+                 * different instruments. The size is the whole-file claim:
+                 * a stale or mismatched split leaves a short shard, whose
+                 * reader would serve a neighbor record's bytes as the expert
+                 * asked for, or a long one, which hides the same confusion
+                 * one record over. The manifest bound the offsets already;
+                 * this bounds them against the file. */
+                const int recs = (m->bank[L].n_experts - s + n_sh - 1) / n_sh;
+                if (n_sh > 1 && recs > 0) {
+                    const int64_t want_bytes =
+                        (int64_t)recs * m->bank[L].rec_bytes;
+                    const int64_t have_bytes = waste_file_size(sfd);
+                    if (have_bytes < 0 || have_bytes != want_bytes) {
+                        close(sfd);
+                        js_free(&d); free(src); return -1;
+                    }
+                }
+                /* The probe is the other half: a file can be exactly the
+                 * right length and still not be readable the way the engine
+                 * will read it.
+                 *
                  * waste_dio_alloc, not a stack array. O_DIRECT rejects every
                  * transfer whose *buffer* is unaligned, not only its offset
-                 * and length — the rule bank_probe below is written for, and
+                 * and length -- the rule bank_probe below is written for, and
                  * the reason it allocates rather than declaring. A stack
                  * buffer here passed on macOS, whose F_NOCACHE has no buffer
                  * requirement, and on the x86_64 CI runner, whose filesystem
@@ -2029,7 +2050,6 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                  * Skipped unless a record is a whole number of blocks, since
                  * then the offset itself is one O_DIRECT would refuse, and a
                  * refusal the device made is not evidence about the shard. */
-                const int recs = (m->bank[L].n_experts - s + n_sh - 1) / n_sh;
                 if (recs > 0 && m->bank[L].rec_bytes >= (int64_t)WASTE_ALIGN &&
                     m->bank[L].rec_bytes % (int64_t)WASTE_ALIGN == 0) {
                     void *probe = waste_dio_alloc(WASTE_ALIGN);
