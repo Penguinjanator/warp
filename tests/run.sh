@@ -66,6 +66,60 @@ same() {
 }
 NO_CMP="cmp not installed (diffutils)"
 
+# Compare two logit dumps from paths that should compute the same thing.
+#
+#   0  within the threshold, and the argmax agrees
+#   1  the argmax moved, which no amount of float noise excuses
+#   2  the argmax holds but the threshold does not — which on a MoE is not
+#      yet a verdict, so callers hand it to route_verdict below
+LOGIT_EPS="${LOGIT_EPS:-1e-3}"
+logitcmp() {
+    python3 - "$1" "$2" "$LOGIT_EPS" <<'LOGITPY'
+import struct, sys
+def L(p):
+    b = open(p, "rb").read()
+    return struct.unpack(f"<{len(b)//4}f", b)
+a, b = L(sys.argv[1]), L(sys.argv[2])
+if len(a) != len(b) or not a:
+    sys.exit(1)
+if a.index(max(a)) != b.index(max(b)):
+    sys.exit(1)
+sys.exit(0 if max(abs(x - y) for x, y in zip(a, b)) < float(sys.argv[3]) else 2)
+LOGITPY
+}
+
+# The second half of that question, for a routed model: the two paths picked
+# different experts somewhere, so ask whether the first place they did was a
+# decision the router itself could not make.
+#
+# This is not a way to excuse a difference. A top-K router turns an
+# arbitrarily small arithmetic difference into a discrete one, so past the
+# first flipped expert the two paths are running different weights and the
+# distance between their logits stops measuring arithmetic — on K3 one flip
+# at token 12 is worth 0.286 of max-abs against a 1e-3 threshold, with every
+# logit before it agreeing to 1e-6. Judging that by distance means either
+# failing on a tie forever or raising the threshold past the point where it
+# could catch anything. tests/route_diff.py judges the flip instead, and a
+# flip on a margin the reference could resolve is still a failure — a louder
+# one, naming the layer.
+route_verdict() {
+    # $1 the other path's route trace, $2 the check's name
+    if [ ! -s "$TMP/seq.route" ] || [ ! -s "$1" ] || [ ! -s "$TMP/seq.scores" ]; then
+        no "$2 diverges"
+        printf "        beyond %s max-abs, and no route trace to say why\n" "$LOGIT_EPS"
+        return
+    fi
+    why=$(python3 tests/route_diff.py --ref "$TMP/seq.route" --other "$1" \
+                  --scores "$TMP/seq.scores" 2>&1)
+    case $? in
+        2) ok "$2 (differs only past a routing tie)" ;;
+        0) no "$2 diverges with the routing unchanged"
+           why="same experts throughout, so the arithmetic itself moved" ;;
+        *) no "$2 diverges" ;;
+    esac
+    printf "        %s\n" "$why"
+}
+
 # uv, with a deadline. A uv that is absent skips cleanly; a uv that is
 # present and cannot work does not fail, it *hangs*, and takes the suite
 # with it — MSYS2's mingw-w64-ucrt-x86_64-uv 0.12.1 opened no TCP sockets
@@ -535,20 +589,20 @@ if [ -d "$MODEL" ]; then
         IDS=1008,10484,318,15383,387,11,316,276,10484,318,19509,387,31082,13,646,10484
     fi
 
-    ./test_forward "$MODEL" "$IDS" "$TMP/seq.bin" 0 >/dev/null 2>&1
-    WASTE_CHUNK=1 ./test_forward "$MODEL" "$IDS" "$TMP/chunk.bin" 0 >/dev/null 2>&1
-    if python3 - "$TMP/seq.bin" "$TMP/chunk.bin" <<'PY'
-import struct, sys
-def L(p):
-    b = open(p, "rb").read()
-    return struct.unpack(f"<{len(b)//4}f", b)
-a, b = L(sys.argv[1]), L(sys.argv[2])
-d = max(abs(x - y) for x, y in zip(a, b))
-sys.exit(0 if d < 1e-3 and a.index(max(a)) == b.index(max(b)) else 1)
-PY
-    then ok "chunked prefill == token-at-a-time"
-    else no "chunked prefill diverges"
-    fi
+    # The route traces cost one line per (token, layer) and are what turns
+    # "these two disagree" into "these two disagree *here*, by *this much*".
+    # Scores come from the reference run only: the chunked path does not
+    # emit them, and the margin that matters is the one the reference saw.
+    WASTE_DUMP_ROUTE="$TMP/seq.route" WASTE_DUMP_SCORES="$TMP/seq.scores" \
+        ./test_forward "$MODEL" "$IDS" "$TMP/seq.bin" 0 >/dev/null 2>&1
+    WASTE_CHUNK=1 WASTE_DUMP_ROUTE="$TMP/chunk.route" \
+        ./test_forward "$MODEL" "$IDS" "$TMP/chunk.bin" 0 >/dev/null 2>&1
+    logitcmp "$TMP/seq.bin" "$TMP/chunk.bin"
+    case $? in
+        0) ok "chunked prefill == token-at-a-time" ;;
+        2) route_verdict "$TMP/chunk.route" "chunked prefill" ;;
+        *) no "chunked prefill diverges" ;;
+    esac
 
     # WASTE_Q8=0 makes the entire trunk resident as f32 — 8x a 4-bit one, so
     # K3's 26 GiB trunk asks for ~210 GB and no host runs this. Say so
@@ -603,24 +657,21 @@ PY
         fi
     fi
 
-    WASTE_BACKEND=cpu ./test_forward "$MODEL" "$IDS" "$TMP/cpu.bin" 0 >/dev/null 2>&1
+    WASTE_BACKEND=cpu WASTE_DUMP_ROUTE="$TMP/cpu.route" \
+        ./test_forward "$MODEL" "$IDS" "$TMP/cpu.bin" 0 >/dev/null 2>&1
     # No cmp is not a divergence: it only costs the bit-identity claim, and
     # the fp-noise bound below is still a real verdict on its own.
     if same "$TMP/seq.bin" "$TMP/cpu.bin"; then
         ok "SIMD backend bit-identical to the CPU baseline"
     else
-        # a difference here is allowed to be tiny, but must be tiny
-        if python3 - "$TMP/seq.bin" "$TMP/cpu.bin" <<'PY'
-import struct, sys
-def L(p):
-    b = open(p, "rb").read()
-    return struct.unpack(f"<{len(b)//4}f", b)
-a, b = L(sys.argv[1]), L(sys.argv[2])
-sys.exit(0 if max(abs(x - y) for x, y in zip(a, b)) < 1e-3 else 1)
-PY
-        then ok "SIMD backend matches the CPU baseline (within fp noise)"
-        else no "SIMD backend diverges from the CPU baseline"
-        fi
+        # a difference here is allowed to be tiny, but must be tiny — or,
+        # where it is not, it must be downstream of a tie
+        logitcmp "$TMP/seq.bin" "$TMP/cpu.bin"
+        case $? in
+            0) ok "SIMD backend matches the CPU baseline (within fp noise)" ;;
+            2) route_verdict "$TMP/cpu.route" "SIMD backend" ;;
+            *) no "SIMD backend diverges from the CPU baseline" ;;
+        esac
     fi
 
     WASTE_CACHE_MB=512 ./test_forward "$MODEL" "$IDS" "$TMP/cache.bin" 0 >/dev/null 2>&1
@@ -933,7 +984,8 @@ RIDS=3,7,11,5,9,13,2,17,4,8,19,23,6,29,12,31
 if ! python3 tools/make_test_container.py --rope --seed 0 "$ROPE" >/dev/null 2>&1; then
     sk "rotary checks" "make_test_container.py --rope did not build a container"
 else
-    ./test_forward "$ROPE" "$RIDS" "$TMP/rope_seq.bin" 0 >/dev/null 2>&1
+    WASTE_DUMP_ROUTE="$TMP/rope_seq.route" WASTE_DUMP_SCORES="$TMP/rope_seq.scores" \
+        ./test_forward "$ROPE" "$RIDS" "$TMP/rope_seq.bin" 0 >/dev/null 2>&1
     if [ ! -s "$TMP/rope_seq.bin" ]; then
         no "the engine did not run a container without mla_use_nope"
     else
@@ -996,19 +1048,22 @@ PY
         # per-token on both paths, so this should hold by construction — and
         # it is exactly the kind of "by construction" that a later batched
         # MLA would break silently.
-        WASTE_CHUNK=1 ./test_forward "$ROPE" "$RIDS" "$TMP/rope_chunk.bin" 0 >/dev/null 2>&1
-        if python3 - "$TMP/rope_seq.bin" "$TMP/rope_chunk.bin" <<'PY'
-import struct, sys
-def L(p):
-    b = open(p, "rb").read()
-    return struct.unpack(f"<{len(b)//4}f", b)
-a, b = L(sys.argv[1]), L(sys.argv[2])
-d = max(abs(x - y) for x, y in zip(a, b))
-sys.exit(0 if d < 1e-3 and a.index(max(a)) == b.index(max(b)) else 1)
-PY
-        then ok "chunked prefill == token-at-a-time with rotation"
-        else no "chunked prefill diverges on a rotated model"
-        fi
+        WASTE_CHUNK=1 WASTE_DUMP_ROUTE="$TMP/rope_chunk.route" \
+            ./test_forward "$ROPE" "$RIDS" "$TMP/rope_chunk.bin" 0 >/dev/null 2>&1
+        logitcmp "$TMP/rope_seq.bin" "$TMP/rope_chunk.bin"
+        case $? in
+            0) ok "chunked prefill == token-at-a-time with rotation" ;;
+            2) rwhy=$(python3 tests/route_diff.py \
+                          --ref "$TMP/rope_seq.route" \
+                          --other "$TMP/rope_chunk.route" \
+                          --scores "$TMP/rope_seq.scores" 2>&1)
+               if [ $? = 2 ]
+               then ok "chunked prefill with rotation (differs only past a routing tie)"
+               else no "chunked prefill diverges on a rotated model"
+               fi
+               printf "        %s\n" "$rwhy" ;;
+            *) no "chunked prefill diverges on a rotated model" ;;
+        esac
 
         # Same model, same seed, one line of config: mla_use_nope written out
         # as false instead of omitted. A loader that tests the key for

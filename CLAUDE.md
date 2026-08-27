@@ -71,6 +71,20 @@ container and the provenance check on the shipped fixture, so it is the one
 way to compare against weights that are not the ones under test), `K3_DIR`
 (the K3 release directory, for the XTML differential).
 
+**On a MoE, never compare two paths by the distance between their logits
+alone.** A top-K router turns an arbitrarily small arithmetic difference
+into a discrete one, and past the first flipped expert the two paths are
+running different weights — the distance then measures how much the model
+cares which of two indistinguishable experts it used, not how far the
+arithmetic moved. On K3 one flipped tie at token 12 is worth max-abs 0.286
+against a 1e-3 threshold, with every logit before it agreeing to 1e-6, and
+the tie's own margin is 7.3e-07 — the tightest of all 1472 decisions in that
+prefill. The suite therefore compares logits *and*, when they part, asks
+`tests/route_diff.py` whether the first routing decision that differed was
+one the reference itself could resolve. LEARNED §71 has the distribution
+that sets `--eps`; the two K3 checks that failed through 0.7.0 failed on
+this and not on a kernel.
+
 Individual checkers, after `make test` (all binaries land at the repo root):
 
 ```bash
@@ -80,6 +94,11 @@ WASTE_CHUNK=1 ./test_forward ...                         # chunked prefill inste
 ./test_container /tmp/tiny.waste/experts-L0.bin 2        # ONE bank + expected record count
 ./test_image /tmp && ./test_state MODEL && ./test_tokenizer MODEL "text"
 ./test_k3parts out.bin && uv run --with torch python tools/k3parts_ref.py out.bin
+
+# why two paths disagree: identical routes, a tie, or a real divergence
+WASTE_DUMP_ROUTE=a.route WASTE_DUMP_SCORES=a.scores ./test_forward M IDS a.bin 0
+WASTE_BACKEND=cpu WASTE_DUMP_ROUTE=b.route ./test_forward M IDS b.bin 0
+tests/route_diff.py --ref a.route --other b.route --scores a.scores
 
 python3 -m unittest discover -s tests/serve -t . -p "test_*.py"   # all serve tests
 python3 -m unittest tests.serve.test_regions -t .                 # one module
@@ -107,7 +126,9 @@ on a 4-bit trunk, so it is out of reach on K3), `WASTE_I8MM=1`,
 `WASTE_TOK_PLAIN=1`, `WASTE_VIS_STAGE`, `WASTE_DUMP_LATENT/HIDDEN`,
 `WASTE_DUMP_DSA` (the sparse-attention selection: which pools won and on
 what scores, so two implementations can be diffed on the decision rather
-than on the logits it produced).
+than on the logits it produced), `WASTE_DUMP_ROUTE` / `WASTE_DUMP_SCORES`
+(the same, for the MoE router: the top-K ids that won, and the full score
+vector they were ranked from — see `tests/route_diff.py` below).
 
 MoE scheduling and the VQ4P kernel: `WASTE_XPAR=1` (one task per routed
 expert instead of one per row range — **off by default**: worth ~1.18x on

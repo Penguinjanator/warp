@@ -5212,3 +5212,79 @@ accidents and are not: the frame count rounds to a multiple of the temporal
 factor before it multiplies the budget, and the search advances `low` to
 `content_height + 1` rather than to the aligned height. Both are
 transcribed.
+
+## 71. The two K3 checks were measuring the router, not the arithmetic (2026-08-27)
+
+`tests/run.sh` had two checks failing on K3 and only on K3: chunked prefill
+and the CPU backend each differed from the default path by max-abs 0.2858
+against a 1e-3 threshold, argmax unchanged. 0.7.0 shipped with them red, and
+both §68 and the changelog blamed the i8mm/SMLAL trunk kernels. **That was
+wrong, and the first measurement killed it**: `trunk_kern` defaults to
+`TK_F32`, so neither kernel was in the run at all. §68's other observation —
+that the two alternatives agree with *each other* exactly, so what differs
+is the default — was right, and is half of what follows.
+
+What it actually is, in the order the evidence arrived:
+
+- A length sweep of the default path against the CPU baseline: 1 token
+  3.9e-07, 4 tokens 5.0e-07, 12 tokens 1.1e-06, **13 tokens 1.4e-02**. Not a
+  drift that grows with length. A step.
+- The route traces at 13 tokens: 6 of 1196 routing decisions differ, **all
+  at token 12**, the one the step appeared on.
+- The scores behind the earliest of them, layer 56, experts 889 and 712.
+  Printed at the dump's `%.6g` they are the same number. At `%.9g` they are
+  0.112161167 and 0.112161085 — **a relative margin of 7.311e-07**, while
+  the same expert's score moves 1.5e-08 between the two engines.
+
+The last number is the whole finding, and it needs the distribution to mean
+anything. Over the full 16-token prefill — 1472 decisions, 92 layers, 384
+experts, top-16 — the gap between rank 16 and rank 17 has a **minimum of
+7.311e-07**. The flip is not *a* tie, it is *the* tie: the closest call the
+model made anywhere in the forward pass. The 1st percentile is 4.4e-05, sixty
+times wider, and the median 7.4e-03. The 47 differences that follow the first
+one average 5e-03, squarely typical — because they are computed on a hidden
+state that has already moved, and are consequences rather than coin flips.
+
+Two independent paths, chunked prefill and the CPU backend, produce
+**byte-identical route traces** and differ from the default in exactly the
+same 48 places. That is not each path having its own noise; it is NEON
+summation order on one side and scalar on the other, disagreeing by 1e-08 on
+a decision that needed 1e-07 to make.
+
+**So the checks were wrong, not the engine.** A top-K router converts an
+arbitrarily small arithmetic difference into a discrete one. Past the first
+flipped expert the two paths are running different weights, and the distance
+between their logits stops being a measurement of arithmetic — it measures
+how much the model cares which of two indistinguishable experts it used. A
+threshold on that quantity has no setting that works: 1e-3 fails on a tie
+forever, and the 0.3 that would pass could not catch a kernel that was
+actually broken. §44 and the `exp1` work already said this about kernel
+comparison ("a logit norm cannot separate *the arithmetic moved* from *the
+selection moved*"); the suite had not been told.
+
+`tests/route_diff.py` asks the question the threshold was standing in for.
+Given the reference's route trace, the other path's, and the reference's own
+scores, it answers **identical**, **tie** (the first disagreement is between
+two experts the reference could not separate, at or under a relative margin
+of 1e-5) or **diverged**. Only the first disagreement is judged, for the
+reason above. `--eps` defaults to 1e-5 because that is the empty decade
+between the tie that flipped, 7.3e-07, and the tightest call that held,
+4.4e-05 — 14x above one and 4x below the other, rather than a round number.
+
+The check that replaces the threshold is **stronger**, in three ways. The
+argmax is now a hard failure on every path rather than a clause on one of
+them. Routing that differs on a margin the reference could resolve is a
+failure that names the token and the layer, where before it was a distance.
+And a difference past the threshold with the routing *unchanged* — the case
+that really is a defect in the arithmetic — is now its own verdict instead
+of being pooled with the tie into a single red line.
+
+The cost is one line per (token, layer) in two traces, about 400 KB on this
+prompt, written by dumps that already existed. The engine is unchanged
+except for the dump's precision: `%.6g` cannot resolve a tie, and a dump
+whose only job is to say how close a decision was must round-trip a float.
+Six digits printed the two scores as equal and made a near-tie look like a
+selection bug.
+
+Kimi-Linear never tripped any of this. Its router does not tie at 16 tokens,
+which is why the checks looked correct for as long as they did.

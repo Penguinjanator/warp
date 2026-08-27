@@ -315,7 +315,8 @@ jobs:
       - name: SPDX headers
         run: |
           missing=$(git ls-files 'src/*.c' 'src/*.h' 'src/*.m' 'cli/*.c' \
-                                'tests/*.c' 'tools/*.py' 'tools/*.sh' \
+                                'tests/*.c' 'tests/*.py' 'tests/*.sh' \
+                                'tests/serve/*.py' 'tools/*.py' 'tools/*.sh' \
                     | xargs grep -L 'SPDX-License-Identifier' || true)
           if [ -n "$missing" ]; then
             echo "missing SPDX header:"; echo "$missing"; exit 1

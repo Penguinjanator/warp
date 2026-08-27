@@ -3616,8 +3616,15 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
         FILE *sf = fopen(dump_scores, "a");
         if (sf) {
             fprintf(sf, "%d %d", dump_pos0, L);
+            /* %.9g, not %.6g: this dump exists to answer how close a
+             * ranking decision was, and six digits cannot resolve the ties
+             * that decide one. Two engines that agree on every score to
+             * float precision printed as *identical* at six digits while
+             * selecting differently, which reads as a selection bug and is
+             * a near-tie the format could not show. Nine digits round-trip
+             * a float. */
             for (int e = 0; e < E; e++)
-                fprintf(sf, " %.6g", score[e] + (bias ? bias[e] : 0.0f));
+                fprintf(sf, " %.9g", score[e] + (bias ? bias[e] : 0.0f));
             fputc('\n', sf);
             fclose(sf);
         }

@@ -8,6 +8,50 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
+## Unreleased
+
+### Fixed
+
+- **The two K3 checks were measuring the router, not the arithmetic**
+  (`docs/LEARNED.md` §71). Chunked prefill and the CPU backend each differed
+  from the default path by max-abs 0.2858 against a 1e-3 threshold, and
+  0.7.0 shipped them red on the explanation that this was the i8mm/SMLAL
+  trunk kernels. **It was not** — `trunk_kern` defaults to `TK_F32`, so
+  neither kernel was in the run.
+
+  It is one routing tie. Of 1472 routing decisions in a 16-token K3 prefill,
+  the earliest the paths disagree on is token 12, layer 56, experts 889 and
+  712, at a **relative margin of 7.311e-07 — the minimum over all 1472**.
+  The 1st percentile is 4.4e-05 and the median 7.4e-03; the 47 differences
+  that follow average 5e-03, because they are computed on a hidden state
+  that has already moved. Two independent paths produce byte-identical route
+  traces and differ from the default in the same 48 places: NEON summation
+  order against scalar, disagreeing by 1e-08 on a decision that needed
+  1e-07.
+
+  A top-K router makes an arbitrarily small arithmetic difference discrete,
+  so past the first flipped expert the logit distance measures how much the
+  model cares which of two indistinguishable experts it ran. No threshold on
+  it works: 1e-3 fails on a tie forever, and the 0.3 that would pass could
+  not catch a broken kernel.
+
+  `tests/route_diff.py` asks the question the threshold stood in for, over
+  the route and score traces `WASTE_DUMP_ROUTE` / `WASTE_DUMP_SCORES`
+  already wrote: **identical**, **tie** (the first disagreement is under a
+  relative margin of `--eps`, default 1e-5) or **diverged**. The default
+  sits in the empty decade between the tie that flipped and the tightest
+  call that held. The three chunked/backend checks now use it, and the
+  result is a stricter suite, not a looser one — the argmax became a hard
+  failure on every path rather than a clause on one, a route that flips on a
+  resolvable margin fails while naming the token and layer, and a threshold
+  miss with the routing *unchanged* — the case that is a real arithmetic
+  defect — is its own verdict instead of being pooled with the tie.
+
+- **`WASTE_DUMP_SCORES` prints `%.9g`.** The dump exists to say how close a
+  ranking decision was, and six digits cannot resolve one: the two scores
+  above both printed as `0.112161` while selecting differently, which reads
+  as a selection bug. Nine digits round-trip a float.
+
 ## 0.7.0 — 2026-08-27
 
 A third model, and the two things that had to change for it to be worth
@@ -38,6 +82,13 @@ rel L2 0.0176 (max abs 0.2858, argmax unchanged) against a 1e-3 threshold.
 That is the i8mm/SMLAL trunk kernels, whose K3 accuracy `CLAUDE.md` already
 records; it is not a regression introduced here and it is not resolved
 here either.
+
+> **Corrected after release.** The failures are real and the numbers above
+> are right, but the cause named here is not: `trunk_kern` defaults to
+> `TK_F32`, so neither kernel was in the run. It is a single routing tie at
+> a relative margin of 7.3e-07, and the checks were measuring the router
+> rather than the arithmetic. See Unreleased, above, and `docs/LEARNED.md`
+> §71.
 
 ### Added
 
