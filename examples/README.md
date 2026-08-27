@@ -326,3 +326,13 @@ python3 -m serve ~/models/k3.waste
 
 See [docs/SERVE.md](../docs/SERVE.md). This file remains the answer for
 `waste chat` and `waste run`, which carry no Python.
+
+## chat-glm53.json
+
+GLM-5.3-Flash. Three fields no Kimi format needs, and none of them optional
+for this one: `prelude`, because GLM opens every conversation `[gMASK]<sop>`
+and that belongs to no role; `stop`, because a turn ends when the next role
+marker begins and there is no suffix to close it with; and `think`, the
+reasoning channel its generation prompt always opens. Written without
+`stop` the format answers correctly and then keeps going into the next
+turn. See docs/GLM.md.

@@ -389,8 +389,31 @@ if [ -d "$MODEL" ]; then
         no "expert record layout"
     fi
 
+    # $SRC defaults to Kimi-Linear's weights and $MODEL does not: point
+    # WASTE_REF_MODEL at K3 without pointing WASTE_REF_SRC anywhere and this
+    # compared K3's container against Kimi-Linear's safetensors and called
+    # the result a converter bug. A mismatched pair is a missing
+    # prerequisite, and this suite says SKIP to those.
+    src_pair=$(python3 - "$MODEL" "$SRC" <<'PYSRC'
+import json, os, sys
+try:
+    m = json.load(open(os.path.join(sys.argv[1], "manifest.json")))["config"]
+    s = json.load(open(os.path.join(sys.argv[2], "config.json")))
+except Exception:
+    sys.exit(0)                       # let the check speak for itself
+s = s.get("text_config", s)
+for k in ("num_hidden_layers", "hidden_size"):
+    a, b = m.get(k), s.get(k)
+    if a is not None and b is not None and a != b:
+        print(f"{os.path.basename(sys.argv[2])} is a different model from "
+              f"this container ({k} {b} vs {a}) - set WASTE_REF_SRC")
+        break
+PYSRC
+)
     if [ "$SYNTHETIC" = 1 ]; then
         sk "container round-trip" "synthetic container has no source weights"
+    elif [ -n "$src_pair" ]; then
+        sk "container round-trip" "$src_pair"
     elif [ -d "$SRC" ] && command -v uv >/dev/null 2>&1; then
         if run_uv run --quiet --with torch --no-project python tools/verify_container.py \
                --container "$MODEL" --src "$SRC" --experts 1 2>/dev/null \
@@ -674,6 +697,60 @@ import sys; sys.exit(0 if abs($eng - $sim) <= 5 else 1)" 2>/dev/null; then
         *) sk "purgeable slots are bit-identical to ordinary ones" "$NO_CMP" ;;
     esac
 
+    # The scheduling decision moe_layer now makes from cache state, and the
+    # background fill that changes that state, must both be invisible in the
+    # output. They are not a numerical choice — the expert-parallel path
+    # sums its per-expert results in j order exactly as the row split does —
+    # but "not a numerical choice" is a property of the kernels, and the
+    # moment it stops being true the engine starts giving different answers
+    # depending on how warm the cache happened to be. That failure would be
+    # unreproducible by construction, so it is pinned here.
+    WASTE_XPAR=0 ./test_forward "$MODEL" "$IDS" "$TMP/xpar0.bin" 0 >/dev/null 2>&1
+    WASTE_XPAR=1 ./test_forward "$MODEL" "$IDS" "$TMP/xpar1.bin" 0 >/dev/null 2>&1
+    same "$TMP/xpar0.bin" "$TMP/xpar1.bin"
+    case $? in
+        0) ok "the expert-parallel path is bit-identical to the row split" ;;
+        1) no "WASTE_XPAR changes the logits — the automatic choice cannot stand" ;;
+        *) sk "expert-parallel bit-identity" "$NO_CMP" ;;
+    esac
+    same "$TMP/seq.bin" "$TMP/xpar0.bin"
+    case $? in
+        0) ok "and so is whichever of the two the cache state selects" ;;
+        1) no "the default path matches neither WASTE_XPAR setting" ;;
+        *) sk "automatic expert-parallel choice" "$NO_CMP" ;;
+    esac
+
+    WASTE_PRELOAD=0 ./test_forward "$MODEL" "$IDS" "$TMP/nofill.bin" 0 >/dev/null 2>&1
+    same "$TMP/seq.bin" "$TMP/nofill.bin"
+    case $? in
+        0) ok "the background fill changes what is resident, not what is computed" ;;
+        1) no "WASTE_PRELOAD changes the logits" ;;
+        *) sk "background fill bit-identity" "$NO_CMP" ;;
+    esac
+
+    # The pool decides how many threads to wake from how big the job is, and
+    # spins before parking. Neither may touch the arithmetic: the split is
+    # by row. Pinned across the extremes of both knobs, because a kernel
+    # that ever became order-dependent would make the answer depend on how
+    # busy the machine was when it ran.
+    pool_same=1
+    for pcfg in "WASTE_WIDE_MIN=0" "WASTE_WIDE_MIN=1099511627776" \
+                "WASTE_SPIN=0" "WASTE_SPIN_SLOW=1" "WASTE_THREADS=1" \
+                "WASTE_THREADS=3"; do
+        env $pcfg ./test_forward "$MODEL" "$IDS" "$TMP/pool.bin" 0 \
+            >/dev/null 2>&1
+        same "$TMP/seq.bin" "$TMP/pool.bin"
+        case $? in
+            0) ;;
+            1) pool_same=0; no "$pcfg changes the logits" ;;
+            *) pool_same=2 ;;
+        esac
+    done
+    case $pool_same in
+        1) ok "the thread pool's dispatch choices are bit-identical (6 combinations)" ;;
+        2) sk "thread pool bit-identity" "$NO_CMP" ;;
+    esac
+
     # kimi_ref.py computes its logits *from* a WASTE container, so an oracle
     # is only comparable against the container that produced it — and not
     # merely against its trunk width. The expert codebooks are k-means, and
@@ -779,8 +856,33 @@ PY
     fi
 
     # learned hotlist: a second run should start warmer than the first
+    # 5G is Kimi-Linear's size, and on a container whose floor is above it
+    # the engine refuses to open - correctly - so the run printed no cache
+    # line and this read that as "the hotlist did nothing". K3's floor is
+    # 29.19 GB. Raising the budget instead would make the check read a
+    # couple of hundred GB twice, which is not what it is for; the hotlist
+    # is exercised where it is cheap.
+    hot_why=""
+    if [ "$SYNTHETIC" != 1 ]; then
+        hot_why=$(python3 - "$MODEL" <<'PYHOT'
+import json, os, subprocess, sys
+WASTE = os.path.join(os.curdir, "waste" + (".exe" if os.name == "nt" else ""))
+r = subprocess.run([WASTE, "plan", sys.argv[1], "--json"],
+                   capture_output=True, text=True)
+try:
+    floor = json.loads(r.stdout)["floor_bytes"]
+except Exception:
+    sys.exit(0)
+if floor > 5 * (1 << 30):
+    print(f"this container's floor is {floor / (1 << 30):.2f} GB and the "
+          f"check opens at 5G, which the engine refuses")
+PYHOT
+)
+    fi
     if [ "$SYNTHETIC" = 1 ]; then
         sk "learned hotlist" "synthetic container carries no tokenizer"
+    elif [ -n "$hot_why" ]; then
+        sk "learned hotlist" "$hot_why"
     else
     rm -f "$MODEL/usage.waste"
     # Read hits and misses together. Counting misses alone cannot tell a
@@ -993,6 +1095,243 @@ PY
 fi
 
 # --------------------------------------------------------------- budget ----
+head_ "GLM-5.3-Flash (mHC, clamped SwiGLU, DSA indexer)"
+
+# Same reasoning as the rotary section above: none of the checks that run on
+# a Kimi reach any of these three, and all three fail *quietly*. mHC's
+# parallel residual streams and its Sinkhorn projection produce
+# weight-shaped logits from any mixing matrix; a clamp at 10 that never
+# fires looks like a clamp that works; and an indexer that selects every
+# pool is indistinguishable from one that selects the right ones until the
+# context outgrows index_topk. So this builds its own GLM-shaped container
+# — a few megabytes, seed 0, byte-reproducible — and diffs it against the
+# PyTorch reference.
+#
+# The prompt length is load-bearing. index_topk 8 over pools of 4 means the
+# indexer may keep two pools; sixteen tokens make four, so the selection is
+# real. At twelve tokens or fewer every pool is kept, the branch degenerates
+# to dense attention, and this check would pass with the selection deleted.
+GLMC="$TMP/glm.waste"
+GIDS=3,7,11,5,9,13,2,17,4,8,19,23,6,29,12,31
+if ! python3 tools/make_test_container.py --glm --seed 0 "$GLMC" >/dev/null 2>&1; then
+    sk "GLM checks" "make_test_container.py --glm did not build a container"
+else
+    ./test_forward "$GLMC" "$GIDS" "$TMP/glm_seq.bin" 0 >/dev/null 2>&1
+    if [ ! -s "$TMP/glm_seq.bin" ]; then
+        no "the engine did not run a GLM container"
+    else
+        GGEN=""
+        if command -v uv >/dev/null 2>&1; then
+            run_uv run --no-project --with torch --with fla-core --with einops \
+                python tools/kimi_ref.py --container "$GLMC" \
+                --prompt-ids "$GIDS" --tokens 0 \
+                --dump "$TMP/glm_ref.bin" >/dev/null 2>&1 || true
+            [ -s "$TMP/glm_ref.bin" ] && GGEN="$TMP/glm_ref.bin"
+        fi
+        GFIX=tests/fixtures/oracle_glmsynth_16tok.bin
+        glm_why=""
+        if [ -z "$GGEN" ] && [ -f "${GFIX%.bin}.json" ]; then
+            glm_why=$(python3 - "$GLMC" "${GFIX%.bin}.json" <<'PYA'
+import hashlib, json, os, sys
+h = hashlib.sha256()
+for n in sorted(os.listdir(sys.argv[1])):
+    h.update(n.encode())
+    h.update(open(os.path.join(sys.argv[1], n), "rb").read())
+want = json.load(open(sys.argv[2])).get("container_sha256")
+if want and h.hexdigest() != want:
+    print("no uv to generate one, and make_test_container.py --glm no "
+          "longer builds the container this fixture was made from — "
+          "regenerate it, see " + os.path.basename(sys.argv[2]))
+PYA
+)
+        fi
+        if [ -n "$glm_why" ]; then
+            sk "engine vs the GLM oracle" "$glm_why"
+        elif [ -n "$GGEN" ] || [ -f "$GFIX" ]; then
+            if python3 - "$TMP/glm_seq.bin" "${GGEN:-$GFIX}" <<'PYB'
+import struct, sys
+def L(p):
+    b = open(p, "rb").read()
+    return struct.unpack(f"<{len(b)//4}f", b)
+a, b = L(sys.argv[1]), L(sys.argv[2])
+sys.exit(0 if max(abs(x - y) for x, y in zip(a, b)) < 1e-3 else 1)
+PYB
+            then
+                if [ -n "$GGEN" ]
+                then ok "mHC, the clamped SwiGLU and DSA match a PyTorch oracle built from this container"
+                else ok "mHC, the clamped SwiGLU and DSA match the shipped GLM fixture"
+                fi
+            else no "the GLM path diverges from the oracle"
+            fi
+        else
+            sk "engine vs the GLM oracle" \
+               "no fixture; regenerate with tools/kimi_ref.py --dump"
+        fi
+
+        # The oracle above proves the two implementations agree. It does not
+        # prove either of them *selected* anything: an indexer that keeps
+        # every pool and a reference that keeps every pool agree perfectly.
+        # So raise index_topk past the prompt on the same weights — the only
+        # difference is the config number — and require the answer to move.
+        GDENSE="$TMP/glm-dense.waste"
+        if python3 tools/make_test_container.py --glm --seed 0 --index-topk 64 \
+                "$GDENSE" >/dev/null 2>&1 &&
+           same "$GLMC/trunk.bin" "$GDENSE/trunk.bin"; then
+            ./test_forward "$GDENSE" "$GIDS" "$TMP/glm_dense.bin" 0 >/dev/null 2>&1
+            if [ ! -s "$TMP/glm_dense.bin" ]; then
+                no "the engine did not run the dense-attention GLM container"
+            elif python3 - "$TMP/glm_seq.bin" "$TMP/glm_dense.bin" <<'PYC'
+import struct, sys
+def L(p):
+    b = open(p, "rb").read()
+    return struct.unpack(f"<{len(b)//4}f", b)
+a, b = L(sys.argv[1]), L(sys.argv[2])
+# Anything this side of the oracle's own 1e-3 would mean the sparse path
+# attended over the same positions the dense one did.
+sys.exit(0 if max(abs(x - y) for x, y in zip(a, b)) > 1e-2 else 1)
+PYC
+            then ok "the DSA indexer really narrows attention (same weights, index_topk 8 vs 64)"
+            else no "index_topk 8 and index_topk 64 give the same logits — nothing was selected"
+            fi
+        else
+            sk "DSA indexer narrows attention" "could not build the dense twin"
+        fi
+
+        # mHC keeps hc_mult residual streams and the DSA indexer keeps a
+        # pool history, and both are session state. Neither is covered by
+        # the round-trip above, which runs on a Kimi.
+        if ./test_state "$GLMC" 2>/dev/null | grep -q "^STATE OK"; then
+            ok "a GLM session round-trips its streams and its indexer pools"
+        else
+            no "GLM session state does not round-trip"
+        fi
+
+        # waste_model_prefill routes a GLM container through the per-token
+        # path because the chunked one implements neither mHC nor the
+        # indexer. This is what says the fallback is really taken.
+        WASTE_CHUNK=1 ./test_forward "$GLMC" "$GIDS" "$TMP/glm_chunk.bin" 0 >/dev/null 2>&1
+        same "$TMP/glm_seq.bin" "$TMP/glm_chunk.bin"
+        case $? in
+            0) ok "chunked prefill falls back to the decode path, bit for bit" ;;
+            1) no "chunked prefill on a GLM container differs from decoding it" ;;
+            *) sk "chunked prefill on a GLM container" "$NO_CMP" ;;
+        esac
+    fi
+fi
+
+head_ "GLM's vision tower"
+
+# Its own container, for the same reason the GLM and rotary sections have
+# one: nothing that runs on a Kimi reaches this tower, and the failure it
+# would hide is the quiet kind. A patch order that disagrees with the
+# rotary indices rotates every patch by someone else's position, and the
+# embeddings stay finite and plausible; a bilinear resize where the release
+# uses bicubic changes every pixel by a little.
+GLMV="$TMP/glmvis.waste"
+if ! python3 tools/make_test_container.py --glm --vision --seed 0 "$GLMV" \
+        >/dev/null 2>&1; then
+    sk "GLM vision checks" "make_test_container.py --glm --vision did not build one"
+else
+    # The patch tensor both sides see, generated once so the comparison is
+    # of the tower and not of two random number generators.
+    python3 - "$TMP/vpix.bin" <<'PYA'
+import struct, sys
+s, vals = 1, []
+for _ in range(4 * 6 * 1176):
+    s = (s * 1103515245 + 12345) % (1 << 32)
+    vals.append(((s >> 16) & 0x7fff) / 32768.0 - 0.5)
+open(sys.argv[1], "wb").write(struct.pack(f"<{len(vals)}f", *vals))
+PYA
+    if ! ./test_vision_glm tower "$GLMV" 4 6 "$TMP/vpix.bin" \
+            "$TMP/vis_eng.bin" >/dev/null 2>&1; then
+        no "the engine did not run GLM's tower"
+    elif ! command -v uv >/dev/null 2>&1; then
+        sk "GLM tower vs the PyTorch oracle" "uv not installed"
+    else
+        run_uv run --no-project --with torch python tools/glm_vision_ref.py \
+            --container "$GLMV" --grid 4 6 --pixels "$TMP/vpix.bin" \
+            --dump "$TMP/vis_ref.bin" >/dev/null 2>&1 || true
+        if [ ! -s "$TMP/vis_ref.bin" ]; then
+            sk "GLM tower vs the PyTorch oracle" "the reference did not run"
+        elif python3 - "$TMP/vis_eng.bin" "$TMP/vis_ref.bin" <<'PYB'
+import struct, sys
+def L(p):
+    b = open(p, "rb").read()
+    return struct.unpack(f"<{len(b)//4}f", b)
+a, b = L(sys.argv[1]), L(sys.argv[2])
+sys.exit(0 if len(a) == len(b) and
+         max(abs(x - y) for x, y in zip(a, b)) < 1e-3 else 1)
+PYB
+        then ok "24 blocks, 2D rope, per-head q/k norms and the gated merger match the oracle"
+        else no "GLM's tower diverges from the oracle"
+        fi
+    fi
+
+    # The preprocessing, separately, because it fails differently. An image
+    # whose dimensions are already a multiple of patch*merge makes the
+    # resize the identity, so what is left to compare is the patch order and
+    # the normalization — and those are exact, not approximate.
+    python3 - "$TMP/aligned.png" <<'PYC'
+import struct, sys, zlib
+W, H = 224, 140                      # both multiples of 28
+raw = bytearray()
+for y in range(H):
+    raw.append(0)
+    for x in range(W):
+        raw += bytes(((x * 7 + y * 3) % 256, (x * x + y) % 256,
+                      (x + y * 11) % 256))
+def chunk(t, d):
+    c = t + d
+    return struct.pack(">I", len(d)) + c + struct.pack(">I", zlib.crc32(c) & 0xffffffff)
+png = (b"\x89PNG\r\n\x1a\n"
+       + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+       + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+       + chunk(b"IEND", b""))
+open(sys.argv[1], "wb").write(png)
+PYC
+    if ! ./test_vision_glm pixels "$GLMV" "$TMP/aligned.png" \
+            "$TMP/vis_px.bin" >"$TMP/vis_px.log" 2>&1; then
+        no "GLM's image preprocessing did not run"
+    elif python3 - "$TMP/vis_px.bin" "$GLMV" <<'PYD'
+import json, os, struct, sys
+# The reference's own reshape/permute/expand, spelled out: reshape to
+# (C, gh/m, m, patch, gw/m, m, patch), permute to block-major, then repeat
+# the patch across the temporal axis. If the engine's order disagrees the
+# difference is not small, it is a different image.
+W, H, patch, merge, T = 224, 140, 14, 2, 2
+gh, gw = H // patch, W // patch
+cfg = json.load(open(os.path.join(sys.argv[2], "vision.json")))
+mean, std = cfg["image_mean"], cfg["image_std"]
+px = [[[0.0] * W for _ in range(H)] for _ in range(3)]
+for y in range(H):
+    for x in range(W):
+        v = ((x * 7 + y * 3) % 256, (x * x + y) % 256, (x + y * 11) % 256)
+        for c in range(3):
+            px[c][y][x] = (v[c] / 255.0 - mean[c]) / std[c]
+want = []
+for by in range(gh // merge):
+    for bx in range(gw // merge):
+        for dy in range(merge):
+            for dx in range(merge):
+                py, pxi = by * merge + dy, bx * merge + dx
+                row = []
+                for c in range(3):
+                    one = [px[c][py * patch + j][pxi * patch + i]
+                           for j in range(patch) for i in range(patch)]
+                    for _ in range(T):
+                        row += one
+                want.append(row)
+b = open(sys.argv[1], "rb").read()
+got = struct.unpack(f"<{len(b)//4}f", b)
+flat = [v for r in want for v in r]
+sys.exit(0 if len(got) == len(flat) and
+         max(abs(a - c) for a, c in zip(got, flat)) < 2e-4 else 1)
+PYD
+    then ok "patches are block-major over merge blocks, with the temporal slot copied"
+    else no "GLM's patch order or normalization is not the release's"
+    fi
+fi
+
 head_ "RAM budget"
 
 # The default budget is the one path check_budget.sh cannot reach, because
@@ -1038,10 +1377,18 @@ held = plan["floor_bytes"] - plan["min_expert_cache"] + info["expert_cache_bytes
 # the engine reports it: recommended_bytes is capped at the container's whole
 # expert set, so on a merged container it is no longer floor + 3 * this
 ws = plan["working_set_bytes"]
+bank = plan.get("bank_bytes", 0)
 want = plan["floor_bytes"]
-for k in (3, 2, 1):
-    if plan["floor_bytes"] + ws * k <= cap:
-        want = plan["floor_bytes"] + ws * k
+# The ladder the engine walks: as many whole working sets as the machine
+# allows, starting from however many cover the container's entire expert set
+# — beyond which a cache cannot be improved by making it larger — and never
+# a cache bigger than that set. Three used to be the top rung, and on a
+# machine with room it left the rest of it unused.
+kmax = max(3, -(-bank // ws) if (bank and ws) else 3)
+for k in range(kmax, 0, -1):
+    got = min(ws * k, bank) if bank else ws * k
+    if plan["floor_bytes"] + got <= cap:
+        want = plan["floor_bytes"] + got
         break
 rec = plan["min_expert_cache"] // (2 * info["top_k"]) if info["top_k"] else 0
 G = 1 << 30
@@ -1425,6 +1772,20 @@ elif out=$(python3 tests/test_convert_resume.py 2>&1); then
     ok "resume keeps finished layers, never renumbers them, and publishes"
 else
     no "convert.py resume"
+    printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5
+fi
+
+# GLM states its layer mix and its eos differently from Kimi, and both
+# differences are silent when a converter copies them through: KDA lands on
+# the wrong layers, generation stops on nothing. Neither is visible to the
+# oracle diff above — the oracle reads the same manifest and would be wrong
+# the same way — so it is checked against what the release says instead.
+if ! command -v python3 >/dev/null 2>&1; then
+    sk "convert.py GLM config" "python3 not installed"
+elif out=$(python3 tests/test_convert_glm.py 2>&1); then
+    ok "GLM's 0-based layer mix, its eos list and its unread tensors are converted"
+else
+    no "convert.py GLM config"
     printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5
 fi
 

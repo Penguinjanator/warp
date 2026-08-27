@@ -27,71 +27,164 @@
 
 #include "simd.h"
 #include "waste_backend.h"
+#include "waste_metal.h"
 
 #include <stdio.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#include "threads.h"
 
 static NSString *const kSrc = @R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 
-struct P { int in; int ng; int group; int bits; uint rowbytes; };
+struct P { int in; int ng; int group; int bits; uint rowbytes; uint m; };
+struct VQP { uint m; uint nv; uint st; uint en;
+             uint idx_off; uint sc_off; uint lut_off; uint y_off; };
 
-/* One threadgroup per output row, threads striding the input so their loads
- * are coalesced, then a threadgroup reduction.
+/* One simdgroup per output row, eight rows per threadgroup.
  *
- * The first version put one thread on a whole row. That is the obvious
- * mapping and the wrong one: adjacent threads then read addresses rowbytes
- * apart, so every load is its own cache line, and a 7168-long dot runs
- * serially in one lane.
+ * The 2026-07-28 version of this kernel did three things that together cost
+ * it the argument in docs/BACKENDS.md, and all three are visible in what
+ * replaced them:
  *
- * Group scales are applied per element rather than per group, which lets a
- * thread take any index without caring where the group boundaries fall. It
- * is the same arithmetic — sum_k s_k sum_i w_i x_i == sum_i s_{k(i)} w_i x_i
- * — for one extra half-to-float per element. */
-kernel void mvq_f32(device float             *y   [[buffer(0)]],
-                    device const uchar       *W   [[buffer(1)]],
-                    device const ushort      *ws  [[buffer(2)]],
-                    device const float       *x   [[buffer(3)]],
-                    constant P               &p   [[buffer(4)]],
-                    uint  row   [[threadgroup_position_in_grid]],
-                    uint  tid   [[thread_position_in_threadgroup]],
-                    uint  nthr  [[threads_per_threadgroup]],
-                    threadgroup float *part [[threadgroup(0)]])
+ *   - it converted a group scale from half to float *per weight*, so a
+ *     7168-long row paid 7168 conversions for its 56 scales;
+ *   - it reduced through threadgroup memory with a log2(n) barrier ladder,
+ *     where simd_sum is one instruction and no barrier at all;
+ *   - it read one byte at a time, where a uint4 load moves 32 weights.
+ *
+ * tools/metalbw.c measures the difference at K3's [12288 x 7168] trunk
+ * shape: 53 GB/s then, ~140 GB/s now, against 78 GB/s for the exact NEON
+ * path and a 284 GB/s streaming ceiling on this GPU.
+ */
+kernel void mvq4(device float             *y  [[buffer(0)]],
+                 device const uint4       *W  [[buffer(1)]],
+                 device const half        *ws [[buffer(2)]],
+                 device const float       *x  [[buffer(3)]],
+                 constant P               &p  [[buffer(4)]],
+                 uint  tgid [[threadgroup_position_in_grid]],
+                 uint  sgid [[simdgroup_index_in_threadgroup]],
+                 uint  lane [[thread_index_in_simdgroup]])
 {
-    device const uchar  *W0 = W  + (ulong)row * p.rowbytes;
-    device const ushort *sc = ws + (ulong)row * p.ng;
-    const int gshift = (p.group == 128) ? 7 : int(log2(float(p.group)) + 0.5f);
-
+    const uint row = tgid * 8 + sgid;
+    if (row >= p.m) return;
+    device const uint4 *w  = W  + (ulong)row * (p.rowbytes >> 4);
+    device const half  *sc = ws + (ulong)row * p.ng;
+    const uint nvec = p.rowbytes >> 4;
+    const uint gshift = (p.group == 128) ? 7u : uint(log2(float(p.group)) + 0.5f);
     float acc = 0.0f;
-    if (p.bits == 8) {
-        device const char *w = (device const char *)W0;
-        for (int i = int(tid); i < p.in; i += int(nthr))
-            acc += float(w[i]) * x[i] * float(as_type<half>(sc[i >> gshift]));
-    } else if (p.bits == 4) {
-        for (int i = int(tid); i < p.in; i += int(nthr)) {
-            const uchar byte = W0[i >> 1];
-            const int v = (i & 1) ? int(byte >> 4) - 8 : int(byte & 0x0F) - 8;
-            acc += float(v) * x[i] * float(as_type<half>(sc[i >> gshift]));
+    for (uint j = lane; j < nvec; j += 32) {
+        const uint4 packed = w[j];
+        const uint base = j << 5;
+        float part = 0.0f;
+        for (uint b = 0; b < 4; b++) {
+            const uint word = packed[b];
+            for (uint k = 0; k < 4; k++) {
+                const uint byte = (word >> (8 * k)) & 0xffu;
+                const uint i = base + b * 8 + k * 2;
+                part += float(int(byte & 0xfu) - 8) * x[i]
+                      + float(int(byte >> 4)  - 8) * x[i + 1];
+            }
         }
-    } else {
-        for (int i = int(tid); i < p.in; i += int(nthr)) {
-            const long off = (long)i * 3;
-            const int b0 = int(W0[off >> 3]), b1 = int(W0[(off >> 3) + 1]);
-            const int v = ((b0 >> (off & 7)) | (b1 << (8 - (off & 7)))) & 7;
-            acc += float(v - 4) * x[i] * float(as_type<half>(sc[i >> gshift]));
-        }
+        acc += float(sc[base >> gshift]) * part;
     }
+    acc = simd_sum(acc);
+    if (lane == 0) y[row] = acc;
+}
 
-    part[tid] = acc;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = nthr / 2; s > 0; s >>= 1) {
-        if (tid < s) part[tid] += part[tid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+/* Q8G: same shape, char4 loads, one scale per group. */
+kernel void mvq8(device float             *y  [[buffer(0)]],
+                 device const char4       *W  [[buffer(1)]],
+                 device const half        *ws [[buffer(2)]],
+                 device const float4      *x  [[buffer(3)]],
+                 constant P               &p  [[buffer(4)]],
+                 uint  tgid [[threadgroup_position_in_grid]],
+                 uint  sgid [[simdgroup_index_in_threadgroup]],
+                 uint  lane [[thread_index_in_simdgroup]])
+{
+    const uint row = tgid * 8 + sgid;
+    if (row >= p.m) return;
+    device const char4  *w  = W  + (ulong)row * (p.rowbytes >> 2);
+    device const half   *sc = ws + (ulong)row * p.ng;
+    const uint nvec = p.rowbytes >> 2;
+    const uint gshift = (p.group == 128) ? 7u : uint(log2(float(p.group)) + 0.5f);
+    float acc = 0.0f;
+    for (uint j = lane; j < nvec; j += 32) {
+        const float4 wv = float4(w[j]);
+        acc += float(sc[(j << 2) >> gshift]) * dot(wv, x[j]);
     }
-    if (tid == 0) y[row] = part[0];
+    acc = simd_sum(acc);
+    if (lane == 0) y[row] = acc;
+}
+
+/* ---- the VQ3R expert apply -------------------------------------------
+ * y[r] = scale[r] * sum_v ( T0[c0] + T1[c1] + T2[c2] ), with the table
+ * block for position v at lut[v * st * en] and the three index bytes for
+ * row r at idx[(blk*nv + v)*64*st + r*st] — the layout src/model.c's
+ * vq_rows walks, unchanged.
+ *
+ * One thread per row, 64 rows a threadgroup, which makes a warp's three
+ * index bytes 96 contiguous bytes and shares the table block for v across
+ * the whole group. The accumulation order is the CPU's: v ascending, the
+ * three stages added together first and then into the running sum. That is
+ * deliberate — it is what lets the two paths agree bit for bit rather than
+ * merely closely, which docs/LEARNED.md §43 argues is the only standard
+ * worth having on a kernel feeding a router that lives on near-ties.
+ *
+ * Everything about this kernel is ordinary. What made it worth writing is
+ * occupancy: one apply is 3072 rows, about 6% of what this GPU wants in
+ * flight, and it measures 12 GB/s of index — half the CPU. Sixteen of them
+ * in one command buffer measure 126 GB/s, five times the CPU. So the unit
+ * of work is a layer's routed experts, not an expert. */
+kernel void vq3r(device float           *y   [[buffer(0)]],
+                 device const uchar     *rec [[buffer(1)]],
+                 device const float     *lut [[buffer(2)]],
+                 constant VQP           &p   [[buffer(3)]],
+                 uint tgid [[threadgroup_position_in_grid]],
+                 uint tid  [[thread_index_in_threadgroup]])
+{
+    device const uchar *idx = rec + p.idx_off;
+    device const half  *sc  = (device const half *)(rec + p.sc_off);
+    device const float *L   = lut + p.lut_off;
+    const uint row = tgid * 64 + tid;
+    if (row >= p.m) return;
+    float acc = 0.0f;
+    for (uint v = 0; v < p.nv; v++) {
+        device const float *b = L + (ulong)v * p.st * p.en;
+        device const uchar *ix = idx + ((ulong)tgid * p.nv + v) * 64 * p.st + tid * p.st;
+        acc += b[ix[0]] + b[p.en + ix[1]] + b[2 * p.en + ix[2]];
+    }
+    y[p.y_off + row] = acc * float(sc[row]);
+}
+
+/* Q3G, the path nothing ships but the loader still accepts. Kept scalar. */
+kernel void mvq3(device float             *y  [[buffer(0)]],
+                 device const uchar       *W  [[buffer(1)]],
+                 device const half        *ws [[buffer(2)]],
+                 device const float       *x  [[buffer(3)]],
+                 constant P               &p  [[buffer(4)]],
+                 uint  tgid [[threadgroup_position_in_grid]],
+                 uint  sgid [[simdgroup_index_in_threadgroup]],
+                 uint  lane [[thread_index_in_simdgroup]])
+{
+    const uint row = tgid * 8 + sgid;
+    if (row >= p.m) return;
+    device const uchar *W0 = W  + (ulong)row * p.rowbytes;
+    device const half  *sc = ws + (ulong)row * p.ng;
+    const uint gshift = (p.group == 128) ? 7u : uint(log2(float(p.group)) + 0.5f);
+    float acc = 0.0f;
+    for (uint i = lane; i < uint(p.in); i += 32) {
+        const ulong off = (ulong)i * 3;
+        const int b0 = int(W0[off >> 3]), b1 = int(W0[(off >> 3) + 1]);
+        const int v = ((b0 >> (off & 7)) | (b1 << (8 - (off & 7)))) & 7;
+        acc += float(v - 4) * x[i] * float(sc[i >> gshift]);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) y[row] = acc;
 }
 )MSL";
 
@@ -109,13 +202,23 @@ static struct {
     int ready;
     id<MTLDevice> dev;
     id<MTLCommandQueue> queue;
-    id<MTLComputePipelineState> mvq;
+    id<MTLComputePipelineState> mvq4, mvq8, mvq3, vq3r;
+    id<MTLBuffer> scratch_vq;
+    size_t scratch_vq_cap;
     mt_slot slot[MT_SLOTS];
     id<MTLBuffer> scratch_x, scratch_y;
     size_t scratch_x_cap, scratch_y_cap;
     size_t page;
 } g;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* WASTE_METAL_STATS=1: where the time in this file actually goes. Kept
+ * because "the GPU dispatch is slow" and "the call never reached the GPU"
+ * look identical from the outside. */
+double waste_metal_t_gpu, waste_metal_t_copy, waste_metal_t_wrap;
+unsigned long long waste_metal_n_gpu, waste_metal_n_fallback, waste_metal_bytes;
+static double mt_now(void)
+{ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec/1e9; }
 
 static size_t mt_hash(const void *p)
 {
@@ -163,61 +266,200 @@ static id<MTLBuffer> mt_scratch(__strong id<MTLBuffer> *slot, size_t *cap,
 
 /* ---- the kernel --------------------------------------------------------- */
 
-struct MtParams { int in; int ng; int group; int bits; unsigned rowbytes; };
+struct MtParams { int in; int ng; int group; int bits; unsigned rowbytes; unsigned m; };
+/* Mirrors struct VQP in the shader above, field for field. */
+struct MtVQP { unsigned m, nv, st, en, idx_off, sc_off, lut_off, y_off; };
 
 extern void waste_mvq_rows_f32(int b, int e, void *p);   /* CPU fallback */
 
 static void mvq_rows_f32_metal(int b, int e, void *p)
 {
     mvq_arg *a = (mvq_arg *)p;
+    id<MTLComputePipelineState> ps = a->bits == 4 ? g.mvq4
+                                   : a->bits == 8 ? g.mvq8 : g.mvq3;
+    /* uint4 / char4 loads want a row that is a whole number of vectors,
+     * and the caller's `in` must cover the row exactly. Anything else is
+     * the CPU's — cheaper than a special case in the shader for a shape no
+     * container this project converts produces. */
+    const int lanes = a->bits == 4 ? 32 : a->bits == 8 ? 4 : 1;
+    if (b != 0 || (a->bits != 3 && (a->rowbytes % (lanes / (a->bits == 4 ? 2 : 1)))) ||
+        (a->in % lanes)) {
+        waste_metal_n_fallback++;
+        waste_parallel_for(e - b, 64, waste_k.mvq_rows_cpu, p);
+        return;
+    }
+    const double t_enter = mt_now();
     pthread_mutex_lock(&g_mu);
     @autoreleasepool {
         id<MTLBuffer> bw = mt_wrap(a->W, (size_t)e * a->rowbytes);
         id<MTLBuffer> bs = mt_wrap(a->ws, (size_t)e * a->ng * sizeof(uint16_t));
-        if (!bw || !bs) {
-            pthread_mutex_unlock(&g_mu);
-            waste_mvq_rows_f32(b, e, p);
-            return;
-        }
-
-        const float *x = (const float *)a->xs;
         id<MTLBuffer> bx = mt_scratch(&g.scratch_x, &g.scratch_x_cap,
                                       (size_t)a->in * sizeof(float));
         id<MTLBuffer> by = mt_scratch(&g.scratch_y, &g.scratch_y_cap,
                                       (size_t)e * sizeof(float));
-        if (!bx || !by) {
+        if (!bw || !bs || !bx || !by) {
+            waste_metal_n_fallback++;
             pthread_mutex_unlock(&g_mu);
-            waste_mvq_rows_f32(b, e, p);
+            waste_parallel_for(e, 64, waste_k.mvq_rows_cpu, p);
             return;
         }
-        memcpy([bx contents], x, (size_t)a->in * sizeof(float));
+        waste_metal_t_wrap += mt_now() - t_enter;
+        const double t_c0 = mt_now();
+        memcpy([bx contents], (const float *)a->xs, (size_t)a->in * sizeof(float));
+        waste_metal_t_copy += mt_now() - t_c0;
 
         struct MtParams pr = { a->in, a->ng, a->group, a->bits,
-                               (unsigned)a->rowbytes };
+                               (unsigned)a->rowbytes, (unsigned)e };
         id<MTLCommandBuffer> cb = [g.queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        [enc setComputePipelineState:g.mvq];
+        [enc setComputePipelineState:ps];
         [enc setBuffer:by offset:0 atIndex:0];
         [enc setBuffer:bw offset:0 atIndex:1];
         [enc setBuffer:bs offset:0 atIndex:2];
         [enc setBuffer:bx offset:0 atIndex:3];
         [enc setBytes:&pr length:sizeof pr atIndex:4];
-        NSUInteger tg = 128;                    /* power of two, for the reduction */
-        if (tg > g.mvq.maxTotalThreadsPerThreadgroup)
-            tg = g.mvq.maxTotalThreadsPerThreadgroup;
-        [enc setThreadgroupMemoryLength:tg * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(e - b), 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)e + 7) / 8, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [enc endEncoding];
+        const double t_g0 = mt_now();
         [cb commit];
         [cb waitUntilCompleted];
-        memcpy(a->y + b, (const float *)[by contents] + b,
-               (size_t)(e - b) * sizeof(float));
+        waste_metal_t_gpu += mt_now() - t_g0;
+        waste_metal_n_gpu++;
+        waste_metal_bytes += (unsigned long long)e * a->rowbytes;
+        const double t_c1 = mt_now();
+        memcpy(a->y, (const float *)[by contents], (size_t)e * sizeof(float));
+        waste_metal_t_copy += mt_now() - t_c1;
     }
     pthread_mutex_unlock(&g_mu);
 }
 
+/* ---- the fused VQ3R apply ----------------------------------------------
+ *
+ * One command buffer, one *concurrent* compute encoder, one dispatch per
+ * job. Concurrency is the whole point and it had to be measured rather
+ * than assumed: N separate command buffers serialize (8 buffers of 6144
+ * rows measure 41 GB/s against one grid of 49152 at 127), while N
+ * dispatches inside one concurrent encoder do not (16 of 3072 rows measure
+ * 126). tools/metalbw.m carries both tables.
+ *
+ * Each job binds its own record — an expert lives in its own cache slot,
+ * page-aligned because O_DIRECT already needed it — and its own LUT
+ * offset. Outputs go to one device scratch buffer and are copied back
+ * together, which is 200 KB a layer.
+ */
+int waste_metal_vq3r(const waste_vq_job *jobs, int n)
+{
+    if (!g.ready || g.ready < 0 || n <= 0) return -1;
+    int rc = -1;
+    pthread_mutex_lock(&g_mu);
+    @autoreleasepool {
+        size_t ytotal = 0;
+        for (int i = 0; i < n; i++) ytotal += (size_t)jobs[i].m;
+        id<MTLBuffer> by = mt_scratch(&g.scratch_vq, &g.scratch_vq_cap,
+                                      ytotal * sizeof(float));
+        if (!by) { pthread_mutex_unlock(&g_mu); return -1; }
+
+        id<MTLCommandBuffer> cb = [g.queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc =
+            [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        [enc setComputePipelineState:g.vq3r];
+        [enc setBuffer:by offset:0 atIndex:0];
+        unsigned yoff = 0;
+        int ok = 1;
+        for (int i = 0; i < n; i++) {
+            const waste_vq_job *j = &jobs[i];
+            id<MTLBuffer> br = mt_wrap(j->rec, j->rec_bytes);
+            id<MTLBuffer> bl = mt_wrap(j->lut, j->lut_bytes);
+            if (!br || !bl) { ok = 0; break; }
+            struct MtVQP p = { (unsigned)j->m, (unsigned)j->nv, (unsigned)j->stages,
+                             (unsigned)j->entries, j->idx_off, j->sc_off,
+                             j->lut_off, yoff };
+            [enc setBuffer:br offset:0 atIndex:1];
+            [enc setBuffer:bl offset:0 atIndex:2];
+            [enc setBytes:&p length:sizeof p atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((j->m + 63) / 64), 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            yoff += (unsigned)j->m;
+        }
+        [enc endEncoding];
+        if (ok) {
+            [cb commit];
+            [cb waitUntilCompleted];
+            const float *src = (const float *)[by contents];
+            for (int i = 0; i < n; i++) {
+                memcpy(jobs[i].y, src, (size_t)jobs[i].m * sizeof(float));
+                src += jobs[i].m;
+            }
+            rc = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+    return rc;
+}
+
 /* ---- registration ------------------------------------------------------- */
+
+void waste_metal_selftest(void)
+{
+    if (!g.ready || g.ready < 0) return;
+
+        @autoreleasepool {
+            const unsigned M = 12288, K = 7168, G = 128, ng = K/G, rb = K/2;
+            const size_t wb = (size_t)M * rb;
+            const int NC = 32;
+            NSMutableArray *drv = [NSMutableArray array], *noc = [NSMutableArray array];
+            NSMutableArray *sdrv = [NSMutableArray array], *snoc = [NSMutableArray array];
+            for (int i = 0; i < NC; i++) {
+                id<MTLBuffer> a1 = [g.dev newBufferWithLength:wb options:MTLResourceStorageModeShared];
+                id<MTLBuffer> a2 = [g.dev newBufferWithLength:(size_t)M*ng*2 options:MTLResourceStorageModeShared];
+                memset(a1.contents, 0x37 + i, wb); memset(a2.contents, 0x38, (size_t)M*ng*2);
+                [drv addObject:a1]; [sdrv addObject:a2];
+                void *hp = NULL, *sp = NULL;
+                if (posix_memalign(&hp, g.page ? g.page : 16384, (wb + 16383) & ~(size_t)16383) ||
+                    posix_memalign(&sp, g.page ? g.page : 16384, ((size_t)M*ng*2 + 16383) & ~(size_t)16383))
+                    continue;
+                memset(hp, 0x37 + i, wb); memset(sp, 0x38, (size_t)M*ng*2);
+                [noc addObject:[g.dev newBufferWithBytesNoCopy:hp length:(wb + 16383) & ~(size_t)16383
+                                                      options:MTLResourceStorageModeShared deallocator:nil]];
+                [snoc addObject:[g.dev newBufferWithBytesNoCopy:sp length:((size_t)M*ng*2 + 16383) & ~(size_t)16383
+                                                       options:MTLResourceStorageModeShared deallocator:nil]];
+            }
+            id<MTLBuffer> X = [g.dev newBufferWithLength:K*4 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> Y = [g.dev newBufferWithLength:M*4 options:MTLResourceStorageModeShared];
+            float *hostx = (float *)malloc(K*4); float *hosty = (float *)malloc(M*4);
+            struct MtParams pr = { (int)K, (int)ng, (int)G, 4, rb, M };
+            const char *nm[4] = { "driver buf, reused ", "driver buf, 32 rot ",
+                                  "nocopy host, 32 rot", "nocopy + x/y memcpy" };
+            for (int mode = 0; mode < 4; mode++) {
+                if (mode >= 2 && noc.count < (NSUInteger)NC) continue;
+                double best = 1e18, sum = 0;
+                const int R = 64;
+                for (int r = 0; r < R; r++) {
+                    const int c = (mode == 0) ? 0 : r % NC;
+                    id<MTLBuffer> BW = (mode >= 2) ? noc[c] : drv[c];
+                    id<MTLBuffer> BS = (mode >= 2) ? snoc[c] : sdrv[c];
+                    const double t0 = mt_now();
+                    if (mode == 3) memcpy(X.contents, hostx, K*4);
+                    id<MTLCommandBuffer> cb = [g.queue commandBuffer];
+                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                    [enc setComputePipelineState:g.mvq4];
+                    [enc setBuffer:Y offset:0 atIndex:0]; [enc setBuffer:BW offset:0 atIndex:1];
+                    [enc setBuffer:BS offset:0 atIndex:2]; [enc setBuffer:X offset:0 atIndex:3];
+                    [enc setBytes:&pr length:sizeof pr atIndex:4];
+                    [enc dispatchThreadgroups:MTLSizeMake(M/8,1,1)
+                        threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                    [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                    if (mode == 3) memcpy(hosty, Y.contents, M*4);
+                    const double dt = mt_now() - t0;
+                    if (dt < best) best = dt; if (r >= 8) sum += dt;
+                }
+                fprintf(stderr, "waste: metal selftest %s  mean %.3f ms %6.1f GB/s  best %6.1f GB/s\n",
+                        nm[mode], sum/(R-8)*1e3, wb/(sum/(R-8))/1e9, wb/best/1e9);
+            }
+            free(hostx); free(hosty);
+        }
+    }
 
 const char *waste_register_metal(waste_kernels *t)
 {
@@ -243,10 +485,16 @@ const char *waste_register_metal(waste_kernels *t)
             pthread_mutex_unlock(&g_mu);
             return NULL;
         }
-        id<MTLFunction> fn = [lib newFunctionWithName:@"mvq_f32"];
-        g.mvq = [g.dev newComputePipelineStateWithFunction:fn error:&err];
+        g.mvq4 = [g.dev newComputePipelineStateWithFunction:
+                     [lib newFunctionWithName:@"mvq4"] error:&err];
+        g.mvq8 = [g.dev newComputePipelineStateWithFunction:
+                     [lib newFunctionWithName:@"mvq8"] error:&err];
+        g.mvq3 = [g.dev newComputePipelineStateWithFunction:
+                     [lib newFunctionWithName:@"mvq3"] error:&err];
+        g.vq3r = [g.dev newComputePipelineStateWithFunction:
+                     [lib newFunctionWithName:@"vq3r"] error:&err];
         g.queue = [g.dev newCommandQueue];
-        if (!g.mvq || !g.queue) {
+        if (!g.mvq4 || !g.mvq8 || !g.mvq3 || !g.vq3r || !g.queue) {
             g.ready = -1;
             pthread_mutex_unlock(&g_mu);
             return NULL;
@@ -254,8 +502,18 @@ const char *waste_register_metal(waste_kernels *t)
         g.page = (size_t)getpagesize();
         g.ready = 1;
     }
+    /* WASTE_METAL_SELFTEST=1 runs the same kernel on a buffer this file
+     * allocated, inside the process that is about to use it. It answers the
+     * one question the standalone benchmark cannot: whether a dispatch that
+     * measures 0.33 ms on its own measures 0.33 ms here. */
+    if (getenv("WASTE_METAL_SELFTEST")) waste_metal_selftest();
     t->mvq_rows_f32 = mvq_rows_f32_metal;
     t->on_device = 1;      /* one dispatch for the whole range, not per thread */
+    /* A command buffer costs about 11 us to commit and wait for on this
+     * machine (tools/metalbw.m). Six threads of NEON clear a megabyte of
+     * Q4G in well under that, so anything smaller stays on the pool. */
+    { const char *e = getenv("WASTE_METAL_MIN_KB");
+      t->device_min_bytes = (size_t)(e ? atoi(e) : 1024) << 10; }
     pthread_mutex_unlock(&g_mu);
     return "Metal";
 }

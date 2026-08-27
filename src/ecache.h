@@ -101,6 +101,8 @@ typedef struct {
     int held[WASTE_PF_MAX];
     int n_held;
     uint64_t purged;                 /* slots the kernel reclaimed         */
+    uint64_t filled;                 /* records the background fill read   */
+    int fill_cursor;                 /* first slot it has not looked at    */
 } waste_ecache;
 
 /* O_DIRECT requires the destination buffer to be aligned to the device's
@@ -182,6 +184,42 @@ void waste_ecache_io_stop(waste_ecache *c);
  * For a router that wants to prefer experts it already has (arXiv:2412.00099).
  */
 void waste_ecache_resident_mask(waste_ecache *c, int layer, int n, uint8_t *out);
+
+/* "Is every one of these already here?" — the same question as the mask
+ * above, asked about a named handful instead of a whole layer, and answered
+ * in n hash lookups rather than num_experts of them.
+ *
+ * It exists because a scheduling decision depends on it. Holding K records
+ * before doing any arithmetic is a barrier against the read-ahead, which is
+ * a regression when the records are still on their way and free
+ * parallelism when they are already in RAM. READY only, for the same reason
+ * the mask says: INFLIGHT is a read that has not landed. */
+int waste_ecache_resident_all(waste_ecache *c, int layer, const int *ids, int n);
+
+/* ---- filling a cache that can hold everything ---------------------------
+ *
+ * When the budget holds every expert the container has, the demand stream
+ * still discovers them one record at a time: 200 tokens of Kimi-Linear read
+ * 13.2 GB of a 16.5 GB bank as 3443 separate misses, spread over minutes,
+ * and until a record has been asked for once it is not there. Nothing about
+ * that is necessary — the slot is already allocated and the read is going to
+ * happen anyway.
+ *
+ * `admit` is the other way in: it puts a record into an EMPTY slot and does
+ * nothing else. It never evicts, never claims the slot for a caller, and
+ * never counts a hit or a miss — the demand hit rate has to keep meaning
+ * what it meant. Its bytes are counted, because they are real reads.
+ *
+ * The caller enumerates: the bank layout lives in the model, not here. It
+ * is worth doing only when every record fits, which is also the only case
+ * where "put anything in an empty slot" cannot displace something better.
+ *
+ * Returns 1 when a record was read, 0 when there was nothing to do (already
+ * resident or on its way, or no empty slot left), -1 on a failed read.
+ * Requires the reader threads: without them there is no lock to publish
+ * under and no condition for a waiting demand read to be woken on. */
+int waste_ecache_admit(waste_ecache *c, int layer, int expert,
+                       waste_fetch_fn fetch, void *user);
 
 void waste_ecache_hint(waste_ecache *c, int layer, const int *ids, int n);
 

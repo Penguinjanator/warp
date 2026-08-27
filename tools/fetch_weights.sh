@@ -13,7 +13,10 @@
 #   - each shard is retried with exponential backoff and jitter, and so is
 #     every small file the repo's own listing names — a file that exists and
 #     was not fetched is a failure, not a 404;
-#   - a shard counts as done only when its size matches Content-Length,
+#   - a shard counts as done only when its size matches Content-Length, and
+#     one that is *longer* than Content-Length is deleted rather than
+#     resumed — `-C -` would ask for a range past the end and burn every
+#     retry on it;
 #     and completed shards are recorded in a state file so re-runs skip
 #     them without even a HEAD request;
 #   - free space is checked before starting and again before every shard,
@@ -363,6 +366,18 @@ for try in \$(seq 1 \$max_retry); do
         echo "\$f" >> "\$state"
         say "ok   \$f (\$((got/1048576)) MB)"
         exit 0
+    fi
+
+    # A file LONGER than the shard is not a partial download of it, and
+    # -C - cannot fix it: the range it asks for starts past the end, every
+    # retry fails the same way, and the run gives up on a shard whose bytes
+    # are all on the CDN. Seen for real — killing this script mid-shard and
+    # restarting it left 9.03 GB where the shard is 5.36 GB, and 8 retries
+    # went into resuming from an offset that does not exist. Start clean.
+    if [ -n "\$want" ] && [ "\$got" -gt "\$want" ]; then
+        say "\$f is \$((got/1048576)) MB against \$((want/1048576)) MB, restarting from zero"
+        rm -f "\$dest/\$f"
+        got=0
     fi
 
     [ "\$got" -gt 0 ] && say "resume \$f at \$((got/1048576)) MB (try \$try)" \\

@@ -102,12 +102,23 @@ class TestLoad(Base):
                      contains='no "user" turn')
 
     def test_a_turn_that_never_ends_is_refused(self):
-        """No control token in the assistant suffix: every reply would run
-        to max_tokens and report finish_reason 'length'."""
+        """No control token in the assistant suffix and no "stop": every
+        reply would run to max_tokens and report finish_reason 'length'."""
         self.refuses({"user": ["<|im_user|>", "<|im_end|>"],
                       "assistant": ["<|im_assistant|>", "\n"],
                       "open": "<|im_assistant|>"},
-                     contains="nothing would end a generated turn")
+                     contains="ends a generated turn")
+
+    def test_a_stop_of_its_own_ends_the_turn(self):
+        """A format whose turns end because the next role marker begins —
+        GLM writes `<|assistant|>answer` then `<|user|>next question` — has
+        no suffix to close them with, and says so in "stop"."""
+        fmt = self.load({"user": ["<|im_user|>", ""],
+                         "assistant": ["<|im_assistant|>", ""],
+                         "open": "<|im_assistant|>",
+                         "stop": "<|im_user|>"})
+        self.assertEqual(fmt.stop_marker, "<|im_user|>")
+        self.assertIn(fmt.stop_id, fmt.markers)
 
     def test_a_role_pair_must_be_two_strings(self):
         self.refuses({"user": ["<|im_user|>"], "open": "<|im_assistant|>"},
@@ -189,7 +200,7 @@ class TestRender(Base):
                                                   "arguments": "{}"}}]}])
 
     def test_an_image_part(self):
-        self.refuses("cannot place one", [{"role": "user", "content": [
+        self.refuses("does not say how to place one", [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": "data:,"}}]}])
 
     def test_a_role_the_template_does_not_describe(self):
@@ -251,6 +262,134 @@ class TestPlainParser(unittest.TestCase):
         self.feed(p, [(1001, "h")])
         self.assertEqual(p.reasoning, "")
         self.assertEqual(p.tool_calls, [])
+
+
+# The three things a Kimi format does not need and GLM-5.3-Flash does. Each
+# is here because the format could not otherwise be written down, and each
+# fails quietly when it is missing: no prelude and the model is addressed in
+# a format it was not trained on; no stop and the reply runs into the next
+# turn; no think pair and the model's scratch work is returned as the answer.
+GLM_JSON = {
+    "prelude": "<|im_system|>",
+    "system": ["<|im_system|>", ""],
+    "user": ["<|im_user|>", ""],
+    "assistant": ["<|im_assistant|>", ""],
+    "open": "<|im_assistant|>",
+    "think": ["<|im_middle|>", "<|im_end|>"],
+    "stop": "<|im_user|>",
+    "effort": "<|im_system|>Reasoning Effort: {}",
+}
+
+
+class TestThinkChannel(Base):
+    """A chat.json that carries a prelude, a reasoning channel and a stop.
+
+    The markers are the fake tokenizer's rather than GLM's, because what is
+    under test is the format machinery and not the vocabulary; GLM's own
+    file is examples/chat-glm53.json and the converter installs it.
+    """
+
+    def fmt(self, **over):
+        return self.load({**GLM_JSON, **over})
+
+    def rendered(self, fmt, **kw):
+        return "".join(seg.text for seg in fmt.build_chat_segments(
+            [{"role": "user", "content": "hi"}], **kw))
+
+    def test_the_prelude_opens_the_conversation(self):
+        out = self.rendered(self.fmt(), thinking=True)
+        self.assertTrue(out.startswith("<|im_system|><|im_user|>hi"), out)
+
+    def test_the_generation_prompt_opens_the_channel(self):
+        out = self.rendered(self.fmt(), thinking=True)
+        self.assertTrue(out.endswith("<|im_assistant|><|im_middle|>"), out)
+
+    def test_the_effort_is_a_turn_of_its_own(self):
+        out = self.rendered(self.fmt(), thinking=True, thinking_effort="high")
+        self.assertIn("Reasoning Effort: High", out)
+
+    def test_an_effort_the_format_cannot_express_is_refused(self):
+        fmt = self.fmt(effort="")
+        with self.assertRaises(ChatFormatError) as cm:
+            self.rendered(fmt, thinking=True, thinking_effort="high")
+        self.assertIn("reasoning effort", str(cm.exception))
+
+    def test_a_format_that_always_thinks_cannot_be_asked_not_to(self):
+        """GLM's template has no path that leaves the channel closed, and
+        answering with it closed puts a stray close marker in the reply."""
+        with self.assertRaises(ChatFormatError) as cm:
+            self.rendered(self.fmt(), thinking=False)
+        self.assertIn("always opens a reasoning channel", str(cm.exception))
+
+    def test_the_stop_is_the_next_role_marker(self):
+        fmt = self.fmt()
+        self.assertEqual(fmt.stop_marker, "<|im_user|>")
+
+    def test_markup_the_tokenizer_lacks_is_refused_in_every_field(self):
+        for field, value in (("prelude", "<|nope|>"),
+                             ("think", ["<|nope|>", "<|im_end|>"]),
+                             ("effort", "<|nope|>{}")):
+            with self.assertRaises(ChatFormatError, msg=field):
+                self.fmt(**{field: value})
+
+    def test_think_must_be_a_pair(self):
+        self.refuses({**GLM_JSON, "think": ["<|im_middle|>"]},
+                     contains="[open, close]")
+
+    def test_the_reply_splits_into_reasoning_and_content(self):
+        fmt = self.fmt()
+        p = PlainParser(markers=fmt.markers,
+                        think_close_id=fmt.think_close_id, in_think=True)
+        for tid, piece in [(1001, "weigh"), (1002, "ing"),
+                           (fmt.think_close_id, ""), (1003, "Rome")]:
+            p.feed_token(tid, piece)
+        self.assertEqual(p.reasoning, "weighing")
+        self.assertEqual(p.content, "Rome")
+        self.assertEqual(p.openai_message(),
+                         {"role": "assistant", "content": "Rome",
+                          "reasoning_content": "weighing"})
+
+    def test_the_close_marker_belongs_to_neither_channel(self):
+        fmt = self.fmt()
+        p = PlainParser(markers=fmt.markers,
+                        think_close_id=fmt.think_close_id, in_think=True)
+        d = p.feed_token(fmt.think_close_id, "<|im_end|>")
+        self.assertEqual((d.reasoning, d.content), ("", ""))
+        self.assertFalse(p.finished)
+
+    def test_an_image_is_placed_when_the_format_names_a_block(self):
+        """The block is markup and the caller's bytes went to the tower, so
+        nothing of the image reaches the tokenizer as text."""
+        fmt = self.fmt(image="<|im_middle|>")
+        segs = fmt.build_chat_segments(
+            [{"role": "user", "content": [
+                {"type": "text", "text": "what is this"},
+                {"type": "image_url", "image_url": {"url": "data:,"}}]}],
+            thinking=True, image_prompts=["<|im_middle|>"])
+        img = [s for s in segs if s.text == "<|im_middle|>" and s.markup]
+        self.assertEqual(len(img), 2)      # the block, and the think opener
+        self.assertIn("what is this", "".join(s.text for s in segs))
+
+    def test_more_images_encoded_than_placed_is_refused(self):
+        fmt = self.fmt(image="<|im_middle|>")
+        with self.assertRaises(ChatFormatError) as cm:
+            fmt.build_chat_segments(
+                [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "data:,"}}]}],
+                thinking=True, image_prompts=["<|im_middle|>", "<|im_middle|>"])
+        self.assertIn("more images were encoded", str(cm.exception))
+
+    def test_the_stop_still_ends_the_turn_from_inside_the_channel(self):
+        """A reply that hits the stop before closing its reasoning is
+        truncated, not an exception: what it managed to think is returned."""
+        fmt = self.fmt()
+        p = PlainParser(markers=fmt.markers,
+                        think_close_id=fmt.think_close_id, in_think=True)
+        p.feed_token(1001, "half a thou")
+        p.feed_token(fmt.stop_id, "<|im_user|>")
+        self.assertTrue(p.finished)
+        self.assertEqual(p.reasoning, "half a thou")
+        self.assertIsNone(p.openai_message()["content"])
 
 
 if __name__ == "__main__":

@@ -171,6 +171,126 @@ CONFIG_ALIASES = (
 CONFIG_FLAG_ALIASES = (("moe_renormalize", "norm_topk_prob"),)
 
 
+def is_glm(cfg):
+    """GLM-5.3-Flash, by the name it gives itself.
+
+    Same shape as the rest of this family — KDA layers interleaved with MLA,
+    a sigmoid/top-k router over per-layer expert banks — plus three things
+    no Kimi container has: mHC residual streams, a clamped SwiGLU, and the
+    DSA k-pool indexer on the full-attention layers. All three are config
+    keys the engine reads directly, so what this needs from the converter is
+    the two places where GLM states the same thing differently."""
+    hf = ((cfg.get("_outer", {}).get("architectures")
+           or cfg.get("architectures") or [""]))[0]
+    return "Glm5Next" in hf or str(cfg.get("model_type", "")).startswith("glm5")
+
+
+def glm_normalise(out):
+    """The GLM-specific half of normalise_cfg, in place.
+
+    Two conversions, and the first is the dangerous one. GLM states its
+    layer mix in `layer_types`, and its `linear_attn_config.kda_layers` is
+    **0-based** where Kimi's — the one the engine reads — is 1-based. Copied
+    through unchanged it puts KDA on the wrong layers and MLA on the rest:
+    every tensor is found, every shape checks out, and the answer is noise.
+    So it is rebuilt from layer_types, which is unambiguous, rather than
+    shifted by one and hoped for."""
+    types = out.get("layer_types")
+    if types:
+        lac = dict(out.get("linear_attn_config") or {})
+        lac["kda_layers"] = [i + 1 for i, t in enumerate(types)
+                             if t == "linear_attention"]
+        lac["full_attn_layers"] = [i + 1 for i, t in enumerate(types)
+                                   if t != "linear_attention"]
+        out["linear_attn_config"] = lac
+    # `eos_token_id` is a list of three on GLM — end-of-text plus the two
+    # turn markers. The engine's config holds one id, and it is the one a
+    # plain continuation should stop on; the chat stops belong to the chat
+    # format, not to the model config.
+    eos = out.get("eos_token_id")
+    if isinstance(eos, list) and eos:
+        out["eos_token_id"] = eos[0]
+    return out
+
+
+def source_prefixes(cfg):
+    """(container tensor_prefix, checkpoint layer prefix, inner config).
+
+    Two prefixes, because they are two different things and this family
+    spells them three ways:
+
+        Kimi-Linear   model.layers.N.…                  prefix ""
+        Kimi K3       language_model.model.layers.N.…   prefix "language_model."
+        GLM-5.3       model.language_model.layers.N.…   prefix ""
+
+    `src_pfx` is what the *checkpoint* puts before `layers.N` and is used to
+    find the experts; `prefix` is what the engine puts before `model.` and
+    is what the container publishes. They differ by more than a string on
+    GLM, where the two components are nested the other way round and no
+    prefix can reconcile them — see glm_rename.
+
+    Returns the inner config too, since the same test decides whether there
+    is a wrapper to unwrap at all."""
+    prefix, src_pfx = "", "model."
+    if "text_config" in cfg:                 # K3 and GLM nest the text model
+        cfg = {**cfg["text_config"], "_outer": {k: v for k, v in cfg.items()
+                                                if k != "text_config"}}
+        if is_glm(cfg):
+            src_pfx = "model.language_model."
+        else:
+            prefix, src_pfx = "language_model.", "language_model.model."
+    return prefix, src_pfx, cfg
+
+
+def glm_rename(name):
+    """GLM wraps the text model the other way round from K3.
+
+        K3    language_model.model.layers.N.…   language_model.lm_head.weight
+        GLM   model.language_model.layers.N.…   lm_head.weight
+
+    Same two components, opposite order, and `lm_head` outside the wrapper
+    on one and inside it on the other. The engine looks up
+    `{tensor_prefix}model.layers.N.…`, so K3's spelling is a prefix away
+    from it and GLM's is not: nothing would be found, every tensor would
+    read as absent, and the load would refuse a container that in fact
+    holds every weight.
+
+    So GLM's container is prefix-less and the wrapper is dropped here.
+    There is nothing left for a prefix to disambiguate — the vision tower
+    is not carried (see glm_drop_trunk) — and `lm_head.weight` is already
+    where a prefix-less container wants it."""
+    pfx = "model.language_model."
+    if name.startswith(pfx):
+        return "model." + name[len(pfx):]
+    # The tower goes under the name src/vision.c looks it up by, which is
+    # the one K3 established. Same reason as above: the engine's lookup is a
+    # fixed string, and a container that spells it differently holds weights
+    # nothing will ever ask for.
+    vis = "model.visual."
+    if name.startswith(vis):
+        return "vision_tower." + name[len(vis):]
+    return name
+
+
+def glm_drop_trunk(src_pfx, n_layers):
+    """Which of GLM's trunk tensors this container has no reader for.
+
+    Only the MTP layer, now: `num_nextn_predict_layers` puts one at index
+    num_hidden_layers, and it is a speculative-decoding head rather than
+    part of the forward pass.
+
+    Dropped rather than carried, because the trunk is resident for the life
+    of the process and a tensor nothing reads is RAM taken from the expert
+    cache. The vision tower is carried — it has a reader now — and is
+    loaded only when a caller asks for it, on the same terms as K3's."""
+    mtp = re.compile(re.escape(src_pfx) + r"layers\.(\d+)\.")
+
+    def drop(name):
+        m = mtp.match(name)
+        return bool(m) and int(m.group(1)) >= n_layers
+    return drop
+
+
 def normalise_cfg(cfg):
     """A copy of the HF config with MoE keys under the names the engine reads."""
     out = dict(cfg)
@@ -180,13 +300,19 @@ def normalise_cfg(cfg):
     for canon, hf in CONFIG_FLAG_ALIASES:
         if canon not in out and out.get(hf):
             out[canon] = True
+    if is_glm(cfg):
+        glm_normalise(out)
     return out
 
 
-def moe_layout(st, prefix, layer):
-    """Which of MOE_LAYOUTS this checkpoint uses, from what is actually on disk."""
+def moe_layout(st, src_pfx, layer):
+    """Which of MOE_LAYOUTS this checkpoint uses, from what is actually on disk.
+
+    `src_pfx` is everything the checkpoint puts before `layers.N` — which is
+    not the container's tensor_prefix plus "model.", because GLM nests the
+    two the other way round (see glm_rename)."""
     for name, seg, tags in MOE_LAYOUTS:
-        probe = f"{prefix}model.layers.{layer}.{seg}.experts.0.{tags[0]}.weight"
+        probe = f"{src_pfx}layers.{layer}.{seg}.experts.0.{tags[0]}.weight"
         if st.have(probe) or st.have(probe + "_packed"):
             return name, seg, tuple(zip(KIND_ORDER, tags))
     return None, None, None
@@ -701,7 +827,7 @@ def convert_layer(job):
     file and separate codebook file. The parent decides the base — from the
     published manifest, from an existing bank's own records, or new after
     the published record count — and never renumbers a bank that exists."""
-    (L, src, out, prefix, n_exp, stages, entries, index_bits, device,
+    (L, src, out, src_pfx, n_exp, stages, entries, index_bits, device,
      cb_sample, cb_base, cached_ok) = job
     import time as _t
     bank = os.path.join(out, f"experts-L{L}.bin")
@@ -716,12 +842,12 @@ def convert_layer(job):
     st = ST(src)
     dev = torch.device(device)
 
-    lname, seg, kinds = moe_layout(st, prefix, L)
+    lname, seg, kinds = moe_layout(st, src_pfx, L)
     if lname is None:
         return (L, 0, cb_base, "missing")
 
     def ename(e, tag):
-        return f"{prefix}model.layers.{L}.{seg}.experts.{e}.{tag}.weight"
+        return f"{src_pfx}layers.{L}.{seg}.experts.{e}.{tag}.weight"
 
     t0 = _t.time()
     shapes = [tuple(st.tensor(ename(0, tag)).shape) for _, tag in kinds]
@@ -764,7 +890,23 @@ def convert_layer(job):
 
 
 
-def build_trunk(args, sr, st, existing, manifest_path):
+def glm_flatten(name, t):
+    """The tower's convolutions, as the matrices the engine reads.
+
+    `patch_embed.proj` is a Conv3d and ships as [1024, 3, 2, 14, 14];
+    `downsample` is a Conv2d at [4096, 1024, 2, 2]. Both are applied as a
+    matmul over everything but the first axis, and the container's tensor
+    header holds four dimensions — a five-dimensional shape is refused at
+    load, with an I/O error and no clue as to which tensor. So they are
+    written flat, in the weight's own axis order, which is the order both
+    src/vision.c and tools/glm_vision_ref.py flatten to."""
+    if name.startswith("vision_tower.") and t.dim() > 2:
+        return t.reshape(t.shape[0], -1)
+    return t
+
+
+def build_trunk(args, sr, st, existing, manifest_path, drop=None, rename=None,
+                reshape=None):
     """Write trunk.bin.tmp and return its index, or None if the run must stop.
 
     A function rather than a stretch of main() because --reclaim has to run
@@ -806,12 +948,27 @@ def build_trunk(args, sr, st, existing, manifest_path):
         # interval.
         with open(trunk_tmp, "wb") as tf:
             for name in sorted(sr.names()):
-                if ".experts." in name or name.endswith(("_packed", "_scale")):
+                # The companions of a quantized weight, not anything whose
+                # name happens to end in "_scale": GLM ships a real learned
+                # parameter called `hc_attn_scale`, and the old suffix test
+                # dropped all 90 of them — the container converted, and the
+                # load then refused it for a missing tensor after an hour.
+                # Every companion in this family is a `.weight` plus a
+                # suffix (K3's weight_packed/weight_scale, fp8's
+                # weight_scale_inv), so match that and nothing else.
+                if ".experts." in name or name.endswith(
+                        (".weight_packed", ".weight_scale", ".weight_scale_inv")):
+                    continue
+                if drop and drop(name):
                     continue
                 if not st.have(name):
                     continue                  # shard not downloaded yet
                 t = st.tensor(name)
+                if rename:
+                    name = rename(name)
                 name = trunk_rename(name, _trunk_seg)
+                if reshape:
+                    t = reshape(name, t)
                 off = tf.tell()
                 if t.dim() == 1 or t.numel() < 1 << 16:
                     tf.write(raw_bytes(t.float()))
@@ -822,8 +979,14 @@ def build_trunk(args, sr, st, existing, manifest_path):
                     # 4 bits for the bulk; the embedding table and the output
                     # head keep 8, they are small and sit at both ends of the
                     # network where error is least forgiving
+                    # 8 bits at the ends of the network, and at the mHC
+                    # mapping: its 24 outputs decide how the residual
+                    # streams mix for the whole layer, so an error there is
+                    # not one weight's worth. Together they are 34 MB on
+                    # GLM against the 4-bit alternative's 8.
                     big = not (name.endswith("embed_tokens.weight")
-                               or name.endswith("lm_head.weight"))
+                               or name.endswith("lm_head.weight")
+                               or ".hc_attn_" in name or ".hc_ffn_" in name)
                     bits = 8 if (args.trunk8 or not big) else args.trunk_bits
                     if bits == 3:
                         q, sc, shape = quantize_q3g(t); fmt = FMT_Q3G
@@ -919,11 +1082,7 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     cfg = json.load(open(os.path.join(args.src, "config.json")))
-    prefix = ""
-    if "text_config" in cfg:                     # K3 nests the text model
-        cfg = {**cfg["text_config"], "_outer": {k: v for k, v in cfg.items()
-                                                if k != "text_config"}}
-        prefix = "language_model."
+    prefix, src_pfx, cfg = source_prefixes(cfg)
     st = ST(args.src)
     sr = ShardReader(args.src)
     dev = torch.device(args.device)
@@ -997,6 +1156,27 @@ def main():
     n_layers = cfg["num_hidden_layers"]
     n_exp = cfg.get("num_experts") or cfg.get("n_routed_experts")
     print(f"prefix {prefix!r}  layers {n_layers}  experts {n_exp}")
+
+    # ---- what this converter refuses to guess at, on GLM -----------------
+    glm = is_glm(cfg)
+    drop_trunk = None
+    if glm:
+        # Cross-layer top-k sharing: a "shared" indexer layer reuses the
+        # previous full layer's selection instead of running an indexer of
+        # its own. GLM-5.3-Flash ships all-"full", the engine implements
+        # only that, and a container converted from a mixed release would
+        # attend over a selection nothing computed. Refuse rather than
+        # produce it.
+        shared = [i for i, t in enumerate(cfg.get("indexer_types") or [])
+                  if t != "full"]
+        if shared:
+            print(f"this release shares DSA top-k across layers "
+                  f"({len(shared)} of {n_layers} are not 'full'), which the "
+                  f"engine does not implement — see docs/GLM.md",
+                  file=sys.stderr)
+            return 1
+
+        drop_trunk = glm_drop_trunk(src_pfx, n_layers)
     first_dense = cfg.get("first_k_dense_replace", 0)
     if args.experts:
         n_exp = min(n_exp, args.experts)
@@ -1035,14 +1215,14 @@ def main():
     # which would be a corrupt source rather than a shape to support.
     _lname, _seg, _kinds = (None, None, None)
     for _L in range(n_layers):
-        _lname, _seg, _kinds = moe_layout(st, prefix, _L)
+        _lname, _seg, _kinds = moe_layout(st, src_pfx, _L)
         if _lname:
             break
     if _lname is None:
         _seg, _kinds = MOE_LAYOUTS[0][1], KINDS
 
     def ename(L, e, tag):
-        return f"{prefix}model.layers.{L}.{_seg}.experts.{e}.{tag}.weight"
+        return f"{src_pfx}layers.{L}.{_seg}.experts.{e}.{tag}.weight"
 
     n_cb_per_layer = 3 * args.stages
     next_base = old_books
@@ -1085,7 +1265,7 @@ def main():
                 next_base += n_cb_per_layer
         elif base + n_cb_per_layer > next_base:
             next_base = base + n_cb_per_layer
-        jobs.append((L, args.src, args.out, prefix, n_exp, args.stages,
+        jobs.append((L, args.src, args.out, src_pfx, n_exp, args.stages,
                      args.entries, args.index_bits, str(dev), args.cb_sample,
                      base, cached_ok))
 
@@ -1096,7 +1276,9 @@ def main():
         # writes trunk.bin.tmp either way and the published trunk.bin is
         # still only replaced together with the manifest, so nothing about
         # what this run can survive changes — only the order.
-        tindex = build_trunk(args, sr, st, existing, manifest_path)
+        tindex = build_trunk(args, sr, st, existing, manifest_path, drop_trunk,
+                             glm_rename if glm else None,
+                             glm_flatten if glm else None)
         if tindex is None:
             return 1
         reclaim(debt, args.reclaim, ShardDebt.TRUNK, "trunk")
@@ -1192,12 +1374,30 @@ def main():
 
 
     # ---- tokenizer: copy it in so the container is self-contained -------
+    tok_specials = []
+    copied_tok = False
     for name in ("tiktoken.model", "tokenizer.model"):
         src_tok = os.path.join(args.src, name)
         if os.path.exists(src_tok):
             atomic_copyfile(src_tok, os.path.join(args.out, "tokenizer.model"))
             print(f"tokenizer: copied {name}")
+            copied_tok = True
             break
+    # A release with no tiktoken rank file but a `tokenizers` tokenizer.json
+    # — GLM's shape. Re-encoded rather than copied, and refused rather than
+    # approximated when its pattern or its merge order is not the one
+    # src/tokenizer.c implements. See tools/hf_tokenizer.py.
+    if not copied_tok and os.path.exists(os.path.join(args.src, "tokenizer.json")):
+        import hf_tokenizer
+        text, han_split, tok_specials = hf_tokenizer.convert(args.src)
+        atomic_text(os.path.join(args.out, "tokenizer.model"), text)
+        # The engine defaults to the Kimi pattern, so only the other case is
+        # written — and it is written, not inferred at load: the difference
+        # is one token on "A股" and shows up nowhere as an error.
+        if not han_split:
+            cfg["tokenizer_han_split"] = False
+        print(f"tokenizer: re-encoded tokenizer.json"
+              f"{'' if han_split else ' (no Han branch in its pattern)'}")
 
     # ---- special tokens --------------------------------------------------
     # tiktoken's rank file holds only ordinary merges; the markup tokens live
@@ -1206,10 +1406,15 @@ def main():
     # media markers an image would be wrapped in.
     p_cfg = os.path.join(args.src, "tokenizer_config.json")
     special_texts = set()
-    if os.path.exists(p_cfg):
-        dec = json.load(open(p_cfg)).get("added_tokens_decoder", {})
+    if os.path.exists(p_cfg) or tok_specials:
+        dec = (json.load(open(p_cfg)).get("added_tokens_decoder", {})
+               if os.path.exists(p_cfg) else {})
         specials = sorted(((int(i), v["content"]) for i, v in dec.items()),
                           key=lambda x: x[0])
+        # tokenizer.json carries its own added_tokens; fall back to them
+        # rather than ship a container whose markup encodes as plain text.
+        if not specials and tok_specials:
+            specials = [(e["id"], e["text"]) for e in tok_specials]
         if specials:
             atomic_json(os.path.join(args.out, "specials.json"),
                         [{"id": i, "text": t} for i, t in specials])
@@ -1257,11 +1462,13 @@ def main():
     # model reads its own turn structure as prose. That is what the marker
     # check below refuses, and it also catches a release that renames them.
     _tmpl_for = {"kimi-k3": "chat-k3.json",
-                 "kimi-linear": "chat-kimi-linear.json"}
+                 "kimi-linear": "chat-kimi-linear.json",
+                 "glm5-next": "chat-glm53.json"}
     _hf0 = ((cfg.get("_outer", {}).get("architectures")
              or cfg.get("architectures") or [""]))[0]
     _arch0 = ("kimi-k3" if "KimiK3" in _hf0 else
-              "kimi-linear" if "KimiLinear" in _hf0 else "")
+              "kimi-linear" if "KimiLinear" in _hf0 else
+              "glm5-next" if "Glm5Next" in _hf0 else "")
     _dst = os.path.join(args.out, "chat.json")
     _name = _tmpl_for.get(_arch0)
     if _name and not os.path.exists(_dst):
@@ -1274,9 +1481,13 @@ def main():
             # Only when we have a specials list to check against: a release
             # without tokenizer_config.json tells us nothing, and refusing on
             # no evidence would be worse than the old unconditional copy.
+            # Both spellings this family uses for a control token: K3 and
+            # Kimi write <|...|>, GLM's think markers are bare <think> and
+            # </think>. A template checked for one and not the other passes
+            # while carrying a marker the tokenizer will emit as text.
             _absent = sorted({
                 m for m in re.findall(
-                    r"<\|[^|>]*\|>",
+                    r"<\|[^|>]*\|>|</?think>",
                     io.open(_src_tmpl, encoding="utf-8").read())
                 if m not in special_texts}) if special_texts else []
             if _absent:
@@ -1318,6 +1529,49 @@ def main():
     # does, and K3 normalizes to [-1, 1] with mean = std = 0.5, which is
     # not what CLIP does. Guess nothing that the release states.
     vc = cfg.get("_outer", {}).get("vision_config")
+    if vc and glm:
+        # Two towers, and the engine has to be told which. They agree on
+        # almost nothing below the block level: GLM has no learned position
+        # grid (2D rope only), q/k norms and biases the K3 tower does not,
+        # a clamped SwiGLU where K3 has GELU, a Conv3d patch embed over two
+        # temporal slots, and a Conv2d downsample into a gated merger where
+        # K3 has a 2x2 reshape and a two-layer projector. `tower` names it;
+        # a container without the key is K3's, which is every container
+        # written before this one.
+        vj = {k: v for k, v in vc.items() if not k.startswith("_")}
+        vj["tower"] = "glm5-next"
+        vj["media_placeholder_token_id"] = \
+            cfg.get("_outer", {}).get("image_token_id")
+        for k in ("image_start_token_id", "image_end_token_id"):
+            if cfg.get("_outer", {}).get(k) is not None:
+                vj[k] = cfg["_outer"][k]
+        # The release states its preprocessing and it is not K3's: CLIP's
+        # normalization rather than [-1, 1], and a token budget rather than
+        # a fixed grid. Read, never assumed — a tower fed the wrong
+        # normalization still matches its own oracle, because the oracle
+        # reads the same file.
+        p_proc = os.path.join(args.src, "processor_config.json")
+        if os.path.exists(p_proc):
+            ip = (json.load(open(p_proc)).get("image_processor") or {})
+            for k in ("image_mean", "image_std", "patch_size", "merge_size",
+                      "temporal_patch_size", "min_image_tokens",
+                      "max_image_tokens"):
+                if ip.get(k) is not None:
+                    vj[k] = ip[k]
+            print(f"vision: normalization from processor_config.json, "
+                  f"mean {vj.get('image_mean')}")
+        else:
+            print("vision: WARNING no processor_config.json in --src; the "
+                  "tower will run on unstated normalization", file=sys.stderr)
+        # Our cap on what an image costs the context, as on K3: an image is
+        # priced as text of the same length. The release's own ceiling is
+        # 8000 merged tokens, which is most of a conversation.
+        vj["max_patches"] = min(int(vj.get("max_image_tokens") or 1024), 1024)
+        atomic_json(os.path.join(args.out, "vision.json"), vj)
+        print(f"vision: {vj.get('depth', '?')}-layer GLM tower, patch "
+              f"{vj.get('patch_size', '?')}, merge {vj.get('merge_size', '?')}, "
+              f"max_patches {vj['max_patches']}")
+        vc = None
     if vc:
         vj = {k: v for k, v in vc.items() if not k.startswith("_")}
         vj["vt_rms_eps"] = 1.1920928955078125e-07
@@ -1355,7 +1609,9 @@ def main():
     # --reclaim has already run this, before the experts, so that the shards
     # holding non-expert tensors become deletable at all.
     if tindex is None:
-        tindex = build_trunk(args, sr, st, existing, manifest_path)
+        tindex = build_trunk(args, sr, st, existing, manifest_path, drop_trunk,
+                             glm_rename if glm else None,
+                             glm_flatten if glm else None)
         if tindex is None:
             return 1
     trunk_path = os.path.join(args.out, "trunk.bin")
@@ -1371,6 +1627,7 @@ def main():
             or cfg.get("architectures") or [""]))[0]
     arch = ("kimi-k3" if "KimiK3" in _hf else
             "kimi-linear" if "KimiLinear" in _hf else
+            "glm5-next" if "Glm5Next" in _hf else
             _hf or cfg.get("model_type", "unknown"))
 
     manifest = {

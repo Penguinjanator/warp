@@ -243,8 +243,15 @@ examples:
         # Serving from chat.json rather than XTML. Say what is missing, in
         # the same breath as saying it works — a client that sends `tools`
         # and gets a 400 should not be the first time this is mentioned.
-        print(f"chat     from {model}/chat.json — plain conversation only, "
-              f"no tools,\n         no reasoning channel, no images")
+        # What is missing, in the same breath as saying it works — a
+        # client that sends `tools` and gets a 400 should not be the first
+        # time this is mentioned. The reasoning channel is the one part a
+        # chat.json can now carry, so it is reported and not assumed.
+        think = ("a reasoning channel" if srv.chat_format.think
+                 else "no reasoning channel")
+        images = "images" if srv.chat_format.image else "no images"
+        print(f"chat     from {model}/chat.json — plain conversation, "
+              f"{think},\n         {images}, no tools")
 
     shown = args.host if ":" not in args.host else f"[{args.host}]"
     print(f"\nlistening on http://{shown}:{args.port}  "

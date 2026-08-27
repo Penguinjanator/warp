@@ -10,6 +10,7 @@
  */
 
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdlib.h>
@@ -33,8 +34,14 @@ int main(int argc, char **argv)
         return 2;
     }
     const char *dir = argv[1];
-    int ids[512], n = 0;
-    for (char *p = strtok(argv[2], ","); p && n < 512; p = strtok(NULL, ","))
+    /* Enough to reach a sparse-attention branch. GLM's index_topk is 2048,
+     * so the selection only starts choosing past 2048 cached tokens, and a
+     * 512-id cap meant the only prompt this harness could build ran the
+     * dense path and reported it as if it had tested the other one. */
+    enum { MAXIDS = 8192 };
+    static int ids[MAXIDS];
+    int n = 0;
+    for (char *p = strtok(argv[2], ","); p && n < MAXIDS; p = strtok(NULL, ","))
         ids[n++] = atoi(p);
     const char *out = argc > 3 ? argv[3] : NULL;
     const int n_gen = argc > 4 ? atoi(argv[4]) : 0;
@@ -119,19 +126,42 @@ int main(int argc, char **argv)
     if (getenv("WASTE_PROFILE")) {
         /* indented names are sub-totals of the line above and are excluded
          * from `tot`, so the percentages add to 100 */
-        const char *names[9] = {"  LUT build","kda","mla","moe(all)",
+        const char *names[10] = {"  LUT build","kda","mla","moe(all)",
                                 "  expert I/O","  expert mm","lm_head",
-                                "  LUT apply","  batched mm"};
+                                "  LUT apply","  batched mm","  trunk matvec"};
         double tot = 0;
-        for (int i = 0; i < 9; i++)
-            tot += (i == 0 || i == 4 || i == 5 || i == 7 || i == 8) ? 0 : waste_prof[i];
+        for (int i = 0; i < 10; i++)
+            tot += (i == 0 || i == 4 || i == 5 || i == 7 || i == 8 || i == 9) ? 0 : waste_prof[i];
         printf("\n-- profile (s, %d steps) --\n", n + n_gen);
-        for (int i = 0; i < 9; i++)
+        for (int i = 0; i < 10; i++)
             if (waste_prof[i] > 0)
                 printf("  %-14s %7.2f  %5.1f%%\n", names[i], waste_prof[i],
                        100.0 * waste_prof[i] / tot);
         printf("  %-14s %7.2f\n", "accounted", tot);
+        { extern uint64_t waste_tmv_bytes; extern uint64_t waste_prof_n[16];
+          printf("  trunk matvec: %llu calls, %.2f GB, %.1f GB/s\n",
+                 (unsigned long long)waste_prof_n[9],
+                 waste_tmv_bytes / 1e9,
+                 waste_prof[9] > 0 ? waste_tmv_bytes / waste_prof[9] / 1e9 : 0.0);
+          extern double waste_tmv_t[4]; extern uint64_t waste_tmv_b[4], waste_tmv_c[4];
+          const char *bn[4] = {"   <1MB","  1-8MB"," 8-32MB","  >32MB"};
+          for (int k = 0; k < 4; k++)
+              if (waste_tmv_c[k])
+                  printf("    %s  %7llu calls %8.2f GB %7.2f s %7.1f GB/s\n", bn[k],
+                         (unsigned long long)waste_tmv_c[k], waste_tmv_b[k]/1e9,
+                         waste_tmv_t[k], waste_tmv_b[k]/waste_tmv_t[k]/1e9); }
     }
+#if defined(WASTE_ENABLE_METAL)
+    /* The same kernel on this file's own buffers, after a real decode.
+     * docs/EXP1.md §5b: before decode it measures 132 GB/s and after it
+     * measures 9, which is what a dispatch-rate claim has to be checked
+     * against before any Metal number is believed. */
+    if (getenv("WASTE_METAL_SELFTEST")) {
+        void waste_metal_selftest(void);
+        fprintf(stderr, "-- selftest after decode --\n");
+        waste_metal_selftest();
+    }
+#endif
     printf("\ncache: %llu hits / %llu misses = %.1f%% hit, %llu evictions, "
            "%.2f GB read\n",
            (unsigned long long)m.cache.hits, (unsigned long long)m.cache.misses,

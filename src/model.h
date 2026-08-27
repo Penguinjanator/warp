@@ -13,6 +13,7 @@
 #define WASTE_MODEL_H
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -51,6 +52,11 @@ typedef struct {
     int kda_heads, kda_dim, conv_k;
 #define WASTE_MAX_LAYERS 128
 
+/* Streams an mHC container may ask for. GLM-5.3-Flash uses 4; the bound is
+ * what lets waste_model_step keep post/comb on the stack. cfg_sane refuses
+ * anything above it. */
+#define WASTE_MAX_HC 16
+
 /* Vector positions sharing one fp32 scale in the int8 LUT (WQ_VQ4P).
  * Bounds the int16 accumulator: 4 stages x 32 positions x 127 = 16256, so
  * a block cannot overflow before it is folded into fp32. It is also what
@@ -77,6 +83,28 @@ typedef struct {
     int   act_situ;                  /* 1 = SiTU instead of SiLU            */
     float situ_beta, situ_linear_beta;
     char  prefix[64];                /* "" or "language_model." (K3)        */
+
+    /* --- GLM-5.3-Flash additions (all absent/0 elsewhere) --------------- */
+    /* Manifold-Constrained Hyper-Connections (mHC). The residual stream is
+     * `hc_mult` parallel copies instead of one; every sublayer collapses
+     * them with learned weights, and its output is scattered back through a
+     * doubly-stochastic mixing matrix. 0 = the ordinary single stream. */
+    int   hc_mult;
+    int   hc_iters;                  /* Sinkhorn-Knopp iterations           */
+    float hc_eps;
+    /* swiglu_limit: gate is clamped above, up on both sides, before the
+     * SiLU-and-multiply. 0 = no clamp, which is every Kimi model. */
+    float swiglu_limit;
+    /* DeepSeek Sparse Attention, k-pool flavour. The indexer scores pools
+     * of `index_kpool` cached tokens and keeps the best `index_topk /
+     * index_kpool` of them, so an MLA layer attends over at most
+     * index_topk (+ tail) positions instead of the whole context.
+     * 0 = dense attention, which is every other model here. */
+    int   index_topk, index_kpool, index_heads, index_dim, index_tail;
+    /* Whether the tokenizer's pre-tokenization pattern gives Han its own
+     * branch. 1 on both Kimi models and the default; GLM's pattern has no
+     * such branch and its containers say so. */
+    int   tok_han_split;
     /* generation_config.json's eos_token_id, mirrored into the container
      * config. The tokenizer used to derive this positionally as
      * base_vocab + 2, which is right on both Kimi models by luck of the
@@ -109,6 +137,13 @@ typedef struct {
 } waste_bank;
 
 /* Read from vision.json when the container has a tower. */
+/* Which tower a container carries. They share a block shape and nothing
+ * below it: K3's has a learned position grid, GELU and no biases; GLM's has
+ * 2D rope only, per-head q/k norms, biases everywhere, a clamped SwiGLU, a
+ * two-slot temporal patch and a gated merger. vision.json names it, and a
+ * file without the key is K3's — every container written before this one. */
+typedef enum { WASTE_TOWER_K3 = 0, WASTE_TOWER_GLM = 1 } waste_tower;
+
 typedef struct {
     int hidden, heads, qkv_hidden, inter, layers;
     int pos_h, pos_w, text_hidden, patch;
@@ -116,6 +151,15 @@ typedef struct {
     float mean[3], std[3];       /* pixel normalization — see image.c      */
     int   media_token;           /* the id an image expands from           */
     int   max_patches;
+    /* --- GLM's tower (0 elsewhere) ------------------------------------- */
+    int   tower;                 /* waste_tower                            */
+    int   merge;                 /* spatial_merge_size, 2                  */
+    int   temporal;              /* temporal_patch_size, 2                 */
+    int   out_hidden;            /* what the merger projects into          */
+    int   proj_inter;            /* the merger's SwiGLU width              */
+    float swiglu_limit;
+    int   img_start, img_end;    /* the ids an image block is wrapped in   */
+    int   min_tokens;            /* the release's floor on an image's cost */
 } waste_vision_cfg;
 
 typedef struct {
@@ -170,6 +214,23 @@ typedef struct {
      * is absorbed into the query and the output instead (see mla_layer). */
     float *latcache[WASTE_MAX_LAYERS];            /* [kv_cap][kv_lora + qk_rope]         */
     int n_kv[WASTE_MAX_LAYERS], kv_cap;
+    /* DSA indexer state, one entry per full-attention layer. `idxpool` is
+     * the compressed key of every *complete* pool — index_dim floats per
+     * index_kpool tokens, which is 32x smaller than keeping the raw keys —
+     * and `idxbuf` holds the (key, gate) pairs of the pool still being
+     * filled. Both are NULL when the container has no indexer. */
+    float *idxpool[WASTE_MAX_LAYERS];            /* [kv_cap/kpool][index_dim]           */
+    float *idxbuf[WASTE_MAX_LAYERS];             /* [kpool][2 * index_dim]              */
+    int    n_pool[WASTE_MAX_LAYERS], pool_cap;
+    int   *idxsel;                   /* the positions one step attends over  */
+    float *idxq;                     /* the indexer's own q, then its head
+                                      * weights — never m->tmp, which the
+                                      * MLA query is still living in       */
+    float *idxscore;                 /* one score per candidate pool         */
+    int   *idxrank;                  /* its top-k scratch                    */
+    /* mHC scratch: the flattened stream vector the mapping reads, and the
+     * collapsed single stream the sublayer runs on. */
+    float *hcflat, *hccol, *hcmix;
 
     /* scratch */
     float *x, *h, *tmp, *att, *logits;
@@ -200,9 +261,18 @@ typedef struct {
     uint16_t *embsc;
     float *qabs, *cacc, *mrow;      /* MLA absorption scratch, per head    */
     float *e_gate, *e_up, *e_down, *ff, *lut, *xs;
+    size_t lut_bytes;               /* what m->lut was allocated */
     int8_t *xq;
     uint64_t expert_reads;
     waste_ecache cache;
+    /* Background fill. Runs only when the resolved cache can hold every
+     * record the container has, walks the banks in file order, and stops on
+     * its own when the cache is full or when the model is freed. See
+     * waste_ecache_admit and start_fill. */
+    pthread_t fill_th;
+    int       fill_running;
+    _Atomic int fill_stop;
+    uint64_t  fill_records;          /* how many there are to read at all  */
     uint8_t *miss_buf;               /* used when the cache is disabled     */
     int      want_direct;            /* the caller asked for the bypass     */
     int      direct_io;              /* 0 = a bank fell back to page cache  */
@@ -258,6 +328,13 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed);
 void        waste_model_reset(waste_model *m);
 int         waste_model_resize_cache(waste_model *m, size_t cache_bytes);
 void        waste_model_set_lookahead(int n);
+void        waste_model_set_sdot4(int on, int sg);
+void        waste_model_set_device_min_kb(long kb);
+void        waste_model_set_metal_moe(int on);
+void        waste_model_set_vq8(int on);
+void        waste_model_set_wide(int mask);
+int         waste_model_fast_threads(void);
+int         waste_pool_threads_public(void);
 int         waste_model_get_lookahead(void);
 const char *waste_model_read_error(const waste_model *m, int *layer, int *expert);
 /* Clears both sticky per-call flags: the record error and the context
@@ -328,6 +405,11 @@ int waste_embed_row(waste_model *m, int token, float *dst);
  * tower or it was not loaded. */
 int waste_vision_encode(waste_model *m, const float *pixels, int h, int w,
                         float *out);
+/* GLM-5.3-Flash's tower. Same contract — patches in, one merged embedding
+ * per merge block out — and a different network inside; see vision.c.
+ * `pixels` is [h*w][3 * temporal * patch * patch] in block-major order. */
+int waste_vision_encode_glm(waste_model *m, const float *pixels, int h, int w,
+                            float *out);
 int waste_vision_available(const waste_model *m);
 
 /* Decodes an image and lays it out as [gh*gw][3*14*14], normalized. The
@@ -337,6 +419,11 @@ int waste_vision_available(const waste_model *m);
  * media block as text, so the wrapper needs them before the encode. */
 int waste_image_size(const char *path, int *w, int *h);
 
+/* GLM's preprocessing: a different grid rule and a different patch order,
+ * both stated by the release. Returns [gh*gw][3 * temporal * patch^2] in
+ * block-major order over merge blocks; the caller frees. */
+float *waste_image_load_glm(const char *path, const waste_vision_cfg *v,
+                            int *out_h, int *out_w);
 float *waste_image_load(const char *path, int max_patches,
                         const float *mean, const float *std,
                         int *out_h, int *out_w);
@@ -345,6 +432,9 @@ float *waste_image_load(const char *path, int max_patches,
  * K3 whose maths is new, so they are checked against the reference
  * implementation directly rather than only end to end. */
 float waste_situ_pair(float gate, float up, float beta, float linear_beta);
+/* SwiGLU over a range, in whichever of this family's three forms the
+ * container asks for: plain, SiTU (K3), or clamped (GLM). */
+void waste_act_pair_range(const waste_config *c, float *gate, const float *up, int n);
 void  waste_kda_decay_gate(float *g, const float *A_log, const float *dt_bias,
                            int H, int D, float lower_bound);
 void  waste_kda_decay_gate_ex(float *g, const float *A_log, const float *dt_bias,

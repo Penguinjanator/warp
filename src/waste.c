@@ -342,11 +342,20 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
         const int fmt = (int)js_int(&d, js_get(&d, e, "fmt"), 0);
         if (fmt != 0 && strstr(nm, "embed_tokens.weight")) continue;
         const uint64_t nb = (uint64_t)js_int(&d, js_get(&d, e, "bytes"), 0);
-        /* The vision tower and projector sit outside tensor_prefix. They
-         * are loaded only when a caller asks for images, so they are
-         * counted apart and folded in by waste_open — counting them here
+        /* The tower is loaded only when a caller asks for images, so it is
+         * counted apart and folded in by waste_open — counting it here
          * would overstate the floor for every text-only run, and leaving
-         * them out entirely understated it for every run with one. */
+         * it out entirely understated it for every run with one.
+         *
+         * By name, not by "outside tensor_prefix". On K3 the two coincide
+         * and on GLM they do not: its container has no prefix at all, so
+         * the old test put its 282 MB tower in the floor of every text-only
+         * plan. The loader makes the same distinction, in the same terms. */
+        if (!strncmp(nm, "vision_tower.", 13) ||
+            !strncmp(nm, "mm_projector.", 13)) {
+            out->vision_bytes += nb;
+            continue;
+        }
         if (prefix[0] && strncmp(nm, prefix, strlen(prefix)) != 0) {
             out->vision_bytes += nb;
             continue;
@@ -426,6 +435,18 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
                      + (uint64_t)n_mla * ctx_tokens *
                        ((uint64_t)kv_lora + qk_rope) * 4;                /* KV */
     (void)qk_nope; (void)v_head;
+    {   /* The DSA indexer's pooled keys are session state too: one
+         * index_dim vector per index_kpool tokens per full-attention layer.
+         * Small beside the latents — a 32nd of them on GLM — but it grows
+         * with the context exactly as they do, so it belongs in the same
+         * arithmetic rather than in the flat scratch. */
+        const int itk = (int)js_int(&d, js_get(&d, cfg, "index_topk"), 0);
+        const int ikp = (int)js_int(&d, js_get(&d, cfg, "index_kpool"), 1);
+        const int idm = (int)js_int(&d, js_get(&d, cfg, "index_head_dim"), 0);
+        if (itk > 0 && ikp > 0 && idm > 0)
+            out->state_bytes += (uint64_t)n_mla *
+                ((uint64_t)(ctx_tokens / ikp + 1) * idm + 2ull * ikp * idm) * 4;
+    }
 
     /* Scratch, counted rather than guessed. The old flat 64 MB was out by
      * 4x on the decode buffers alone (e_gate/e_up/e_down are 252 MB on K3)
@@ -471,6 +492,32 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
     sc += ((uint64_t)8 * big + 8 * moe_inter + 8 * dense_inter + 512) * 4;
     sc += (uint64_t)3 * nheads * (kv_lora ? kv_lora : 1) * 4;   /* MLA absorb  */
     sc += (uint64_t)(nb + 4) * hidden * 4;                  /* AttnRes buffers */
+    {   /* mHC: the residual stream is hc_mult copies, hc_collapse keeps a
+         * flattened copy of it beside them, and the activation-quantization
+         * buffers are sized from the widest matvec — which on a mHC model
+         * is that flattened vector, not the dense FFN. */
+        const int hcm = (int)js_int(&d, js_get(&d, cfg, "hc_mult"), 0);
+        if (hcm > 0) {
+            sc += (uint64_t)2 * hcm * hidden * 4;
+            const uint64_t hcw = (uint64_t)hcm * hidden;
+            const uint64_t was = hidden > dense_inter ? hidden : dense_inter;
+            if (hcw > was) {
+                sc += (hcw - was) * 2;                   /* m->xq   */
+                sc += (hcw - was) / 32 * 4;              /* m->xs   */
+                sc += (uint64_t)T * (hcw - was);         /* m->mmxq */
+            }
+        }
+        /* the indexer's per-step buffers: the selection, one score per
+         * candidate pool, its ranking, and the indexer's own query */
+        const int itk = (int)js_int(&d, js_get(&d, cfg, "index_topk"), 0);
+        const int ikp = (int)js_int(&d, js_get(&d, cfg, "index_kpool"), 1);
+        const int idm = (int)js_int(&d, js_get(&d, cfg, "index_head_dim"), 0);
+        const int ihd = (int)js_int(&d, js_get(&d, cfg, "index_n_heads"), 0);
+        if (itk > 0 && ikp > 0)
+            sc += (uint64_t)(itk + ikp) * 4 +
+                  2ull * (ctx_tokens / ikp + 1) * 4 +
+                  (uint64_t)(ihd * idm + ihd) * 4;
+    }
     /* chunked prefill, allocated on first use and never freed */
     sc += (uint64_t)T * hidden * 4 * 3;                     /* cx/cnorm/cresid */
     {   /* Decode keeps three LUTs and chunked prefill keeps 2*T+1.
@@ -524,6 +571,7 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
          * and changing it would move a figure tests/run.sh asserts. */
         bank_total = bytes * (uint64_t)layers;
     }
+    out->bank_bytes = bank_total;
     out->min_expert_cache = rec * (uint64_t)top_k * 2;
     out->floor_bytes = out->trunk_bytes + out->state_bytes +
                        out->scratch_bytes + out->min_expert_cache;
@@ -649,9 +697,39 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
 
     if (!budget) {
         const uint64_t ws = c->plan.working_set_bytes;
+        const uint64_t bank = c->plan.bank_bytes;
         budget = c->plan.floor_bytes;
-        for (int k = 3; k >= 1; k--) {
-            const uint64_t b = c->plan.floor_bytes + ws * (uint64_t)k;
+        /* How many working sets to try for, from the top down.
+         *
+         * Three used to be the top of this ladder, and on a machine with
+         * room that left the rest of it unused: Kimi-Linear's whole expert
+         * set is 16.5 GB and the default took 1.6 GB of cache on a 64 GB
+         * laptop; K3 on a 256 GB host took the same 51.6 GB it takes on
+         * this one. Three working sets is what `recommended_bytes` means —
+         * "worth having, without knowing the machine" — and it is the wrong
+         * ceiling once the machine is known.
+         *
+         * The real ceiling is the bank. A cache that holds every expert
+         * never reads one twice, and a byte more than that is a slot
+         * nothing will ever fill, so the ladder now starts at whatever
+         * number of working sets covers the bank and walks down from there.
+         * On a container smaller than the machine it lands on "all of it".
+         *
+         * What makes this safe is not new: the cap below it is still three
+         * quarters of what this process may use, and the cliff §39 and §56
+         * measured lives above that, not below. And an unfilled slot is
+         * address space, not memory — the pages fault in as records arrive,
+         * and the records that arrive are the ones the run would otherwise
+         * have read from disk again. */
+        uint64_t kmax = 3;
+        if (ws && bank) {
+            const uint64_t whole = (bank + ws - 1) / ws;
+            if (whole > kmax) kmax = whole;
+        }
+        for (uint64_t k = kmax; ws && k >= 1; k--) {
+            uint64_t want = ws * k;
+            if (bank && want > bank) want = bank;
+            const uint64_t b = c->plan.floor_bytes + want;
             if (!cap || b <= cap) { budget = b; break; }
         }
     }
@@ -714,7 +792,10 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
         snprintf(c->usage, sizeof c->usage, "%s/usage.waste", model_path);
     c->cfg.usage_path = c->usage;
     c->tok = waste_tok_open(model_path);      /* optional */
-    if (c->tok) waste_tok_set_eos(c->tok, c->m.cfg.eos_token_id);
+    if (c->tok) {
+        waste_tok_set_eos(c->tok, c->m.cfg.eos_token_id);
+        waste_tok_set_han_split(c->tok, c->m.cfg.tok_han_split);
+    }
     /* warm the cache from what previous runs learned, if anything */
     c->warmed = waste_model_warm_cache(&c->m, c->usage);
     *out = c;
@@ -830,19 +911,24 @@ waste_status waste_image_add(waste_ctx *c, const char *path, size_t *n_out)
     if (!c->m.want_vision || !c->m.vcfg.layers) return WASTE_E_UNSUPPORTED;
     if (c->img_n >= WASTE_MAX_IMAGES) return WASTE_E_ARG;
 
+    const int glm = c->m.vcfg.tower == WASTE_TOWER_GLM;
+    const int mg = glm ? c->m.vcfg.merge : 2;
     int gh = 0, gw = 0;
-    float *px = waste_image_load(path, c->m.vcfg.max_patches,
-                                 c->m.vcfg.mean, c->m.vcfg.std, &gh, &gw);
+    float *px = glm
+        ? waste_image_load_glm(path, &c->m.vcfg, &gh, &gw)
+        : waste_image_load(path, c->m.vcfg.max_patches,
+                           c->m.vcfg.mean, c->m.vcfg.std, &gh, &gw);
     if (!px) return WASTE_E_IO;
 
-    const size_t rows = (size_t)(gh / 2) * (size_t)(gw / 2);
+    const size_t rows = (size_t)(gh / mg) * (size_t)(gw / mg);
     const size_t th = (size_t)c->m.vcfg.text_hidden;
     float *nb = (float *)realloc(c->img, (c->img_rows + rows) * th * sizeof(float));
     if (!nb) { free(px); return WASTE_E_OOM; }
     c->img = nb;
 
-    const int rc = waste_vision_encode(&c->m, px, gh, gw,
-                                       c->img + c->img_rows * th);
+    const int rc = glm
+        ? waste_vision_encode_glm(&c->m, px, gh, gw, c->img + c->img_rows * th)
+        : waste_vision_encode(&c->m, px, gh, gw, c->img + c->img_rows * th);
     free(px);
     if (rc) return WASTE_E_IO;
 
@@ -1242,6 +1328,7 @@ waste_status waste_model_get_info(const waste_ctx *c, waste_model_info *out)
      * not recognize is reported verbatim rather than guessed at. */
     out->arch = strstr(cf->arch, "KimiK3")     ? "kimi-k3"
               : strstr(cf->arch, "KimiLinear") ? "kimi-linear"
+              : strstr(cf->arch, "Glm5Next")   ? "glm5-next"
               : cf->arch[0]                    ? cf->arch
                                                : "unknown";
     out->quant_summary = c->quant;

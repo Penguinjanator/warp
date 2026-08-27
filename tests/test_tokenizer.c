@@ -25,6 +25,11 @@ int main(int argc, char **argv)
     }
     const char *plain = getenv("WASTE_TOK_PLAIN");
     const int markup = !(plain && *plain != '0');
+    /* The engine takes this from the container's config; waste_tok_open
+     * reads a directory, not a manifest, so the harness needs its own way
+     * to reach the GLM pattern. See waste_tok_set_han_split. */
+    const char *nohan = getenv("WASTE_TOK_NOHAN");
+    if (nohan && *nohan != '0') waste_tok_set_han_split(t, 0);
     for (int a = 2; a < argc; a++) {
         int32_t ids[4096];
         const int n = waste_tok_encode(t, argv[a], ids, 4096, markup);

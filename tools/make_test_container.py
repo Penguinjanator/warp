@@ -82,6 +82,60 @@ CFG = {
 }
 C_KDA = H_KDA * D_KDA
 
+# GLM's tower at 1/32 scale. Every field the engine reads, and the ratios
+# that matter kept: head_dim 16 so the rotary table has something to
+# interleave, merge 2 so the downsample is a real reshape, and two blocks
+# rather than one so a residual has somewhere to accumulate.
+VISION = {
+    "model_type": "glm5_next_vision",
+    "depth": 2,
+    "hidden_size": 32,
+    "num_heads": 2,
+    "intermediate_size": 64,
+    "out_hidden_size": 128,          # = CFG hidden_size
+    "projection_intermediate_size": 96,
+    "patch_size": 14,
+    "spatial_merge_size": 2,
+    "merge_size": 2,
+    "temporal_patch_size": 2,
+    "in_channels": 3,
+    "rms_norm_eps": 1e-5,
+    "swiglu_limit": 10.0,
+    "attention_bias": True,
+    "hidden_act": "silu",
+}
+
+# --glm turns the above into a GLM-5.3-Flash at the same scale. Three things
+# are new and none of them exist on any Kimi container, so this is the only
+# shape that reaches them:
+#
+#   mHC             the residual stream is HC_MULT parallel copies
+#   swiglu_limit    gate/up clamped before the SiLU-and-multiply
+#   the DSA indexer full-attention layers score pools of INDEX_KPOOL tokens
+#                   and attend over the best INDEX_TOPK/INDEX_KPOOL of them
+#
+# index_topk is deliberately tiny. At 8 the sparse branch is reached after
+# eight tokens, which a test can prompt for; at GLM's own 2048 it would need
+# a 2049-token prompt and would never run in CI.
+HC_MULT, HC_ITERS = 4, 20
+INDEX_HEADS, INDEX_DIM, INDEX_KPOOL, INDEX_TOPK = 2, 16, 4, 8
+GLM = {
+    "model_type": "glm5_next_text",
+    "architectures": ["Glm5NextForConditionalGeneration"],
+    "q_lora_rank": 48,
+    "qk_rope_head_dim": 0,            # NoPE all the way: GLM has no rotary
+    "hidden_act": "silu",
+    "swiglu_limit": 10.0,
+    "hc_mult": HC_MULT,
+    "hc_sinkhorn_iters": HC_ITERS,
+    "hc_eps": 1e-6,
+    "index_n_heads": INDEX_HEADS,
+    "index_head_dim": INDEX_DIM,
+    "index_kpool": INDEX_KPOOL,
+    "index_topk": INDEX_TOPK,
+    "index_kpool_always_select_tail": True,
+}
+
 # --rope turns the above into a DeepSeek-V3 at the same scale, which is the
 # only shape that reaches src/model.c's rotary: the Kimi models set
 # mla_use_nope and pass the qk_rope dims through unrotated, so a container
@@ -119,13 +173,14 @@ class Trunk:
         self.rng = rng
         self.prefix = prefix
 
-    def f32(self, name, shape):
+    def f32(self, name, shape, prefixed=True):
         n = 1
         for s in shape:
             n *= s
         off = len(self.buf)
         self.buf += f32([self.rng.uniform(-0.5, 0.5) for _ in range(n)])
-        self.index.append({"name": self.prefix + name, "fmt": FMT_F32,
+        self.index.append({"name": (self.prefix if prefixed else "") + name,
+                           "fmt": FMT_F32,
                            "off": off, "shape": list(shape),
                            "bytes": len(self.buf) - off})
 
@@ -285,6 +340,19 @@ def main():
                     help="put the text tensors under a tensor_prefix, e.g. "
                          "language_model., and add one tensor outside it — "
                          "K3's shape, and the one the loader skips")
+    ap.add_argument("--glm", action="store_true",
+                    help="a GLM-5.3-Flash instead of a Kimi-Linear: mHC "
+                         "residual streams, a clamped SwiGLU and the DSA "
+                         "indexer on the full-attention layers")
+    ap.add_argument("--vision", action="store_true",
+                    help="--glm only: add a GLM vision tower at test scale, "
+                         "so src/vision.c's second tower has a container CI "
+                         "can reach")
+    ap.add_argument("--index-topk", type=int, metavar="N",
+                    help="--glm only: override index_topk. The default 8 puts "
+                         "the sparse branch two pools in, so a 12-token "
+                         "prompt reaches it; a value above the prompt length "
+                         "keeps every pool and must give dense attention")
     ap.add_argument("--rope", action="store_true",
                     help="a DeepSeek-V3 instead of a Kimi-Linear: every layer "
                          "MLA, no mla_use_nope, and rope_theta with YaRN — the "
@@ -318,6 +386,16 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     cfg = dict(CFG)
+    if args.glm:
+        if args.rope:
+            ap.error("--glm and --rope are different models")
+        cfg.update(GLM)
+        if args.index_topk:
+            cfg["index_topk"] = args.index_topk
+    elif args.index_topk:
+        ap.error("--index-topk needs --glm")
+    if args.vision and not args.glm:
+        ap.error("--vision is GLM's tower; K3's is not generated here")
     if args.rope:
         # Dropping linear_attn_config is what makes every layer MLA, so the
         # rotation is exercised at depth rather than in the one full-attention
@@ -359,12 +437,24 @@ def main():
     moe, dense = cfg["moe_intermediate_size"], cfg["intermediate_size"]
     kda = {l - 1 for l in cfg.get("linear_attn_config", {}).get("kda_layers", [])}
 
+    hc = cfg.get("hc_mult", 0)
+    q_lora = cfg.get("q_lora_rank") or 0
+
     t = Trunk(rng, args.prefix)
     t.quant("model.embed_tokens.weight", [cfg["vocab_size"], hid])
     for L in range(cfg["num_hidden_layers"]):
         p = f"model.layers.{L}."
         t.f32(p + "input_layernorm.weight", [hid])
         t.f32(p + "post_attention_layernorm.weight", [hid])
+        for site in ("attn", "ffn") if hc else ():
+            # (2 + H) * H mixing logits from the H * hidden flattened
+            # streams: pre, post, and the H x H combine matrix.
+            t.quant(p + f"hc_{site}_fn", [(2 + hc) * hc, hc * hid], bits=8)
+            # base is what the logits are offset by and scale is the three
+            # gains on them; both are tiny, so f32 as the converter leaves
+            # anything under 65536 elements.
+            t.f32(p + f"hc_{site}_base", [(2 + hc) * hc])
+            t.f32(p + f"hc_{site}_scale", [3])
         if L in kda:
             a = p + "self_attn."
             for w in ("q_proj", "k_proj", "v_proj"):
@@ -382,11 +472,27 @@ def main():
             t.f32(a + "o_norm.weight", [D_KDA])
         else:
             a = p + "self_attn."
-            t.quant(a + "q_proj.weight", [nh * qd, hid])
+            if q_lora:
+                t.quant(a + "q_a_proj.weight", [q_lora, hid])
+                t.f32(a + "q_a_layernorm.weight", [q_lora])
+                t.quant(a + "q_b_proj.weight", [nh * qd, q_lora])
+            else:
+                t.quant(a + "q_proj.weight", [nh * qd, hid])
             t.quant(a + "kv_a_proj_with_mqa.weight", [kvl + rope, hid])
             t.f32(a + "kv_a_layernorm.weight", [kvl])
             t.quant(a + "kv_b_proj.weight", [nh * (cfg["qk_nope_head_dim"] + vh), kvl])
             t.quant(a + "o_proj.weight", [hid, nh * vh])
+            if cfg.get("index_topk"):
+                ix, idm = a + "indexer.", cfg["index_head_dim"]
+                ih, kp = cfg["index_n_heads"], cfg["index_kpool"]
+                t.quant(ix + "wq_b.weight", [ih * idm, q_lora])
+                t.quant(ix + "wk.weight", [idm, hid])
+                # a LayerNorm, so it has a bias as well as a gain
+                t.f32(ix + "k_norm.weight", [idm])
+                t.f32(ix + "k_norm.bias", [idm])
+                t.quant(ix + "weights_proj.weight", [ih, hid])
+                t.quant(ix + "index_kpool_compress_gate", [idm, hid])
+                t.f32(ix + "index_kpool_compress_ape", [kp, idm])
         if L < cfg["first_k_dense_replace"]:
             t.quant(p + "mlp.gate_proj.weight", [dense, hid])
             t.quant(p + "mlp.up_proj.weight", [dense, hid])
@@ -399,6 +505,44 @@ def main():
             t.quant(m + "shared_experts.gate_proj.weight", [sh, hid])
             t.quant(m + "shared_experts.up_proj.weight", [sh, hid])
             t.quant(m + "shared_experts.down_proj.weight", [hid, sh])
+    if args.vision:
+        # A GLM tower at test scale: the same 25 tensor kinds the release
+        # has, at dimensions that make an encode take milliseconds. The
+        # shapes are what the engine branches on — a bias where the release
+        # has one, a per-head q/k norm, a Conv3d patch embed flattened to
+        # two dimensions as the converter flattens it — and the weights are
+        # noise, exactly as everywhere else here.
+        v = VISION
+        vd, vh_, vi = v["hidden_size"], v["num_heads"], v["intermediate_size"]
+        vo, vp = v["out_hidden_size"], v["projection_intermediate_size"]
+        npix = 3 * v["temporal_patch_size"] * v["patch_size"] ** 2
+        t.f32("vision_tower.patch_embed.proj.weight", [vd, npix], prefixed=False)
+        t.f32("vision_tower.patch_embed.proj.bias", [vd], prefixed=False)
+        for b in range(v["depth"]):
+            a = f"vision_tower.blocks.{b}."
+            t.f32(a + "norm1.weight", [vd], prefixed=False)
+            t.f32(a + "norm2.weight", [vd], prefixed=False)
+            t.f32(a + "attn.qkv.weight", [3 * vd, vd], prefixed=False)
+            t.f32(a + "attn.qkv.bias", [3 * vd], prefixed=False)
+            t.f32(a + "attn.q_norm.weight", [vd // vh_], prefixed=False)
+            t.f32(a + "attn.k_norm.weight", [vd // vh_], prefixed=False)
+            t.f32(a + "attn.proj.weight", [vd, vd], prefixed=False)
+            t.f32(a + "attn.proj.bias", [vd], prefixed=False)
+            for w in ("gate_proj", "up_proj"):
+                t.f32(a + f"mlp.{w}.weight", [vi, vd], prefixed=False)
+                t.f32(a + f"mlp.{w}.bias", [vi], prefixed=False)
+            t.f32(a + "mlp.down_proj.weight", [vd, vi], prefixed=False)
+            t.f32(a + "mlp.down_proj.bias", [vd], prefixed=False)
+        t.f32("vision_tower.post_layernorm.weight", [vd], prefixed=False)
+        m2 = v["spatial_merge_size"]
+        t.f32("vision_tower.downsample.weight", [vo, vd * m2 * m2], prefixed=False)
+        t.f32("vision_tower.downsample.bias", [vo], prefixed=False)
+        t.f32("vision_tower.merger.proj.weight", [vo, vo], prefixed=False)
+        t.f32("vision_tower.merger.post_projection_norm.weight", [vo], prefixed=False)
+        t.f32("vision_tower.merger.post_projection_norm.bias", [vo], prefixed=False)
+        t.f32("vision_tower.merger.gate_proj.weight", [vp, vo], prefixed=False)
+        t.f32("vision_tower.merger.up_proj.weight", [vp, vo], prefixed=False)
+        t.f32("vision_tower.merger.down_proj.weight", [vo, vp], prefixed=False)
     t.f32("model.norm.weight", [hid])
     t.quant("lm_head.weight", [cfg["vocab_size"], hid])
     if args.prefix:
@@ -455,6 +599,18 @@ def main():
     with open(os.path.join(args.out, "manifest.json"), "w",
               newline="\n") as f:
         json.dump(manifest, f, indent=1)
+
+    if args.vision:
+        vj = dict(VISION)
+        vj["tower"] = "glm5-next"
+        vj["media_placeholder_token_id"] = cfg["vocab_size"] - 1
+        vj["max_patches"] = 64
+        vj["min_image_tokens"] = 1
+        vj["image_mean"] = [0.48145466, 0.4578275, 0.40821073]
+        vj["image_std"] = [0.26862954, 0.26130258, 0.27577711]
+        with open(os.path.join(args.out, "vision.json"), "w",
+                  newline="\n") as f:
+            json.dump(vj, f, indent=1)
 
     total = sum(os.path.getsize(os.path.join(args.out, f))
                 for f in os.listdir(args.out))

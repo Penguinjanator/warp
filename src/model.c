@@ -30,6 +30,7 @@
 #include "kda.h"
 #include "simd.h"
 #include "waste_backend.h"
+#include "waste_metal.h"
 #include "waste_format.h"
 
 #define MAXP 512
@@ -38,7 +39,22 @@
 #include <time.h>
 double waste_prof[16];
 uint64_t waste_prof_n[16];
-enum { P_LUTB, P_KDA, P_MLA, P_ROUTE, P_EDEQ, P_EMM, P_HEAD, P_LUTA, P_MM };
+uint64_t waste_tmv_bytes;
+int *waste_route_cap; int waste_route_n, waste_route_cap_n;
+/* WASTE_TRUNK_CHECK=1: run the f32 reference beside whichever quantized
+ * trunk kernel is selected and accumulate the relative error on real
+ * activations. Two kernels can agree with the reference to 4e-5 on one
+ * model and disagree with each other by 0.13 of a logit norm on another
+ * (docs/EXP1.md §2c), so the only way to rank them is to measure them
+ * where they run, on the tensors they run on. */
+static int trunk_check = 0;
+double waste_tcheck_num, waste_tcheck_den, waste_tcheck_max;
+unsigned long long waste_tcheck_n;
+/* matvec_t by call size: [<1MB, <8MB, <32MB, rest] */
+double waste_tmv_t[4];
+uint64_t waste_tmv_b[4], waste_tmv_c[4];
+enum { P_LUTB, P_KDA, P_MLA, P_ROUTE, P_EDEQ, P_EMM, P_HEAD, P_LUTA, P_MM,
+       P_TMV, P_KDAK };
 static int prof_on = -1;
 static pthread_mutex_t prof_mu = PTHREAD_MUTEX_INITIALIZER;
 static double pnow(void)
@@ -162,8 +178,16 @@ static inline float dotf(const float *a, const float *b, int n)
 
 static int q8_off = 1;     /* 1 = keep the trunk stored as int8          */
 static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
+/* Which kernel the Q4G trunk matvec uses. The trunk is 28.0 GB of Q4G on
+ * K3 and every byte is read once per token, so this one choice is ~46% of
+ * a decode step (docs/EXP1.md §1). See model_opts_init for what each mode
+ * costs in accuracy. */
+enum { TK_F32 = 0, TK_SDOT = 1, TK_I8MM = 2, TK_SMLAL = 3 };
+static int trunk_kern = TK_F32;   /* WASTE_TRUNK_KERNEL                   */
+static int sdot4_sg = 32;  /* TK_SDOT only: activations per int8 scale    */
 static int i8mm_on = 0;    /* SMMLA batched matmul; costs activation int8 */
 static const char *dump_route = NULL;  /* WASTE_DUMP_ROUTE, see moe_layer */
+static const char *dump_dsa = NULL;    /* WASTE_DUMP_DSA, see dsa_select   */
 static const char *dump_scores = NULL; /* WASTE_DUMP_SCORES, see moe_layer */
 static float ccr_lambda = 0.0f;        /* WASTE_CCR_LAMBDA, see moe_layer */
 /* Absolute position of the first token of the pass being routed. The dump
@@ -173,7 +197,39 @@ static float ccr_lambda = 0.0f;        /* WASTE_CCR_LAMBDA, see moe_layer */
 static int dump_pos0 = 0;
 static int lookahead_n = 0;            /* WASTE_LOOKAHEAD, see moe_layer  */
 static int p6_chunk = 4;               /* WASTE_P6_CHUNK, see vq_apply    */
-static int xpar_on = 0;                /* WASTE_XPAR=1 opts in; see below   */
+/* -1 = decide per layer from what is already in the cache, 0 = never,
+ * 1 = always. WASTE_XPAR sets the last two; the default is the first, and
+ * moe_layer explains what it decides on. */
+static int xpar_on = -1;
+static int metal_moe = 0;              /* WASTE_METAL_MOE, see moe_layer    */
+static int vq8_on = 0;                 /* WASTE_VQ8: int8 VQ3R table        */
+/* Which kernels are cut for the performance cores rather than the whole
+ * pool. A bitmask because LEARNED §47's finding is per kernel, not per
+ * machine: bit 0 the VQ apply, bit 1 the quantized trunk matvec, bit 2 the
+ * LUT build. 0 is the pool for everything, which is what every number in
+ * this repo before now was measured on. */
+enum { WIDE_VQ = 1, WIDE_TRUNK = 2, WIDE_LUTB = 4 };
+/* On by default, which LEARNED §47 explicitly declined to do — and the
+ * difference is what "on" means. §47 measured *capping the pool* at the
+ * performance-core count: 25% on one model and -34% on the other, because
+ * the kernel that wants every core loses them all. This takes cores away
+ * from nothing. The VQ apply and the LUT build are cut for the fast group
+ * and everything else still gets the whole machine, so the trunk matvec is
+ * unaffected and only the two kernels whose barrier was waiting on an
+ * efficiency core change. Measured positive on both models, and the split
+ * is by row so the logits are bit-identical either way (checked). The
+ * trunk matvec is deliberately *not* in the default: it measures neutral
+ * on both, so it is a switch and not a choice. WASTE_WIDE=0 turns it off. */
+static int wide_mask = WIDE_VQ | WIDE_LUTB;   /* WASTE_WIDE */
+
+/* One call site's dispatch: the fast group when this kernel is in the
+ * mask, the whole pool otherwise. */
+static inline void pf_wide(int bit, int n, int min_chunk, waste_range_fn fn,
+                           void *arg)
+{
+    if (wide_mask & bit) waste_parallel_for_fast(n, min_chunk, fn, arg);
+    else waste_parallel_for(n, min_chunk, fn, arg);
+}
 static int xpar_batch = 4;             /* WASTE_XPAR_BATCH, see moe_layer  */
 static pthread_once_t model_opts_once = PTHREAD_ONCE_INIT;
 
@@ -185,6 +241,47 @@ static void model_opts_init(void)
     if (e && *e == '0') q8_off = 0;
     e = getenv("WASTE_SDOT");
     sdot_on = e && *e != '0';
+    /* The 4-bit trunk through SDOT. K3's trunk is 28.0 GB of Q4G and every
+     * byte is read once per token, so this kernel is ~40% of a decode step.
+     * The f32 path reaches 60 GB/s on this machine against a 217 GB/s
+     * streaming ceiling (tools/mvqbw.c) because a 4-bit weight has to
+     * become a float before it can be multiplied; quantizing the
+     * activations too puts it at 202 GB/s, i.e. at the machine. What it
+     * costs is that the arithmetic is no longer the f32 reference's —
+     * hence a switch, and hence WASTE_SDOT4_SG, which sets how many
+     * activations share one int8 scale (32 by default; the weights' own
+     * group is 128). */
+    /* WASTE_TRUNK_KERNEL: 0 f32 (the reference), 1 SDOT, 2 i8mm, 3 SMLAL.
+     *
+     * The f32 path reaches 65 GB/s on this machine against a 188 GB/s
+     * streaming ceiling (tools/mvqbw.c) because a 4-bit weight has to
+     * become a float before it can be multiplied. Quantizing the
+     * activations too removes that, and the three ways of doing it are a
+     * straight speed-for-accuracy line:
+     *
+     *   1 SDOT   int8 activations       173 GB/s   max|d| 0.695
+     *   2 i8mm   15-bit, two planes     144 GB/s   max|d| 0.016
+     *   3 SMLAL  int16 activations      113 GB/s   max|d| 0.005
+     *   0 f32    exact                   78 GB/s   0
+     *
+     * SDOT is fastest and is not payable: on K3 it measures KL 0.289
+     * teacher-forced over twelve positions, against §56's KL 0.118 for a
+     * truncation that repo calls broken. The error is small at one
+     * position (rel L2 0.03) and the KDA recurrence accumulates it — which
+     * is also why the same kernel measures KL 0.0013 on Kimi-Linear's 27
+     * layers. i8mm buys 43x the accuracy for 83% of the speed. */
+    e = getenv("WASTE_TRUNK_KERNEL");
+    trunk_kern = e ? atoi(e) : TK_F32;
+    if (trunk_kern < 0 || trunk_kern > TK_SMLAL) trunk_kern = TK_F32;
+    if ((trunk_kern == TK_SDOT || trunk_kern == TK_I8MM) &&
+        !(waste_cpu_features() & WASTE_CPU_DOTPROD)) trunk_kern = TK_F32;
+    if (trunk_kern == TK_I8MM && !(waste_cpu_features() & WASTE_CPU_I8MM))
+        trunk_kern = TK_SMLAL;
+    e = getenv("WASTE_TRUNK_CHECK");
+    trunk_check = e && *e != '0';
+    e = getenv("WASTE_SDOT4_SG");
+    sdot4_sg = e ? atoi(e) : 32;
+    if (sdot4_sg != 32 && sdot4_sg != 64 && sdot4_sg != 128) sdot4_sg = 32;
     /* Here with the rest of them: read per-load, this was the one env
      * switch still written by every concurrent waste_model_load.
      * waste_cpu_features() is self-caching and does not need the backend. */
@@ -194,6 +291,8 @@ static void model_opts_init(void)
     if (i8mm_on && !(waste_cpu_features() & WASTE_CPU_I8MM)) i8mm_on = 0;
     /* Read once rather than per layer per token: moe_layer runs 92
      * times a token and getenv is not free. */
+    dump_dsa = getenv("WASTE_DUMP_DSA");
+    if (dump_dsa && !*dump_dsa) dump_dsa = NULL;
     dump_route = getenv("WASTE_DUMP_ROUTE");
     dump_scores = getenv("WASTE_DUMP_SCORES");
     { const char *s = getenv("WASTE_CCR_LAMBDA");
@@ -217,8 +316,27 @@ static void model_opts_init(void)
      * the read-ahead. No batch size wins both — docs/LEARNED.md §44 has
      * the sweep. Which regime a run is in depends on the model and the
      * machine, not on anything the container states, so it is a switch. */
+    /* The routed experts' VQ applies as one device batch per layer phase.
+     * One apply is too small to fill this GPU — 3072 rows measures 12 GB/s
+     * of index against the CPU's 24.5 — and a layer's sixteen of them in
+     * one concurrent command buffer measure 126. So the switch is not
+     * "use the GPU", it is "batch the layer", and it costs the barrier
+     * docs/LEARNED.md §44 describes: every record held before any
+     * arithmetic starts. Off by default until that trade is measured on
+     * more than one machine. */
+    /* The VQ3R apply through an int8 table held in registers rather than
+     * a float one walked in memory. 1.76x on the kernel single-threaded
+     * (tools/lutbw.c kernel E). Off by default: it quantizes the table,
+     * which makes the path discontinuous in §43's sense. */
+    { const char *e2 = getenv("WASTE_WIDE");
+      if (e2) wide_mask = atoi(e2);
+      if (wide_mask < 0) wide_mask = 0; }
+    { const char *e2 = getenv("WASTE_VQ8");
+      vq8_on = e2 && *e2 != '0'; }
+    { const char *e2 = getenv("WASTE_METAL_MOE");
+      metal_moe = e2 && *e2 != '0'; }
     { const char *e2 = getenv("WASTE_XPAR");
-      xpar_on = e2 && *e2 != '0'; }
+      xpar_on = e2 ? (*e2 != '0') : -1; }
     /* Experts held — and so barriered — at a time. Small keeps the reads
      * overlapping the arithmetic; large gives the pool more to chew on. */
     { const char *e2 = getenv("WASTE_XPAR_BATCH");
@@ -278,11 +396,52 @@ void waste_mvq_rows_f32(int b, int e, void *p)
         unp = (int8_t *)malloc((size_t)g);
         if (!unp) return;
     }
+    (void)unp;
     for (int o = b; o < e; o++) {
         const int8_t *row = a->W + (size_t)o * a->rowbytes;
         const uint16_t *ws = a->ws + (size_t)o * ng;
         float acc = 0;
         for (int k = 0; k < ng; k++) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+            /* Q4G, whole group: unpack in registers instead of staging the
+             * nibbles through a byte buffer. Same FMAs into the same 4-lane
+             * accumulator in the same order, so the result is bit for bit
+             * what the staged path produces — measured with tools/mvqbw.c,
+             * where dropping the staging buffer is worth 1.24x on K3's
+             * [12288 x 7168] trunk shape at 18 threads. The staged path
+             * stays for 3-bit rows, for a group that is not a multiple of
+             * 32, and for the ragged last group. */
+            if (a->bits == 4 && (k + 1) * g <= a->in && (g & 31) == 0) {
+                const uint8_t *p4 = (const uint8_t *)row + (size_t)k * g / 2;
+                const float *xx = x + (size_t)k * g;
+                const uint8x16_t m0f = vdupq_n_u8(0x0f);
+                const int8x16_t  m8  = vdupq_n_s8(8);
+                float32x4_t s0 = vdupq_n_f32(0);
+                for (int j = 0; j < g / 2; j += 16) {
+                    const uint8x16_t by = vld1q_u8(p4 + j);
+                    const int8x16_t lo =
+                        vsubq_s8(vreinterpretq_s8_u8(vandq_u8(by, m0f)), m8);
+                    const int8x16_t hi =
+                        vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(by, 4)), m8);
+                    const int8x16x2_t z = vzipq_s8(lo, hi);
+                    const float *xp = xx + 2 * j;
+                    for (int h = 0; h < 2; h++) {
+                        const int16x8_t l16 = vmovl_s8(vget_low_s8(z.val[h]));
+                        const int16x8_t h16 = vmovl_s8(vget_high_s8(z.val[h]));
+                        s0 = vfmaq_f32(s0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(l16))),
+                                       vld1q_f32(xp + 16 * h + 0));
+                        s0 = vfmaq_f32(s0, vcvtq_f32_s32(vmovl_s16(vget_high_s16(l16))),
+                                       vld1q_f32(xp + 16 * h + 4));
+                        s0 = vfmaq_f32(s0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(h16))),
+                                       vld1q_f32(xp + 16 * h + 8));
+                        s0 = vfmaq_f32(s0, vcvtq_f32_s32(vmovl_s16(vget_high_s16(h16))),
+                                       vld1q_f32(xp + 16 * h + 12));
+                    }
+                }
+                acc += f16_to_f32(ws[k]) * vaddvq_f32(s0);
+                continue;
+            }
+#endif
             const int8_t *w;
             if (a->bits == 3) {
                 const uint8_t *p3 = (const uint8_t *)row;
@@ -325,6 +484,212 @@ void waste_mvq_rows_f32(int b, int e, void *p)
     free(unp);
 }
 
+/* ---- Q4G x int8 activations (SDOT) --------------------------------------
+ * Two nibbles per byte, low first, so the even and odd elements of a group
+ * face different halves of the byte. Rather than interleaving the weights
+ * back together, quant_act4 writes the activations deinterleaved — the
+ * group's even elements first, then its odd ones — so each half of the
+ * unpacked byte meets a contiguous int8 vector and the kernel is two
+ * vdotq_s32 per sixteen bytes with nothing in between.
+ *
+ * `sg` activations share one scale. The weights' group of 128 sets how
+ * many weight scales there are and cannot change; the activation scale is
+ * ours to choose, and a hidden state has outliers, so a finer one is the
+ * cheap half of the accuracy. It costs one horizontal add and one fmul per
+ * sub-group.
+ */
+static void mvq4_rows_sdot(int b, int e, void *p)
+{
+#if defined(__ARM_FEATURE_DOTPROD)
+    const mvq4_arg *a = (const mvq4_arg *)p;
+    const int ng = a->ng, g = a->group, ns = a->ns, half = a->sg / 2;
+    const uint8x16_t m0f = vdupq_n_u8(0x0f);
+    const int8x16_t  m8  = vdupq_n_s8(8);
+    for (int o = b; o < e; o++) {
+        const uint8_t *row = a->W + (size_t)o * a->rowbytes;
+        const uint16_t *ws = a->ws + (size_t)o * ng;
+        float acc = 0;
+        for (int k = 0; k < ng; k++) {
+            const uint8_t *p4 = row + (size_t)k * g / 2;
+            const int8_t *xe = a->xq + (size_t)k * g;
+            const int8_t *xo = xe + g / 2;
+            const float wsf = f16_to_f32(ws[k]);
+            const float *xsc = a->xs + (size_t)k * ns;
+            for (int t = 0; t < ns; t++) {
+                int32x4_t d = vdupq_n_s32(0);
+                const int j0 = t * half;
+                for (int j = j0; j < j0 + half; j += 16) {
+                    const uint8x16_t by = vld1q_u8(p4 + j);
+                    const int8x16_t lo =
+                        vsubq_s8(vreinterpretq_s8_u8(vandq_u8(by, m0f)), m8);
+                    const int8x16_t hi =
+                        vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(by, 4)), m8);
+                    d = vdotq_s32(d, lo, vld1q_s8(xe + j));
+                    d = vdotq_s32(d, hi, vld1q_s8(xo + j));
+                }
+                acc += wsf * xsc[t] * (float)vaddvq_s32(d);
+            }
+        }
+        a->y[o] = acc;
+    }
+#else
+    (void)b; (void)e; (void)p;
+#endif
+}
+
+/* The i8mm kernel is its own translation unit: FEAT_I8MM is not in the
+ * baseline the portable ARM build targets, so arm_neon.h hides vmmlaq_s32
+ * unless the file asks for it. src/simd_i8mm.c does, the Makefile gives
+ * only that file the flag, and this call is guarded by the runtime bit —
+ * the same arrangement simd_avx2.c has on x86, and for the same reason.
+ * See docs/EXP1.md §2 for what it buys: 144 GB/s against the f32 path's
+ * 78 and 43x SDOT's accuracy. */
+void waste_mvq4_rows_i8mm(int b, int e, void *p);
+
+/* ---- Q4G x int16 activations (SMLAL) ------------------------------------
+ * No i8mm needed and 15 bits of activation exactly as SMMLA gets, at 113
+ * GB/s instead of 144. It is here as the portable member of the family and
+ * as the fallback when FEAT_I8MM is absent. Activations are deinterleaved
+ * even|odd inside the group, as for SDOT. */
+static void mvq4_rows_smlal(int b, int e, void *p)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    const mvq4_arg *a = (const mvq4_arg *)p;
+    const int ng = a->ng, g = a->group;
+    const int16_t *x16 = (const int16_t *)a->xq;
+    const uint8x16_t m0f = vdupq_n_u8(0x0f);
+    const int8x16_t  m8  = vdupq_n_s8(8);
+    for (int o = b; o < e; o++) {
+        const uint8_t *row = a->W + (size_t)o * a->rowbytes;
+        const uint16_t *ws = a->ws + (size_t)o * ng;
+        float acc = 0;
+        for (int k = 0; k < ng; k++) {
+            const uint8_t *p4 = row + (size_t)k * g / 2;
+            const int16_t *xe = x16 + (size_t)k * g;
+            const int16_t *xo = xe + g / 2;
+            int32x4_t d0 = vdupq_n_s32(0), d1 = vdupq_n_s32(0);
+            for (int j = 0; j < g / 2; j += 16) {
+                const uint8x16_t by = vld1q_u8(p4 + j);
+                const int8x16_t lo =
+                    vsubq_s8(vreinterpretq_s8_u8(vandq_u8(by, m0f)), m8);
+                const int8x16_t hi =
+                    vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(by, 4)), m8);
+                const int16x8_t l0 = vmovl_s8(vget_low_s8(lo)),
+                                l1 = vmovl_s8(vget_high_s8(lo));
+                const int16x8_t h0 = vmovl_s8(vget_low_s8(hi)),
+                                h1 = vmovl_s8(vget_high_s8(hi));
+                d0 = vmlal_s16(d0, vget_low_s16(l0),  vld1_s16(xe + j + 0));
+                d1 = vmlal_s16(d1, vget_high_s16(l0), vld1_s16(xe + j + 4));
+                d0 = vmlal_s16(d0, vget_low_s16(l1),  vld1_s16(xe + j + 8));
+                d1 = vmlal_s16(d1, vget_high_s16(l1), vld1_s16(xe + j + 12));
+                d0 = vmlal_s16(d0, vget_low_s16(h0),  vld1_s16(xo + j + 0));
+                d1 = vmlal_s16(d1, vget_high_s16(h0), vld1_s16(xo + j + 4));
+                d0 = vmlal_s16(d0, vget_low_s16(h1),  vld1_s16(xo + j + 8));
+                d1 = vmlal_s16(d1, vget_high_s16(h1), vld1_s16(xo + j + 12));
+            }
+            acc += f16_to_f32(ws[k]) * a->xs[k] *
+                   (float)(vaddvq_s32(d0) + vaddvq_s32(d1));
+        }
+        a->y[o] = acc;
+    }
+#else
+    (void)b; (void)e; (void)p;
+#endif
+}
+
+/* Activations for mvq4_rows_i8mm: one amax per weight group, a base-128
+ * split into two int8 planes, laid out the way the B operand is read. */
+static void quant_act4_mm(const float *x, int n, int g, int8_t *q, float *sc)
+{
+    const int ng = (n + g - 1) / g;
+    for (int k = 0; k < ng; k++) {
+        const int beg = k * g, end = (beg + g < n) ? beg + g : n;
+        float amax = 0;
+        for (int i = beg; i < end; i++) {
+            const float v = fabsf(x[i]);
+            if (v > amax) amax = v;
+        }
+        const float s = amax > 0 ? amax / 16383.0f : 1.0f;
+        sc[k] = s;
+        const float inv = 1.0f / s;
+        int8_t *base = q + (size_t)k * 2 * g;
+        memset(base, 0, (size_t)2 * g);
+        for (int i = beg; i < beg + g; i++) {
+            int v = 0;
+            if (i < end) {
+                v = (int)lrintf(x[i] * inv);
+                v = v > 16383 ? 16383 : (v < -16383 ? -16383 : v);
+            }
+            int hi = (v + 64) >> 7;
+            if (hi > 127) hi = 127; else if (hi < -128) hi = -128;
+            const int lo = v - 128 * hi;
+            const int r = i - beg, h = r >> 1;
+            int8_t *pl = base + ((r & 1) ? g : 0);
+            pl[(h >> 3) * 16 + (h & 7)]     = (int8_t)hi;
+            pl[(h >> 3) * 16 + 8 + (h & 7)] = (int8_t)lo;
+        }
+    }
+}
+
+/* Activations for mvq4_rows_smlal: int16, one amax per weight group,
+ * deinterleaved even|odd inside the group. */
+static void quant_act4_16(const float *x, int n, int g, int8_t *q, float *sc)
+{
+    const int ng = (n + g - 1) / g;
+    int16_t *x16 = (int16_t *)q;
+    for (int k = 0; k < ng; k++) {
+        const int beg = k * g, end = (beg + g < n) ? beg + g : n;
+        float amax = 0;
+        for (int i = beg; i < end; i++) {
+            const float v = fabsf(x[i]);
+            if (v > amax) amax = v;
+        }
+        const float s = amax > 0 ? amax / 32767.0f : 1.0f;
+        sc[k] = s;
+        const float inv = 1.0f / s;
+        for (int i = beg; i < beg + g; i++) {
+            int v = 0;
+            if (i < end) {
+                v = (int)lrintf(x[i] * inv);
+                v = v > 32767 ? 32767 : (v < -32767 ? -32767 : v);
+            }
+            const int r = i - beg;
+            x16[(size_t)k * g + (r >> 1) + ((r & 1) ? g / 2 : 0)] = (int16_t)v;
+        }
+    }
+}
+
+/* int8 activations for the kernel above: per sub-group amax, deinterleaved
+ * within each weight group, zero-padded past `n` so a ragged last group
+ * contributes nothing. */
+static void quant_act4(const float *x, int n, int g, int sg, int8_t *q, float *sc)
+{
+    const int ng = (n + g - 1) / g, ns = g / sg;
+    for (int k = 0; k < ng; k++) {
+        for (int t = 0; t < ns; t++) {
+            const int beg = k * g + t * sg;
+            const int end = (beg + sg < n) ? beg + sg : (beg < n ? n : beg);
+            float amax = 0;
+            for (int i = beg; i < end; i++) {
+                const float v = fabsf(x[i]);
+                if (v > amax) amax = v;
+            }
+            const float s = amax > 0 ? amax / 127.0f : 1.0f;
+            sc[k * ns + t] = s;
+            const float inv = 1.0f / s;
+            for (int i = beg; i < beg + sg; i++) {
+                int v = 0;
+                if (i < end) {
+                    v = (int)lrintf(x[i] * inv);
+                    v = v > 127 ? 127 : (v < -127 ? -127 : v);
+                }
+                const int r = i - k * g;
+                q[k * g + (r >> 1) + ((r & 1) ? g / 2 : 0)] = (int8_t)v;
+            }
+        }
+    }
+}
+
 static void mvq_rows(int b, int e, void *p)
 {
     mvq_arg *a = (mvq_arg *)p;
@@ -358,11 +723,17 @@ static void matvec(float *y, const float *W, const float *x, int out, int in)
 }
 
 /* A device backend takes the whole range at once; the pool would otherwise
- * split one GPU dispatch into a dozen. */
-static inline void run_rows(int n, int min_chunk, waste_range_fn fn, void *arg)
+ * split one GPU dispatch into a dozen. Below `device_min_bytes` the
+ * dispatch floor is larger than the work, so the pool keeps it — with the
+ * CPU kernel, which is a different function pointer since the accelerator
+ * has overwritten the one the pool would otherwise have called. */
+static inline void run_rows(int n, int min_chunk, waste_range_fn fn, void *arg,
+                            size_t bytes)
 {
-    if (waste_k.on_device) fn(0, n, arg);
-    else waste_parallel_for(n, min_chunk, fn, arg);
+    if (waste_k.on_device && bytes >= waste_k.device_min_bytes) { fn(0, n, arg); return; }
+    waste_parallel_for_work(n, min_chunk,
+                            waste_k.on_device ? waste_k.mvq_rows_cpu : fn, arg,
+                            bytes);
 }
 
 /* Quantize x into per-group int8 (same grouping as the weights). */
@@ -388,19 +759,84 @@ static void quant_act(const float *x, int n, int g, int8_t *q, float *sc)
 }
 
 /* Matvec against a trunk tensor, quantized path when available. */
+static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
+                           const float *x, int out, int in);
+
+/* Every dense trunk projection lands here, and on K3 that is 28.0 GB of
+ * Q4G read once per token — the single largest byte term in a decode step
+ * (docs/LEARNED.md §59). It has no bucket of its own in the profile, which
+ * is why "kda 29%" was being read as if it were all recurrence. */
 static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
                      const float *x, int out, int in)
+{
+    if (!prof_on) { matvec_t_inner(m, y, t, x, out, in); return; }
+    const double t0 = pnow();
+    matvec_t_inner(m, y, t, x, out, in);
+    const double dt = pnow() - t0;
+    const uint64_t nb = t ? (uint64_t)out * t->rowbytes : 0;
+    const int bk = nb < (1u<<20) ? 0 : nb < (8u<<20) ? 1 : nb < (32u<<20) ? 2 : 3;
+    pthread_mutex_lock(&prof_mu);
+    waste_prof[P_TMV] += dt; waste_prof_n[P_TMV]++;
+    waste_tmv_bytes += nb;
+    waste_tmv_t[bk] += dt; waste_tmv_b[bk] += nb; waste_tmv_c[bk]++;
+    pthread_mutex_unlock(&prof_mu);
+}
+
+static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
+                           const float *x, int out, int in)
 {
     if (!t || (!t->q && !t->data)) { memset(y, 0, (size_t)out * sizeof(float)); return; }
     if (!t->q) { matvec(y, t->data, x, out, in); return; }
     const int g = t->group, ng = (in + g - 1) / g;
+    if (trunk_kern != TK_F32 && t->bits == 4 && (g & 31) == 0) {
+        mvq4_arg a = { y, (const uint8_t *)t->q, t->qs, m->xq, m->xs,
+                       in, ng, g, sdot4_sg, g / sdot4_sg, t->rowbytes };
+        waste_range_fn fn = NULL;
+        if (trunk_kern == TK_SDOT && g % sdot4_sg == 0) {
+            quant_act4(x, in, g, sdot4_sg, m->xq, m->xs);
+            fn = mvq4_rows_sdot;
+        } else if (trunk_kern == TK_I8MM) {
+            quant_act4_mm(x, in, g, m->xq, m->xs);
+            fn = waste_mvq4_rows_i8mm;
+        } else if (trunk_kern == TK_SMLAL) {
+            quant_act4_16(x, in, g, m->xq, m->xs);
+            fn = mvq4_rows_smlal;
+        }
+        if (fn) {
+            waste_parallel_for_work(out, 64, fn, &a,
+                                    (size_t)out * t->rowbytes);
+            if (trunk_check) {
+                float *ref = (float *)malloc((size_t)out * sizeof(float));
+                if (ref) {
+                    mvq_arg r = { ref, t->q, t->qs, NULL, x, in, ng, g,
+                                  t->bits, t->rowbytes };
+                    waste_parallel_for(out, 64, waste_k.mvq_rows_cpu, &r);
+                    double num = 0, den = 0;
+                    for (int i = 0; i < out; i++) {
+                        const double d = (double)y[i] - ref[i];
+                        num += d * d; den += (double)ref[i] * ref[i];
+                        if (fabs(d) > waste_tcheck_max) waste_tcheck_max = fabs(d);
+                    }
+                    if (den > 0) {
+                        waste_tcheck_num += num / den;
+                        waste_tcheck_den += 1.0;
+                        waste_tcheck_n++;
+                    }
+                    free(ref);
+                }
+            }
+            return;
+        }
+    }
     if (sdot_on && t->bits == 8) {
         quant_act(x, in, g, m->xq, m->xs);
         mvq_arg a = { y, t->q, t->qs, m->xq, m->xs, in, ng, g, 8, (size_t)ng * g };
-        waste_parallel_for(out, 64, mvq_rows, &a);
+        waste_parallel_for_work(out, 64, mvq_rows, &a,
+                                (size_t)out * t->rowbytes);
     } else {
         mvq_arg a = { y, t->q, t->qs, NULL, x, in, ng, g, t->bits, t->rowbytes };
-        run_rows(out, 64, waste_k.mvq_rows_f32, &a);
+        run_rows(out, 64, waste_k.mvq_rows_f32, &a,
+                 (size_t)out * t->rowbytes);
     }
 }
 
@@ -514,6 +950,33 @@ float waste_situ_pair(float g, float u, float beta, float lbeta)
     return a * (lbeta > 0.0f ? lbeta * tanhf(u / lbeta) : u);
 }
 
+/* SwiGLU and the two variants of it this family ships, over a whole range.
+ *
+ * One function rather than the if/else that used to sit at each of its
+ * seven call sites: GLM-5.3-Flash adds a third form and the sites are
+ * exactly the places a new one gets forgotten. `g` is the gate half and is
+ * overwritten with the product; `u` is the up half.
+ *
+ * The clamp is not cosmetic. GLM applies it to gate above and to up on both
+ * sides *before* the SiLU, and at limit 10 it fires on real activations —
+ * dropping it leaves a model that looks right and drifts. */
+void waste_act_pair_range(const waste_config *c, float *g, const float *u, int n)
+{
+    if (c->act_situ) {
+        for (int i = 0; i < n; i++)
+            g[i] = waste_situ_pair(g[i], u[i], c->situ_beta, c->situ_linear_beta);
+    } else if (c->swiglu_limit > 0.0f) {
+        const float lim = c->swiglu_limit;
+        for (int i = 0; i < n; i++) {
+            const float a = g[i] > lim ? lim : g[i];
+            const float b = u[i] > lim ? lim : (u[i] < -lim ? -lim : u[i]);
+            g[i] = silu(a) * b;
+        }
+    } else {
+        for (int i = 0; i < n; i++) g[i] = silu(g[i]) * u[i];
+    }
+}
+
 static void softmax(float *x, int n)
 {
     float mx = x[0];
@@ -592,7 +1055,19 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
 
         const int is_vision = !strncmp(t->name, "vision_tower.", 13) ||
                               !strncmp(t->name, "mm_projector.", 13);
-        if (m->cfg.prefix[0] && !(is_vision && m->want_vision) &&
+        /* The tower is skipped unless it was asked for, and that has to be
+         * its own test rather than a corollary of the prefix one: K3's
+         * container has a prefix and every non-prefixed tensor is the
+         * tower, so the two coincided there. GLM's container has no prefix
+         * at all, and the coincidence made its 282 MB resident on every
+         * open, image or no image. */
+        if (is_vision && !m->want_vision) {
+            t->on_disk = 1;
+            t->file_off = off;
+            t->file_scale_off = soff;
+            continue;
+        }
+        if (m->cfg.prefix[0] && !is_vision &&
             strncmp(t->name, m->cfg.prefix, strlen(m->cfg.prefix)) != 0) {
             t->on_disk = 1;
             t->file_off = off;
@@ -765,6 +1240,31 @@ static int validate_text_tensors(waste_model *m)
             REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L), hid, c->n_heads * c->v_head);
         }
 
+        if (c->hc_mult) {
+            const int nmix = (2 + c->hc_mult) * c->hc_mult;
+            const char *site[2] = { "attn", "ffn" };
+            for (int i = 0; i < 2; i++) {
+                REQUIRE_MATRIX(tname("%smodel.layers.%d.hc_%s_fn", c->prefix, L, site[i]),
+                               nmix, c->hc_mult * hid);
+                REQUIRE_DATA(tname("%smodel.layers.%d.hc_%s_base", c->prefix, L, site[i]),
+                             (size_t)nmix);
+                REQUIRE_DATA(tname("%smodel.layers.%d.hc_%s_scale", c->prefix, L, site[i]), 3);
+            }
+        }
+        if (c->index_topk && !c->kda_layer[L]) {
+            const char *ix = "%smodel.layers.%d.self_attn.indexer.%s";
+            REQUIRE_MATRIX(tname(ix, c->prefix, L, "wq_b.weight"),
+                           c->index_heads * c->index_dim, c->q_lora);
+            REQUIRE_MATRIX(tname(ix, c->prefix, L, "wk.weight"), c->index_dim, hid);
+            REQUIRE_VECTOR(tname(ix, c->prefix, L, "k_norm.weight"), c->index_dim);
+            REQUIRE_VECTOR(tname(ix, c->prefix, L, "k_norm.bias"), c->index_dim);
+            REQUIRE_MATRIX(tname(ix, c->prefix, L, "weights_proj.weight"), c->index_heads, hid);
+            REQUIRE_MATRIX(tname(ix, c->prefix, L, "index_kpool_compress_gate"),
+                           c->index_dim, hid);
+            REQUIRE_DATA(tname(ix, c->prefix, L, "index_kpool_compress_ape"),
+                         (size_t)c->index_kpool * c->index_dim);
+        }
+
         if (c->attn_res_block) {
             REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attention_res_norm.weight", c->prefix, L), hid);
             REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attention_res_proj.weight", c->prefix, L), hid);
@@ -846,6 +1346,28 @@ static int cfg_sane(const waste_config *c)
             (int64_t)c->n_heads * c->v_head > INT_MAX ||
             (int64_t)c->n_heads * (c->qk_nope + c->v_head) > INT_MAX)
             return 0;
+    }
+    /* mHC multiplies the resident residual stream and every buffer sized
+     * from it, so it is bounded like a dimension rather than a flag. */
+    if (c->hc_mult < 0 || c->hc_mult > 16) return 0;
+    if (c->hc_mult) {
+        if (c->hc_iters < 1 || c->hc_iters > 1024) return 0;
+        if (!(c->hc_eps > 0.0f) || !(c->hc_eps < 1.0f)) return 0;
+        if ((int64_t)c->hc_mult * c->hidden > INT_MAX) return 0;
+    }
+    if (!(c->swiglu_limit >= 0.0f)) return 0;              /* also NaN */
+    /* The indexer is all-or-nothing: a container that states a topk without
+     * the shapes to score with would silently attend over nothing. */
+    if (c->index_kpool < 1 || c->index_kpool > 64) return 0;
+    if (c->index_topk < 0 || c->index_topk > (1 << 24)) return 0;
+    if (c->index_heads < 0 || c->index_heads > (1 << 16)) return 0;
+    if (c->index_dim < 0 || c->index_dim > (1 << 20)) return 0;
+    if (c->index_topk) {
+        if (c->index_heads < 1 || c->index_dim < 1) return 0;
+        if (c->index_topk % c->index_kpool) return 0;
+        if ((int64_t)c->index_heads * c->index_dim > INT_MAX) return 0;
+    } else if (c->index_heads || c->index_dim) {
+        return 0;
     }
     if (c->n_experts && c->moe_inter < 1) return 0;
     if ((!c->n_experts || c->first_dense) && c->dense_inter < 1) return 0;
@@ -1007,6 +1529,20 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
 
     rope_init(c, d, cfg);
 
+    /* GLM-5.3-Flash: mHC, the clamped SwiGLU and the DSA indexer. Absent on
+     * every Kimi container, where all of these read back 0 and the ordinary
+     * paths run unchanged. */
+    c->hc_mult  = (int)js_int(d, js_get(d, cfg, "hc_mult"), 0);
+    c->hc_iters = (int)js_int(d, js_get(d, cfg, "hc_sinkhorn_iters"), 0);
+    c->hc_eps   = (float)js_num(d, js_get(d, cfg, "hc_eps"), 1e-6);
+    c->swiglu_limit = (float)js_num(d, js_get(d, cfg, "swiglu_limit"), 0.0);
+    c->index_topk  = (int)js_int(d, js_get(d, cfg, "index_topk"), 0);
+    c->index_kpool = (int)js_int(d, js_get(d, cfg, "index_kpool"), 1);
+    c->index_heads = (int)js_int(d, js_get(d, cfg, "index_n_heads"), 0);
+    c->index_dim   = (int)js_int(d, js_get(d, cfg, "index_head_dim"), 0);
+    c->index_tail  = js_get(d, cfg, "index_kpool_always_select_tail") >= 0;
+    c->tok_han_split = js_bool(d, js_get(d, cfg, "tokenizer_han_split"), 1);
+
     int lac = js_get(d, cfg, "linear_attn_config");
     c->full_rank_gate = js_get(d, lac, "use_full_rank_gate") >= 0;
     c->gate_lower_bound = (float)js_num(d, js_get(d, lac, "gate_lower_bound"), 0.0);
@@ -1024,6 +1560,8 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
 /* Defined below, next to record_check; the cache needs it at load. */
 static int bank_fetch(void *user, int layer, int expert, uint8_t *dst);
 static void start_readers(waste_model *m);
+static void start_fill(waste_model *m);
+static void stop_fill(waste_model *m);
 
 /* Wire the resident trunk. The cache is the cold part of this engine —
  * 19 to 30% hit — and this is the hot one: 27.5 GB on K3, read in full
@@ -1208,6 +1746,47 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
             js_doc vd;
             if (js_parse(&vd, vs) >= 0) {
                 waste_vision_cfg *v = &m->vcfg;
+                {   /* GLM states its tower under the HF names, K3 under
+                     * the converter's `vt_` ones. Read the tower first and
+                     * then the geometry it implies, rather than defaulting
+                     * every field twice. */
+                    char tw[32];
+                    js_str(&vd, js_get(&vd, 0, "tower"), tw, sizeof tw);
+                    v->tower = strcmp(tw, "glm5-next") == 0
+                             ? WASTE_TOWER_GLM : WASTE_TOWER_K3;
+                }
+                if (v->tower == WASTE_TOWER_GLM) {
+                    v->hidden      = (int)js_int(&vd, js_get(&vd, 0, "hidden_size"), 1024);
+                    v->heads       = (int)js_int(&vd, js_get(&vd, 0, "num_heads"), 16);
+                    v->qkv_hidden  = v->hidden;      /* qkv is 3x hidden   */
+                    v->inter       = (int)js_int(&vd, js_get(&vd, 0, "intermediate_size"), 4096);
+                    v->layers      = (int)js_int(&vd, js_get(&vd, 0, "depth"), 24);
+                    v->merge       = (int)js_int(&vd, js_get(&vd, 0, "spatial_merge_size"), 2);
+                    v->temporal    = (int)js_int(&vd, js_get(&vd, 0, "temporal_patch_size"), 2);
+                    v->out_hidden  = (int)js_int(&vd, js_get(&vd, 0, "out_hidden_size"), c->hidden);
+                    v->proj_inter  = (int)js_int(&vd, js_get(&vd, 0, "projection_intermediate_size"), 10240);
+                    v->swiglu_limit = (float)js_num(&vd, js_get(&vd, 0, "swiglu_limit"), 0.0);
+                    v->img_start   = (int)js_int(&vd, js_get(&vd, 0, "image_start_token_id"), -1);
+                    v->img_end     = (int)js_int(&vd, js_get(&vd, 0, "image_end_token_id"), -1);
+                    v->text_hidden = v->out_hidden;
+                    v->patch       = (int)js_int(&vd, js_get(&vd, 0, "patch_size"), 14);
+                    /* Its norms are Glm5NextRMSNorm(dim, eps=rms_norm_eps),
+                     * so unlike K3's the eps is stated and is not float
+                     * epsilon. The merger's is a LayerNorm at torch's
+                     * default. */
+                    v->eps         = (float)js_num(&vd, js_get(&vd, 0, "rms_norm_eps"), 1e-5);
+                    v->proj_eps    = 1e-5f;
+                    /* pos_h/pos_w belong to K3's learned grid and are not
+                     * read; keep them in range for cfg_sane. */
+                    v->pos_h = v->pos_w = 1;
+                    v->media_token = (int)js_int(&vd, js_get(&vd, 0,
+                                         "media_placeholder_token_id"), -1);
+                    v->max_patches = (int)js_int(&vd, js_get(&vd, 0,
+                                         "max_patches"), 1024);
+                    v->min_tokens  = (int)js_int(&vd, js_get(&vd, 0,
+                                         "min_image_tokens"), 1);
+                    goto vision_pixels;
+                }
                 v->hidden      = (int)js_int(&vd, js_get(&vd, 0, "vt_hidden_size"), 1024);
                 v->heads       = (int)js_int(&vd, js_get(&vd, 0, "vt_num_attention_heads"), 12);
                 v->qkv_hidden  = (int)js_int(&vd, js_get(&vd, 0, "qkv_hidden_size"), 1536);
@@ -1225,6 +1804,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                                      "media_placeholder_token_id"), -1);
                 v->max_patches = (int)js_int(&vd, js_get(&vd, 0,
                                      "max_patches"), 1024);
+            vision_pixels:
                 {   /* K3 normalizes to [-1, 1]: preprocessor_config.json
                      * carries mean = std = 0.5 under `media_proc_cfg`, and
                      * kimi_k3_vision_processing.py applies exactly those.
@@ -1258,6 +1838,13 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                    v->pos_h > 0 && v->pos_h <= (1 << 16) &&
                    v->pos_w > 0 && v->pos_w <= (1 << 16) &&
                    v->text_hidden == c->hidden && v->patch == 14 &&
+                   (v->tower != WASTE_TOWER_GLM ||
+                    (v->merge >= 1 && v->merge <= 8 &&
+                     v->temporal >= 1 && v->temporal <= 8 &&
+                     v->out_hidden > 0 && v->out_hidden <= (1 << 20) &&
+                     v->proj_inter > 0 && v->proj_inter <= (1 << 22) &&
+                     v->hidden % v->heads == 0 &&
+                     isfinite(v->swiglu_limit) && v->swiglu_limit >= 0.0f)) &&
                    v->media_token >= 0 && v->media_token < c->vocab &&
                    v->max_patches >= 4 && v->max_patches <= (1 << 20) &&
                    isfinite(v->eps) && v->eps > 0.0f &&
@@ -1361,6 +1948,10 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
 
     /* state + scratch */
     const int H = c->kda_heads, D = c->kda_dim, C = H * D;
+    /* Pools a full context can produce. The +1 is the pool the last token
+     * closes: kv_cap tokens make exactly kv_cap/kpool of them, and rounding
+     * up costs one vector and removes a bound to get wrong. */
+    m->pool_cap = c->index_kpool ? kv_cap / c->index_kpool + 1 : 0;
     for (int L = 0; L < c->n_layers; L++) {
         if (c->kda_layer[L]) {
             m->S[L] = (float *)calloc((size_t)H * D * D, sizeof(float));
@@ -1369,10 +1960,42 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
             m->has_mla = 1;      /* this is what makes kv_cap a real bound */
             m->latcache[L] = (float *)calloc(
                 (size_t)kv_cap * (c->kv_lora + c->qk_rope), sizeof(float));
+            if (c->index_topk) {
+                m->idxpool[L] = (float *)calloc(
+                    (size_t)m->pool_cap * c->index_dim, sizeof(float));
+                m->idxbuf[L] = (float *)calloc(
+                    (size_t)c->index_kpool * 2 * c->index_dim, sizeof(float));
+                if (!m->idxpool[L] || !m->idxbuf[L]) return -1;
+            }
         }
     }
+    if (c->index_topk && m->has_mla) {
+        /* One selection at a time, shared by every layer: it is consumed by
+         * the head loop before the next layer records anything. */
+        m->idxsel = (int *)calloc((size_t)c->index_topk + c->index_kpool,
+                                  sizeof(int));
+        m->idxscore = (float *)calloc((size_t)m->pool_cap, sizeof(float));
+        m->idxrank = (int *)calloc((size_t)m->pool_cap, sizeof(int));
+        m->idxq = (float *)calloc((size_t)c->index_heads * c->index_dim +
+                                  c->index_heads, sizeof(float));
+        if (!m->idxsel || !m->idxscore || !m->idxrank || !m->idxq) return -1;
+    }
     const int big = c->hidden > C ? c->hidden : C;
-    m->x = (float *)calloc((size_t)c->hidden, sizeof(float));
+    /* mHC keeps hc_mult residual streams instead of one. Every other user
+     * of m->x reads stream 0, which is where the single-stream models put
+     * the whole thing, so the multiplier is confined to this allocation
+     * and to the three places that walk the buffer whole. */
+    const int hc = c->hc_mult ? c->hc_mult : 1;
+    m->x = (float *)calloc((size_t)hc * c->hidden, sizeof(float));
+    if (c->hc_mult) {
+        const int nmix = (2 + c->hc_mult) * c->hc_mult;
+        m->hcflat = (float *)calloc((size_t)hc * c->hidden, sizeof(float));
+        m->hccol  = (float *)calloc((size_t)c->hidden, sizeof(float));
+        /* the mapping's outputs, then the `pre` weights hc_collapse keeps
+         * past them rather than on its caller's stack */
+        m->hcmix  = (float *)calloc((size_t)nmix + c->hc_mult, sizeof(float));
+        if (!m->hcflat || !m->hccol || !m->hcmix) return -1;
+    }
     m->h = (float *)calloc((size_t)c->hidden, sizeof(float));
     m->tmp = (float *)calloc((size_t)8 * big + 8 * c->moe_inter + 8 * c->dense_inter
                              + (size_t)4 * c->n_heads * (c->v_head + c->qk_nope + c->qk_rope)
@@ -1390,7 +2013,11 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     }
     {   /* int8 activations for the SMMLA batched matmul: a full chunk of
          * the widest input the trunk has (the dense FFN's 33792) */
-        const int widest = c->dense_inter > c->hidden ? c->dense_inter : c->hidden;
+        int widest = c->dense_inter > c->hidden ? c->dense_inter : c->hidden;
+        /* Same bound as m->xq below, for the same reason: the batched
+         * matmul quantizes rows of whatever width it is handed. */
+        if ((int64_t)(c->hc_mult ? c->hc_mult : 1) * c->hidden > widest)
+            widest = (c->hc_mult ? c->hc_mult : 1) * c->hidden;
         m->mmx_cap = (size_t)WASTE_CHUNK_MAX * widest;
         m->mms_cap = (size_t)WASTE_CHUNK_MAX * ((widest + 127) / 128 + 1);
         m->mmxq = (int8_t *)malloc(m->mmx_cap);
@@ -1437,8 +2064,19 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                                   ? c->latent_dim : c->hidden)), sizeof(float));
     }
     {
-        const int nmax = c->hidden > c->dense_inter ? c->hidden : c->dense_inter;
-        m->xq = (int8_t *)calloc((size_t)nmax + 256, 1);
+        int nmax = c->hidden > c->dense_inter ? c->hidden : c->dense_inter;
+        /* mHC's mapping reads the whole flattened stream vector, which is
+         * hc_mult times the hidden size and on GLM the widest quantized
+         * matvec in the model: 16384 against the dense FFN's 12288. Sized
+         * from the FFN alone this buffer is 4096 activations short of what
+         * hc_collapse quantizes into it, and the 1024 bytes of slack below
+         * hide that at test scale and not at model scale. */
+        const int64_t hcw = (int64_t)(c->hc_mult ? c->hc_mult : 1) * c->hidden;
+        if (hcw > nmax) nmax = (int)hcw;
+        /* Two bytes per activation: the i8mm path writes two int8 planes
+         * and the SMLAL path writes int16, both over the padded group
+         * count rather than over `in`. */
+        m->xq = (int8_t *)calloc((size_t)nmax * 2 + 1024, 1);
         m->xs = (float *)calloc((size_t)nmax / 32 + 64, sizeof(float));
     }
 
@@ -1450,14 +2088,20 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         int nmax = c->hidden > c->moe_inter ? c->hidden : c->moe_inter;
         if (lt > nmax) nmax = lt;
         const size_t nvmax = (size_t)(nmax / m->vec_dim + 1);
-        m->lut = (float *)malloc((size_t)3 * nvmax *
+        /* Page-aligned: a device backend wraps these with no copy, and
+         * newBufferWithBytesNoCopy refuses anything else. */
+        m->lut_bytes = (size_t)3 * nvmax * m->stages * m->cb_entries * sizeof(float);
+        m->lut = (float *)waste_dio_alloc((size_t)3 * nvmax *
                                  m->stages * m->cb_entries * sizeof(float));
         /* An int8 shadow of m->lut, region for region, filled by
          * vq_build_lut. Same element count as the float table and a
          * quarter of the bytes. */
         const size_t reg = nvmax * (size_t)m->stages * m->cb_entries;
         const size_t nsc = nvmax / WASTE_VQ_LUT_BLK + 2;
-        if (m->index_bits == 6) {
+        /* The int8 shadow of the table. VQ4P needs it; VQ3R uses it only
+         * under WASTE_VQ8, and the allocation is 1 MB on K3, so it is
+         * simpler to have it than to make every consumer test twice. */
+        if (m->index_bits == 6 || vq8_on) {
             m->lut8 = (int8_t *)malloc(3 * reg);
             m->lut8_scale = (float *)malloc(3 * nsc * sizeof(float));
         }
@@ -1472,13 +2116,13 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
             m->xga  = (float *)malloc((size_t)K * c->moe_inter * sizeof(float));
             m->xub  = (float *)malloc((size_t)K * c->moe_inter * sizeof(float));
             m->xacc = (float *)malloc((size_t)K * lt2 * sizeof(float));
-            m->xlut = (float *)malloc((size_t)K * reg * sizeof(float));
-            if (m->index_bits == 6) {
+            m->xlut = (float *)waste_dio_alloc((size_t)K * reg * sizeof(float));
+            if (m->index_bits == 6 || vq8_on) {
                 m->xlut8 = (int8_t *)malloc((size_t)K * reg);
                 m->xqs = (float *)malloc((size_t)K * nsc * sizeof(float));
             }
             if (!m->xga || !m->xub || !m->xacc || !m->xlut ||
-                (m->index_bits == 6 && (!m->xlut8 || !m->xqs))) {
+                ((m->index_bits == 6 || vq8_on) && (!m->xlut8 || !m->xqs))) {
                 free(m->xga); free(m->xub); free(m->xacc);
                 free(m->xlut); free(m->xlut8); free(m->xqs);
                 m->xga = m->xub = m->xacc = m->xlut = m->xqs = NULL;
@@ -1514,6 +2158,9 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         else if (!m->latcache[L]) return -1;
     }
     if (c->attn_res_block && !m->blockres) return -1;
+    /* Last, so a load that fails leaves no thread reading a model nobody
+     * owns — every return above this line is a failure. */
+    start_fill(m);
     return 0;
 }
 
@@ -1524,6 +2171,9 @@ void waste_model_free(waste_model *m)
      * waste_ecache_free — which runs last — is the difference between a
      * clean shutdown and a read on a descriptor that has been closed and
      * possibly reused. */
+    /* Before the readers stop and before the bank descriptors close: the
+     * fill thread preads on both. */
+    stop_fill(m);
     waste_ecache_io_stop(&m->cache);
 
     /* Reachable on a partially-built model now that waste_open frees what
@@ -1545,19 +2195,22 @@ void waste_model_free(waste_model *m)
     free(m->codebooksT);
     for (int L = 0; L < 128; L++) {
         free(m->S[L]); free(m->conv[L]); free(m->latcache[L]);
+        free(m->idxpool[L]); free(m->idxbuf[L]);
         if (m->bank[L].fd >= 0) close(m->bank[L].fd);
     }
     free(m->x); free(m->h); free(m->tmp); free(m->att); free(m->logits);
-    free(m->ff); free(m->e_gate); free(m->e_up); free(m->e_down); free(m->lut);
+    free(m->ff); free(m->e_gate); free(m->e_up); free(m->e_down); waste_dio_free(m->lut);
     free(m->lut8); free(m->lut8_scale);
     free(m->xga); free(m->xub); free(m->xacc);
-    free(m->xlut); free(m->xlut8); free(m->xqs);
+    waste_dio_free(m->xlut); free(m->xlut8); free(m->xqs);
     free(m->xq); free(m->xs); waste_dio_free(m->miss_buf);
     free(m->blockres); free(m->prefix_sum); free(m->ares);
     free(m->cx); free(m->cnorm); free(m->cresid); free(m->cq); free(m->ckv);
     free(m->clat); free(m->cff); free(m->cexp); free(m->cblockres);
     free(m->cprefix); free(m->croute); free(m->crw); free(m->cused);
     free(m->cq8); free(m->cq8_scale);
+    free(m->hcflat); free(m->hccol); free(m->hcmix);
+    free(m->idxsel); free(m->idxscore); free(m->idxrank);
     waste_ecache_free(&m->cache);
     pthread_mutex_destroy(&m->fetch_mu);
 }
@@ -1923,7 +2576,7 @@ static void vq_build_lut(waste_model *m, float *lut, int cb_base,
     /* Vectors are independent. The build was serial while everything around
      * it used the pool, and on K3 it is 8.0 GFLOP per token — 7.0 of them
      * for the down projections, which are rebuilt once per routed expert. */
-    waste_parallel_for(N / vec_dim, 16, waste_k.lutb_range, &a);
+    pf_wide(WIDE_LUTB, N / vec_dim, 16, waste_k.lutb_range, &a);
     if (q) vq_quant_lut(lut, N / vec_dim, stages, entries, q, qs);
     PROF_END(P_LUTB);
 }
@@ -2181,6 +2834,9 @@ static void vq_apply_serial(waste_model *m, float *y, const uint8_t *idx,
     if (m->index_bits == 6) {
         vqp_arg a = { y, idx, scale, q, qs, nv };
         waste_k.vq_rows_p6(0, M, &a);
+    } else if (vq8_on && q && waste_k.vq_rows_e) {
+        vqp_arg a = { y, idx, scale, q, qs, nv };
+        waste_k.vq_rows_e(0, M, &a);
     } else {
         vq_arg a = { y, idx, scale, lut, nv, m->stages, m->cb_entries };
         vq_rows(0, M, &a);
@@ -2207,12 +2863,15 @@ static void vq_apply(waste_model *m, float *y, const uint8_t *idx,
     const int nv = N / m->vec_dim;
     if (m->index_bits == 6) {
         vqp_arg a = { y, idx, scale, q, qs, nv };
-        waste_parallel_for(M, VQ_TILE * p6_chunk, waste_k.vq_rows_p6, &a);
+        pf_wide(WIDE_VQ, M, VQ_TILE * p6_chunk, waste_k.vq_rows_p6, &a);
+    } else if (vq8_on && q && waste_k.vq_rows_e) {
+        vqp_arg a = { y, idx, scale, q, qs, nv };
+        pf_wide(WIDE_VQ, M, VQ_TILE * VQ_SUPER, waste_k.vq_rows_e, &a);
     } else {
         vq_arg a = { y, idx, scale, lut, nv, m->stages, m->cb_entries };
         /* min_chunk = VQ_TILE keeps every thread's range block-aligned,
          * which the blocked index layout requires. */
-        waste_parallel_for(M, VQ_TILE * VQ_SUPER, vq_rows, &a);
+        pf_wide(WIDE_VQ, M, VQ_TILE * VQ_SUPER, vq_rows, &a);
     }
     PROF_END(P_LUTA);
 }
@@ -2274,12 +2933,7 @@ static void moe_expert_range(int b, int e, void *p)
                         a->lut_gate, a->q_gate, a->qs_gate);
         vq_apply_serial(m, ub, rec + h->up_off, sc + inter, inter, lat,
                         a->lut_up, a->q_up, a->qs_up);
-        if (c->act_situ)
-            for (int i = 0; i < inter; i++)
-                ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta,
-                                        c->situ_linear_beta);
-        else
-            for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
+        waste_act_pair_range(c, ga, ub, inter);
         vq_matvec_serial(m, acc, rec + h->down_off, sc + 2 * inter, ga, lat,
                          inter, h->codebook_id + 2 * m->stages, ld, qd, qsd);
         /* acc is left unweighted on purpose: the caller applies w[j] in the
@@ -2456,12 +3110,225 @@ static void rope_apply(int half, float *x, const float *cs, const float *sn)
     }
 }
 
+/* ---- DeepSeek Sparse Attention, k-pool flavour (GLM-5.3-Flash) ---------
+ *
+ * An MLA layer here does not attend over the whole context. A small
+ * indexer, with projections of its own, scores *pools* of index_kpool
+ * adjacent cached tokens and keeps the best index_topk / index_kpool of
+ * them; the query then attends over those pools' tokens plus the tail of
+ * the context that has not filled a pool yet.
+ *
+ * Two things make this cheap to keep resident. A pool's compressed key is
+ * one index_dim vector per index_kpool tokens — 32x less than the raw keys
+ * the scores would otherwise need — and it is computed once, when its last
+ * token arrives, never recomputed. So the per-step state is a rolling
+ * buffer of the (key, gate) pairs of the pool being filled, and an
+ * append-only array of finished pool keys.
+ *
+ * Below index_topk tokens of context this is exactly dense attention: every
+ * complete pool is selected and the tail covers the rest. dsa_select says
+ * so by returning -1, and the head loop takes its ordinary path. That is
+ * not an approximation for short prompts — it is what the arithmetic
+ * reduces to, and it is why the selection cost only appears where the
+ * saving does.
+ */
+static void layernorm(float *o, const float *x, const float *w,
+                      const float *b, int n, float eps)
+{
+    float mean = 0;
+    for (int i = 0; i < n; i++) mean += x[i];
+    mean /= (float)n;
+    float var = 0;
+    for (int i = 0; i < n; i++) { const float d = x[i] - mean; var += d * d; }
+    const float inv = 1.0f / sqrtf(var / (float)n + eps);
+    for (int i = 0; i < n; i++) o[i] = (x[i] - mean) * inv * w[i] + b[i];
+}
+
+/* Fold this token into the pool being filled, and close the pool when it is
+ * the last token of one. `in` is the attention input, i.e. the layer's
+ * post-input_layernorm hidden state, which is what the indexer reads. */
+static void dsa_record(waste_model *m, int L, const float *in, int pos)
+{
+    const waste_config *c = &m->cfg;
+    const int D = c->index_dim, P = c->index_kpool, hid = c->hidden;
+    float *slot = m->idxbuf[L] + (size_t)(pos % P) * 2 * D;
+
+    matvec_t(m, slot, waste_find(m, tname(
+                 "%smodel.layers.%d.self_attn.indexer.wk.weight", c->prefix, L)),
+             in, D, hid);
+    /* A LayerNorm, not an RMSNorm: it subtracts the mean and it has a bias.
+     * Everything else in this model normalizes the other way, which is
+     * exactly why it is spelled out here. */
+    layernorm(slot, slot, T(m, "%smodel.layers.%d.self_attn.indexer.k_norm.weight", c->prefix, L),
+              T(m, "%smodel.layers.%d.self_attn.indexer.k_norm.bias", c->prefix, L),
+              D, 1e-6f);
+    matvec_t(m, slot + D, waste_find(m, tname(
+                 "%smodel.layers.%d.self_attn.indexer.index_kpool_compress_gate",
+                 c->prefix, L)), in, D, hid);
+
+    if (pos % P != P - 1) return;                 /* pool still incomplete */
+    if (m->n_pool[L] >= m->pool_cap) return;      /* bounded by kv_cap */
+
+    /* The pooled key is a per-channel weighted average over the pool's
+     * tokens: one softmax of (gate + a learned positional bias) per
+     * channel, across index_kpool tokens. Not one softmax per token. */
+    const float *ape = T(m, "%smodel.layers.%d.self_attn.indexer.index_kpool_compress_ape",
+                         c->prefix, L);
+    float *dst = m->idxpool[L] + (size_t)m->n_pool[L] * D;
+    for (int d = 0; d < D; d++) {
+        float mx = -1e30f;
+        for (int j = 0; j < P; j++) {
+            const float v = m->idxbuf[L][(size_t)j * 2 * D + D + d] + ape[j * D + d];
+            if (v > mx) mx = v;
+        }
+        float sum = 0, acc = 0;
+        for (int j = 0; j < P; j++) {
+            const float e = expf(m->idxbuf[L][(size_t)j * 2 * D + D + d] +
+                                 ape[j * D + d] - mx);
+            sum += e;
+            acc += e * m->idxbuf[L][(size_t)j * 2 * D + d];
+        }
+        dst[d] = acc / sum;
+    }
+    m->n_pool[L]++;
+}
+
+typedef struct {
+    const float *pool, *q, *w;
+    float *score;
+    int D, heads;
+    float scale;
+} dsa_par;
+
+static void dsa_score_range(int lo, int hi, void *ap)
+{
+    const dsa_par *a = (const dsa_par *)ap;
+    for (int p = lo; p < hi; p++) {
+        const float *k = a->pool + (size_t)p * a->D;
+        float acc = 0;
+        for (int h = 0; h < a->heads; h++) {
+            float d = dotf(a->q + (size_t)h * a->D, k, a->D) * a->scale;
+            if (d > 0.0f) acc += a->w[h] * d;      /* relu, then weighted */
+        }
+        a->score[p] = acc;
+    }
+}
+
+/* Keep the `k` highest scores with a size-k min-heap over pool ids. */
+static void dsa_heap_push(int *heap, int *n, int k, const float *score, int p)
+{
+    if (*n < k) {
+        int i = (*n)++;
+        heap[i] = p;
+        while (i) {
+            const int par = (i - 1) / 2;
+            if (score[heap[par]] <= score[heap[i]]) break;
+            const int t = heap[par]; heap[par] = heap[i]; heap[i] = t;
+            i = par;
+        }
+        return;
+    }
+    if (score[p] <= score[heap[0]]) return;
+    heap[0] = p;
+    for (int i = 0;;) {
+        const int l = 2 * i + 1, r = l + 1;
+        int sm = i;
+        if (l < k && score[heap[l]] < score[heap[sm]]) sm = l;
+        if (r < k && score[heap[r]] < score[heap[sm]]) sm = r;
+        if (sm == i) break;
+        const int t = heap[sm]; heap[sm] = heap[i]; heap[i] = t;
+        i = sm;
+    }
+}
+
+static int cmp_int(const void *a, const void *b)
+{
+    const int x = *(const int *)a, y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
+/* Which cached positions this query attends over. Writes them ascending
+ * into m->idxsel and returns how many; -1 means "all of them", which is
+ * both the short-context case and the cheapest one. */
+static int dsa_select(waste_model *m, int L, const float *in,
+                      const float *q_resid, int pos)
+{
+    const waste_config *c = &m->cfg;
+    const int D = c->index_dim, P = c->index_kpool, hid = c->hidden;
+    const int kv_len = pos + 1, npool = m->n_pool[L];
+    int keep = c->index_topk / P;
+    if (keep > npool) keep = npool;
+    if (keep >= npool) return -1;               /* every pool kept: dense */
+
+    float *q = m->idxq;
+    float *w = q + (size_t)c->index_heads * D;
+    matvec_t(m, q, waste_find(m, tname(
+                 "%smodel.layers.%d.self_attn.indexer.wq_b.weight", c->prefix, L)),
+             q_resid, c->index_heads * D, c->q_lora);
+    matvec_t(m, w, waste_find(m, tname(
+                 "%smodel.layers.%d.self_attn.indexer.weights_proj.weight",
+                 c->prefix, L)), in, c->index_heads, hid);
+    const float hs = 1.0f / sqrtf((float)c->index_heads);
+    for (int h = 0; h < c->index_heads; h++) w[h] *= hs;
+
+    {
+        dsa_par a = { m->idxpool[L], q, w, m->idxscore, D, c->index_heads,
+                      1.0f / sqrtf((float)D) };
+        waste_parallel_for(npool, 64, dsa_score_range, &a);
+    }
+
+    /* Ties are possible and mean the same thing: a pool whose every head
+     * scored negative lands at exactly 0 after the relu, and so do all its
+     * neighbours. Which of those the heap keeps is unspecified here and
+     * ordered by index upstream; they contribute the same nothing either
+     * way. */
+    int n = 0;
+    for (int p = 0; p < npool; p++)
+        dsa_heap_push(m->idxrank, &n, keep, m->idxscore, p);
+    qsort(m->idxrank, (size_t)n, sizeof(int), cmp_int);
+
+    int out = 0;
+    for (int i = 0; i < n; i++) {
+        const int base = m->idxrank[i] * P;
+        for (int j = 0; j < P; j++) m->idxsel[out++] = base + j;
+    }
+    /* WASTE_DUMP_DSA=path records the selection itself, one line per
+     * (layer, position):
+     *
+     *     L pos npool keep  p0,p1,... : score0 score1 ...
+     *
+     * the pools that won and the scores they won on. A logit diff can say
+     * that two implementations disagree; only this can say whether they
+     * disagree about the *ranking* or about a tie, and that is the
+     * difference between a bug and float noise. */
+    if (dump_dsa) {
+        FILE *df = fopen(dump_dsa, "a");
+        if (df) {
+            fprintf(df, "%d %d %d %d ", L, pos, npool, n);
+            for (int i = 0; i < n; i++) fprintf(df, "%d,", m->idxrank[i]);
+            fprintf(df, " :");
+            for (int p2 = 0; p2 < npool; p2++)
+                fprintf(df, " %.9g", m->idxscore[p2]);
+            fputc('\n', df);
+            fclose(df);
+        }
+    }
+    /* The tail: the tokens past the last complete pool are always visible,
+     * which is what keeps the most recent context from waiting for a pool
+     * to fill before it can be attended to. */
+    if (c->index_tail)
+        for (int t = npool * P; t < kv_len; t++) m->idxsel[out++] = t;
+    return out;
+}
+
 typedef struct {
     waste_model *m;
     const waste_tensor *kvb;
     const float *q, *lat;
     float *o;
     int S, qd, qk_nope, qk_rope, vh, kv_lora, latd;
+    const int *sel;                  /* NULL = every cached position       */
+    int nsel;
     float scale;
 } mla_par;
 
@@ -2488,18 +3355,23 @@ static void mla_head_range(int lo, int hi, void *ap)
             for (int j = 0; j < kl; j++) qa[j] += qi * rw[j];
         }
 
-        for (int s = 0; s < S; s++) {
-            const float *cs = a->lat + (size_t)s * latd;
+        /* Dense unless the indexer narrowed it: `sel` lists the positions
+         * this query may see, ascending, and everything downstream works in
+         * terms of how many there are rather than of the context length. */
+        const int *sel = a->sel;
+        const int n = sel ? a->nsel : S;
+        for (int t = 0; t < n; t++) {
+            const float *cs = a->lat + (size_t)(sel ? sel[t] : t) * latd;
             float acc = dotf(qa, cs, kl);
             acc += dotf(qh + nope, cs + kl, rope);
-            sc[s] = acc * a->scale;
+            sc[t] = acc * a->scale;
         }
-        softmax(sc, S);
+        softmax(sc, n);
 
         memset(ca, 0, (size_t)kl * sizeof(float));
-        for (int s = 0; s < S; s++) {
-            const float w = sc[s];
-            const float *cs = a->lat + (size_t)s * latd;
+        for (int t = 0; t < n; t++) {
+            const float w = sc[t];
+            const float *cs = a->lat + (size_t)(sel ? sel[t] : t) * latd;
             for (int j = 0; j < kl; j++) ca[j] += w * cs[j];
         }
 
@@ -2520,9 +3392,11 @@ static void mla_layer(waste_model *m, int L, const float *in, float *out, int po
     const int latd = c->kv_lora + c->qk_rope;
     float *q = m->tmp, *ckv = q + nh * qd, *o = ckv + latd;
 
+    float *q_resid = NULL;
     if (c->q_lora) {
         /* K3 LoRAs the query too: q_a -> RMSNorm -> q_b */
         float *qa = o + (size_t)nh * vh;
+        q_resid = qa;
         matvec_t(m, qa, waste_find(m, tname("%smodel.layers.%d.self_attn.q_a_proj.weight",
                                             c->prefix, L)), in, c->q_lora, hid);
         waste_rmsnorm(qa, qa, waste_find(m, tname("%smodel.layers.%d.self_attn.q_a_layernorm.weight",
@@ -2562,9 +3436,20 @@ static void mla_layer(waste_model *m, int L, const float *in, float *out, int po
     }
     m->n_kv[L] = pos + 1;
 
+    /* The indexer runs on the same input the projections did, after this
+     * token is in the cache — so a query always sees itself — and before
+     * the heads, which need its answer. */
+    int nsel = -1;
+    if (c->index_topk) {
+        dsa_record(m, L, in, pos);
+        nsel = dsa_select(m, L, in, q_resid, pos);
+    }
+
     {
         mla_par a;
         a.m = m;
+        a.sel = nsel >= 0 ? m->idxsel : NULL;
+        a.nsel = nsel >= 0 ? nsel : 0;
         a.kvb = waste_find(m, tname("%smodel.layers.%d.self_attn.kv_b_proj.weight",
                                     c->prefix, L));
         a.q = q; a.lat = m->latcache[L]; a.o = o;
@@ -2593,11 +3478,7 @@ static void ffn(waste_model *m, const waste_tensor *W1, const waste_tensor *W3,
     float *a = m->ff, *b = a + inter;
     matvec_t(m, a, W1, in, inter, hid);
     matvec_t(m, b, W3, in, inter, hid);
-    if (m->cfg.act_situ)
-        for (int i = 0; i < inter; i++)
-            a[i] = waste_situ_pair(a[i], b[i], m->cfg.situ_beta, m->cfg.situ_linear_beta);
-    else
-        for (int i = 0; i < inter; i++) a[i] = silu(a[i]) * b[i];
+    waste_act_pair_range(&m->cfg, a, b, inter);
     float *dst = accum ? m->h : out;
     matvec_t(m, dst, W2, a, hid, inter);
     if (accum) for (int i = 0; i < hid; i++) out[i] += w * dst[i];
@@ -2752,6 +3633,21 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
      * next_layer_top field docs/FORMAT.md has reserved since the skeleton.
      * Both questions are "is the signal there", and both are cheaper to
      * answer from a trace than from a build. */
+    /* Route capture, for tests/sweep.c.
+     *
+     * On K3 at top-8 two kernels that agree with the f32 path to 4e-5 on
+     * Kimi-Linear differ from *each other* by logit rel L2 0.13 — because
+     * any perturbation, however small, eventually flips one expert out of
+     * eight at some layer, and a flipped expert is a discrete change with
+     * a size of its own. So a logit norm cannot separate "the arithmetic
+     * moved" from "the selection moved", and on this model it is mostly
+     * measuring the second. This records what was actually selected, which
+     * is the interpretable gate §61 and §62 used on the CUDA work. */
+    if (waste_route_cap && waste_route_n + K <= waste_route_cap_n) {
+        for (int j = 0; j < K; j++) waste_route_cap[waste_route_n + j] = idx[j];
+        waste_route_n += K;
+    }
+
     if (dump_route) {
         /* Third group on the line: what the *next* layer's router says about
          * *this* layer's hidden state. That is the predictor deltafin calls
@@ -2803,11 +3699,159 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
         q_gate = m->lut8; q_up = q_gate + lut_sz; q_down = q_up + lut_sz;
         qs_gate = m->lut8_scale; qs_up = qs_gate + nsc; qs_down = qs_up + nsc;
     }
+#if defined(WASTE_ENABLE_METAL)
+    /* ---- the routed experts, in batches, applied on the device ---------
+     *
+     * Two phases per batch. Phase 1 is the batch's gate and up in one
+     * command buffer — they share the layer's two tables, because every
+     * routed expert sees the same input. Phase 2 is the batch's down, each
+     * with its own table, because each sees its own activated
+     * intermediate.
+     *
+     * Batches rather than the whole layer, and the reason is measured:
+     * holding all K records before any arithmetic starts is the barrier
+     * docs/LEARNED.md §44 describes, and with the applies on the device it
+     * costs more than they save — expert I/O went 2.69 -> 8.19 s over
+     * eight steps while the apply went 5.78 -> 4.31. The hint above has
+     * already queued every read; a batch only has to wait for its own.
+     *
+     * Between the phases the CPU does the SiTU and builds the batch's down
+     * tables, which is where §61's "build the LUT on the device" would go
+     * next — on that vehicle it was the difference between 3.8 and 9.1
+     * tok/s.
+     */
+    if (metal_moe && m->xga && m->index_bits != 6 && K > 1 &&
+        K <= WASTE_PF_MAX && m->cache.n_slots >= 4 * K) {
+        const uint8_t *recs[WASTE_PF_MAX];
+        waste_vq_job jobs[2 * WASTE_PF_MAX];
+        const size_t rec_bytes = m->bank[L].rec_bytes;
+        int ok = 1, lut_done = 0;
+        for (int j0 = 0; j0 < K && ok; j0 += xpar_batch) {
+            int j1 = j0 + xpar_batch;
+            if (j1 > K) j1 = K;
+            PROF_START(P_EDEQ);
+            int n = j0;
+            for (; n < j1; n++) {
+                recs[n] = waste_ecache_hold(&m->cache, L, idx[n], bank_fetch, m);
+                if (!recs[n]) break;
+            }
+            PROF_END(P_EDEQ);
+            if (n < j1) { ok = 0; break; }
+
+            if (!lut_done) {
+                const waste_expert_hdr *h0 = (const waste_expert_hdr *)recs[j0];
+                vq_build_lut(m, lut_gate, h0->codebook_id + 0 * m->stages,
+                             xin, lat, m->stages, m->cb_entries, m->vec_dim,
+                             NULL, NULL);
+                vq_build_lut(m, lut_up, h0->codebook_id + 1 * m->stages,
+                             xin, lat, m->stages, m->cb_entries, m->vec_dim,
+                             NULL, NULL);
+                lut_done = 1;
+            }
+
+            PROF_START(P_LUTA);
+            int nj = 0;
+            for (int j = j0; j < j1; j++) {
+                const waste_expert_hdr *h = (const waste_expert_hdr *)recs[j];
+                waste_vq_job *g1 = &jobs[nj++], *u1 = &jobs[nj++];
+                g1->y = m->xga + (size_t)j * inter;
+                g1->rec = recs[j]; g1->rec_bytes = rec_bytes;
+                g1->idx_off = (uint32_t)h->gate_off;
+                g1->sc_off = (uint32_t)h->chan_corr_off;
+                g1->lut = m->lut; g1->lut_bytes = m->lut_bytes;
+                g1->lut_off = 0;
+                g1->m = inter; g1->nv = lat / m->vec_dim;
+                g1->stages = m->stages; g1->entries = m->cb_entries;
+                *u1 = *g1;
+                u1->y = m->xub + (size_t)j * inter;
+                u1->idx_off = (uint32_t)h->up_off;
+                u1->sc_off = (uint32_t)(h->chan_corr_off + (size_t)inter * 2);
+                u1->lut_off = (uint32_t)lut_sz;
+            }
+            ok = waste_metal_vq3r(jobs, nj) == 0;
+            PROF_END(P_LUTA);
+            if (!ok) break;
+
+            PROF_START(P_EMM);
+            for (int j = j0; j < j1; j++) {
+                float *g2 = m->xga + (size_t)j * inter;
+                const float *u2 = m->xub + (size_t)j * inter;
+                waste_act_pair_range(c, g2, u2, inter);
+            }
+            PROF_END(P_EMM);
+
+            PROF_START(P_LUTB);
+            for (int j = j0; j < j1; j++) {
+                const waste_expert_hdr *h = (const waste_expert_hdr *)recs[j];
+                lutb_arg a = { m->xlut + (size_t)j * m->xlut_sz, m->codebooksT,
+                               m->xga + (size_t)j * inter,
+                               h->codebook_id + 2 * m->stages, m->stages,
+                               m->cb_entries, m->vec_dim };
+                waste_parallel_for(inter / m->vec_dim, 16, waste_k.lutb_range, &a);
+            }
+            PROF_END(P_LUTB);
+
+            {
+            PROF_START(P_LUTA);
+            nj = 0;
+            for (int j = j0; j < j1; j++) {
+                const waste_expert_hdr *h = (const waste_expert_hdr *)recs[j];
+                waste_vq_job *d = &jobs[nj++];
+                d->y = m->xacc + (size_t)j * lat;
+                d->rec = recs[j]; d->rec_bytes = rec_bytes;
+                d->idx_off = (uint32_t)h->down_off;
+                d->sc_off = (uint32_t)(h->chan_corr_off + (size_t)2 * inter * 2);
+                d->lut = m->xlut;
+                d->lut_bytes = (size_t)K * m->xlut_sz * sizeof(float);
+                d->lut_off = (uint32_t)((size_t)j * m->xlut_sz);
+                d->m = lat; d->nv = inter / m->vec_dim;
+                d->stages = m->stages; d->entries = m->cb_entries;
+            }
+            ok = waste_metal_vq3r(jobs, nj) == 0;
+            PROF_END(P_LUTA);
+            }
+            waste_ecache_release(&m->cache);
+        }
+        if (ok) {
+            PROF_START(P_EMM);
+            for (int j = 0; j < K; j++) {
+                const float *accj = m->xacc + (size_t)j * lat;
+                const float wj = w[j];
+                for (int i = 0; i < lat; i++) ysum[i] += wj * accj[i];
+            }
+            PROF_END(P_EMM);
+            goto moe_done;
+        }
+        /* Anything that did not run on the device falls through to the
+         * serial loop, which re-reads and reports the reason. */
+        waste_ecache_release(&m->cache);
+    }
+#endif
+
     /* Expert-parallel path. Needs the per-expert scratch, and needs the
      * cache to be able to hold all K records at once — the held set is
      * unevictable, so a cache that is not comfortably larger than K would
-     * be asked to find a victim among slots that are all pinned. */
-    if (xpar_on && m->xga && K > 1 && K <= WASTE_PF_MAX &&
+     * be asked to find a victim among slots that are all pinned.
+     *
+     * And, by default, it needs this layer's K experts to be in the cache
+     * already. That is the whole of §44's finding read the other way round:
+     * one task per expert is a barrier against the read-ahead, worth 1.18x
+     * when there is nothing to read and a regression when there is. The
+     * env var used to be the only way to say which, and the right value
+     * inverted between models — because what it was really standing in for
+     * was whether the experts were resident, and that is a question the
+     * cache can answer in K hash lookups.
+     *
+     * So it is asked here instead, per layer and per token. A run whose
+     * budget holds the whole bank takes this path on every layer after the
+     * first pass; a K3 run that streams takes it on the layers that happen
+     * to be warm and leaves the reads overlapping everywhere else. Neither
+     * needs a flag, and the answer follows the cache rather than the
+     * container. WASTE_XPAR=0/1 still forces it either way. */
+    const int xpar_here = xpar_on >= 0
+        ? xpar_on
+        : waste_ecache_resident_all(&m->cache, L, idx, K);
+    if (xpar_here && m->xga && K > 1 && K <= WASTE_PF_MAX &&
         m->cache.n_slots >= 4 * K) {
         /* In batches, not all K at once. Holding every record before doing
          * any arithmetic is a barrier against the read-ahead: the hint has
@@ -2894,11 +3938,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
                  q_gate, qs_gate);
         vq_apply(m, ub, rec + h->up_off, sc + inter, inter, lat, lut_up,
                  q_up, qs_up);
-        if (c->act_situ)
-            for (int i = 0; i < inter; i++)
-                ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta, c->situ_linear_beta);
-        else
-            for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
+        waste_act_pair_range(c, ga, ub, inter);
         vq_matvec(m, acc, rec + h->down_off, sc + 2 * inter, ga, lat, inter,
                   h->codebook_id + 2 * m->stages, lut_down, q_down, qs_down);
         const float wj = w[j];
@@ -2933,6 +3973,141 @@ moe_done:
         waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight", c->prefix, L)),
         in, tmp, c->moe_inter * (c->n_shared ? c->n_shared : 1), hid, 1.0f, 0);
     for (int i = 0; i < hid; i++) out[i] += tmp[i];
+}
+
+/* ---- Manifold-Constrained Hyper-Connections (GLM-5.3-Flash) ------------
+ *
+ * mHC replaces the single residual stream with `hc_mult` parallel ones.
+ * Before each sublayer a learned mapping reads all of them at once and
+ * produces three things:
+ *
+ *   pre  [H]      collapse weights — the one vector the sublayer runs on
+ *   post [H]      where the sublayer's output lands, per stream
+ *   comb [H][H]   how the streams mix into each other
+ *
+ * comb is then projected onto the doubly-stochastic manifold by
+ * Sinkhorn-Knopp — alternating row and column normalization — which is the
+ * "manifold-constrained" half of the name and what bounds the stream norms
+ * across 45 layers. Twenty iterations on a 4x4 matrix, twice a layer:
+ * nothing beside the 24 x 16384 projection that produced its logits.
+ *
+ * This is the same *kind* of mechanism as K3's Attention Residuals above —
+ * both enrich what a layer sees beyond the immediately preceding one — and
+ * the two are mutually exclusive in practice. Where AttnRes keeps a history
+ * and attends over it, mHC keeps H streams and mixes them.
+ *
+ * The mapping runs in f32 because upstream casts the streams, the weights
+ * and all three outputs to float before touching them; the engine is f32
+ * throughout, so that matches by construction rather than by conversion.
+ */
+static void hc_norm_rows(float *comb, int H, float eps)
+{
+    for (int i = 0; i < H; i++) {
+        float sum = 0;
+        for (int j = 0; j < H; j++) sum += comb[i * H + j];
+        const float inv = 1.0f / (sum + eps);
+        for (int j = 0; j < H; j++) comb[i * H + j] *= inv;
+    }
+}
+
+static void hc_norm_cols(float *comb, int H, float eps)
+{
+    for (int j = 0; j < H; j++) {
+        float sum = 0;
+        for (int i = 0; i < H; i++) sum += comb[i * H + j];
+        const float inv = 1.0f / (sum + eps);
+        for (int i = 0; i < H; i++) comb[i * H + j] *= inv;
+    }
+}
+
+/* One mHC site. `site` is "attn" or "ffn"; the two differ only in which
+ * (fn, base, scale) triple they read. Fills post/comb for hc_scatter and
+ * writes the collapsed stream the sublayer runs on. */
+static void hc_collapse(waste_model *m, int L, const char *site, const float *x,
+                        float *post, float *comb, float *collapsed)
+{
+    const waste_config *c = &m->cfg;
+    const int H = c->hc_mult, hid = c->hidden;
+    const size_t HD = (size_t)H * hid;
+    const int nmix = (2 + H) * H;
+
+    /* Unweighted RMSNorm over the flattened streams — no learned gain, so
+     * this is not waste_rmsnorm with a vector of ones: it is the whole
+     * H * hidden vector normalized as one. */
+    float ss = 0;
+    for (size_t i = 0; i < HD; i++) ss += x[i] * x[i];
+    const float inv = 1.0f / sqrtf(ss / (float)HD + c->eps);
+    for (size_t i = 0; i < HD; i++) m->hcflat[i] = x[i] * inv;
+
+    float *w = m->hcmix;
+    matvec_t(m, w, waste_find(m, tname("%smodel.layers.%d.hc_%s_fn",
+                                       c->prefix, L, site)),
+             m->hcflat, nmix, (int)HD);
+    const float *base = T(m, "%smodel.layers.%d.hc_%s_base", c->prefix, L, site);
+    const float *sc   = T(m, "%smodel.layers.%d.hc_%s_scale", c->prefix, L, site);
+    float *pre = w + nmix;
+
+    for (int i = 0; i < H; i++) {
+        pre[i]  = 1.0f / (1.0f + expf(-(w[i] * sc[0] + base[i]))) + c->hc_eps;
+        post[i] = 2.0f / (1.0f + expf(-(w[H + i] * sc[1] + base[H + i])));
+    }
+    for (int i = 0; i < H; i++) {
+        float *row = comb + (size_t)i * H;
+        for (int j = 0; j < H; j++)
+            row[j] = w[2 * H + i * H + j] * sc[2] + base[2 * H + i * H + j];
+        softmax(row, H);
+        for (int j = 0; j < H; j++) row[j] += c->hc_eps;
+    }
+    /* Columns first, then hc_iters-1 rounds of (rows, columns): the order
+     * upstream uses, and the count is off by one from the obvious reading
+     * of "iterations" because the first column pass happens before the
+     * loop. Sinkhorn does not converge to the same matrix from the other
+     * order in a finite number of steps. */
+    hc_norm_cols(comb, H, c->hc_eps);
+    for (int it = 1; it < c->hc_iters; it++) {
+        hc_norm_rows(comb, H, c->hc_eps);
+        hc_norm_cols(comb, H, c->hc_eps);
+    }
+
+    for (int d = 0; d < hid; d++) {
+        float acc = 0;
+        for (int i = 0; i < H; i++) acc += pre[i] * x[(size_t)i * hid + d];
+        collapsed[d] = acc;
+    }
+}
+
+/* x[i] <- post[i] * y + sum_k comb[k][i] * x[k], the scatter half of a
+ * site. Upstream writes it as matmul(comb.transpose(-1, -2), residual),
+ * which is this indexing read the other way round. */
+static void hc_scatter(waste_model *m, float *x, const float *post,
+                       const float *comb, const float *y)
+{
+    const int H = m->cfg.hc_mult, hid = m->cfg.hidden;
+    float *tmp = m->hcflat;                  /* free again by this point */
+    for (int i = 0; i < H; i++) {
+        float *dst = tmp + (size_t)i * hid;
+        const float pi = post[i];
+        for (int d = 0; d < hid; d++) dst[d] = pi * y[d];
+        for (int k = 0; k < H; k++) {
+            const float ck = comb[(size_t)k * H + i];
+            const float *src = x + (size_t)k * hid;
+            for (int d = 0; d < hid; d++) dst[d] += ck * src[d];
+        }
+    }
+    memcpy(x, tmp, (size_t)H * hid * sizeof(float));
+}
+
+/* The final collapse: GLM's hc_head is an unweighted mean over the streams,
+ * not another learned mapping. */
+static void hc_head(const waste_config *c, float *out, const float *x)
+{
+    const int H = c->hc_mult, hid = c->hidden;
+    const float inv = 1.0f / (float)H;
+    for (int d = 0; d < hid; d++) {
+        float acc = 0;
+        for (int i = 0; i < H; i++) acc += x[(size_t)i * hid + d];
+        out[d] = acc * inv;
+    }
 }
 
 /* ---- Attention Residuals (K3) ------------------------------------------
@@ -3000,7 +4175,11 @@ typedef struct {
     int32_t  n_layers, hidden, kda_heads, kda_dim, conv_k, n_heads;
     int32_t  qk_nope, qk_rope, v_head, attn_res_block;
     int32_t  pos, n_blockres;
-    uint32_t reserved[2];
+    /* hc_mult widens the residual stream this file ends with; index_dim
+     * decides whether it carries indexer pools at all. Both were reserved
+     * words, and both have to be compared: a file written by one and read
+     * by the other is the right length in neither direction. */
+    int32_t  hc_mult, index_dim;
 } waste_state_hdr;
 
 static void state_fill(const waste_model *m, waste_state_hdr *h, int pos)
@@ -3013,6 +4192,7 @@ static void state_fill(const waste_model *m, waste_state_hdr *h, int pos)
     h->kda_heads = c->kda_heads; h->kda_dim = c->kda_dim; h->conv_k = c->conv_k;
     h->n_heads = c->n_heads; h->qk_nope = c->qk_nope; h->qk_rope = c->qk_rope;
     h->v_head = c->v_head; h->attn_res_block = c->attn_res_block;
+    h->hc_mult = c->hc_mult; h->index_dim = c->index_topk ? c->index_dim : 0;
     h->pos = pos; h->n_blockres = m->n_blockres;
 }
 
@@ -3032,7 +4212,9 @@ void waste_model_reset(waste_model *m)
         m->n_kv[L] = 0;
     }
     m->n_blockres = 0;
-    if (m->x) memset(m->x, 0, (size_t)c->hidden * sizeof(float));
+    if (m->x) memset(m->x, 0, (size_t)(c->hc_mult ? c->hc_mult : 1) *
+                              c->hidden * sizeof(float));
+    for (int L = 0; L < c->n_layers; L++) m->n_pool[L] = 0;
     if (m->blockres && c->attn_res_block) {
         const int nb = c->n_layers / c->attn_res_block + 2;
         memset(m->blockres, 0, (size_t)nb * c->hidden * sizeof(float));
@@ -3044,6 +4226,39 @@ void waste_model_reset(waste_model *m)
  * is the whole point — a new process costs 48 seconds of model load on K3
  * and, worse, a different machine state. */
 void waste_model_set_lookahead(int n) { lookahead_n = n < 0 ? 0 : n; }
+
+/* For tests/sweep.c: the SDOT trunk path is chosen once from the
+ * environment, and an arm has to be able to flip it inside one process —
+ * two arms in two processes are two computers (docs/LEARNED.md §33). */
+void waste_model_set_sdot4(int mode, int sg)
+{
+    const uint32_t f = waste_cpu_features();
+    if ((mode == TK_SDOT || mode == TK_I8MM) && !(f & WASTE_CPU_DOTPROD)) mode = TK_F32;
+    if (mode == TK_I8MM && !(f & WASTE_CPU_I8MM)) mode = TK_SMLAL;
+    if (mode < 0 || mode > TK_SMLAL) mode = TK_F32;
+    trunk_kern = mode;
+    if (sg == 32 || sg == 64 || sg == 128) sdot4_sg = sg;
+}
+/* For tests/sweep.c: the size above which a matvec goes to the device.
+ * 0 sends everything, a very large value sends nothing — which is how one
+ * process measures both arms of "is the GPU worth it here". */
+/* For tests/sweep.c: the routed experts' applies on the device, or not. */
+void waste_model_set_metal_moe(int on) { metal_moe = on; }
+
+/* For tests/sweep.c. Only effective when the int8 shadow was
+ * allocated at load, i.e. when WASTE_VQ8 was set in the environment
+ * — the table is a load-time allocation and an arm cannot conjure it. */
+void waste_model_set_vq8(int on) { vq8_on = on; }
+
+void waste_model_set_wide(int mask) { wide_mask = mask < 0 ? 0 : mask; }
+int  waste_model_fast_threads(void) { return waste_pool_fast(); }
+int  waste_pool_threads_public(void) { return waste_pool_threads(); }
+
+void waste_model_set_device_min_kb(long kb)
+{
+    waste_k.device_min_bytes = kb < 0 ? (size_t)-1 : (size_t)kb << 10;
+}
+
 int  waste_model_get_lookahead(void)  { return lookahead_n; }
 
 /* Read-ahead. The internal SSD reaches 12.89 GB/s at queue depth 2 against
@@ -3066,6 +4281,70 @@ static void start_readers(waste_model *m)
     waste_ecache_io_start(&m->cache, bank_fetch, m, nio, depth);
 }
 
+/* ---- background fill ----------------------------------------------------
+ *
+ * When the resolved cache can hold every record the container has, the
+ * demand stream still discovers them one miss at a time — 200 tokens of
+ * Kimi-Linear read 13.2 GB of a 16.5 GB bank as 3443 separate misses, and
+ * until a record has been asked for once it is not there. This reads the
+ * rest, in bank order, on one thread, while the model runs.
+ *
+ * It is not a preload: nothing waits for it. A run that generates four
+ * tokens gets whatever landed in the meantime and pays for the reads it
+ * would have paid for anyway, spread differently; a run that generates
+ * hundreds finds every layer resident well before it would have. The
+ * second-order effect is the larger one — a fully resident layer is what
+ * lets moe_layer take the expert-parallel path (see xpar_here), which is
+ * worth 1.17x on Kimi-Linear and cannot be taken while records are still
+ * arriving.
+ *
+ * Only when everything fits. Below that, "put anything in an empty slot"
+ * competes with the demand stream for the slots it is about to need, and
+ * LFRU is a better judge of what belongs there than file order is.
+ *
+ * WASTE_PRELOAD=0 turns it off; it is not otherwise configurable, because
+ * the condition that gates it is not a preference.
+ */
+static void *fill_worker(void *p)
+{
+    waste_model *m = (waste_model *)p;
+    for (int L = 0; L < m->cfg.n_layers; L++) {
+        if (m->bank[L].fd < 0) continue;
+        for (int e = 0; e < m->bank[L].n_experts; e++) {
+            if (atomic_load(&m->fill_stop)) return NULL;
+            /* 0 means "already here, or no empty slot left". The second is
+             * the end of the sweep and the first is not, so it cannot stop
+             * on it — but the cursor makes a full cache cheap to discover,
+             * one lock and no read. */
+            if (waste_ecache_admit(&m->cache, L, e, bank_fetch, m) < 0)
+                return NULL;            /* a bad read; the demand path reports it */
+        }
+    }
+    return NULL;
+}
+
+static void start_fill(waste_model *m)
+{
+    m->fill_records = 0;
+    for (int L = 0; L < m->cfg.n_layers; L++)
+        if (m->bank[L].fd >= 0)
+            m->fill_records += (uint64_t)m->bank[L].n_experts;
+    if (!m->fill_records || !m->cache.io) return;
+    if ((uint64_t)m->cache.n_slots < m->fill_records) return;
+    { const char *e = getenv("WASTE_PRELOAD"); if (e && *e == '0') return; }
+    atomic_store(&m->fill_stop, 0);
+    if (pthread_create(&m->fill_th, NULL, fill_worker, m) == 0)
+        m->fill_running = 1;
+}
+
+static void stop_fill(waste_model *m)
+{
+    if (!m->fill_running) return;
+    atomic_store(&m->fill_stop, 1);
+    pthread_join(m->fill_th, NULL);
+    m->fill_running = 0;
+}
+
 /* Give the cache a different size without touching the trunk.
  *
  * A budget sweep used to need one process per budget, because the cache is
@@ -3081,9 +4360,11 @@ int waste_model_resize_cache(waste_model *m, size_t cache_bytes)
     for (int L = 0; L < m->cfg.n_layers; L++)
         if (m->bank[L].rec_bytes > rec) rec = m->bank[L].rec_bytes;
     if (rec <= 0) return -1;
+    stop_fill(m);                          /* it holds slots of this cache */
     waste_ecache_free(&m->cache);          /* stops the readers first */
     if (waste_ecache_init(&m->cache, cache_bytes, (size_t)rec, policy)) return -1;
     start_readers(m);
+    start_fill(m);
     return 0;
 }
 
@@ -3115,13 +4396,27 @@ int waste_model_state_save(const waste_model *m, const char *path, int pos)
             if (fwrite(&nkv, sizeof nkv, 1, f) != 1) { rc = -1; break; }
             const size_t kn = (size_t)nkv * (c->kv_lora + c->qk_rope);
             if (kn && fwrite(m->latcache[L], sizeof(float), kn, f) != kn) rc = -1;
+            /* The indexer's pools are context, not weights: a session
+             * restored without them attends over a selection made from an
+             * empty history, which is wrong quietly rather than loudly. */
+            if (!rc && c->index_topk) {
+                const int32_t np = m->n_pool[L];
+                const size_t pn = (size_t)np * c->index_dim;
+                const size_t bn = (size_t)c->index_kpool * 2 * c->index_dim;
+                if (fwrite(&np, sizeof np, 1, f) != 1) rc = -1;
+                else if (pn && fwrite(m->idxpool[L], sizeof(float), pn, f) != pn) rc = -1;
+                else if (fwrite(m->idxbuf[L], sizeof(float), bn, f) != bn) rc = -1;
+            }
         }
     }
     if (!rc && c->attn_res_block && m->n_blockres > 0) {
         const size_t n = (size_t)m->n_blockres * c->hidden;
         if (fwrite(m->blockres, sizeof(float), n, f) != n) rc = -1;
     }
-    if (!rc && fwrite(m->x, sizeof(float), (size_t)c->hidden, f) != (size_t)c->hidden) rc = -1;
+    {
+        const size_t xn = (size_t)(c->hc_mult ? c->hc_mult : 1) * c->hidden;
+        if (!rc && fwrite(m->x, sizeof(float), xn, f) != xn) rc = -1;
+    }
     if (!rc && waste_sync_file(f)) rc = -1;
     if (fclose(f)) rc = -1;
     if (!rc && waste_replace_file(tmp, path)) rc = -1;
@@ -3146,7 +4441,8 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
         h.kda_heads != want.kda_heads || h.kda_dim != want.kda_dim ||
         h.conv_k != want.conv_k || h.n_heads != want.n_heads ||
         h.qk_nope != want.qk_nope || h.qk_rope != want.qk_rope ||
-        h.v_head != want.v_head || h.attn_res_block != want.attn_res_block) {
+        h.v_head != want.v_head || h.attn_res_block != want.attn_res_block ||
+        h.hc_mult != want.hc_mult || h.index_dim != want.index_dim) {
         fclose(f);
         return -2;                       /* state does not belong to this model */
     }
@@ -3182,13 +4478,28 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
                 fclose(f); return -2;
             }
             bytes = sizeof nkv + (uint64_t)nkv * (c->kv_lora + c->qk_rope) * 4;
+            if (c->index_topk) {
+                int32_t np = 0;
+                const uint64_t at = off + bytes;
+                if (at > fsize || fsize - at < sizeof np ||
+                    waste_pread(fileno(f), &np, sizeof np, (int64_t)at) != sizeof np) {
+                    fclose(f); return -2;
+                }
+                if (np < 0 || np > m->pool_cap ||
+                    np != (c->index_kpool ? h.pos / c->index_kpool : 0)) {
+                    fclose(f); return -2;
+                }
+                bytes += sizeof np + ((uint64_t)np * c->index_dim +
+                                      (uint64_t)c->index_kpool * 2 * c->index_dim) * 4;
+            }
         }
         if (off > fsize || bytes > fsize - off) { fclose(f); return -2; }
         off += bytes;
     }
     {
         const uint64_t tail = (uint64_t)h.n_blockres * c->hidden * 4 +
-                              (uint64_t)c->hidden * 4;
+                              (uint64_t)(c->hc_mult ? c->hc_mult : 1) *
+                              c->hidden * 4;
         if (off > fsize || tail > fsize - off || off + tail != fsize) {
             fclose(f); return -2;
         }
@@ -3208,6 +4519,16 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
             const size_t kn = (size_t)nkv * (c->kv_lora + c->qk_rope);
             if (kn && fread(m->latcache[L], sizeof(float), kn, f) != kn) rc = -1;
             m->n_kv[L] = nkv;
+            if (!rc && c->index_topk) {
+                int32_t np = 0;
+                const size_t bn = (size_t)c->index_kpool * 2 * c->index_dim;
+                if (fread(&np, sizeof np, 1, f) != 1) { rc = -1; break; }
+                if (np < 0 || np > m->pool_cap) { rc = -1; break; }
+                const size_t pn = (size_t)np * c->index_dim;
+                if (pn && fread(m->idxpool[L], sizeof(float), pn, f) != pn) rc = -1;
+                else if (fread(m->idxbuf[L], sizeof(float), bn, f) != bn) rc = -1;
+                m->n_pool[L] = np;
+            }
         }
     }
     m->n_blockres = h.n_blockres;
@@ -3215,7 +4536,10 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
         const size_t n = (size_t)h.n_blockres * c->hidden;
         if (fread(m->blockres, sizeof(float), n, f) != n) rc = -1;
     }
-    if (!rc && fread(m->x, sizeof(float), (size_t)c->hidden, f) != (size_t)c->hidden) rc = -1;
+    {
+        const size_t xn = (size_t)(c->hc_mult ? c->hc_mult : 1) * c->hidden;
+        if (!rc && fread(m->x, sizeof(float), xn, f) != xn) rc = -1;
+    }
     fclose(f);
     if (!rc && pos) *pos = h.pos;
     /* -3 means the file changed or the device failed after the successful
@@ -3639,11 +4963,7 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
                      lut_gu + (size_t)(2 * t + 1) * lut_sz,
                      q_gu ? q_gu + (size_t)(2 * t + 1) * lut_sz : NULL,
                      qs_gu ? qs_gu + (size_t)(2 * t + 1) * nsc : NULL);
-            if (c->act_situ)
-                for (int i = 0; i < inter; i++)
-                    ga[i] = waste_situ_pair(ga[i], ub[i], c->situ_beta, c->situ_linear_beta);
-            else
-                for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
+            waste_act_pair_range(c, ga, ub, inter);
             vq_matvec(m, acc, rec + h->down_off, s16 + 2 * inter, ga, lat, inter,
                       h->codebook_id + 2 * m->stages, lut_down,
                       q_down, qs_down);
@@ -3679,9 +4999,7 @@ chunk_lost:
     waste_matmul_t(m, sb, waste_find(m, tname(
                  "%smodel.layers.%d.block_sparse_moe.shared_experts.up_proj.weight",
                  c->prefix, L)), in, si, hid, nT);
-    for (int i = 0; i < nT * si; i++)
-        sa[i] = c->act_situ ? waste_situ_pair(sa[i], sb[i], c->situ_beta, c->situ_linear_beta)
-                            : silu(sa[i]) * sb[i];
+    waste_act_pair_range(c, sa, sb, nT * si);
     waste_matmul_t(m, sh, waste_find(m, tname(
                  "%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight",
                  c->prefix, L)), sa, hid, si, nT);
@@ -3714,6 +5032,21 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     const int hid = c->hidden;
     if (n <= 0) return m->logits;
     if (n == 1) return waste_model_step(m, tokens[0], pos0, NULL);
+    /* The chunked path carries one residual per token and one dense
+     * attention per layer. mHC's parallel streams and the DSA indexer's
+     * per-token pool bookkeeping are neither, and a chunk that quietly ran
+     * without them would differ from the same prompt decoded one token at a
+     * time — the exact failure WASTE_CHUNK exists to be checked against. So
+     * a container with either is prefilled the way it decodes, one token
+     * per call, until the chunked path grows both. */
+    if (c->hc_mult || c->index_topk) {
+        const float *out = NULL;
+        for (int t = 0; t < n; t++) {
+            out = waste_model_step(m, tokens[t], pos0 + t, NULL);
+            if (!out) return NULL;
+        }
+        return out;
+    }
     dump_pos0 = pos0;
     if (n > WASTE_CHUNK_MAX) n = WASTE_CHUNK_MAX;
     /* mla_layer writes one latent per position with no bound of its own,
@@ -3812,9 +5145,7 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
             float *a = m->cff, *b = a + (size_t)n * inter;
             waste_matmul_t(m, a, waste_find(m, tname("%smodel.layers.%d.mlp.gate_proj.weight", c->prefix, L)), m->cnorm, inter, hid, n);
             waste_matmul_t(m, b, waste_find(m, tname("%smodel.layers.%d.mlp.up_proj.weight", c->prefix, L)), m->cnorm, inter, hid, n);
-            for (int i = 0; i < n * inter; i++)
-                a[i] = c->act_situ ? waste_situ_pair(a[i], b[i], c->situ_beta, c->situ_linear_beta)
-                                   : silu(a[i]) * b[i];
+            waste_act_pair_range(c, a, b, n * inter);
             waste_matmul_t(m, m->cresid, waste_find(m, tname("%smodel.layers.%d.mlp.down_proj.weight", c->prefix, L)), a, hid, inter, n);
         }
 
@@ -3875,11 +5206,17 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     } else {
         waste_embed_row(m, token, m->x);
     }
+    /* mHC: every stream starts as a copy of the embedding — upstream
+     * expands the embedding along a new axis of hc_mult before layer 0. */
+    for (int i = 1; i < c->hc_mult; i++)
+        memcpy(m->x + (size_t)i * hid, m->x, (size_t)hid * sizeof(float));
 
     float *resid = (float *)malloc((size_t)hid * sizeof(float));
     float *norm = (float *)malloc((size_t)hid * sizeof(float));
     if (!resid || !norm) { free(resid); free(norm); return NULL; }
     const int ares_on = c->attn_res_block > 0;
+    const int hc_on = c->hc_mult > 0;
+    float hc_post[WASTE_MAX_HC], hc_comb[WASTE_MAX_HC * WASTE_MAX_HC];
     float *ps = m->prefix_sum;
     int ps_live = 0;
     m->n_blockres = 0;
@@ -3905,11 +5242,15 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         }
 
         snprintf(b, sizeof b, "%smodel.layers.%d.input_layernorm.weight", c->prefix, L);
-        waste_rmsnorm(norm, m->x, waste_find(m, b)->data, hid, c->eps);
+        if (hc_on) hc_collapse(m, L, "attn", m->x, hc_post, hc_comb, m->hccol);
+        waste_rmsnorm(norm, hc_on ? m->hccol : m->x, waste_find(m, b)->data,
+                      hid, c->eps);
         if (c->kda_layer[L]) { PROF_START(P_KDA); kda_layer(m, L, norm, resid); PROF_END(P_KDA); }
         else { PROF_START(P_MLA); mla_layer(m, L, norm, resid, pos); PROF_END(P_MLA); }
 
-        if (ares_on) {
+        if (hc_on) {
+            hc_scatter(m, m->x, hc_post, hc_comb, resid);
+        } else if (ares_on) {
             if (ps_live) for (int i = 0; i < hid; i++) ps[i] += resid[i];
             else { memcpy(ps, resid, (size_t)hid * sizeof(float)); ps_live = 1; }
             waste_apply_attn_res(m, m->blockres, m->n_blockres, ps,
@@ -3921,7 +5262,9 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         }
 
         snprintf(b, sizeof b, "%smodel.layers.%d.post_attention_layernorm.weight", c->prefix, L);
-        waste_rmsnorm(norm, m->x, waste_find(m, b)->data, hid, c->eps);
+        if (hc_on) hc_collapse(m, L, "ffn", m->x, hc_post, hc_comb, m->hccol);
+        waste_rmsnorm(norm, hc_on ? m->hccol : m->x, waste_find(m, b)->data,
+                      hid, c->eps);
         snprintf(b, sizeof b, "%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L);
         if (waste_find(m, b)) {
             PROF_START(P_ROUTE);
@@ -3934,7 +5277,9 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
                 waste_find(m, tname("%smodel.layers.%d.mlp.down_proj.weight", c->prefix, L)),
                 norm, resid, c->dense_inter, hid, 1.0f, 0);
 
-        if (ares_on) {
+        if (hc_on) {
+            hc_scatter(m, m->x, hc_post, hc_comb, resid);
+        } else if (ares_on) {
             for (int i = 0; i < hid; i++) ps[i] += resid[i];
             memcpy(m->x, ps, (size_t)hid * sizeof(float));
         } else {
@@ -3946,7 +5291,9 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         const char *dump_hidden = getenv("WASTE_DUMP_HIDDEN");
         if (dump_hidden) {
             FILE *df = fopen(dump_hidden, L ? "ab" : "wb");
-            if (df) { fwrite(m->x, sizeof(float), (size_t)hid, df); fclose(df); }
+            if (df) { fwrite(m->x, sizeof(float),
+                             (size_t)hid * (hc_on ? c->hc_mult : 1), df);
+                      fclose(df); }
         }
     }
     /* One last AttnRes: the output layer attends over every block
@@ -3957,7 +5304,10 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
             waste_find(m, tname("%smodel.output_attn_res_norm.weight", c->prefix))->data,
             waste_find(m, tname("%smodel.output_attn_res_proj.weight", c->prefix))->data,
             m->x);
-    waste_rmsnorm(norm, m->x, waste_find(m, tname("%smodel.norm.weight", c->prefix))->data, hid, c->eps);
+    if (hc_on) hc_head(c, m->hccol, m->x);
+    waste_rmsnorm(norm, hc_on ? m->hccol : m->x,
+                  waste_find(m, tname("%smodel.norm.weight", c->prefix))->data,
+                  hid, c->eps);
     PROF_START(P_HEAD);
     matvec_t(m, m->logits, waste_find(m, tname("%slm_head.weight", c->prefix)), norm, c->vocab, hid);
     PROF_END(P_HEAD);

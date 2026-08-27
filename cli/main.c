@@ -389,10 +389,36 @@ static int on_token(const waste_token_info *i, const char *piece, void *user)
  * .jinja into the container for tools that do interpret it.
  *
  * chat.json in the container, all fields optional:
- *   {"system":["<|im_start|>system\n","<|im_end|>\n"],
+ *   {"prelude": "[gMASK]<sop>",
+ *    "system":["<|im_start|>system\n","<|im_end|>\n"],
  *    "user":  ["<|im_start|>user\n","<|im_end|>\n"],
  *    "assistant":["<|im_start|>assistant\n","<|im_end|>\n"],
- *    "open":  "<|im_start|>assistant\n"}
+ *    "open":  "<|im_start|>assistant\n",
+ *    "think": ["<think>","</think>"],
+ *    "stop":  "<|im_end|>"}
+ *
+ * The last three are what a Kimi format does not need and GLM-5.3-Flash
+ * does. All three were added because the format could not otherwise be
+ * written down, not to make it more expressive:
+ *
+ *   `prelude`  emitted once before the first turn. GLM's conversations all
+ *              begin `[gMASK]<sop>`, which is not part of any role.
+ *   `think`    the reasoning channel. GLM always opens one — its generation
+ *              prompt is `<|assistant|><think>` — and closes it with
+ *              `</think>` before the answer. Naming the pair is what lets a
+ *              reader separate reasoning from content instead of printing
+ *              the model's scratch work as if it were the reply.
+ *   `stop`     what ends a generated turn, for a format where that is not
+ *              the assistant suffix. GLM writes `<|assistant|>answer` and
+ *              then `<|user|>next question`: the turn ends when the *next
+ *              role marker* begins, so there is no suffix to close it with
+ *              and the history must not carry one. Without a stop of its
+ *              own the CLI ran on and kept answering questions nobody
+ *              asked. Defaults to the assistant suffix.
+ *   `image`    the block one image expands into, holding exactly one
+ *              placeholder for the engine to repeat — GLM's is
+ *              `<|begin_of_image|><|image|><|end_of_image|>`. Absent, the
+ *              K3 block is used, which is the only one this CLI knew.
  *
  * Without one the CLI says so and continues raw, which is honest: a
  * guessed format is worse than a visible absence. --raw forces it. */
@@ -401,6 +427,10 @@ typedef struct {
     char usr_p[128], usr_s[128];
     char asst_p[128], asst_s[128];
     char open[128];
+    char prelude[128];
+    char think_o[64], think_c[64];
+    char stop[128];
+    char image[128];
     int  have;
 } chatfmt;
 
@@ -443,6 +473,38 @@ static void jstr_field(const char *js, const char *key, int idx,
     out[n] = 0;
 }
 
+/* One JSON string value, by key. The pair fields go through jstr_field
+ * above; this is for the ones that are a string on their own. */
+static void jstr_bare(const char *js, const char *key, char *out, size_t cap)
+{
+    out[0] = 0;
+    const char *k = strstr(js, key);
+    if (!k) return;
+    const char *q = strchr(k + strlen(key), '"');
+    if (!q) return;
+    size_t i = 0;
+    for (q++; *q && *q != '"' && i + 1 < cap; q++) {
+        if (*q == '\\' && q[1]) {
+            q++;
+            out[i++] = *q == 'n' ? '\n' : *q == 't' ? '\t' : *q;
+        } else out[i++] = *q;
+    }
+    out[i] = 0;
+}
+
+/* What opens the assistant's turn: the role marker, plus the reasoning
+ * channel when the format has one. GLM's generation prompt is
+ * `<|assistant|><think>` — the model is expected to think and closes the
+ * channel itself with `</think>`, so opening it is the caller's job. A
+ * format with no think pair is unchanged. */
+static const char *asst_open(const chatfmt *f, char *buf, size_t cap)
+{
+    const char *role = f->open[0] ? f->open : f->asst_p;
+    if (!f->think_o[0]) return role;
+    snprintf(buf, cap, "%s%s", role, f->think_o);
+    return buf;
+}
+
 static int load_chatfmt(const char *model, chatfmt *f)
 {
     memset(f, 0, sizeof *f);
@@ -460,19 +522,16 @@ static int load_chatfmt(const char *model, chatfmt *f)
     jstr_field(buf, "\"user\"", 1, f->usr_s, sizeof f->usr_s);
     jstr_field(buf, "\"assistant\"", 0, f->asst_p, sizeof f->asst_p);
     jstr_field(buf, "\"assistant\"", 1, f->asst_s, sizeof f->asst_s);
-    /* "open" is a bare string, not a pair; reuse the scanner on a fake array */
-    const char *o = strstr(buf, "\"open\"");
-    if (o) {
-        const char *q = strchr(o + 6, '"');
-        if (q) {
-            size_t i = 0;
-            for (q++; *q && *q != '"' && i + 1 < sizeof f->open; q++) {
-                if (*q == '\\' && q[1]) { q++; f->open[i++] = *q == 'n' ? '\n' : *q == 't' ? '\t' : *q; }
-                else f->open[i++] = *q;
-            }
-            f->open[i] = 0;
-        }
-    }
+    /* "open", "prelude" and "stop" are bare strings, not pairs. */
+    jstr_bare(buf, "\"open\"", f->open, sizeof f->open);
+    jstr_bare(buf, "\"prelude\"", f->prelude, sizeof f->prelude);
+    jstr_bare(buf, "\"stop\"", f->stop, sizeof f->stop);
+    jstr_bare(buf, "\"image\"", f->image, sizeof f->image);
+    jstr_field(buf, "\"think\"", 0, f->think_o, sizeof f->think_o);
+    jstr_field(buf, "\"think\"", 1, f->think_c, sizeof f->think_c);
+    /* A format that does not name one ends its turn with the assistant
+     * suffix, which is what it has always done. */
+    if (!f->stop[0]) snprintf(f->stop, sizeof f->stop, "%s", f->asst_s);
     f->have = f->usr_p[0] || f->asst_p[0] || f->open[0];
     return f->have;
 }
@@ -493,14 +552,15 @@ static int cmd_plan(int argc, char **argv)
         printf("{\"ctx\":%u,\"trunk_bytes\":%llu,\"state_bytes\":%llu,"
                "\"scratch_bytes\":%llu,\"min_expert_cache\":%llu,"
                "\"floor_bytes\":%llu,\"recommended_bytes\":%llu,"
-               "\"working_set_bytes\":%llu",
+               "\"working_set_bytes\":%llu,\"bank_bytes\":%llu",
                o.ctx, (unsigned long long)p.trunk_bytes,
                (unsigned long long)p.state_bytes,
                (unsigned long long)p.scratch_bytes,
                (unsigned long long)p.min_expert_cache,
                (unsigned long long)p.floor_bytes,
                (unsigned long long)p.recommended_bytes,
-               (unsigned long long)p.working_set_bytes);
+               (unsigned long long)p.working_set_bytes,
+               (unsigned long long)p.bank_bytes);
         /* The human form already says "machine N GB" and the JSON did not,
          * so anything reading this had to work out physical RAM for itself
          * — which on Windows means neither sysconf nor /proc exists and the
@@ -560,6 +620,22 @@ static int cmd_plan(int argc, char **argv)
            "                                      container holds; below one\n"
            "                                      working set the cache keeps\n"
            "                                      nothing alive between tokens)\n", b[0]);
+    /* What a machine with room should be sized against, and the line
+     * `recommended` cannot be: recommended answers "worth having" without
+     * knowing the machine and stops at three working sets, which on a
+     * container smaller than RAM leaves most of the machine unused. This is
+     * the budget at which no expert is ever read twice. */
+    if (p.bank_bytes) {
+        char rb[32], kb[32];
+        human(p.floor_bytes + p.bank_bytes, rb, 32);
+        human(p.bank_bytes, kb, 32);
+        printf("  fully resident        %12s   (floor + every expert the\n"
+               "                                      container holds, %s;\n"
+               "                                      no record is read twice.\n"
+               "                                      The automatic budget\n"
+               "                                      climbs to this when the\n"
+               "                                      machine has the room)\n", rb, kb);
+    }
     if (p.vision_bytes) {
         char vb[32];
         human(p.vision_bytes, vb, 32);
@@ -637,7 +713,8 @@ static int cmd_info(int argc, char **argv)
  * another 17, so 64 was exactly too small once the dimensions went in. */
 #define MEDIA_HEAD_CAP (WASTE_MAX_IMAGES_CLI * 128 + 1)
 
-static int prefix_images(waste_ctx *c, const opts *o, char *buf, size_t cap)
+static int prefix_images(waste_ctx *c, const opts *o, char *buf, size_t cap,
+                         const chatfmt *fmt)
 {
     size_t k = 0;
     for (int i = 0; i < o->n_image; i++) {
@@ -663,9 +740,14 @@ static int prefix_images(waste_ctx *c, const opts *o, char *buf, size_t cap)
         char dims[48] = "";
         if (waste_image_dimensions(o->image[i], &iw, &ih) == WASTE_OK)
             snprintf(dims, sizeof dims, "image %dx%d", iw, ih);
-        const int w = snprintf(buf + k, cap - k, "%s%s%s%s%s",
-                               "<|media_begin|>", dims, "<|media_content|>",
-                               "<|media_pad|>", "<|media_end|>");
+        /* A format that states its own block gets it verbatim: GLM's is
+         * `<|begin_of_image|><|image|><|end_of_image|>` and carries no
+         * dimensions, because its processor does not tell the model them. */
+        const int w = fmt && fmt->image[0]
+            ? snprintf(buf + k, cap - k, "%s", fmt->image)
+            : snprintf(buf + k, cap - k, "%s%s%s%s%s",
+                       "<|media_begin|>", dims, "<|media_content|>",
+                       "<|media_pad|>", "<|media_end|>");
         if (w < 0 || (size_t)w >= cap - k) {
             fprintf(stderr, "prompt too long\n");
             return 1;
@@ -731,7 +813,7 @@ static int build_prompt(waste_ctx *c, const opts *o, const char *prompt,
     char head[MEDIA_HEAD_CAP];
     head[0] = 0;
     if (o->n_image && !o->media_inlined &&
-        prefix_images(c, o, head, sizeof head)) return 1;
+        prefix_images(c, o, head, sizeof head, NULL)) return 1;
     const seg s[2] = { { head, 1 }, { prompt, 1 } };
     return build_prompt_segs(c, o, s, 2, ids, cap, n);
 }
@@ -744,7 +826,7 @@ static int run_prompt(waste_ctx *c, const opts *o, const char *prompt, int show_
     char head[MEDIA_HEAD_CAP];
     head[0] = 0;
     if (o->n_image && !o->media_inlined &&
-        prefix_images(c, o, head, sizeof head)) return 1;
+        prefix_images(c, o, head, sizeof head, NULL)) return 1;
     const seg s[2] = { { head, 1 }, { prompt, 1 } };
     opts q = *o;
     q.media_inlined = 1;          /* prefix_images already ran, above */
@@ -862,7 +944,7 @@ static int cmd_run(int argc, char **argv)
         char head[MEDIA_HEAD_CAP];
         head[0] = 0;
         if (o.n_image) {
-            if (prefix_images(c, &o, head, sizeof head)) {
+            if (prefix_images(c, &o, head, sizeof head, &fmt)) {
                 waste_close(c); free(prompt); return 1;
             }
             o.media_inlined = 1;
@@ -870,7 +952,9 @@ static int cmd_run(int argc, char **argv)
         /* Markup is the template's; the system text and the prompt are
          * the caller's and are encoded as plain text. The image block
          * goes inside the user turn, before the words. */
-        const seg s[7] = {
+        char openbuf[192];
+        const seg s[8] = {
+            { fmt.prelude,                            1 },
             { o.system && *o.system ? fmt.sys_p : "", 1 },
             { o.system ? o.system : "",               0 },
             { o.system && *o.system ? fmt.sys_s : "", 1 },
@@ -879,14 +963,14 @@ static int cmd_run(int argc, char **argv)
             { prompt,                                 0 },
             { fmt.usr_s,                              1 },
         };
-        seg all[8];
+        seg all[9];
         memcpy(all, s, sizeof s);
-        all[7] = (seg){ fmt.open, 1 };
+        all[8] = (seg){ asst_open(&fmt, openbuf, sizeof openbuf), 1 };
         /* stop where the assistant's turn closes, so the marker does not
          * land in the user's output */
-        if (!o.stop && fmt.asst_s[0]) o.stop = fmt.asst_s;
+        if (!o.stop && fmt.stop[0]) o.stop = fmt.stop;
         o.no_echo = 1;              /* the prompt here is mostly markers */
-        r = run_segs(c, &o, all, 8, NULL, !o.quiet);
+        r = run_segs(c, &o, all, 9, NULL, !o.quiet);
     } else {
         r = run_prompt(c, &o, prompt, !o.quiet);
     }
@@ -922,16 +1006,24 @@ static int cmd_chat(int argc, char **argv)
            "/image FILE attaches a picture, /stats prints counters, "
            "Ctrl-D exits\n");
 
+    /* The prelude opens the conversation and belongs to no role: GLM's
+     * begins `[gMASK]<sop>`. It goes in once, before the system turn if
+     * there is one and before the first user turn otherwise, which is what
+     * `pending_prelude` below carries. */
+    const char *pending_prelude = fmt.prelude;
+
     /* The system turn goes in once, before anything else. */
     if (templated && o.system && *o.system) {
         opts q = o;
         q.n_image = 0;              /* a picture belongs to a user turn */
-        const seg system_turn[3] = {
+        const seg system_turn[4] = {
+            { pending_prelude, 1 },
             { fmt.sys_p, 1 }, { o.system, 0 }, { fmt.sys_s, 1 },
         };
+        pending_prelude = "";
         int32_t ids[MAXTOK];
         size_t n = 0;
-        if (build_prompt_segs(c, &q, system_turn, 3, ids, MAXTOK, &n)) {
+        if (build_prompt_segs(c, &q, system_turn, 4, ids, MAXTOK, &n)) {
             waste_close(c);
             return 1;
         }
@@ -1007,18 +1099,21 @@ static int cmd_chat(int argc, char **argv)
             char head[MEDIA_HEAD_CAP];
             head[0] = 0;
             if (t.n_image) {
-                if (prefix_images(c, &t, head, sizeof head)) { o.n_image = 0; continue; }
+                if (prefix_images(c, &t, head, sizeof head, &fmt)) { o.n_image = 0; continue; }
                 t.media_inlined = 1;
             }
             /* `line` is what the user typed: plain, so a marker pasted
              * into a chat turn cannot end it or open a system message. */
-            const seg s[5] = {
+            char openbuf[192];
+            const seg s[6] = {
+                { pending_prelude, 1 },
                 { fmt.usr_p, 1 }, { head, 1 }, { line, 0 }, { fmt.usr_s, 1 },
-                { fmt.open[0] ? fmt.open : fmt.asst_p, 1 },
+                { asst_open(&fmt, openbuf, sizeof openbuf), 1 },
             };
+            pending_prelude = "";
             t.no_echo = 1;
-            if (!t.stop && fmt.asst_s[0]) t.stop = fmt.asst_s;
-            run_segs(c, &t, s, 5, NULL, 0);
+            if (!t.stop && fmt.stop[0]) t.stop = fmt.stop;
+            run_segs(c, &t, s, 6, NULL, 0);
         } else {
             run_prompt(c, &o, line, 0);
         }

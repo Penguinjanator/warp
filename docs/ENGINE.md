@@ -149,8 +149,27 @@ pre-read-ahead sweep; the ratios between them are the point and read-ahead
 does not change them — see [EFFICIENCY.md](EFFICIENCY.md).)
 
 So the default steps down a whole working set at a time and takes the
-largest that fits under **3/4** of the RAM this process may use:
-`floor + 3x`, else `2x`, else `1x`, else the floor.
+largest that fits under **3/4** of the RAM this process may use.
+
+The top of that ladder used to be `floor + 3x`, and on a machine with room
+that left the rest of it unused. Three working sets is what
+`recommended_bytes` means — worth having, without knowing the machine — and
+it is the wrong ceiling once the machine *is* known: Kimi-Linear's entire
+expert set is 17.17 GB and the default took 1.65 GB of cache on a 64 GB
+laptop; K3 on a 256 GB host took the same 51.6 GB it takes here.
+
+The real ceiling is the container's own bank. A cache that holds every
+expert never reads one twice, and a byte beyond that is a slot nothing will
+ever fill — so the ladder starts at however many working sets cover
+`bank_bytes` and walks down: `floor + min(bank, k x working set)` for the
+largest `k` that fits. On a container smaller than the machine it lands on
+"all of it", and `waste plan` reports that budget as **fully resident**.
+
+Nothing about the cliff changes, because the cap that guards it does not:
+three quarters of what this process may use, with the cliff above it. And an
+unfilled slot is address space rather than memory — the pages fault in as
+records arrive, and the records that arrive are the ones the run would
+otherwise have read from disk again.
 
 The quarter left to the OS is a measurement, not a margin of taste. It was
 an eighth until 2026-08-09, which put the ceiling at 56 GB on a 64 GB
@@ -161,9 +180,12 @@ the default picked 54.77 GB and ran at **0.08 tok/s against 0.77 at
 46 GB** — same container, ten times slower, higher hit rate, lower RSS.
 [LEARNED.md](LEARNED.md) §56.
 K3 lands on `floor + 1x` here — a 46.25 GB budget, 17.56 GB of cache, and
-the top of the measured curve with no flag given. A 128 GB machine still
-gets the full `3x`, and a model whose recommendation already fits, like
-Kimi-Linear, is unaffected. When even the floor is above the cap the
+the top of the measured curve with no flag given; its bank is 962.83 GB, so
+no rung above that fits and the change above is invisible to it. A 128 GB
+machine still gets `3x`, a 256 GB one gets `9x`. Kimi-Linear, whose whole
+bank fits under the cap here, now gets the bank: 18.48 GB resolved,
+**14.81 tok/s against 12.67 and 17.7 GB read against 66.3** over 200 tokens
+([LEARNED.md](LEARNED.md) §66). When even the floor is above the cap the
 engine runs at the floor and says so on stderr, because the alternative
 is refusing to open a model that does technically fit.
 

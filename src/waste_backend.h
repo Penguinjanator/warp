@@ -38,6 +38,7 @@
 #define WASTE_BACKEND_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -82,11 +83,25 @@ typedef struct {
     void (*mvq_rows_f32)(int b, int e, void *arg);
     void (*lutb_range)(int lo, int hi, void *arg);
     void (*vq_rows_p6)(int b, int e, void *arg);
+    /* VQ3R through an int8 table held in registers. NULL where no
+     * backend implements it, which is every non-ARM target today. */
+    void (*vq_rows_e)(int b, int e, void *arg);
 
     /* Set by a backend that wants the whole row range in one call — a GPU
      * dispatch must not be split across pool threads. Call sites use
      * waste_run_rows() rather than waste_parallel_for() directly. */
     int on_device;
+
+    /* The best CPU kernel, snapshotted before any accelerator overwrites
+     * the slot above it. A device dispatch has a floor — about 11 us for a
+     * Metal command buffer on this machine — so a matvec small enough to
+     * finish inside that floor belongs on the pool, and the pool needs a
+     * kernel that is not the device's. */
+    void (*mvq_rows_cpu)(int b, int e, void *arg);
+
+    /* Below this many weight bytes a matvec goes to mvq_rows_cpu instead.
+     * 0 when no device backend is registered. */
+    size_t device_min_bytes;
 
     /* A backend implementing only some slots leaves the rest at CPU. */
 } waste_kernels;

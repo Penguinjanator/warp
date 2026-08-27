@@ -129,22 +129,51 @@ startup the server asks for the richer format first and falls back:
 1. **XTML**, if the container's tokenizer carries `<|open|>`, `<|sep|>`,
    `<|close|>` and `<|end_of_msg|>` as single tokens. Channels, tools,
    images — everything below in this document.
-2. **The container's own `chat.json`**, otherwise. The same four
-   prefix/suffix strings `waste chat` reads, so a container is addressed
-   identically over HTTP and on the command line, and a hand-edited
-   `chat.json` is honoured by both. Kimi-Linear is served this way.
+2. **The container's own `chat.json`**, otherwise. The same strings
+   `waste chat` reads, so a container is addressed identically over HTTP
+   and on the command line, and a hand-edited `chat.json` is honoured by
+   both. Kimi-Linear and GLM-5.3-Flash are served this way.
 
 ```
-chat     from ~/models/kimi-linear.waste/chat.json — plain conversation only,
-         no tools, no reasoning channel, no images
+chat     from ~/models/kimi-linear.waste/chat.json — plain conversation, no reasoning channel,
+         no images, no tools
+chat     from ~/models/glm53.waste/chat.json — plain conversation, a reasoning channel,
+         images, no tools
 ```
 
-Plain means plain: system / user / assistant turns, blocking and streaming,
-with the stop token taken from the template's assistant suffix rather than
-guessed. Everything four strings cannot express is refused with a 400 that
-names the field — `tools`, `reasoning_effort`, an image part, a tool result
-turn. None of it is silently dropped; a server that ignores
-`reasoning_effort` reports a different amount of reasoning than it did.
+Plain means plain: system / user / assistant turns, blocking and streaming.
+Everything the format cannot express is refused with a 400 that names the
+field — `tools`, a tool result turn, an image part on a format with no
+`image` block. None of it is silently
+dropped; a server that ignores `reasoning_effort` reports a different
+amount of reasoning than it did.
+
+Three of the fields exist because GLM's format cannot be written without
+them, and each is optional and absent on both Kimi formats:
+
+| field | what it is for |
+|---|---|
+| `prelude` | emitted once before the first turn, belonging to no role — GLM's is `[gMASK]<sop>` |
+| `stop` | what ends a generated turn, for a format where that is not the assistant suffix |
+| `think` | the reasoning channel's `[open, close]` pair |
+| `effort` | how the format asks for a reasoning effort, e.g. `"<\|system\|>Reasoning Effort: {}"` |
+| `image` | the block one image expands into, holding exactly one placeholder |
+
+`stop` is the one that fails quietly without it. A GLM turn ends because
+the *next* role marker begins — `<|assistant|>answer` then
+`<|user|>question` — so there is no suffix to close it with and the history
+must not carry one. Taking the stop from the assistant suffix, as every
+Kimi format wants, left the reply running into the next turn and answering
+questions nobody had asked.
+
+`think` is what makes `reasoning_content` possible from a chat.json
+container: the reply reader splits on the close marker, so the model's
+scratch work comes back beside the answer rather than as the answer. A
+container whose specials carry no think markup still refuses a request that
+asks for one. A container whose format *always* opens the channel — GLM's
+does, and its template has no path that does not — refuses `thinking:
+false` for the same reason: answering with the channel closed puts a stray
+close marker in the reply.
 
 `chat.json` is validated more strictly here than by the CLI's reader, which
 has a person watching and an interrupt key. Serving needs an `open`, a

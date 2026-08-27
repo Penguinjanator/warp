@@ -4,7 +4,7 @@ WARP is an embeddable inference engine written in C, with no third-party runtime
 
 The project is driven by humans: the ideas, hypotheses, priorities, tests, and decisions are human. The code is written by LLMs. At this scale, that is the only way to iterate on new algorithms and test hypotheses fast enough.
 
-The goal is to run huge frontier models such as Kimi K3 on consumer hardware. Today, the complete 2.78-trillion-parameter Kimi K3 runs on a 64 GB MacBook Pro at about **0.6 tokens per second**.
+The goal is to run huge frontier models such as Kimi K3 on consumer hardware. Today, the complete 2.78-trillion-parameter Kimi K3 runs on a 64 GB MacBook Pro at about **0.6 tokens per second**, and the 313-billion-parameter GLM-5.3-Flash — text and images — at about **3.9**.
 
 **Ultimately we want WARP to execute Kimi K3 locally to improve itself** (we are currently using Opus 5 with extra thinking).
 
@@ -34,12 +34,20 @@ For the full design and measurements, see [docs/ENGINE.md](docs/ENGINE.md) and [
 Measured on a 64 GB MacBook Pro with an M5 Pro and the model container on the
 internal SSD:
 
-| Model | Container | Minimum RAM | Decode speed |
-|---|---:|---:|---:|
-| Kimi K3 2.78T | 982 GB | 29.19 GB | 0.45–0.62 tok/s |
-| Kimi-Linear 48B | 19 GB | 1.32 GB | 10.62 tok/s |
+| Model | Container | Minimum RAM | 64 tokens | 200 tokens |
+|---|---:|---:|---:|---:|
+| Kimi K3 2.78T | 982 GB | 29.19 GB | 0.45–0.62 tok/s | — |
+| GLM-5.3-Flash 313B | 112 GB | 5.14 GB | 3.32 tok/s | **3.86 tok/s** |
+| Kimi-Linear 48B | 19 GB | 1.32 GB | 14.29 tok/s | **17.22 tok/s** |
+
+The longer run is faster because the expert cache is still filling during
+the first few dozen tokens; both columns are what the same command prints,
+not a steady state extrapolated from it. K3 has no 200-token column here
+because one run of it takes ten minutes and reads 4.6 TB.
 
 For K3, 64 GB is the practical minimum. A 32 GB machine can open the model but will page heavily. The default memory budget on the test machine is 46.39 GB, including a 17.56 GB expert cache.
+
+Kimi-Linear's figure is the one that moved: the automatic budget used to stop three working sets short of the machine, so a 19 GB container got a 1.65 GB cache on a 64 GB laptop. It now climbs to the container's whole expert set when the machine has the room — 18.48 GB resolved, every expert resident — and that is worth 11.13 → 12.60 tok/s over 64 tokens, with the bytes read falling from 66.3 GB to 17.7. On top of it the thread pool stopped waking its efficiency cores for jobs too small to hide the ~54 µs that costs, which is another 14.41 → 16.74 over 150 tokens. K3 is unchanged by both: its 962.83 GB of experts do not fit on any machine here, and at 465 GB read per 20 tokens neither residency nor dispatch is where its time goes. [docs/LEARNED.md](docs/LEARNED.md) §66, §67.
 
 Most of that requirement is the 27.28 GB resident trunk rather than the cache. Shrinking the expert cache from 17.32 GB to 3.32 GB costs about 10% of throughput; enlarging it past the default costs everything. Measured across four cache sizes in one process:
 
@@ -78,7 +86,7 @@ Additional measurements, profiling data, router-lookahead results, and quantizat
 
 ## Vision
 
-Kimi K3 is multimodal, and WARP can use one or more images together with text. Pass `--image` once per image:
+Kimi K3 and GLM-5.3-Flash are both multimodal, and WARP can use one or more images together with text. Pass `--image` once per image:
 
 ```bash
 ./waste run ~/models/k3.waste "Describe this image" --image photo.jpg
@@ -88,7 +96,12 @@ Kimi K3 is multimodal, and WARP can use one or more images together with text. P
 
 In interactive mode, `/image FILE` attaches an image to the next message. An image is expanded into many prompt positions: an 896×896 image uses 256 positions at the default patch budget. The vision tower takes about 15.7 seconds for 1024 patches on the test machine, but most of the cost comes afterward because every image position passes through the language model like a text position. In the current K3 measurements, that is about 2.8 seconds per image position.
 
-See [docs/K3.md](docs/K3.md) for the vision architecture and measurements, and [examples/README.md](examples/README.md) for CLI, C, and HTTP multimodal examples.
+GLM's tower is a different one and cheaper to feed: the 200×140 picture in
+the [GLM section](#glm-53-flash) costs 40 prompt positions, and generation
+after it runs at the same speed as without it. Its tower is 282 MB against
+K3's 434 MB, and both are loaded only when images are asked for.
+
+See [docs/K3.md](docs/K3.md) and [docs/GLM.md](docs/GLM.md) for the two vision architectures and their measurements, and [examples/README.md](examples/README.md) for CLI, C, and HTTP multimodal examples.
 
 ## Other models
 
@@ -118,6 +131,105 @@ the DeepSeek release's own `modeling_deepseek.py`.
 Kimi K3 and Kimi-Linear are unaffected: their forward pass is byte-identical to
 0.6.7, by construction rather than by a runtime branch.
 
+### GLM-5.3-Flash
+
+`zai-org/GLM-5.3-Flash` — 313 B parameters, 328 GB of fp8 as published — is
+converted and running, text and images.
+
+```
+$ waste run ~/models/glm53.waste "What is the capital of Italy? Answer in one sentence."
+waste: no --budget, using 46.37 GB of 64.00 GB (expert cache 41.36 GB)
+The user is asking a simple factual question: What is the capital of Italy?
+They want the answer in one sentence.
+
+The capital of Italy is Rome. This is a well-established fact. I should
+answer in one sentence as requested.</think>The capital of Italy is Rome.
+[56 tokens, 12.79 s, 4.38 tok/s | experts 17327 hit / 1489 miss = 92%]
+```
+
+Everything before `</think>` is the model's reasoning. GLM's generation
+prompt always opens that channel and the model closes it itself; the CLI
+prints both, and over HTTP they come back as `reasoning_content` and
+`content` separately.
+
+| | |
+|---|---:|
+| parameters | 313.89 B total, 17.31 B active per token |
+| container | 112 GB — 5301 MB trunk, 42 expert banks of 2598 MB |
+| minimum RAM | 5.14 GB, plus 805 MB when images are enabled |
+| default budget here | 46.37 GB, of which 41.36 GB expert cache |
+| decode | 3.32 tok/s over 64 tokens, **3.86 over 200** |
+
+Against a PyTorch oracle built from the same container: relative L2
+**2.41e-5**, argmax and top-10 identical.
+
+**It is the model that fits this class of machine.** K3 needs 29.19 GB
+before it caches a single expert and then gets a token's working set and a
+half; GLM's floor is 5.14 GB, so a 64 GB laptop caches 36% of its entire
+expert set — and a much smaller machine still runs it. Measured over 64
+tokens, varying only `--budget`:
+
+| budget | expert cache | hit rate | read | decode |
+|---:|---:|---:|---:|---:|
+| 9 GB | 4.0 GB | 66.0% | 228 GB | 2.82 tok/s |
+| 12 GB — what a 16 GB machine resolves | 7.0 GB | 70.2% | 190 GB | 2.99 tok/s |
+| 16 GB | 11.0 GB | 74.0% | 160 GB | 3.06 tok/s |
+| 24 GB | 19.0 GB | 79.4% | 121 GB | 3.14 tok/s |
+| 46 GB — the default here | 41.4 GB | 87.7% | 73 GB | 3.32 tok/s |
+
+The curve is shallow because the reads overlap the arithmetic: six times the
+cache cuts the disk traffic by two thirds and buys 18% of throughput. What
+that means in practice is that **a 16 GB machine runs a 313 B model at 90%
+of the speed a 64 GB one does** — the engine leaves a quarter of RAM to the
+OS, so it resolves about 12 GB there — and more RAM mostly buys quiet disks.
+Until the disk is slow: on the 0.94 GB/s enclosure this project has
+measured, 228 GB against 73 is four minutes of reading against one.
+
+### What is new in it
+
+It turned out to be mostly this engine already: the same KDA recurrence, the
+same MLA with `kv_b_proj` absorbed, the same router, the same fp8 reader and
+the same nested config layout as K3. Three things are new and each is behind
+a config key that is absent everywhere else: **mHC**, which carries four
+parallel residual streams instead of one and mixes them through a
+Sinkhorn-projected matrix at every sublayer; a **clamped SwiGLU**; and
+**DeepSeek Sparse Attention** in its k-pool form, where a full-attention
+layer scores pools of four cached tokens and attends over the best 512 of
+them plus the tail.
+
+The re-encoded tokenizer agrees with the release's own on 21 of 21 strings,
+and VQ3R lands at the same 0.195 relative error on GLM's experts as on K3's.
+
+### Images
+
+Its vision tower is a second one — 24 blocks with 2D rope, per-head q/k
+norms, a gated merger — and matches its own PyTorch oracle to rel L2 3.3e-5:
+
+```
+$ waste run ~/models/glm53.waste "What does this image look like? One sentence." \
+      --image x.png -n 200
+[x.png: 40 image tokens]
+The image is a colorful, abstract pattern. It consists of diagonal stripes
+of various colors (green, blue, purple, pink, yellow, red) with some
+vertical lines within them.</think>This image displays a vibrant, abstract
+pattern of diagonal stripes in various colors like green, blue, purple, and
+pink, overlaid with fine vertical lines.
+[104 tokens, 24.98 s, 4.16 tok/s | experts 32067 hit / 2877 miss = 92%]
+```
+
+`x.png` is a 200×140 test pattern generated from
+`(x*7+y*3, x*x+y, x+y*11) mod 256`, which really is diagonal colour bands
+with vertical structure — the description is of the file, not of a
+plausible-sounding picture.
+
+An image costs the context what text of the same length costs: 40 merged
+tokens for that 200×140 picture, and the generation that follows runs at
+the same speed as any other. The tower itself is 282 MB and is loaded only
+when images are asked for.
+
+[docs/GLM.md](docs/GLM.md) has the architecture, the three places the
+release states something differently, and what is still left out.
+
 ## What you need
 
 To build and test WARP:
@@ -127,6 +239,15 @@ To build and test WARP:
 - no BLAS, Python, CUDA, or other external dependency for the current CPU
   inference path.
 
+To run GLM-5.3-Flash, which is the one most machines can hold:
+
+- **16 GB of RAM is enough**; 5.14 GB is the hard floor at 4K context, and
+  64 GB is what the measurements above were taken on;
+- **112 GB of internal NVMe storage** for the converted container;
+- another **306 GiB of temporary storage** if converting the published
+  weights yourself. This staging storage may be external and can be freed
+  afterward, or reclaimed as the conversion proceeds.
+
 To run Kimi K3:
 
 - **64 GB of RAM recommended**; 29.19 GB is the hard floor at 4K context;
@@ -134,7 +255,7 @@ To run Kimi K3:
 - another **1.42 TB of temporary storage** if converting the published weights
   yourself. This staging storage may be external and can be freed afterward.
 
-If you only want to try the engine, start with Kimi-Linear. Its container is 19 GB, it needs 1.32 GB of RAM, and it runs at about 10.6 tok/s on the same machine.
+If you only want to try the engine, start with Kimi-Linear. Its container is 19 GB, it needs 1.32 GB of RAM, and it runs at about 14.4 tok/s on the same machine.
 
 Python, PyTorch, and safetensors are needed only for model conversion and validation, never for inference.
 
@@ -150,6 +271,89 @@ make check
 ```
 
 `make` builds the `waste` CLI and `libwaste.a`. `make check` creates a small synthetic model, so it does not download weights.
+
+### Quick start: GLM-5.3-Flash
+
+The shortest path to a working 313 B model on a laptop. Every figure below
+was measured on the machine at the top of this file; the download and the
+conversion are both resumable and both safe to kill.
+
+**Before you start**, you need room for two things at once: **306 GiB** of
+published weights on the staging disk, and **112 GB** for the container. The
+container belongs on internal NVMe — a container on an external disk is
+correct and slow, and the difference is 12.78 GB/s against 0.94 on a tested
+enclosure. The staging weights can live anywhere.
+
+```bash
+# 1. Build. Takes under a minute; no weights involved.
+git clone https://github.com/sqliteai/warp
+cd waste
+make
+
+# 2. Check the download before starting it: shard count, size, free space.
+tools/fetch_weights.sh --repo zai-org/GLM-5.3-Flash \
+    --dest /Volumes/staging/glm53 --dry-run
+
+# 3. Download. 62 shards, 306 GiB. About 2 hours here, at a rate that
+#    varied between 36 and 97 MB/s. Re-run it if it stops; nothing
+#    already fetched is fetched twice.
+tools/fetch_weights.sh --repo zai-org/GLM-5.3-Flash \
+    --dest /Volumes/staging/glm53
+
+# 4. Convert. About 45 minutes with three workers: 42 expert layers at
+#    ~160 s each, then the trunk. Put the output on the internal SSD.
+uv run --with torch python tools/convert.py \
+    --src /Volumes/staging/glm53 \
+    --out ~/models/glm53.waste \
+    --jobs 3
+
+# 5. Run it. Leave room for the reasoning channel: GLM thinks before it
+#    answers, and -n counts both.
+./waste run  ~/models/glm53.waste "What is the capital of Italy?" -n 200
+./waste chat ~/models/glm53.waste
+```
+
+That is all of it. There are no GLM-specific flags: the converter recognises
+the architecture, writes the chat format and the vision config, and
+re-encodes the tokenizer, and the engine picks its own memory budget and
+says what it picked.
+
+```
+$ ./waste chat ~/models/glm53.waste
+waste: no --budget, using 46.37 GB of 64.00 GB (expert cache 41.36 GB)
+chat format from ~/models/glm53.waste/chat.json
+
+> What is the capital of Italy? Answer in one sentence.
+The user is asking a simple factual question: What is the capital of Italy?
+They want the answer in one sentence.
+
+The capital of Italy is Rome. This is a well-established fact. I should
+answer in one sentence as requested.</think>The capital of Italy is Rome.
+```
+
+The text before `</think>` is the model's reasoning channel, which GLM
+always opens and closes itself. Over HTTP it comes back as
+`reasoning_content`, separate from the answer. `-n` counts both, so a
+question that needs thinking needs a larger budget than the answer alone
+suggests.
+
+**What to expect on the way.** The first few dozen tokens are slower than
+the rest — the expert cache is still filling — so a short reply runs at
+around 3.3 tok/s and a long one settles near 3.9. Prefill runs at the same
+speed as decode, so a 2000-token prompt takes minutes before the first
+output token; that is a property of the engine and not of this model.
+
+**If you have less RAM**, nothing changes about the commands: the engine
+resolves a smaller budget on its own and says so. The table in the
+[GLM-5.3-Flash](#glm-53-flash) section above measures what each budget
+buys — 16 GB is enough, at 3.06 tok/s against 3.32.
+
+**If you are short of disk**, `--reclaim on` deletes each source shard as
+the converter finishes with it, so the peak is the container plus the
+shards still owed instead of both in full. It is not reversible and
+`tools/verify_container.py` can no longer check the result against its
+source, so prove the recipe with `--reclaim dry` first — [docs/K3.md](docs/K3.md)
+has the refusals and the ledger discipline.
 
 ### Get Kimi K3, already converted
 
@@ -225,6 +429,15 @@ curl localhost:8000/v1/chat/completions \
 ```
 
 It supports streaming, tools, structured output, thinking controls, and images. See [docs/SERVE.md](docs/SERVE.md) for the protocol and [examples/README.md](examples/README.md) for complete requests.
+
+A GLM container is served the same way, from its own `chat.json`: plain
+conversation and images, with the reasoning channel returned as
+`reasoning_content` beside `content`. Tools are refused by name rather than
+half-rendered — four strings cannot express a tool declaration.
+
+```bash
+python3 -m serve ~/models/glm53.waste --port 8000
+```
 
 ## Library
 

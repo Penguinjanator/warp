@@ -185,10 +185,102 @@ static void vq_rows_p6_neon(int b, int e, void *p)
     }
 }
 
+
+/* VQ3R through a register-resident int8 table.
+ *
+ * The gather in src/model.c's vq_rows is three dependent loads per eight
+ * weights out of a 1.34 MB fp32 table, and docs/LEARNED.md §25 established
+ * that unrolling it is all that ever moved it. §41 then explained why it
+ * cannot become a byte shuffle the way VQ4P did: `vqtbl4q_s8` indexes 64
+ * entries and VQ3R has 256, so a stage costs four of them plus the adds,
+ * and §41 measured that at 1.24x and stopped.
+ *
+ * Two things make it 1.76x here instead. `vqtbl4q_s8` answers 0 for any
+ * index past 63, so the four lookups over c, c-64, c-128 and c-192 add
+ * together with no select and no mask — exactly one of them is non-zero.
+ * And `vld3q_u8` deinterleaves the [row][stage] index layout sixteen rows
+ * at a time, which is what makes a stage-major loop affordable: the table
+ * for one (v, stage) is loaded once and met by all 64 rows of the block.
+ *
+ * The table is int8 for the same reason VQ4P's is, with the same one scale
+ * per WASTE_VQ_LUT_BLK positions — a LUT entry is dot(x_v, centroid) and
+ * its magnitude follows ||x_v||, so a single global scale would round the
+ * quiet positions to zero. That makes this path discontinuous in the sense
+ * §43 describes, which is why it is a switch and not a replacement.
+ */
+static void vq_rows_e_neon(int b, int e, void *p)
+{
+    vqp_arg *a = (vqp_arg *)p;
+    const int nv = a->nv;
+    const int en = 256, st = 3;
+    const uint8x16_t k64 = vdupq_n_u8(64), k128 = vdupq_n_u8(128),
+                     k192 = vdupq_n_u8(192);
+    float acc[VQ_TILE];
+
+    for (int r0 = b; r0 < e; r0 += VQ_TILE) {
+        const int nr = (r0 + VQ_TILE <= e) ? VQ_TILE : e - r0;
+        for (int r = 0; r < nr; r++) acc[r] = 0.0f;
+
+        for (int v0 = 0; v0 < nv; v0 += WASTE_VQ_LUT_BLK) {
+            int v1 = v0 + WASTE_VQ_LUT_BLK;
+            if (v1 > nv) v1 = nv;
+            /* 3 stages x 32 positions x 127 = 12192, inside int16. */
+            int16_t sum[VQ_TILE];
+            memset(sum, 0, sizeof sum);
+
+            if (nr == VQ_TILE) {
+                int16x8_t s[8];
+                for (int i = 0; i < 8; i++) s[i] = vdupq_n_s16(0);
+                for (int v = v0; v < v1; v++) {
+                    const int8_t *blk = a->lut8 + (size_t)v * st * en;
+                    const uint8_t *ix = a->idx +
+                        ((size_t)(r0 / VQ_TILE) * nv + v) * VQ_TILE * st;
+                    for (int s3 = 0; s3 < st; s3++) {
+                        const int8_t *T = blk + s3 * en;
+                        int8x16x4_t T0, T1, T2, T3;
+                        for (int k = 0; k < 4; k++) {
+                            T0.val[k] = vld1q_s8(T +   0 + k * 16);
+                            T1.val[k] = vld1q_s8(T +  64 + k * 16);
+                            T2.val[k] = vld1q_s8(T + 128 + k * 16);
+                            T3.val[k] = vld1q_s8(T + 192 + k * 16);
+                        }
+                        for (int g = 0; g < 4; g++) {
+                            const uint8x16x3_t I = vld3q_u8(ix + g * 48);
+                            const uint8x16_t c = I.val[s3];
+                            int8x16_t rv = vaddq_s8(vqtbl4q_s8(T0, c),
+                                                    vqtbl4q_s8(T1, vsubq_u8(c, k64)));
+                            rv = vaddq_s8(rv, vqtbl4q_s8(T2, vsubq_u8(c, k128)));
+                            rv = vaddq_s8(rv, vqtbl4q_s8(T3, vsubq_u8(c, k192)));
+                            s[g * 2]     = vaddw_s8(s[g * 2],     vget_low_s8(rv));
+                            s[g * 2 + 1] = vaddw_s8(s[g * 2 + 1], vget_high_s8(rv));
+                        }
+                    }
+                }
+                for (int i = 0; i < 8; i++) vst1q_s16(sum + i * 8, s[i]);
+            } else {
+                for (int v = v0; v < v1; v++) {
+                    const int8_t *blk = a->lut8 + (size_t)v * st * en;
+                    const uint8_t *ix = a->idx +
+                        ((size_t)(r0 / VQ_TILE) * nv + v) * VQ_TILE * st;
+                    for (int r = 0; r < nr; r++)
+                        sum[r] = (int16_t)(sum[r] + blk[ix[r * st]] +
+                                           blk[en + ix[r * st + 1]] +
+                                           blk[2 * en + ix[r * st + 2]]);
+                }
+            }
+            const float ls = a->lscale[v0 / WASTE_VQ_LUT_BLK];
+            for (int r = 0; r < nr; r++) acc[r] += ls * (float)sum[r];
+        }
+        for (int r = 0; r < nr; r++)
+            a->y[r0 + r] = acc[r] * waste_f16(a->scale[r0 + r]);
+    }
+}
+
 const char *waste_kda_register_neon(waste_kernels *t)
 {
     t->kda_step = kda_step_neon;
     t->vq_rows_p6 = vq_rows_p6_neon;
+    t->vq_rows_e = vq_rows_e_neon;
     /* short_conv_step and rmsnorm_gated stay on the CPU baseline until
      * they show up in a profile — partial override is the whole point. */
     /* The name reports what this build *uses*, not what the CPU offers.

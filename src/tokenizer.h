@@ -38,6 +38,11 @@ int  waste_tok_eos(const waste_tok *t);
  * Ignored when id <= 0, so a container that does not state one keeps the
  * reserved-block default. */
 void waste_tok_set_eos(waste_tok *t, int id);
+/* 1 (the default) = the model's pattern gives Han its own [\p{Han}]+
+ * branch, as both Kimi releases do; 0 = it does not, and Han is an
+ * ordinary \p{L} — GLM-5.3-Flash's pattern. The two differ only where a
+ * Han run touches a Latin one, and they differ silently. */
+void waste_tok_set_han_split(waste_tok *t, int on);
 
 /* Encodes `text` into `out` (capacity `cap`); returns the count, or -1 if
  * it would not fit. Special tokens in the text are NOT interpreted. */

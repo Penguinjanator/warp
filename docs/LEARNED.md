@@ -4514,3 +4514,701 @@ or on a machine with room, not on a bare laptop. The estimate that preceded
 it — "20-30 minutes of paging, with a real chance the OS starts killing
 things" — was wrong in kind rather than in degree: macOS grew swap to 40 GB
 and froze instead of killing anything.
+
+## 65. GLM-5.3-Flash is this engine with three things added (2026-08-27)
+
+`zai-org/GLM-5.3-Flash` was published the day before this was written: 313 B
+parameters, 328 GB of fp8, `Glm5NextForConditionalGeneration`. The question
+was how much of it this engine already runs. The answer turned out to be
+most of it, and the interesting part is which of the differences were
+*loud* and which were silent.
+
+### What was already there
+
+Nothing had to be written for any of this. The layer mix is 34 KDA and 11
+MLA, one full-attention layer in four — Kimi-Linear's pattern at K3's
+scale. The KDA is the same recurrence with the same parameterization:
+`f_a`/`f_b` forget gate, per-head `A_log`, `gate_lower_bound` -5.0, short
+conv 4, `g_a`/`g_b` output gate, gated RMSNorm. The router is DeepSeek's,
+which is K3's: sigmoid scores, an `e_score_correction_bias` for selection
+only, renormalized top-8, `routed_scaling_factor` 2.5. The tensors are
+named the way K2 and K3's are, the config nests under `text_config` with a
+`language_model.` prefix exactly as K3's does, and the weights are fp8 with
+block scales, which the converter has read since K2.
+
+Even the MLA needed nothing: `qk_rope_head_dim` is **0** and `mla_use_nope`
+is set, so `mla_layer` runs with a zero-width rope slice and the absorption
+is unchanged. GLM's own positional signal is in the KDA layers and in the
+indexer's rope, not in MLA at all.
+
+### What was new, and what it cost
+
+| | where | resident cost |
+|---|---|---|
+| mHC, 4 residual streams | the layer loop, both sites | 35 B params, 8-bit |
+| clamped SwiGLU, limit 10 | seven activation sites | none |
+| DSA k-pool indexer | `mla_layer` | 128 B/token/layer |
+
+The third is the one worth recording. DeepSeek Sparse Attention here scores
+*pools* of four adjacent tokens rather than tokens, keeps
+`index_topk / index_kpool` = 512 of them, and always appends the tail that
+has not filled a pool. Two consequences fell out of writing it:
+
+- **A pool's compressed key is computed once and is 32x smaller than the
+  keys it summarizes.** One 128-wide vector per four tokens per
+  full-attention layer, appended when the pool's last token arrives. The
+  per-step state is that array plus a four-slot rolling buffer. Against the
+  latents already cached (512 floats per token per layer) it is a
+  fourteenth. The obvious implementation — cache the raw keys and pool them
+  at selection time — would have cost 32x more and recomputed the same
+  softmax every step.
+
+- **Below `index_topk` tokens the sparse path *is* the dense path**, not an
+  approximation of it. With no more complete pools than the query may keep,
+  the selection is every visible token. So the branch costs nothing at
+  short context and the selection arithmetic appears exactly where the
+  saving does. `dsa_select` returns -1 for it and the head loop takes the
+  path it always took.
+
+### The two that were silent, and one that was found by checking
+
+Loud failures need no discipline. These three did:
+
+**`kda_layers` is 0-based on GLM and 1-based in a WASTE manifest.** Copied
+through it puts KDA on the wrong layers. Every tensor is found, every shape
+checks out, `cfg_sane` passes, the container loads, and the model answers
+noise. The converter rebuilds the list from `layer_types` instead, which
+states the same thing without an origin convention.
+
+**`eos_token_id` is a list of three.** Read as an integer it stops on
+nothing.
+
+Neither is visible to the oracle diff, because the oracle reads the same
+manifest and would be wrong in the same direction. That is the general
+shape of a converter bug and the reason `tests/test_convert_glm.py` checks
+against what the *release* says rather than against the container.
+
+**The pre-tokenizer has no Han branch.** This one was not deduced, it was
+measured, and it is the concrete result of this section. Kimi's pattern
+starts with `[\p{Han}]+`; GLM's does not, so on GLM a Han run and the Latin
+run touching it are one pre-token where on Kimi they are two. Sixteen
+tokens in GLM's vocabulary span that boundary and they are ordinary words:
+
+| | with the Han branch | GLM, and the release |
+|---|---|---|
+| `A股` | `32 98963` | `111321` |
+| `维生素C` | `103261 34` | `121569` |
+| `C罗` | `34 99209` | `126152` |
+| `QQ音乐` | `47724 99908` | `126724` |
+
+A tokenizer that is right on 22 English and CJK strings and wrong on `A股`
+is the failure mode this family keeps producing: correct on everything the
+corpus happens to contain. The corpus now contains it, the container states
+which pattern it wants in `tokenizer_han_split`, and `tools/tokdiff.py`
+compares against whichever reference the source actually ships — tiktoken
+for a rank file, `tokenizers` for a `tokenizer.json`. 21 of 21 identical
+against the real GLM vocabulary.
+
+A fourth thing was expected to be silent and was not: the merge list.
+Re-encoding `tokenizer.json` into a tiktoken rank file only reproduces the
+release's encoder if the merge list is ordered by the id of what each merge
+produces — merge-by-rank and merge-by-list-position are otherwise two
+encoders sharing one vocabulary. GLM's is so ordered (0 descents in 321648
+merges), and `hf_tokenizer.py` refuses rather than approximates when a
+release's is not. Its first version demanded something stricter — that both
+halves of every merge rank below the result — and rejected this tokenizer
+over 56373 merges that are simply redundant spellings (`Ġ`+`th` beside
+`Ġt`+`h`, both producing `Ġth`). The check was wrong, not the tokenizer;
+what matters is the order of the results, not the ranks of the inputs.
+
+### The size, which is why this is worth having
+
+Arithmetic from `config.json`, not a conversion:
+
+| | GLM-5.3-Flash | K3 |
+|---|---:|---:|
+| trunk, resident | ~4.8 GiB | 27.3 GiB |
+| experts at VQ3R | ~106.5 GiB | 982 GiB |
+| one token's working set | ~3.2 GB | ~17 GB |
+
+On the 64 GB machine §64 measured K3 at 0.39 tok/s on, GLM's trunk leaves
+room to cache something on the order of 40% of its entire expert set, where
+K3 gets a working set and a half. §63's four-token window and §39's
+hit-rate curve both say what to expect from that, and neither has been run
+here — no GLM container has been converted yet. Everything in this section
+that is not from `config.json` was measured on a synthetic container at
+1/32 scale, whose shapes are the ones the engine branches on and whose
+weights are noise.
+
+## 66. The budget stopped three working sets short of the machine (2026-08-27)
+
+The automatic budget walked a ladder whose top rung was `floor + 3x` a
+token's working set. That is what `recommended_bytes` means — "worth
+having, without knowing the machine" — and it is the wrong ceiling once the
+machine is known. On this 64 GB laptop Kimi-Linear's **entire** expert set
+is 17.17 GB and the default gave it **1.65 GB** of cache; K3 on a 256 GB
+host would take the same 51.6 GB of cache it takes here.
+
+The real ceiling is the container's own bank: a cache that holds every
+expert never reads one twice, and a byte past that is a slot nothing will
+ever fill. So the ladder now starts at however many working sets cover
+`bank_bytes` and walks down, and the cache never exceeds the bank. Nothing
+about §39's and §56's cliff changes, because the cap that guards it does
+not — three quarters of what the process may use, with the cliff above it —
+and an unfilled slot is address space, not memory.
+
+Three things came out of that, and only the first was the plan.
+
+### 1. The RAM, on a container that fits
+
+Kimi-Linear, `waste bench`, defaults, this machine:
+
+| | before | after |
+|---|---:|---:|
+| resolved budget | 3.07 GB | **18.48 GB** |
+| expert cache | 1.65 GB | 17.20 GB |
+| hit rate, 200 tok | 70.7% | **96.3%** |
+| bytes read, 200 tok | 66.27 GB | **17.75 GB** |
+| tok/s, 64 tok | 11.13 | **12.60** |
+| tok/s, 200 tok | 12.67 | **14.81** |
+
+K3 is untouched — 0.3251 tok/s before and after, byte for byte the same
+465 GB read — because its bank is 962.83 GB and no rung above `floor + 1x`
+fits under the cap. The change is only visible where the container is
+smaller than the machine, which is exactly where it was meant to be.
+
+### 2. Residency is what WASTE_XPAR was really asking about
+
+§44 measured one task per routed expert at 1.18x on Kimi-Linear and a
+regression on K3, and the reason it gave was already the answer: holding K
+records before doing any arithmetic is *a barrier against the read-ahead*.
+It is free parallelism when the records are in RAM and a stall when they
+are on their way. The flag was standing in for a fact the cache can state.
+
+So `moe_layer` asks it, per layer and per token, in `top_k` hash lookups
+(`waste_ecache_resident_all`). Measured, same build, same container:
+
+| | XPAR=0 | XPAR=1 | default (asks the cache) |
+|---|---:|---:|---:|
+| Kimi-Linear, 200 tok | 12.18 | 14.51 | **14.25** |
+| K3, 20 tok | 0.3251 | 0.1729 | **0.3251** |
+
+The automatic choice takes 89% of the forced win where forcing is right and
+**all** of the loss where it is wrong. `WASTE_XPAR=0/1` still overrides.
+
+What makes this admissible at all is that the two paths are bit-identical —
+both sum per-expert results in `j` order — and that is now asserted in
+`tests/run.sh` rather than believed. A scheduling choice made from cache
+state that also moved the numbers would make an answer depend on how warm
+the cache happened to be, which is unreproducible by construction.
+
+### 3. A cache that can hold everything should not discover it by missing
+
+With the bank resident, 200 tokens still read 13.2 GB of it as **3443
+separate demand misses**. The slots were already allocated and the reads
+were going to happen; what the demand stream adds is that they happen late,
+one at a time, and that a layer is not fully resident — and so cannot take
+the path above — until every one of its experts has been asked for once.
+
+A background thread now walks the banks in file order and fills empty slots
+(`waste_ecache_admit`: never evicts, never counts a hit or a miss, counts
+its bytes). It starts only when every record fits, because below that
+"put anything in an empty slot" competes with the demand stream for slots
+it is about to need, and LFRU is a better judge than file order.
+
+It is a win at every length measured, including the short ones that read
+three times the bytes:
+
+| tokens | fill off | fill on |
+|---:|---:|---:|
+| 16 | 7.19 | **7.24** |
+| 32 | 9.64 | **10.02** |
+| 64 | 11.79 | **12.50** |
+| 200 | 14.21 | **14.98** |
+
+### What this does not do, and one thing it is not
+
+**It is not throughput on a machine that was already fast enough.** On this
+NVMe the read-ahead was hiding almost all of Kimi-Linear's I/O: expert I/O
+was 0.8% of a step at a 19 GB cache and the whole gain above comes from the
+scheduling change residency enables, not from the reads themselves. The
+reads matter where the disk is slower — the tested USB enclosure at
+0.94 GB/s would spend 70 s on 66 GB and 19 s on 17.7 — and on K3, where
+17 GB a token cannot be hidden at any queue depth.
+
+**Where it should pay is a machine this project does not have.** GLM-5.3-
+Flash (§65) is ~4.8 GiB of trunk and ~106.5 GiB of experts: on a 128 or
+256 GB host the new ladder makes it fully resident and the fill reads it in
+once, where the old one gave it a 9.6 GB cache. Nobody here can run that,
+and this section says so rather than estimating it.
+
+**An f32 trunk is not the next lever.** With the experts resident the
+profile is 49.7% trunk matvec and 30.8% KDA, so the obvious thought is to
+spend the spare RAM on the trunk too. Measured: `WASTE_Q8=0` on
+Kimi-Linear is **12.74 tok/s against 15.02** — 8x the trunk RAM for a 15%
+loss, because the quantized matvec is memory-bandwidth bound and dequantizing
+makes it worse. The remaining time is arithmetic, and arithmetic is not
+where more RAM helps.
+
+## 67. Waking the pool cost 54 us, 150 times a token (2026-08-27)
+
+With §66's expert set resident, a Kimi-Linear decode step profiles as 49.7%
+trunk matvec and 30.8% KDA — arithmetic, not I/O. The obvious reading is
+that the kernels are the wall. They are not, or not yet: **a third of the
+dispatches in a step were spent waking threads.**
+
+### The measurement that settles it
+
+An empty kernel, dispatched in a loop, on this 18-core machine (6
+performance, 12 efficiency):
+
+| pool | empty dispatch, 4096 rows | over 128 rows |
+|---|---:|---:|
+| 18 threads (12 of them parked E-core workers) | **54.06 us** | 53.36 us |
+| 6 threads, all performance | **1.63 us** | 1.38 us |
+
+The row count does not matter, which is the whole point: this is not work,
+it is the cost of starting one. Two causes, and they compound:
+
+- Workers park on a condvar. Waking one is a scheduler round trip.
+- The barrier at the end waits for the *slowest* participant, and on this
+  machine that is an efficiency-core thread the scheduler takes tens of
+  microseconds to run. It contributes nothing to a short job and delays
+  every one of them.
+
+A decode step dispatches about 150 times — nine matvecs per KDA layer, the
+router, the shared experts, the recurrence, the VQ kernels. At 54 us that
+is 8 ms of a 67 ms token.
+
+### Two changes, and which one mattered
+
+**Spin before parking.** Workers spin on the job word for a bounded number
+of iterations before falling back to the condvar; the caller publishes with
+a release store, the chunk cursor and the completion count became atomics,
+and the condvars stayed for whoever did park. Worth about **2.4%** on its
+own (14.46 -> 14.80) — because a full-pool dispatch still had to wake the
+twelve parked E-core workers, and they still set the barrier.
+
+**Do not reach for the slow group unless the job can hide the wake.** A
+dispatch now goes to the fast group — which spins, so ~1.5 us — unless the
+weights it touches exceed `WASTE_WIDE_MIN`, 4 MB by default. Swept on
+Kimi-Linear, 150 tokens:
+
+| threshold | tok/s |
+|---|---:|
+| 0 (fast group always) | 14.86 |
+| 2 MB | 16.56 |
+| **4 MB** | **16.62** |
+| 6 MB | 15.89 |
+| 8 MB | 15.84 |
+| infinite (whole pool always, the old behaviour) | 14.91 |
+
+A real optimum rather than a trend, which is what the mechanism predicts:
+below it the dispatch dominates and the fast group wins, above it the work
+dominates and the extra cores do. Kimi-Linear's q/k/v/o projections are
+4.7 MB and sit just above the line; its low-rank KDA projections
+(`f_a`, `g_a`, `b_proj`) are 37-262 KB and sit far below it.
+
+Together: **14.41 -> 16.74 tok/s, +16.2%**, three runs each, spread 0.02
+and 0.11.
+
+### The inversion in §47 was this all along
+
+§47 recorded that six threads beat eighteen on Kimi-Linear and that
+eighteen beat six on K3, and CLAUDE.md warns not to carry the setting from
+one model to the other. Measured again on this build:
+
+| | before | after |
+|---|---:|---:|
+| 18 threads | 14.46 | **16.97** |
+| 6 threads | 14.49 | 15.35 |
+
+The inversion is gone, and eighteen is now the better answer on the model
+that used to prefer six. Capping the pool was never buying "fewer, faster
+cores"; it was buying "no parked threads to wake". Now that short jobs do
+not wake them, the long jobs get to use them.
+
+### What did not change, and what is still true
+
+**K3 is neutral.** 0.3389 / 0.3166 / 0.2835 against 0.2955 / 0.3251 /
+0.3233 — the same mean inside a +-9% run-to-run spread. It reads 465 GB
+for 20 tokens; 8 ms a token of dispatch is not where its time goes. §66
+said the same thing about residency, and for the same reason.
+
+**Nothing about the numbers moved.** The split is by row, so the logits are
+bit-identical across every combination of `WASTE_SPIN`, `WASTE_WIDE_MIN`
+and `WASTE_THREADS` — checked, and now asserted in `tests/run.sh`.
+
+**On a machine with one kind of core this is inert.** `n_fast` is 0 there,
+`waste_pool_fast()` is the whole pool, and the threshold selects between
+the pool and itself.
+
+### One bug worth recording, because it looked like a data race
+
+The first version seeded the job word with epoch 1 while workers start at
+`seen = 0`. Every worker therefore woke immediately on creation, read `n`
+and `chunk` before anything had written them, and decremented `active`
+below zero — which the first real dispatch then inherited, so it could
+return while its workers were still running. It showed up as two
+ThreadSanitizer reports on `g_pool.n` and `g_pool.chunk` and read like a
+missing barrier. It was not: it was a job that never existed. The pool is
+now clean under TSan across the forward pass, chunked prefill, session
+state, the ownership lock and every option combination above.
+
+## 68. GLM-5.3-Flash, converted and run (2026-08-27)
+
+§65 implemented GLM against a synthetic container at 1/32 scale and said,
+in as many words, that the real conversion was the proof. It has now
+happened. **The container loads, matches a PyTorch oracle to 2.4e-5, and
+answers questions at 3.09 tok/s on a 64 GB laptop.**
+
+    $ waste run ~/models/glm53.waste "The capital of Italy is" -n 20
+    waste: no --budget, using 46.37 GB of 64.00 GB (expert cache 41.36 GB)
+    The capital of Italy is Rome. Rome is the largest city in Italy and is
+    known for its rich history, iconic landmarks such
+    [20 tokens, 5.07 s, 3.94 tok/s | experts 5816 hit / 904 miss = 87%]
+
+### What it cost
+
+| | |
+|---|---:|
+| download, 62 shards | 306 GiB, ~2 h at 36-97 MB/s |
+| conversion, `--jobs 3` | 42 expert layers at 158-163 s each, ~40 min |
+| trunk | 5022 MB, 1246 tensors |
+| experts | 42 x 2598 MB = 109 GB |
+| container | **112 GB** against 328 GB of fp8 source |
+
+The estimate §65 published from `config.json` alone — 4.8 GiB of trunk,
+106.5 GiB of experts, 9.02 MiB per expert record — came out right: the
+first converted layer was 2597.6 MiB for 288 experts, 9.02 MiB each,
+before the rest had even downloaded.
+
+### The two bugs, and the difference between them
+
+**One was caught before the conversion and cost nothing.** GLM nests the
+text model the other way round from K3 —
+`model.language_model.layers.N` against `language_model.model.layers.N`,
+and `lm_head` outside the wrapper rather than inside it — which no
+`tensor_prefix` can reconcile. Found by listing every name and shape the
+engine would demand for this config and checking them against the
+checkpoint's own index: 1246 tensors, 0 missing, 0 mismatched *after* the
+fix, all 1246 missing before it. Fifteen minutes of a partly-downloaded
+checkpoint, against an hour of conversion and a container that would have
+refused to open.
+
+**One was not, and cost an hour.** `build_trunk` skipped any tensor whose
+name ends in `_packed` or `_scale`, meaning the companions of a quantized
+weight. GLM ships a real learned parameter called `hc_attn_scale` — 90 of
+them, two per layer, the gains on the mHC mapping — and all 90 were
+dropped. The conversion finished, the manifest published, and the load
+then said `required tensor is missing: model.layers.0.hc_attn_scale`.
+
+The check was a suffix on the wrong thing. Every companion in this family
+is a `.weight` plus a suffix (`weight_packed`, `weight_scale`,
+`weight_scale_inv`), and matching *that* keeps the parameter and drops the
+companions — including 89 fp8 `weight_scale_inv` tensors that the old test
+did not match and had been writing into K3-era trunks all along.
+
+The general lesson is the one the first bug already illustrates: **a
+converter's failures are cheap to find statically and expensive to find at
+load.** The static check would have caught this one too, and did not,
+because it asked "does the engine's list exist in the checkpoint" and not
+"does the container contain the engine's list". Both directions now run.
+
+### The numbers
+
+`waste info`: **313.33 B parameters total, 16.74 B active per token**, 45
+layers, 288 experts top-8, arch `glm5-next`.
+
+`waste plan`: floor **5.14 GB**, one token's working set 3.17 GB, fully
+resident 119.30 GB. On this machine the ladder from §66 resolves
+**46.37 GB with a 41.36 GB expert cache** — thirteen working sets. The old
+ladder stopped at three, i.e. 14.66 GB.
+
+**Against the oracle**, 4 tokens, the real container:
+
+| | |
+|---|---:|
+| max abs | 2.39e-4 |
+| rel L2 | **2.41e-5** |
+| argmax | 3 vs 3 |
+| top-10 | identical, in the same order |
+
+That is mHC, the clamped SwiGLU, the DSA indexer, KDA, MLA, the router and
+the streaming path all agreeing with an independent PyTorch implementation
+on 313 B real parameters. The DSA branch exercised here is the dense one —
+`index_topk` is 2048 and the prompt is four tokens — so the sparse branch
+remains verified on the synthetic container (§65) and not on this one.
+
+**VQ3R holds on GLM's expert distribution.** Relative error on a real
+`gate_proj`: **0.1951**, against the 19.59-19.77% `docs/K3.md` records for
+K3 and the 0.195 of §50. Same recipe, same number, no retuning.
+
+**Throughput**, `waste bench`, this 64 GB machine:
+
+| | tok/s | hit | read |
+|---|---:|---:|---:|
+| 64 tokens | 2.40 | 87.7% | 72.7 GB |
+| 200 tokens | **3.09** | 89.3% | 160.8 GB |
+| 200 tokens, old §66 ladder (14.66 GB) | 3.16 | 71.4% | **481 GB** |
+
+Five times K3's 0.45-0.62 tok/s, on a model that actually fits the
+machine. And the same shape §66 found on Kimi-Linear: on this NVMe the
+larger cache buys **three times less disk traffic at the same speed**,
+because the read-ahead was already hiding the reads. On the 0.94 GB/s
+enclosure `docs/K3.md` measures, 481 GB is 8.5 minutes of pure reading
+against 2.9.
+
+### Kimi K3 is untouched, and this is the check that says so
+
+Not "the suite passes" — the logits. Same 16-token prompt, same container,
+this build against `cbef892`, the commit this session started from:
+
+    baseline seq vs new seq: max abs 0.000000
+
+Two K3 checks do fail, and they fail identically at `cbef892`: chunked
+prefill and the CPU backend each differ from the default path by
+**rel L2 0.0176** (max abs 0.2858, argmax unchanged), against a 1e-3
+threshold. The two alternatives agree with *each other* exactly, so what
+differs is the default — the i8mm/SMLAL trunk kernels this branch added,
+whose accuracy on K3 CLAUDE.md already records ("two kernels that agree
+with the f32 path to 4e-5 on Kimi-Linear differ from each other by logit
+rel L2 0.13"). Pre-existing, documented, and not this session's to
+silently change.
+
+Two more K3 "failures" were the suite reporting a missing prerequisite as
+a defect, which this repo's rules forbid. `WASTE_REF_SRC` defaults to
+Kimi-Linear's weights, so a K3 run round-tripped K3's container against
+Kimi-Linear's safetensors and called it a converter bug; and the hotlist
+check opens at a hardcoded `--budget 5G`, which is below K3's 29.19 GB
+floor, so the engine refused, no cache line was printed, and that read as
+"the hotlist did nothing". Both are SKIPs now, with the reason. With the
+right source, K3 round-trips: 19.58-19.80% relative error, PASS.
+
+
+## 69. What GLM needed to be usable, and what it did not (2026-08-27)
+
+§68 converted GLM-5.3-Flash and showed it answering a question. That is not
+the same as being usable, and the gap between the two turned out to be four
+things — of which two were a format nobody had written down, one was a
+verification, and one was a measurement that killed the work it was meant
+to justify.
+
+### The chat format could not be written down
+
+`waste chat` on the fresh container did raw continuation, because a
+container with no `chat.json` has no format and the CLI says so rather than
+guessing. Writing one took three fields the four-string format did not
+have, and each was needed because GLM's format cannot be expressed without
+it:
+
+| field | why |
+|---|---|
+| `prelude` | GLM opens every conversation `[gMASK]<sop>`, which belongs to no role |
+| `stop` | a turn ends when the *next role marker* begins, so there is no suffix to close it with |
+| `think` | the generation prompt is `<|assistant|><think>`; the model closes the channel itself |
+
+The `stop` one is the instructive failure. Written without it, the format
+loads and answers correctly and then **keeps going**:
+
+    The capital of Italy is Rome.<|user|>What is the capital of Italy?
+    Answer in one sentence.</think>The capital of Italy is Rome.<|user|>...
+
+because the CLI took its stop from the assistant suffix, GLM has none, and
+the container's `eos_token_id` is `<|endoftext|>` — which is right for a
+raw continuation and is not what ends a chat turn. The release declares
+three eos ids for exactly this reason and the container holds one.
+
+With all three:
+
+    > What is the capital of Italy? One sentence.
+    The user is asking a simple factual question... </think>The capital of
+    Italy is Rome.
+
+### The reasoning channel was refused rather than parsed
+
+`serve/chatfmt.py` said, in as many words, that a chat.json container has no
+think markup and a request asking for one is refused. True of both Kimi
+containers and false of GLM, whose channel is in its specials and whose
+generation prompt always opens it. So `think` is now part of the format,
+`PlainParser` splits on its close marker, and the server returns the two
+separately:
+
+    "content": "The capital of Italy is Rome.",
+    "reasoning_content": "The user is asking a simple factual question..."
+
+streaming included — `reasoning_content` deltas first, then `content`.
+`reasoning_effort` maps to GLM's own spelling of it, a system turn
+(`<|system|>Reasoning Effort: High`), through an optional `effort` field;
+a format that does not say how to ask still refuses rather than dropping
+it silently.
+
+`thinking: false` is **refused** for GLM. Its template has no path that
+leaves the channel closed, and answering with it closed puts a stray
+`</think>` in the reply — measured, not assumed.
+
+### The sparse attention branch, verified on real weights
+
+§68 verified GLM against the oracle at four tokens, where `index_topk` is
+2048 and the selection is therefore every visible token: the dense path.
+The sparse one was verified only on a synthetic container at 1/32 scale.
+
+Closing that needed the sparse branch reached on *real* weights, and a
+2048-token oracle run is hours. So the container was cloned with symlinks
+and a manifest whose `index_topk` is 16 — same 112 GB of weights, four
+pools kept instead of 512 — which reaches the branch at 24 tokens.
+
+**The selections are identical, 55 of 55**, at every (layer, position)
+where the branch fires. Not "the logits are close": the engine's chosen
+pools and the reference's chosen pools, compared directly through a
+`WASTE_DUMP_DSA` trace on one side and the same line format on the other.
+The scores agree to a median 8.4e-4 absolute, and the one 48% relative
+outlier is a score of 0.0198 — cancellation, not disagreement.
+
+The logit difference in that run is 1.95e-3, two orders above §68's
+2.41e-5, and the control says sparsity is not why: **the same 24 tokens
+through the dense path give 1.74e-3.** It is the KDA recurrence
+accumulating over 24 steps in a different summation order, and it grows
+with prompt length whether the attention is sparse or not.
+
+And at the real setting, 2100 tokens: the branch fires on all 11 MLA
+layers for positions 2051-2099, keeping 512 pools of 513 — 2048 pooled
+positions plus the tail, of 2052 cached, which is what the config says it
+should do. Against the same prompt with the selection disabled: rel L2
+0.0909, argmax and top-10 identical. The selection is doing something and
+it is not breaking the answer.
+
+### Chunked prefill would have bought nothing, and here is why
+
+GLM's prefill runs at decode speed — 266 tokens in 69 s — because
+`waste_model_prefill` routes an mHC container through the per-token path.
+The obvious fix is to teach the chunked path mHC. Measured first, on the
+model that already has that path, warm cache:
+
+| prompt | per token | chunked |
+|---:|---:|---:|
+| 64 tokens | 4063 ms | 4075 ms |
+| 512 tokens | 27067 ms | 27231 ms |
+
+Nothing, at either length. The profile says why: in a chunked prefill
+**82.8% of the time is the VQ apply**, and the chunk expands nearly the
+whole bank because 64 tokens at top-8 over 256 experts route almost
+everywhere. Chunking trades disk reads for VQ decode, and on a machine
+where the reads were already cached that is a pure loss.
+
+So prefill is not slow because it is not chunked. It is slow because the
+expert kernel costs the same per (token, expert) either way, and that is
+§43's problem and not this one. The fallback GLM takes costs nothing
+measurable, and building the chunked path for it would have been a day
+spent on a 0.3% regression.
+
+### What long context needs, and what it costs
+
+| ctx | floor | state |
+|---:|---:|---:|
+| 4096 | 5.14 GB | 0.23 GB |
+| 32768 | 5.79 GB | 0.87 GB |
+| 131072 | **8.00 GB** | 3.06 GB |
+
+The indexer's pooled keys are in that: one 128-wide vector per four tokens
+per full-attention layer, which is a fourteenth of the latents beside them.
+Nothing else in the engine grows with context. At 1M — the release's
+figure — the state would be around 25 GB, which is a machine question and
+not an engine one.
+
+
+## 70. GLM's vision tower, and the resize that was not a rounding error (2026-08-27)
+
+§65 listed the tower as not implemented and said why: GLM's is not K3's.
+It is now, and the interesting parts are the two places where "close
+enough" would have been wrong in a way nothing would have reported.
+
+### What it is, against what K3's is
+
+| | K3 | GLM-5.3-Flash |
+|---|---|---|
+| blocks | 27 x 1024, 12 heads | 24 x 1024, 16 heads |
+| position | learned 64x64 grid, bilinearly resized | 2D rope only |
+| q/k | as projected | RMSNormed per head, then rotated |
+| biases | none | on every projection |
+| MLP | GELU (tanh) | clamped SwiGLU |
+| patch | Conv2d over 3x14x14 | Conv3d over 3x2x14x14, the temporal slot a copy |
+| merge | 2x2 reshape, two-layer projector | Conv2d downsample, gated merger with a LayerNorm and an exact GELU |
+
+Two towers in one file rather than a branch inside one, for the reason a
+`if tower == ...` in every function is harder to check than two functions
+that each say one thing.
+
+**It matched the oracle on the first run: rel L2 3.3e-5** on the real 563.6 M
+tower, 7.7e-7 on the synthetic one CI builds. Which is less a statement
+about the code than about writing `tools/glm_vision_ref.py` first and the C
+against it — the four details that are easy to get wrong were wrong in the
+reference too, once each, and were found there.
+
+### The patch order is not a detail
+
+The rows arrive **block-major over merge blocks** — block row, block
+column, then the 2x2 inside it — which is what lets the tower's downsample
+be a reshape, and what `get_vision_position_ids` assumes when it builds the
+rotary indices. Raster order, the obvious reading and what K3 uses, rotates
+every patch by someone else's position. The output stays finite, the norms
+stay plausible, and the model describes a different picture.
+
+It is checked against the reference's own reshape/permute/expand, on an
+image whose dimensions are already a multiple of `patch * merge` so that
+the resize is the identity and only the ordering is under test: **max abs
+difference exactly 0**.
+
+### The resize was 7.7%, and that is not a rounding error
+
+K3's loader samples bilinearly, and the first version of GLM's did too —
+it was the same code and the release's config does not shout about
+resampling. Measured against the processor's own choice:
+
+| the engine's pixels vs | max abs | rel |
+|---|---:|---:|
+| torch bilinear | 0.0000 | **0.0000** |
+| torch bicubic | 0.4172 | 0.0986 |
+| torch bicubic + antialias (what the release does) | 0.2879 | **0.0773** |
+
+The first row is the useful one: the sampling *convention* was already
+exact, half-pixel centres and all. What differed was the kernel, and 7.7%
+relative on the tower's input is a different image, not a noisier one.
+
+So the kernel is implemented — separable, cubic with a = -0.5, support
+widened by the scale factor on a downsample, which is what PIL does and
+what torch ported. **Engine against torch's antialiased bicubic: max abs
+4e-5, rel 0.00000.**
+
+The temptation was to write "the resampling is bilinear where the release
+is bicubic; see the docs" and move on. The number is what made that
+untenable: a documented 7.7% is still a tower being shown something the
+model was not trained on.
+
+### What it costs, and what it does
+
+The tower is 563.6 M parameters, 282 MB at 4 bits, and it is **loaded only
+when a caller asks for images**. That needed its own fix: the skip was
+written as "outside `tensor_prefix`", which on K3 is the same set as "the
+tower" and on GLM — whose container has no prefix at all — is the empty
+set. Its 282 MB were resident on every text-only open, and the memory plan
+counted them in the floor. Both now say `vision_tower.` in as many words.
+
+    $ waste run glm53.waste "What does this image look like?" --image x.png
+    [x.png: 40 image tokens]
+    This image displays a vibrant, abstract pattern of diagonal stripes in
+    various colors like green, blue, purple, and pink, overlaid with fine
+    vertical lines.
+
+which is what the file actually contains. `waste plan` prices it at 805 MB
+more with `--image`, against K3's 1.12 GB.
+
+### The grid rule, transcribed rather than invented
+
+GLM aligns to `patch * merge` = 28 pixels and then fits the result into a
+budget expressed in *merged tokens*, with a binary search over the content
+height when it does not fit. Two things in `smart_resize` look like
+accidents and are not: the frame count rounds to a multiple of the temporal
+factor before it multiplies the budget, and the search advances `low` to
+`content_height + 1` rather than to the aligned height. Both are
+transcribed.
