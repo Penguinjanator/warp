@@ -235,7 +235,8 @@ release states something differently, and what is still left out.
 To build and test WARP:
 
 - a C11 compiler and `make`;
-- macOS or Linux; Windows builds with MinGW-w64;
+- macOS, Linux (arm64 and x86_64), or Windows via MinGW-w64 — CI builds
+  and runs the suite on all four, plus an ASan/UBSan job;
 - no BLAS, Python, CUDA, or other external dependency for the current CPU
   inference path.
 
@@ -458,6 +459,8 @@ The software is currently changing very quickly. Before each release, a large QA
 Measurements are treated as experimental results rather than marketing numbers. Each result is tied to the hardware, container, configuration, and commit on which it was obtained; unstable measurements are reported as ranges, and results later found to be wrong remain recorded as such. The detailed snapshots are in [docs/TECHNICAL.md](docs/TECHNICAL.md) and the full history, including negative results, is in [docs/LEARNED.md](docs/LEARNED.md).
 
 Validation covers more than successful generation. The model-free suite builds a synthetic container; real-model checks compare individual layers and final logits against PyTorch, verify conversion round trips, test vision against its oracle, and exercise the server prompt renderer segment by segment against K3's reference encoder. The validation criteria and current evidence are documented in [docs/GATES.md](docs/GATES.md), with server-specific differential tests in [docs/SERVE.md](docs/SERVE.md).
+
+On a mixture-of-experts model, a distance between logits is not by itself a verdict. A top-K router turns an arbitrarily small arithmetic difference into a discrete one, and past the first flipped expert the two paths are running different weights — the distance then measures how much the model cares which of two indistinguishable experts it used, not how far the arithmetic moved. Since 0.7.1 the suite compares the logits and, where they part, asks which decision moved and whether anything could have resolved it: [tests/route_diff.py](tests/route_diff.py) over the expert ranking and [tests/dsa_diff.py](tests/dsa_diff.py) over the sparse-attention pool ranking, each answering *identical*, *tie*, or *diverged*. Three checks were red against a 1e-3 threshold and none was an engine defect: on K3 the paths first disagree on the closest call in the entire forward pass, a relative margin of 7.3e-07 where the median decision is 7.4e-03, and on GLM they disagree on an exact tie between pools scoring zero. The result is a stricter suite rather than a looser one — a flip on a margin the reference could resolve now fails while naming the token and the layer, and a difference with the routing *unchanged* is its own verdict instead of being pooled with the tie. [docs/LEARNED.md](docs/LEARNED.md) §71–§72 has the distributions behind the thresholds.
 
 Useful references:
 
