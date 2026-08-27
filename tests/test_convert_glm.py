@@ -143,6 +143,28 @@ def main():
           kout["linear_attn_config"]["kda_layers"] == [1, 2, 4] and
           kout["eos_token_id"] == 2)
 
+    # ---- the prefixes, for every architecture at once -------------------
+    #
+    # Adding GLM meant splitting one prefix into two, and the half that is
+    # easy to get wrong is not GLM's — it is K3's, which was already right
+    # and which nothing else in this suite would notice going wrong: the
+    # shipped container still loads, and only a *re-conversion* would
+    # produce one nobody can open. So all three are pinned here.
+    K3 = {"architectures": ["KimiK3ForConditionalGeneration"],
+          "text_config": {"model_type": "kimi_linear",
+                          "architectures": ["KimiLinearForCausalLM"]}}
+    GLM_OUTER = {**GLM, "text_config": GLM_TEXT}
+    KL = {"architectures": ["KimiLinearForCausalLM"], "model_type": "kimi_linear"}
+    want = {
+        "Kimi-Linear": (KL, "", "model."),
+        "Kimi K3": (K3, "language_model.", "language_model.model."),
+        "GLM-5.3-Flash": (GLM_OUTER, "", "model.language_model."),
+    }
+    for name, (cfg, pfx, src) in want.items():
+        got_p, got_s, _ = CONV.source_prefixes(cfg)
+        check(f"{name}: tensor_prefix {pfx!r}, checkpoint prefix {src!r}",
+              (got_p, got_s) == (pfx, src), f"got {(got_p, got_s)}")
+
     # ---- the wrapper, which GLM nests the other way round ---------------
     #
     # K3   language_model.model.layers.N.…   language_model.lm_head.weight

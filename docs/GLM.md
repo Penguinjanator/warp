@@ -182,18 +182,42 @@ error there is not one weight's worth; the two widths are 34 MB and 8 MB.
 
 ### What it comes to
 
-Arithmetic from `config.json`, not a measurement — nothing here has been
-converted yet:
+Measured, on the conversion this document now describes (LEARNED.md §68):
 
-| | |
-|---|---:|
-| trunk, resident | ~4.8 GiB |
-| experts, on disk at VQ3R | ~106.5 GiB |
-| one token's working set | ~3.2 GB (8 experts x 42 layers x 9.5 MB) |
+| | | K3, for scale |
+|---|---:|---:|
+| download | 306 GiB, ~2 h | 1.42 TB |
+| conversion, `--jobs 3` | ~45 min | 4.7 h |
+| trunk, resident | **5022 MB** | 27.3 GiB |
+| experts at VQ3R | 42 x 2598 MB = **109 GB** | 962.8 GB |
+| container | **112 GB** | 982 GB |
+| one token's working set | **3.17 GB** | 17.19 GB |
+| floor | **5.14 GB** | 29.19 GB |
 
-Which is a very different proposition from K3's 27.3 GiB trunk and 982 GiB
-of experts. On a 64 GB machine the trunk leaves room to cache something like
-40% of the whole expert set, where K3 gets a token's working set and a half.
+`waste info` reports **313.33 B parameters, 16.74 B active per token**.
+
+Which is a very different proposition from K3. On this 64 GB machine the
+automatic budget resolves **46.37 GB with a 41.36 GB expert cache** —
+thirteen working sets, 36% of the whole expert set resident — where K3 gets
+one and a half.
+
+### What it does
+
+    $ waste run ~/models/glm53.waste "The capital of Italy is" -n 20
+    waste: no --budget, using 46.37 GB of 64.00 GB (expert cache 41.36 GB)
+    The capital of Italy is Rome. Rome is the largest city in Italy and is
+    known for its rich history, iconic landmarks such
+    [20 tokens, 5.07 s, 3.94 tok/s | experts 5816 hit / 904 miss = 87%]
+
+| `waste bench` | tok/s | hit | read |
+|---|---:|---:|---:|
+| 64 tokens | 2.40 | 87.7% | 72.7 GB |
+| 200 tokens | **3.09** | 89.3% | 160.8 GB |
+
+Five times K3's 0.45-0.62 tok/s. The expert cache buys traffic rather than
+throughput on this NVMe — the same 200 tokens at the pre-§66 budget run at
+3.16 tok/s and read **481 GB** — which is a three-fold difference on a disk
+slow enough for it to show.
 
 ## Not implemented
 
@@ -234,6 +258,13 @@ outgrows `index_topk`.
   fewer every pool is kept and the check would pass with the selection
   deleted. Measured max abs 5.7e-6 on the last token's logits, against a
   1e-3 threshold — the same order as the Kimi baseline.
+
+  **And on the real container**: 4 tokens of the converted 313 B model
+  against the same reference, **rel L2 2.41e-5**, max abs 2.39e-4, argmax
+  and top-10 identical in the same order. The branch exercised there is the
+  dense one — `index_topk` is 2048 and the prompt is four tokens — so the
+  sparse selection stays verified on the synthetic container and not on
+  this one.
 - **that the indexer selects.** The same weights with `index_topk` raised
   above the prompt length, which is one number in the config and nothing
   else. The two must differ; measured 0.56 max abs.
@@ -246,7 +277,8 @@ outgrows `index_topk`.
   the real `tokenizer.json`: 21 of 21 identical, including the Han/Latin
   boundary.
 
-What is *not* checked is the model itself. No GLM container has been
-converted here, so every number above that is not from `config.json` comes
-from a synthetic container at 1/32 scale. The shapes are the ones the engine
-branches on; the weights are noise.
+The synthetic container remains the only place the *sparse* DSA branch is
+exercised, and the only place any of this runs in CI: 1/32 scale, shapes the
+engine branches on, weights that are noise. What the real conversion adds is
+that the same code, on 313 B real parameters, agrees with an independent
+PyTorch implementation and answers questions in English.

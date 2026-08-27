@@ -213,6 +213,35 @@ def glm_normalise(out):
     return out
 
 
+def source_prefixes(cfg):
+    """(container tensor_prefix, checkpoint layer prefix, inner config).
+
+    Two prefixes, because they are two different things and this family
+    spells them three ways:
+
+        Kimi-Linear   model.layers.N.…                  prefix ""
+        Kimi K3       language_model.model.layers.N.…   prefix "language_model."
+        GLM-5.3       model.language_model.layers.N.…   prefix ""
+
+    `src_pfx` is what the *checkpoint* puts before `layers.N` and is used to
+    find the experts; `prefix` is what the engine puts before `model.` and
+    is what the container publishes. They differ by more than a string on
+    GLM, where the two components are nested the other way round and no
+    prefix can reconcile them — see glm_rename.
+
+    Returns the inner config too, since the same test decides whether there
+    is a wrapper to unwrap at all."""
+    prefix, src_pfx = "", "model."
+    if "text_config" in cfg:                 # K3 and GLM nest the text model
+        cfg = {**cfg["text_config"], "_outer": {k: v for k, v in cfg.items()
+                                                if k != "text_config"}}
+        if is_glm(cfg):
+            src_pfx = "model.language_model."
+        else:
+            prefix, src_pfx = "language_model.", "language_model.model."
+    return prefix, src_pfx, cfg
+
+
 def glm_rename(name):
     """GLM wraps the text model the other way round from K3.
 
@@ -897,7 +926,16 @@ def build_trunk(args, sr, st, existing, manifest_path, drop=None, rename=None):
         # interval.
         with open(trunk_tmp, "wb") as tf:
             for name in sorted(sr.names()):
-                if ".experts." in name or name.endswith(("_packed", "_scale")):
+                # The companions of a quantized weight, not anything whose
+                # name happens to end in "_scale": GLM ships a real learned
+                # parameter called `hc_attn_scale`, and the old suffix test
+                # dropped all 90 of them — the container converted, and the
+                # load then refused it for a missing tensor after an hour.
+                # Every companion in this family is a `.weight` plus a
+                # suffix (K3's weight_packed/weight_scale, fp8's
+                # weight_scale_inv), so match that and nothing else.
+                if ".experts." in name or name.endswith(
+                        (".weight_packed", ".weight_scale", ".weight_scale_inv")):
                     continue
                 if drop and drop(name):
                     continue
@@ -1020,20 +1058,7 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     cfg = json.load(open(os.path.join(args.src, "config.json")))
-    # Two prefixes, because they are two different things and the family
-    # spells them differently. `src_pfx` is what the *checkpoint* puts before
-    # `layers.N`; `prefix` is the container's tensor_prefix, i.e. what the
-    # engine puts before `model.`. On K3 they are "language_model.model."
-    # and "language_model."; on GLM the wrapper is the other way round and
-    # the container carries no prefix at all. See glm_rename.
-    prefix, src_pfx = "", "model."
-    if "text_config" in cfg:                     # K3 and GLM nest the text model
-        cfg = {**cfg["text_config"], "_outer": {k: v for k, v in cfg.items()
-                                                if k != "text_config"}}
-        if is_glm(cfg):
-            src_pfx = "model.language_model."
-        else:
-            prefix, src_pfx = "language_model.", "language_model.model."
+    prefix, src_pfx, cfg = source_prefixes(cfg)
     st = ST(args.src)
     sr = ShardReader(args.src)
     dev = torch.device(args.device)

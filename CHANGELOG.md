@@ -94,6 +94,52 @@ field — has to be rebuilt against the new header.
 
 ### Added
 
+- **GLM-5.3-Flash converted and run for real** (`docs/GLM.md`,
+  `docs/LEARNED.md` §68). 306 GiB of shards down, ~45 minutes of conversion
+  at `--jobs 3`, and a **112 GB container** — 5022 MB of trunk and 42 expert
+  banks of 2598 MB. `waste info` reports 313.33 B parameters, 16.74 B active
+  per token.
+
+  Against the PyTorch oracle on the real container: **rel L2 2.41e-5**, max
+  abs 2.39e-4, argmax and top-10 identical in the same order. VQ3R holds on
+  GLM's expert distribution without retuning — 0.1951 relative error on a
+  real `gate_proj`, against the 19.59-19.77% `docs/K3.md` records for K3.
+
+      $ waste run ~/models/glm53.waste "The capital of Italy is" -n 20
+      The capital of Italy is Rome. Rome is the largest city in Italy and is
+      known for its rich history, iconic landmarks such
+      [20 tokens, 5.07 s, 3.94 tok/s | experts 5816 hit / 904 miss = 87%]
+
+  `waste bench`: 2.40 tok/s over 64 tokens, **3.09 over 200** at 89.3% hit,
+  on a 64 GB machine — five times K3's 0.45-0.62. The floor is 5.14 GB and
+  §66's ladder resolves a 41.36 GB expert cache, thirteen working sets.
+
+- **Two converter fixes the real conversion found.** GLM nests the text
+  model the other way round from K3 (`model.language_model.layers.N` against
+  `language_model.model.layers.N`, and `lm_head` outside the wrapper rather
+  than inside), which no `tensor_prefix` can reconcile — caught statically
+  against the checkpoint's index before converting anything. And
+  `build_trunk` dropped every tensor whose name ends in `_scale`, which is
+  the companion of a quantized weight *and* GLM's 90 learned `hc_attn_scale`
+  / `hc_ffn_scale` parameters; the container converted and then refused to
+  open. The test now matches `.weight_packed` / `.weight_scale` /
+  `.weight_scale_inv`, which also stops 89 fp8 companions being written into
+  the trunk as if they were weights.
+
+- **`tools/fetch_weights.sh` recovers from a shard longer than
+  Content-Length.** Killing it mid-shard and restarting left 9.03 GB where
+  the shard is 5.36 GB; `curl -C -` then asked for a range past the end and
+  every retry failed the same way, on a shard whose bytes were all on the
+  CDN. It is deleted and refetched now.
+
+- **Two suite checks stopped reporting a missing prerequisite as a defect**,
+  which this repo's rules forbid. `WASTE_REF_SRC` defaults to Kimi-Linear's
+  weights, so pointing `WASTE_REF_MODEL` at K3 round-tripped K3's container
+  against Kimi-Linear's safetensors and called it a converter bug; and the
+  hotlist check opens at a hardcoded `--budget 5G`, below K3's 29.19 GB
+  floor, so the engine refused and the check read that as the hotlist doing
+  nothing. Both SKIP with the reason now.
+
 - **GLM-5.3-Flash, text-only** (`docs/GLM.md`, `docs/LEARNED.md` §65).
   `zai-org/GLM-5.3-Flash` — 313 B parameters, 328 GB of fp8, published
   2026-08-26 — converts and runs. Most of it was already here: the KDA

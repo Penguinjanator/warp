@@ -4854,3 +4854,133 @@ ThreadSanitizer reports on `g_pool.n` and `g_pool.chunk` and read like a
 missing barrier. It was not: it was a job that never existed. The pool is
 now clean under TSan across the forward pass, chunked prefill, session
 state, the ownership lock and every option combination above.
+
+## 68. GLM-5.3-Flash, converted and run (2026-08-27)
+
+§65 implemented GLM against a synthetic container at 1/32 scale and said,
+in as many words, that the real conversion was the proof. It has now
+happened. **The container loads, matches a PyTorch oracle to 2.4e-5, and
+answers questions at 3.09 tok/s on a 64 GB laptop.**
+
+    $ waste run ~/models/glm53.waste "The capital of Italy is" -n 20
+    waste: no --budget, using 46.37 GB of 64.00 GB (expert cache 41.36 GB)
+    The capital of Italy is Rome. Rome is the largest city in Italy and is
+    known for its rich history, iconic landmarks such
+    [20 tokens, 5.07 s, 3.94 tok/s | experts 5816 hit / 904 miss = 87%]
+
+### What it cost
+
+| | |
+|---|---:|
+| download, 62 shards | 306 GiB, ~2 h at 36-97 MB/s |
+| conversion, `--jobs 3` | 42 expert layers at 158-163 s each, ~40 min |
+| trunk | 5022 MB, 1246 tensors |
+| experts | 42 x 2598 MB = 109 GB |
+| container | **112 GB** against 328 GB of fp8 source |
+
+The estimate §65 published from `config.json` alone — 4.8 GiB of trunk,
+106.5 GiB of experts, 9.02 MiB per expert record — came out right: the
+first converted layer was 2597.6 MiB for 288 experts, 9.02 MiB each,
+before the rest had even downloaded.
+
+### The two bugs, and the difference between them
+
+**One was caught before the conversion and cost nothing.** GLM nests the
+text model the other way round from K3 —
+`model.language_model.layers.N` against `language_model.model.layers.N`,
+and `lm_head` outside the wrapper rather than inside it — which no
+`tensor_prefix` can reconcile. Found by listing every name and shape the
+engine would demand for this config and checking them against the
+checkpoint's own index: 1246 tensors, 0 missing, 0 mismatched *after* the
+fix, all 1246 missing before it. Fifteen minutes of a partly-downloaded
+checkpoint, against an hour of conversion and a container that would have
+refused to open.
+
+**One was not, and cost an hour.** `build_trunk` skipped any tensor whose
+name ends in `_packed` or `_scale`, meaning the companions of a quantized
+weight. GLM ships a real learned parameter called `hc_attn_scale` — 90 of
+them, two per layer, the gains on the mHC mapping — and all 90 were
+dropped. The conversion finished, the manifest published, and the load
+then said `required tensor is missing: model.layers.0.hc_attn_scale`.
+
+The check was a suffix on the wrong thing. Every companion in this family
+is a `.weight` plus a suffix (`weight_packed`, `weight_scale`,
+`weight_scale_inv`), and matching *that* keeps the parameter and drops the
+companions — including 89 fp8 `weight_scale_inv` tensors that the old test
+did not match and had been writing into K3-era trunks all along.
+
+The general lesson is the one the first bug already illustrates: **a
+converter's failures are cheap to find statically and expensive to find at
+load.** The static check would have caught this one too, and did not,
+because it asked "does the engine's list exist in the checkpoint" and not
+"does the container contain the engine's list". Both directions now run.
+
+### The numbers
+
+`waste info`: **313.33 B parameters total, 16.74 B active per token**, 45
+layers, 288 experts top-8, arch `glm5-next`.
+
+`waste plan`: floor **5.14 GB**, one token's working set 3.17 GB, fully
+resident 119.30 GB. On this machine the ladder from §66 resolves
+**46.37 GB with a 41.36 GB expert cache** — thirteen working sets. The old
+ladder stopped at three, i.e. 14.66 GB.
+
+**Against the oracle**, 4 tokens, the real container:
+
+| | |
+|---|---:|
+| max abs | 2.39e-4 |
+| rel L2 | **2.41e-5** |
+| argmax | 3 vs 3 |
+| top-10 | identical, in the same order |
+
+That is mHC, the clamped SwiGLU, the DSA indexer, KDA, MLA, the router and
+the streaming path all agreeing with an independent PyTorch implementation
+on 313 B real parameters. The DSA branch exercised here is the dense one —
+`index_topk` is 2048 and the prompt is four tokens — so the sparse branch
+remains verified on the synthetic container (§65) and not on this one.
+
+**VQ3R holds on GLM's expert distribution.** Relative error on a real
+`gate_proj`: **0.1951**, against the 19.59-19.77% `docs/K3.md` records for
+K3 and the 0.195 of §50. Same recipe, same number, no retuning.
+
+**Throughput**, `waste bench`, this 64 GB machine:
+
+| | tok/s | hit | read |
+|---|---:|---:|---:|
+| 64 tokens | 2.40 | 87.7% | 72.7 GB |
+| 200 tokens | **3.09** | 89.3% | 160.8 GB |
+| 200 tokens, old §66 ladder (14.66 GB) | 3.16 | 71.4% | **481 GB** |
+
+Five times K3's 0.45-0.62 tok/s, on a model that actually fits the
+machine. And the same shape §66 found on Kimi-Linear: on this NVMe the
+larger cache buys **three times less disk traffic at the same speed**,
+because the read-ahead was already hiding the reads. On the 0.94 GB/s
+enclosure `docs/K3.md` measures, 481 GB is 8.5 minutes of pure reading
+against 2.9.
+
+### Kimi K3 is untouched, and this is the check that says so
+
+Not "the suite passes" — the logits. Same 16-token prompt, same container,
+this build against `cbef892`, the commit this session started from:
+
+    baseline seq vs new seq: max abs 0.000000
+
+Two K3 checks do fail, and they fail identically at `cbef892`: chunked
+prefill and the CPU backend each differ from the default path by
+**rel L2 0.0176** (max abs 0.2858, argmax unchanged), against a 1e-3
+threshold. The two alternatives agree with *each other* exactly, so what
+differs is the default — the i8mm/SMLAL trunk kernels this branch added,
+whose accuracy on K3 CLAUDE.md already records ("two kernels that agree
+with the f32 path to 4e-5 on Kimi-Linear differ from each other by logit
+rel L2 0.13"). Pre-existing, documented, and not this session's to
+silently change.
+
+Two more K3 "failures" were the suite reporting a missing prerequisite as
+a defect, which this repo's rules forbid. `WASTE_REF_SRC` defaults to
+Kimi-Linear's weights, so a K3 run round-tripped K3's container against
+Kimi-Linear's safetensors and called it a converter bug; and the hotlist
+check opens at a hardcoded `--budget 5G`, which is below K3's 29.19 GB
+floor, so the engine refused, no cache line was printed, and that read as
+"the hotlist did nothing". Both are SKIPs now, with the reason. With the
+right source, K3 round-trips: 19.58-19.80% relative error, PASS.

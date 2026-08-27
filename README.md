@@ -122,8 +122,26 @@ Kimi K3 and Kimi-Linear are unaffected: their forward pass is byte-identical to
 
 ### GLM-5.3-Flash
 
-`zai-org/GLM-5.3-Flash` — 313 B parameters, 328 GB of fp8 as published — runs
-text-only, and turned out to be mostly this engine already: the same KDA
+`zai-org/GLM-5.3-Flash` — 313 B parameters, 328 GB of fp8 as published — is
+converted, running and text-only. On the 64 GB machine above:
+
+| | |
+|---|---:|
+| container | 112 GB (5022 MB trunk, 42 expert banks of 2598 MB) |
+| minimum RAM | 5.14 GB |
+| default budget here | 46.37 GB, of which 41.36 GB expert cache |
+| decode | **3.09 tok/s** over 200 tokens, 89.3% hit |
+
+```
+$ waste run ~/models/glm53.waste "The capital of Italy is" -n 20
+The capital of Italy is Rome. Rome is the largest city in Italy and is
+known for its rich history, iconic landmarks such
+[20 tokens, 5.07 s, 3.94 tok/s | experts 5816 hit / 904 miss = 87%]
+```
+
+Against a PyTorch oracle built from the same container: relative L2
+**2.41e-5**, argmax and top-10 identical. It turned out to be mostly this
+engine already: the same KDA
 recurrence, the same MLA with `kv_b_proj` absorbed, the same router, the same
 fp8 reader and the same nested config layout as K3. Three things are new and
 each is behind a config key that is absent everywhere else: **mHC**, which
@@ -133,14 +151,12 @@ Sinkhorn-projected matrix at every sublayer; a **clamped SwiGLU**; and
 scores pools of four cached tokens and attends over the best 512 of them plus
 the tail.
 
-No throughput figures, because no GLM container has been converted here yet.
-From `config.json` the container comes to roughly a 4.8 GiB resident trunk and
-106.5 GiB of experts at VQ3R, against K3's 27.3 GiB and 982 GiB — so on a 64 GB
-machine there is room to cache a large fraction of the whole expert set rather
-than a token's working set and a half. What *has* been measured is the
-arithmetic: the engine agrees with a PyTorch reference to 5.7e-6 on a
-GLM-shaped synthetic container, with the sparse-attention branch really taken,
-and the re-encoded tokenizer agrees with the release's own on 21 of 21 strings.
+The download is 306 GiB and the conversion about 45 minutes at `--jobs 3`.
+Five times K3's 0.45-0.62 tok/s, on a model that actually fits the machine:
+its 5.14 GB floor leaves room to cache 36% of the whole expert set, where K3
+gets a token's working set and a half. The re-encoded tokenizer agrees with
+the release's own on 21 of 21 strings, and VQ3R lands at the same 0.195
+relative error on GLM's experts as on K3's.
 
 The vision tower is not implemented — GLM's is not K3's — so the converter
 writes no `vision.json` and the container refuses images by name rather than

@@ -389,8 +389,31 @@ if [ -d "$MODEL" ]; then
         no "expert record layout"
     fi
 
+    # $SRC defaults to Kimi-Linear's weights and $MODEL does not: point
+    # WASTE_REF_MODEL at K3 without pointing WASTE_REF_SRC anywhere and this
+    # compared K3's container against Kimi-Linear's safetensors and called
+    # the result a converter bug. A mismatched pair is a missing
+    # prerequisite, and this suite says SKIP to those.
+    src_pair=$(python3 - "$MODEL" "$SRC" <<'PYSRC'
+import json, os, sys
+try:
+    m = json.load(open(os.path.join(sys.argv[1], "manifest.json")))["config"]
+    s = json.load(open(os.path.join(sys.argv[2], "config.json")))
+except Exception:
+    sys.exit(0)                       # let the check speak for itself
+s = s.get("text_config", s)
+for k in ("num_hidden_layers", "hidden_size"):
+    a, b = m.get(k), s.get(k)
+    if a is not None and b is not None and a != b:
+        print(f"{os.path.basename(sys.argv[2])} is a different model from "
+              f"this container ({k} {b} vs {a}) - set WASTE_REF_SRC")
+        break
+PYSRC
+)
     if [ "$SYNTHETIC" = 1 ]; then
         sk "container round-trip" "synthetic container has no source weights"
+    elif [ -n "$src_pair" ]; then
+        sk "container round-trip" "$src_pair"
     elif [ -d "$SRC" ] && command -v uv >/dev/null 2>&1; then
         if run_uv run --quiet --with torch --no-project python tools/verify_container.py \
                --container "$MODEL" --src "$SRC" --experts 1 2>/dev/null \
@@ -833,8 +856,33 @@ PY
     fi
 
     # learned hotlist: a second run should start warmer than the first
+    # 5G is Kimi-Linear's size, and on a container whose floor is above it
+    # the engine refuses to open - correctly - so the run printed no cache
+    # line and this read that as "the hotlist did nothing". K3's floor is
+    # 29.19 GB. Raising the budget instead would make the check read a
+    # couple of hundred GB twice, which is not what it is for; the hotlist
+    # is exercised where it is cheap.
+    hot_why=""
+    if [ "$SYNTHETIC" != 1 ]; then
+        hot_why=$(python3 - "$MODEL" <<'PYHOT'
+import json, os, subprocess, sys
+WASTE = os.path.join(os.curdir, "waste" + (".exe" if os.name == "nt" else ""))
+r = subprocess.run([WASTE, "plan", sys.argv[1], "--json"],
+                   capture_output=True, text=True)
+try:
+    floor = json.loads(r.stdout)["floor_bytes"]
+except Exception:
+    sys.exit(0)
+if floor > 5 * (1 << 30):
+    print(f"this container's floor is {floor / (1 << 30):.2f} GB and the "
+          f"check opens at 5G, which the engine refuses")
+PYHOT
+)
+    fi
     if [ "$SYNTHETIC" = 1 ]; then
         sk "learned hotlist" "synthetic container carries no tokenizer"
+    elif [ -n "$hot_why" ]; then
+        sk "learned hotlist" "$hot_why"
     else
     rm -f "$MODEL/usage.waste"
     # Read hits and misses together. Counting misses alone cannot tell a
