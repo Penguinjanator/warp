@@ -1205,12 +1205,14 @@ GIDS=3,7,11,5,9,13,2,17,4,8,19,23,6,29,12,31
 if ! python3 tools/make_test_container.py --glm --seed 0 "$GLMC" >/dev/null 2>&1; then
     sk "GLM checks" "make_test_container.py --glm did not build a container"
 else
-    ./test_forward "$GLMC" "$GIDS" "$TMP/glm_seq.bin" 0 >/dev/null 2>&1
+    WASTE_DUMP_DSA="$TMP/glm_dsa_eng.txt" \
+        ./test_forward "$GLMC" "$GIDS" "$TMP/glm_seq.bin" 0 >/dev/null 2>&1
     if [ ! -s "$TMP/glm_seq.bin" ]; then
         no "the engine did not run a GLM container"
     else
         GGEN=""
         if command -v uv >/dev/null 2>&1; then
+            WASTE_DUMP_DSA="$TMP/glm_dsa_ref.txt" \
             run_uv run --no-project --with torch --with fla-core --with einops \
                 python tools/kimi_ref.py --container "$GLMC" \
                 --prompt-ids "$GIDS" --tokens 0 \
@@ -1261,6 +1263,11 @@ PYB
                 if [ -n "$GGEN" ]
                 then printf "        against an oracle generated from this container\n"
                 else printf "        against the shipped fixture (no uv here to generate one)\n"
+                fi
+                if [ -s "$TMP/glm_dsa_eng.txt" ] && [ -s "$TMP/glm_dsa_ref.txt" ]; then
+                    printf "        %s\n" "$(python3 tests/dsa_diff.py \
+                        --a "$TMP/glm_dsa_eng.txt" \
+                        --b "$TMP/glm_dsa_ref.txt" 2>&1)"
                 fi
             fi
         else
