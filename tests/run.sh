@@ -1134,6 +1134,25 @@ else
     sk "VQ4P engine" "cannot build a synthetic index_bits 6 container"
 fi
 
+# make_test_container.py packs VQ4P indices a second time, and the arm above
+# cannot tell whether it packs them the way convert.py does: it compares the
+# engine against itself, so a generator that disagreed with the converter
+# would produce a container the engine decodes into some other set of
+# indices, both backends would decode it the same wrong way, and every check
+# would pass on a layout no conversion writes. This runs the two packings
+# against each other instead. torch belongs to convert.py and never to the
+# engine, so it goes through uv like the other oracles.
+if [ -n "$PY_MISS" ]; then
+    sk "the two VQ4P packings agree" "$PY_MISS"
+elif ! command -v uv >/dev/null 2>&1; then
+    sk "the two VQ4P packings agree" "uv not installed (convert.py needs torch)"
+elif run_uv run --no-project --with torch \
+         python -m unittest tests.test_vq4p_packing 2>&1 | tail -3 | grep -q "^OK"; then
+    ok "make_test_container.py packs VQ4P exactly as convert.py does"
+else
+    no "the two VQ4P packings disagree"
+fi
+
 # --------------------------------------------------------------- rotary ----
 head_ "rotary (MLA on a model that is not NoPE)"
 
