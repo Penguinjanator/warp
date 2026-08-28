@@ -1632,7 +1632,10 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     memset(m, 0, sizeof *m);
     pthread_mutex_init(&m->fetch_mu, NULL);
     m->trunk_fd = -1;
-    for (int L = 0; L < WASTE_MAX_LAYERS; L++) m->bank[L].fd = -1;
+    for (int L = 0; L < WASTE_MAX_LAYERS; L++) {
+        for (int s = 0; s < WASTE_MAX_SHARDS; s++) m->bank[L].fd[s] = -1;
+        m->bank[L].n_shards = 1;
+    }
     m->want_vision = opt->want_vision;
     m->want_direct = opt->direct_io;
     pthread_once(&model_opts_once, model_opts_init);
@@ -1958,9 +1961,72 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
             js_free(&d); free(src); return -2;
         }
         m->bank[L].rec_bytes = m->bank[L].n_experts ? bytes / m->bank[L].n_experts : 0;
-        m->bank[L].fd = bank_open(path, m->bank[L].rec_bytes, m->want_direct,
-                                  &m->direct_io);
-        if (m->bank[L].fd < 0) { js_free(&d); free(src); return -1; }
+        /* Unstriped open is the N=1 case of the striped one: one fd on the
+         * bank's own file. A WASTE_BANK_SHARDS manifest (comma-separated
+         * directories) reopens the bank as N shard files named after the
+         * bank's basename in each directory.
+         *
+         * Every shard must hold its whole share of experts, and that is
+         * checked here rather than discovered later: one WASTE_ALIGN read at
+         * the last record's offset, which is 4 KiB-aligned like every record
+         * and so legal under O_DIRECT. A shard short by whole records — an
+         * interrupted copy, the ordinary way a split goes wrong — refuses
+         * the load instead of failing the first time the router happens to
+         * pick a high-numbered expert, which on K3 can be thousands of
+         * tokens in. A shard truncated *inside* its last record still fails
+         * at that record's read, REC_E_READ, and a wrong N is caught by the
+         * expert id in the record header: neither can be served as a
+         * different expert's weights. */
+        {
+            const char *sh = getenv("WASTE_BANK_SHARDS");
+            char dirs[1024];
+            int n_sh = 1;
+            if (sh && *sh) {
+                /* Truncating the list would silently drop shards, and a
+                 * count that disagrees with the split that produced them is
+                 * a different layout, not a smaller one. */
+                if ((size_t)snprintf(dirs, sizeof dirs, "%s", sh) >= sizeof dirs) {
+                    js_free(&d); free(src); return -2;
+                }
+                n_sh = 1;
+                for (const char *p = dirs; *p; p++) if (*p == ',') n_sh++;
+                if (n_sh > WASTE_MAX_SHARDS) { js_free(&d); free(src); return -2; }
+            }
+            const char *base = strrchr(fn, '/'); base = base ? base + 1 : fn;
+            for (int s = 0; s < n_sh; s++) {
+                char spath[1152];
+                if (n_sh == 1)
+                    snprintf(spath, sizeof spath, "%s/%s", dir, fn);
+                else {
+                    char *dstart = dirs;
+                    for (int k = 0; k < s && dstart; k++) {
+                        dstart = strchr(dstart, ',');
+                        if (dstart) dstart++;
+                    }
+                    if (!dstart || !*dstart) { js_free(&d); free(src); return -2; }
+                    char *comma = strchr(dstart, ',');
+                    size_t dlen = comma ? (size_t)(comma - dstart) : strlen(dstart);
+                    snprintf(spath, sizeof spath, "%.*s/%s", (int)dlen, dstart, base);
+                }
+                int sfd = bank_open(spath, m->bank[L].rec_bytes, m->want_direct,
+                                    &m->direct_io);
+                if (sfd < 0) { js_free(&d); free(src); return -1; }
+                /* Experts round-robin, so shard s holds ids s, s+N, s+2N ...
+                 * and that is ceil((n_experts - s) / N) records. */
+                const int recs = (m->bank[L].n_experts - s + n_sh - 1) / n_sh;
+                if (recs > 0) {
+                    uint8_t probe[WASTE_ALIGN];
+                    const int64_t last = (int64_t)(recs - 1) * m->bank[L].rec_bytes;
+                    if (waste_pread(sfd, probe, WASTE_ALIGN, last) != WASTE_ALIGN) {
+                        close(sfd);
+                        js_free(&d); free(src); return -1;
+                    }
+                }
+                m->bank[L].fd[s] = sfd;
+            }
+            m->bank[L].n_shards = n_sh;
+        }
+        if (m->bank[L].fd[0] < 0) { js_free(&d); free(src); return -1; }
     }
     js_free(&d);
     free(src);
@@ -2217,7 +2283,8 @@ void waste_model_free(waste_model *m)
     for (int L = 0; L < 128; L++) {
         free(m->S[L]); free(m->conv[L]); free(m->latcache[L]);
         free(m->idxpool[L]); free(m->idxbuf[L]);
-        if (m->bank[L].fd >= 0) close(m->bank[L].fd);
+        for (int s = 0; s < WASTE_MAX_SHARDS; s++)
+            if (m->bank[L].fd[s] >= 0) close(m->bank[L].fd[s]);
     }
     free(m->x); free(m->h); free(m->tmp); free(m->att); free(m->logits);
     free(m->ff); free(m->e_gate); free(m->e_up); free(m->e_down); waste_dio_free(m->lut);
@@ -2457,13 +2524,19 @@ static int bank_fetch(void *user, int layer, int expert, uint8_t *dst)
                           layer >= WASTE_MAX_LAYERS;
     waste_bank *b = bad_layer ? NULL : &m->bank[layer];
     if (bad_layer || expert < 0 || expert >= b->n_experts ||
-        b->fd < 0 || b->rec_bytes <= 0)
+        b->fd[0] < 0 || b->rec_bytes <= 0)
         return bank_fail(m, REC_E_HEADER, layer, expert);
 
-    /* pread is positional, so the reader threads share the bank's fd
-     * without a seek to race over. */
-    const int64_t got = waste_pread(b->fd, dst, (size_t)b->rec_bytes,
-                                    (int64_t)expert * (int64_t)b->rec_bytes);
+    /* Striped banks: expert e lives on shard e % n_shards at offset
+     * (e / n_shards) * rec_bytes. Round-robin keeps the top-k experts of a
+     * single token spread across devices, which is the point — the per-token
+     * demand is k experts of ONE layer, so layer-granularity placement would
+     * leave every read of a token on one drive. Unstriped is N=1 and the
+     * division is exact: shard 0, offset e * rec_bytes. pread is positional,
+     * so the reader threads share each shard fd without a seek to race over. */
+    const int shard = expert % b->n_shards;
+    const int64_t off = ((int64_t)(expert / b->n_shards)) * (int64_t)b->rec_bytes;
+    const int64_t got = waste_pread(b->fd[shard], dst, (size_t)b->rec_bytes, off);
     rec_status st = got == (int64_t)b->rec_bytes ? REC_OK : REC_E_READ;
     if (st == REC_OK) st = record_check(m, layer, expert, dst);
     if (st != REC_OK) return bank_fail(m, st, layer, expert);
