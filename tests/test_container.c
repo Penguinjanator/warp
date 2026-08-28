@@ -105,7 +105,10 @@ int main(int argc, char **argv)
         }
         if (off % WASTE_ALIGN) { printf("  not 4 KiB aligned!\n"); bad++; }
         if (h.lowrank_id != 0) { printf("  lowrank_id != 0 (v0 violation)\n"); bad++; }
-        if (h.fmt != WQ_VQ3R && h.fmt != WQ_VQ2R) { printf("  unexpected fmt %u\n", h.fmt); bad++; }
+        /* VQ4P shares VQ3R's record size and layout — only the index
+         * packing inside the payload differs — so it is accepted here for
+         * the same reason: the struct reads are the same either way. */
+        if (h.fmt != WQ_VQ3R && h.fmt != WQ_VQ2R && h.fmt != WQ_VQ4P) { printf("  unexpected fmt %u\n", h.fmt); bad++; }
 
         /* the whole expert in ONE read — the point of the layout */
         const size_t bytes = (size_t)h.rec_4k_blocks * WASTE_ALIGN;
