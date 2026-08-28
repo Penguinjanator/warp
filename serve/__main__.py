@@ -240,18 +240,18 @@ examples:
         print(f"thinking {'off by default' if args.no_thinking else 'on'}"
               f" — reasoning_effort per request")
     else:
-        # Serving from chat.json rather than XTML. Say what is missing, in
-        # the same breath as saying it works — a client that sends `tools`
-        # and gets a 400 should not be the first time this is mentioned.
-        # What is missing, in the same breath as saying it works — a
+        # Serving from chat.json rather than XTML. Say what this container
+        # can and cannot do, in the same breath as saying it works — a
         # client that sends `tools` and gets a 400 should not be the first
-        # time this is mentioned. The reasoning channel is the one part a
-        # chat.json can now carry, so it is reported and not assumed.
+        # time this is mentioned. All three are read from the container: the
+        # channel and the images from chat.json, the tools from whether the
+        # tokenizer carries the whole native protocol.
         think = ("a reasoning channel" if srv.chat_format.think
                  else "no reasoning channel")
         images = "images" if srv.chat_format.image else "no images"
+        tools = "native tools" if srv.chat_format.tool_markers else "no tools"
         print(f"chat     from {model}/chat.json — plain conversation, "
-              f"{think},\n         {images}, no tools")
+              f"{think},\n         {images}, {tools}")
 
     shown = args.host if ":" not in args.host else f"[{args.host}]"
     print(f"\nlistening on http://{shown}:{args.port}  "
