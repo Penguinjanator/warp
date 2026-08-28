@@ -80,6 +80,16 @@ the default stays 16.
 
 Storage is the main constraint. A cold K3 token reads about 17 GB of experts. The internal SSD sustains 12.78 GB/s; a tested USB enclosure managed 0.94 GB/s. Put the converted container on internal NVMe storage.
 
+If you have more than one drive, since 0.7.2 the expert banks can be spread
+across them: `WASTE_BANK_SHARDS=/mnt/a,/mnt/b` reads expert `e` from shard
+`e % N`, so the k experts a single token routes to land on different
+devices instead of queueing behind one. `tools/split_banks.py` writes and
+byte-verifies the shard sets, and the logits are identical either way.
+**No speedup is claimed here** — that needs two drives of comparable speed
+and a real container. Striping across the internal SSD and the USB
+enclosure above would measure the enclosure, not the striping. The
+mechanism ships; the measurement does not.
+
 All layers are checked against a PyTorch reference. Final logits agree within 3.6e-06, and the vision tower agrees with its oracle within 2.3e-06.
 
 Additional measurements, profiling data, router-lookahead results, and quantization experiments are collected in [docs/TECHNICAL.md](docs/TECHNICAL.md).
@@ -434,7 +444,16 @@ It supports streaming, tools, structured output, thinking controls, and images. 
 A GLM container is served the same way, from its own `chat.json`: plain
 conversation and images, with the reasoning channel returned as
 `reasoning_content` beside `content`. Tools are refused by name rather than
-half-rendered — four strings cannot express a tool declaration.
+half-rendered — four strings cannot express a tool declaration, and GLM's
+tokenizer carries no protocol that could.
+
+Kimi-Linear's does. Since 0.7.2 a container whose tokenizer holds all five
+of Kimi's native tool-call markers gets tool calling over HTTP even though
+its `chat.json` describes only the ordinary turns — the format lives in
+`serve/kimitools.py`, and the server says which of the three capabilities a
+container has when it starts. All five or none: half of that rendering
+encodes as ordinary text, so a partial set is a different protocol rather
+than a smaller one.
 
 ```bash
 python3 -m serve ~/models/glm53.waste --port 8000
@@ -461,6 +480,8 @@ Measurements are treated as experimental results rather than marketing numbers. 
 Validation covers more than successful generation. The model-free suite builds a synthetic container; real-model checks compare individual layers and final logits against PyTorch, verify conversion round trips, test vision against its oracle, and exercise the server prompt renderer segment by segment against K3's reference encoder. The validation criteria and current evidence are documented in [docs/GATES.md](docs/GATES.md), with server-specific differential tests in [docs/SERVE.md](docs/SERVE.md).
 
 On a mixture-of-experts model, a distance between logits is not by itself a verdict. A top-K router turns an arbitrarily small arithmetic difference into a discrete one, and past the first flipped expert the two paths are running different weights — the distance then measures how much the model cares which of two indistinguishable experts it used, not how far the arithmetic moved. Since 0.7.1 the suite compares the logits and, where they part, asks which decision moved and whether anything could have resolved it: [tests/route_diff.py](tests/route_diff.py) over the expert ranking and [tests/dsa_diff.py](tests/dsa_diff.py) over the sparse-attention pool ranking, each answering *identical*, *tie*, or *diverged*. Three checks were red against a 1e-3 threshold and none was an engine defect: on K3 the paths first disagree on the closest call in the entire forward pass, a relative margin of 7.3e-07 where the median decision is 7.4e-03, and on GLM they disagree on an exact tie between pools scoring zero. The result is a stricter suite rather than a looser one — a flip on a margin the reference could resolve now fails while naming the token and the layer, and a difference with the routing *unchanged* is its own verdict instead of being pooled with the tie. [docs/LEARNED.md](docs/LEARNED.md) §71–§72 has the distributions behind the thresholds.
+
+The general form of that, and the reason 0.7.2 is mostly test code: a check that compares a thing to itself is not a weak oracle, it is not an oracle. Kimi's tool rendering shipped with 438 self-consistent tests, every one of them passing on a defect one of them had pinned; it is now diffed against the release's own chat template ([tests/serve/test_chatfmt_upstream.py](tests/serve/test_chatfmt_upstream.py)), the way K3's encoder has always been diffed against `encoding_k3.py`. The synthetic `index_bits 6` container the VQ4P checks run on is packed by a second implementation of the converter's own layout, so the two are now run against each other ([tests/test_vq4p_packing.py](tests/test_vq4p_packing.py)) — the arm itself cannot notice, since both backends would decode a wrongly packed container the same wrong way. Neither defect was visible from inside the code, and both were found by comparing against something outside it.
 
 Useful references:
 
