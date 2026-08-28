@@ -27,7 +27,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from . import chatfmt, xtml
+from . import chatfmt, kimitools, xtml
 from .engine import Engine
 from .regions import RegionParser
 
@@ -383,6 +383,8 @@ def build_prompt(engine: Engine, body: dict, *, default_thinking: bool,
         raise APIError(str(e), param=e.param or "messages")
     except xtml.XTMLError as e:
         raise APIError(str(e), param="messages")
+    except kimitools.KimiToolError as e:
+        raise APIError(str(e), param=e.param or "messages")
 
     tokens = engine.tokenize_segments(segments)
     if n_images:

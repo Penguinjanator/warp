@@ -57,6 +57,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from . import kimitools
 from .regions import Delta, ToolCall
 from .xtml import Segment
 
@@ -73,14 +74,6 @@ _MARKER_RE = re.compile(r"<\|[^|>]*\|>|</?think>")
 _ROLE_ALIASES = {"developer": "system"}
 
 _ROLES = ("system", "user", "assistant")
-
-_KIMI_TOOL_MARKERS = (
-    "<|tool_calls_section_begin|>",
-    "<|tool_calls_section_end|>",
-    "<|tool_call_begin|>",
-    "<|tool_call_argument_begin|>",
-    "<|tool_call_end|>",
-)
 
 
 class ChatFormatError(ValueError):
@@ -238,23 +231,11 @@ class ChatFormat:
                     f"chat format disagree")
             ids[text] = got[0]
 
-        # Kimi K2 carries a richer native tool-call protocol in reserved
-        # tokenizer tokens even though chat.json itself only describes the
-        # ordinary conversation turns. Discover those markers defensively:
-        # they count as structure only when every required marker is a real
-        # single special token in this container.
-        discovered: dict[int, str] = {}
-        candidates: list[tuple[int, str]] = []
-
-        for text in _KIMI_TOOL_MARKERS:
-            got = engine.tokenize(text, markup=True)
-            if len(got) != 1:
-                candidates = []
-                break
-            candidates.append((got[0], text))
-
-        if len(candidates) == len(_KIMI_TOOL_MARKERS):
-            discovered = dict(candidates)
+        # A container may carry Kimi's native tool protocol in reserved
+        # tokenizer tokens even though chat.json describes only the ordinary
+        # turns. Whether it does is this file's question; what the protocol
+        # is belongs to kimitools.
+        discovered = kimitools.detect(engine)
 
         return cls(roles=roles, opening=opening, stop_marker=stop_marker,
                    stop_id=ids[stop_marker], prelude=prelude, think=think,
@@ -306,17 +287,7 @@ class ChatFormat:
                     param="tools",
                 )
 
-            # Kimi K2 native tool declaration format.  Keep structural
-            # markers separate from the JSON payload so caller-controlled
-            # strings cannot be interpreted as model markup.
-            segments.append(
-                Segment("<|im_system|>tool_declare<|im_middle|>",
-                        markup=True)
-            )
-            segments.append(
-                Segment(json.dumps(tools, separators=(",", ":")))
-            )
-            segments.append(Segment("<|im_end|>", markup=True))
+            segments.extend(kimitools.declaration(tools))
         for name in ("tool_choice", "response_format", "response_schema"):
             if kwargs.get(name) is not None:
                 raise ChatFormatError(
@@ -369,22 +340,8 @@ class ChatFormat:
                         f'messages[{i}] is a tool result, but this '
                         f'container\'s chat.json has no system turn',
                         param=f"messages[{i}].role")
-                tool_call_id = message.get("tool_call_id")
-                if not tool_call_id:
-                    raise ChatFormatError(
-                        f"messages[{i}] is a tool result without "
-                        "tool_call_id",
-                        param=f"messages[{i}].tool_call_id")
                 prefix, suffix = pair
-                # K2 names this turn for the tool, not for the system:
-                # `message.get('name') or message['role']` in the release's
-                # own template. chat.json's system prefix carries the literal
-                # `system`, so the name is substituted into it.
-                who = message.get("name") or "tool"
-                sys_open = self.roles["system"][0]
-                marker = _rename_turn(sys_open, who)
-                segments.append(Segment(marker, markup=True))
-                segments.append(Segment(f"## Return of {tool_call_id}\n"))
+                segments.extend(kimitools.result_header(message, i, prefix))
                 segments.extend(_content_segments(message.get("content"), i))
                 segments.append(Segment(suffix, markup=True))
                 continue
@@ -406,41 +363,7 @@ class ChatFormat:
                         f"messages[{i}] carries tool_calls on a non-assistant "
                         "turn",
                         param=f"messages[{i}].tool_calls")
-
-                segments.append(
-                    Segment("<|tool_calls_section_begin|>", markup=True)
-                )
-
-                for j, call in enumerate(tool_calls):
-                    call_id = call.get("id")
-                    function = call.get("function") or {}
-                    arguments = function.get("arguments", "")
-
-                    if not call_id:
-                        raise ChatFormatError(
-                            f"messages[{i}].tool_calls[{j}] has no id",
-                            param=f"messages[{i}].tool_calls[{j}].id")
-
-                    if not isinstance(arguments, str):
-                        arguments = json.dumps(
-                            arguments, separators=(",", ":")
-                        )
-
-                    segments.append(
-                        Segment("<|tool_call_begin|>", markup=True)
-                    )
-                    segments.append(Segment(str(call_id)))
-                    segments.append(
-                        Segment("<|tool_call_argument_begin|>", markup=True)
-                    )
-                    segments.append(Segment(arguments))
-                    segments.append(
-                        Segment("<|tool_call_end|>", markup=True)
-                    )
-
-                segments.append(
-                    Segment("<|tool_calls_section_end|>", markup=True)
-                )
+                segments.extend(kimitools.call_section(tool_calls, i))
 
             segments.append(Segment(suffix, markup=True))
 
@@ -453,28 +376,6 @@ class ChatFormat:
             if self.think:
                 segments.append(Segment(self.think[0], markup=True))
         return segments
-
-
-def _rename_turn(opening: str, who: str) -> str:
-    """`<|im_system|>system<|im_middle|>` -> `<|im_system|>{who}<|im_middle|>`.
-
-    A Kimi turn opener is three parts: a role token, a free-text name, and a
-    separator. chat.json spells the whole thing out because for an ordinary
-    turn the name never varies; a tool result is the one turn whose name
-    comes from the message. Rewriting the middle is the smallest thing that
-    keeps chat.json the single source of the turn's shape.
-
-    A format whose opener is not that shape gets the name appended to the
-    role token instead of a silent substitution, so an opener this does not
-    understand renders visibly wrong rather than plausibly wrong.
-    """
-    i = opening.rfind("<|")
-    if i <= 0 or not opening.endswith("|>"):
-        return opening + who
-    j = opening.find("|>")
-    if j < 0 or j + 2 > i:
-        return opening + who
-    return opening[:j + 2] + who + opening[i:]
 
 
 def _strings(roles: dict[str, tuple[str, str]], opening: str) -> list[str]:
@@ -535,48 +436,22 @@ class PlainParser:
         self._in_think = in_think and think_close_id >= 0
         self.reasoning = ""
         self.content = ""
-        self.tool_calls: list[ToolCall] = []
         self._done = False
-
-        # Kimi K2 tool-call parsing state.
-        self._tool_state = "content"
-        self._tool_header = ""
-        self._tool_arguments = ""
-        self._current_tool: Optional[ToolCall] = None
+        # The tool protocol reads itself; this file decides only what is
+        # left over. `tool_calls` stays an attribute here because it is what
+        # openai_message reports.
+        self._tools = kimitools.ToolParser()
 
     @property
     def finished(self) -> bool:
         return self._done
 
+    @property
+    def tool_calls(self) -> list[ToolCall]:
+        return self._tools.calls
+
     def _marker(self, token_id: int) -> Optional[str]:
         return self._markers.get(token_id)
-
-    def _begin_tool_call(self) -> None:
-        self._tool_header = ""
-        self._tool_arguments = ""
-        self._current_tool = None
-        self._tool_state = "header"
-
-    def _parse_tool_header(self) -> ToolCall:
-        """Parse Kimi's `functions.<name>:<index>` call header."""
-        raw = self._tool_header.strip()
-
-        if raw.startswith("functions."):
-            raw = raw[len("functions."):]
-
-        name = raw
-        index = len(self.tool_calls)
-
-        if ":" in raw:
-            maybe_name, maybe_index = raw.rsplit(":", 1)
-            if maybe_name:
-                name = maybe_name
-            try:
-                index = int(maybe_index)
-            except ValueError:
-                pass
-
-        return ToolCall(name=name, index=index)
 
     def feed_token(self, token_id: int, piece: str) -> Delta:
         delta = Delta()
@@ -594,55 +469,16 @@ class PlainParser:
             self._in_think = False
             return delta
 
-        if marker == "<|tool_calls_section_begin|>":
-            self._tool_state = "section"
-            return delta
-
-        if marker == "<|tool_call_begin|>":
-            self._begin_tool_call()
-            return delta
-
-        if marker == "<|tool_call_argument_begin|>":
-            if self._tool_state == "header":
-                self._current_tool = self._parse_tool_header()
-                self.tool_calls.append(self._current_tool)
-                self._tool_state = "arguments"
-            return delta
-
-        if marker == "<|tool_call_end|>":
-            if self._current_tool is not None:
-                self._current_tool.json_block = self._tool_arguments
-            self._current_tool = None
-            self._tool_state = "section"
-            return delta
-
-        if marker == "<|tool_calls_section_end|>":
-            self._current_tool = None
-            self._tool_state = "content"
-            return delta
-
-        # Unknown structural markers retain the old plain-parser behavior:
-        # a real control-token id ends the generated turn.
         if marker is not None:
+            if self._tools.feed_marker(marker, delta):
+                return delta
             self._done = True
             return delta
 
         if not piece:
             return delta
 
-        if self._tool_state == "header":
-            self._tool_header += piece
-            return delta
-
-        if self._tool_state == "arguments":
-            self._tool_arguments += piece
-            if self._current_tool is not None:
-                self._current_tool.json_block = self._tool_arguments
-                delta.tool_calls.append(self._current_tool.index)
-            return delta
-
-        if self._tool_state == "section":
-            # Ignore stray ordinary text between Kimi tool-call structures.
+        if self._tools.feed_text(piece, delta):
             return delta
 
         if self._in_think:
@@ -654,9 +490,8 @@ class PlainParser:
         return delta
 
     def finish(self) -> Delta:
-        """Flush any in-progress Kimi tool argument block."""
-        if self._current_tool is not None:
-            self._current_tool.json_block = self._tool_arguments
+        """Flush a tool call the stream ended in the middle of."""
+        self._tools.finish()
         return Delta()
 
     def openai_message(self) -> dict:

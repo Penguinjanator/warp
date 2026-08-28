@@ -263,6 +263,13 @@ parser that reads replies back into reasoning / content / `tool_calls`;
 `chatfmt.py` is the fallback for a container with no XTML markers, serving
 it from the same `chat.json` the CLI reads — plain conversation only, with
 tools, thinking and images refused by name rather than dropped;
+`kimitools.py` is Kimi's native tool-call protocol — the five markers, the
+rendering and the reply reader — which is neither of the two formats and so
+gets its own module: it is carried in a container's *tokenizer* while its
+`chat.json` says nothing about it, and Kimi-Linear ships those tokens with
+no chat template at all. `tests/serve/test_chatfmt_upstream.py` diffs it
+against K2's published one, `K2_DIR` naming the release, the way
+`test_xtml` does for K3;
 `engine.py` is the ctypes binding plus one lock held for a whole generation
 (a `waste_ctx` is not thread-safe). Struct layouts in `engine.py` mirror
 `waste.h` field for field — change one, change the other.

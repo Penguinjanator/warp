@@ -32,6 +32,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
+from serve import kimitools                              # noqa: E402
 from serve.chatfmt import (ChatFormat, ChatFormatError,   # noqa: E402
                            PlainParser)
 from tests.serve.fake_engine import FakeEngine, LINEAR_MARKERS   # noqa: E402
@@ -89,6 +90,22 @@ class TestLoad(Base):
         self.assertEqual(fmt.stop_id, 15)
         self.assertEqual(fmt.markers[15], "<|im_end|>")
         self.assertEqual(sorted(fmt.roles), ["assistant", "system", "user"])
+
+    def test_a_partial_marker_set_is_no_protocol(self):
+        """Four of the five is a different protocol, not a smaller one.
+
+        Half of this rendering encodes as ordinary text, so the model would
+        read its own tool structure as prose and answer anyway. kimitools
+        disqualifies the set rather than degrading it; this pins that.
+        """
+        for drop in KIMI_K2_MARKERS:
+            if KIMI_K2_MARKERS[drop] not in kimitools.MARKERS:
+                continue
+            partial = {k: v for k, v in KIMI_K2_MARKERS.items() if k != drop}
+            fmt = self.load(SHIPPED, markers=partial)
+            self.assertEqual(
+                {}, fmt.tool_markers,
+                f"dropping {KIMI_K2_MARKERS[drop]} still resolved a protocol")
 
     def test_kimi_tool_markers_are_discovered_when_available(self):
         fmt = self.load(SHIPPED, markers=KIMI_K2_MARKERS)

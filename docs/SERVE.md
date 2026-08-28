@@ -148,8 +148,16 @@ tokens. Kimi-Linear does; GLM does not, and is refused by name.
 
 That last one is a rendering `chat.json` itself cannot describe — four
 prefix/suffix strings say nothing about a tool declaration or an argument
-list — so the protocol lives in `serve/chatfmt.py` and is enabled only when
-the whole marker set resolves. **It is Kimi K2's**, and it is checked
+list — so the protocol lives in `serve/kimitools.py`, its own module beside
+`xtml.py`, and is enabled only when the whole marker set resolves.
+
+The split is by subject rather than by size. *Whether* a container can do
+tools is a fact about its `chat.json` and its tokenizer, so `chatfmt.py`
+decides it and refuses with `ChatFormatError`. *How* a tool call is spelled
+is a fact about the protocol, so `kimitools.py` owns it and a malformed one
+raises `KimiToolError` — the same shape `xtml.py` has with `XTMLError`, and
+`api.py` maps each to a 400. Nothing in `kimitools.py` imports `chatfmt`,
+which is what lets `chatfmt` import it. **It is Kimi K2's**, and it is checked
 against K2's own published `chat_template.jinja` rather than transcribed
 from memory: `tests/serve/test_chatfmt_upstream.py`, which `tests/run.sh`
 runs whenever `K2_DIR` names a release directory, the same discipline
