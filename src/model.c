@@ -1964,15 +1964,30 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         /* Unstriped open is the N=1 case of the striped one: one fd on the
          * bank's own file. A WASTE_BANK_SHARDS manifest (comma-separated
          * directories) reopens the bank as N shard files named after the
-         * bank's basename in each directory. Every shard must exist and be
-         * exactly the size its share of experts demands — a short or long
-         * shard fails the load rather than serving a wrong record. */
+         * bank's basename in each directory.
+         *
+         * Every shard must hold its whole share of experts, and that is
+         * checked here rather than discovered later: one WASTE_ALIGN read at
+         * the last record's offset, which is 4 KiB-aligned like every record
+         * and so legal under O_DIRECT. A shard short by whole records — an
+         * interrupted copy, the ordinary way a split goes wrong — refuses
+         * the load instead of failing the first time the router happens to
+         * pick a high-numbered expert, which on K3 can be thousands of
+         * tokens in. A shard truncated *inside* its last record still fails
+         * at that record's read, REC_E_READ, and a wrong N is caught by the
+         * expert id in the record header: neither can be served as a
+         * different expert's weights. */
         {
             const char *sh = getenv("WASTE_BANK_SHARDS");
             char dirs[1024];
             int n_sh = 1;
             if (sh && *sh) {
-                snprintf(dirs, sizeof dirs, "%s", sh);
+                /* Truncating the list would silently drop shards, and a
+                 * count that disagrees with the split that produced them is
+                 * a different layout, not a smaller one. */
+                if ((size_t)snprintf(dirs, sizeof dirs, "%s", sh) >= sizeof dirs) {
+                    js_free(&d); free(src); return -2;
+                }
                 n_sh = 1;
                 for (const char *p = dirs; *p; p++) if (*p == ',') n_sh++;
                 if (n_sh > WASTE_MAX_SHARDS) { js_free(&d); free(src); return -2; }
@@ -1996,9 +2011,20 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                 int sfd = bank_open(spath, m->bank[L].rec_bytes, m->want_direct,
                                     &m->direct_io);
                 if (sfd < 0) { js_free(&d); free(src); return -1; }
+                /* Experts round-robin, so shard s holds ids s, s+N, s+2N ...
+                 * and that is ceil((n_experts - s) / N) records. */
+                const int recs = (m->bank[L].n_experts - s + n_sh - 1) / n_sh;
+                if (recs > 0) {
+                    uint8_t probe[WASTE_ALIGN];
+                    const int64_t last = (int64_t)(recs - 1) * m->bank[L].rec_bytes;
+                    if (waste_pread(sfd, probe, WASTE_ALIGN, last) != WASTE_ALIGN) {
+                        close(sfd);
+                        js_free(&d); free(src); return -1;
+                    }
+                }
                 m->bank[L].fd[s] = sfd;
-                m->bank[L].n_shards = n_sh;
             }
+            m->bank[L].n_shards = n_sh;
         }
         if (m->bank[L].fd[0] < 0) { js_free(&d); free(src); return -1; }
     }
