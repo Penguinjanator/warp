@@ -2014,9 +2014,46 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                 /* Experts round-robin, so shard s holds ids s, s+N, s+2N ...
                  * and that is ceil((n_experts - s) / N) records.
                  *
+                 * Two things can be wrong with a shard, and they need
+                 * different instruments. The size is the whole-file claim:
+                 * a stale or mismatched split leaves a shard the layout
+                 * does not fit. The manifest bound the offsets already;
+                 * this bounds them against the file, and it needs no read,
+                 * so it also covers containers whose record size is not a
+                 * whole number of blocks — where the probe below
+                 * deliberately skips.
+                 *
+                 * What it is *not* protecting against is a wrong record
+                 * being served as the right one. Measured rather than
+                 * assumed: two shards padded to the sizes N=2 expects but
+                 * carrying a 3-way split's records refuse on the first
+                 * read, "expert 7 of layer 1: record header is not what the
+                 * bank index describes". Every record carries the expert it
+                 * belongs to and record_check reads it, so a misplaced one
+                 * is a refusal and never a substitution. The value here is
+                 * *when*: a long shard loaded happily and generated correct
+                 * output before this check, since the extra records are
+                 * simply never read, and a short one waited for the router
+                 * to reach the missing expert. Both are now a refusal at
+                 * load, which is the difference between a split you can
+                 * trust and one you have not disproved yet. */
+                const int recs = (m->bank[L].n_experts - s + n_sh - 1) / n_sh;
+                if (n_sh > 1 && recs > 0) {
+                    const int64_t want_bytes =
+                        (int64_t)recs * m->bank[L].rec_bytes;
+                    const int64_t have_bytes = waste_file_size(sfd);
+                    if (have_bytes < 0 || have_bytes != want_bytes) {
+                        close(sfd);
+                        js_free(&d); free(src); return -1;
+                    }
+                }
+                /* The probe is the other half: a file can be exactly the
+                 * right length and still not be readable the way the engine
+                 * will read it.
+                 *
                  * waste_dio_alloc, not a stack array. O_DIRECT rejects every
                  * transfer whose *buffer* is unaligned, not only its offset
-                 * and length — the rule bank_probe below is written for, and
+                 * and length -- the rule bank_probe below is written for, and
                  * the reason it allocates rather than declaring. A stack
                  * buffer here passed on macOS, whose F_NOCACHE has no buffer
                  * requirement, and on the x86_64 CI runner, whose filesystem
@@ -2029,7 +2066,6 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                  * Skipped unless a record is a whole number of blocks, since
                  * then the offset itself is one O_DIRECT would refuse, and a
                  * refusal the device made is not evidence about the shard. */
-                const int recs = (m->bank[L].n_experts - s + n_sh - 1) / n_sh;
                 if (recs > 0 && m->bank[L].rec_bytes >= (int64_t)WASTE_ALIGN &&
                     m->bank[L].rec_bytes % (int64_t)WASTE_ALIGN == 0) {
                     void *probe = waste_dio_alloc(WASTE_ALIGN);
