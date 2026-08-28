@@ -2016,11 +2016,27 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                  *
                  * Two things can be wrong with a shard, and they need
                  * different instruments. The size is the whole-file claim:
-                 * a stale or mismatched split leaves a short shard, whose
-                 * reader would serve a neighbor record's bytes as the expert
-                 * asked for, or a long one, which hides the same confusion
-                 * one record over. The manifest bound the offsets already;
-                 * this bounds them against the file. */
+                 * a stale or mismatched split leaves a shard the layout
+                 * does not fit. The manifest bound the offsets already;
+                 * this bounds them against the file, and it needs no read,
+                 * so it also covers containers whose record size is not a
+                 * whole number of blocks — where the probe below
+                 * deliberately skips.
+                 *
+                 * What it is *not* protecting against is a wrong record
+                 * being served as the right one. Measured rather than
+                 * assumed: two shards padded to the sizes N=2 expects but
+                 * carrying a 3-way split's records refuse on the first
+                 * read, "expert 7 of layer 1: record header is not what the
+                 * bank index describes". Every record carries the expert it
+                 * belongs to and record_check reads it, so a misplaced one
+                 * is a refusal and never a substitution. The value here is
+                 * *when*: a long shard loaded happily and generated correct
+                 * output before this check, since the extra records are
+                 * simply never read, and a short one waited for the router
+                 * to reach the missing expert. Both are now a refusal at
+                 * load, which is the difference between a split you can
+                 * trust and one you have not disproved yet. */
                 const int recs = (m->bank[L].n_experts - s + n_sh - 1) / n_sh;
                 if (n_sh > 1 && recs > 0) {
                     const int64_t want_bytes =
