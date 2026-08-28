@@ -1044,6 +1044,103 @@ else
     sk "engine checks" "no container at $MODEL"
 fi
 
+# --------------------------------------------------------------- VQ4P ----
+head_ "VQ4P engine (index_bits 6)"
+
+# vq_rows_p6 — the packed-index apply PR #41's AVX-512 kernel joins — had
+# no container `make check` could reach: the synthetic one was always
+# index_bits 8, and a real --index-bits 6 conversion costs hours plus the
+# source weights. So every green run until this arm covered VQ3R and
+# nothing covered VQ4P, on any platform. Same discipline as the engine
+# block above: no oracle, but the engine is compared against itself. The
+# p6 accumulate itself is integer until the per-block fold, but what
+# reaches the logits also went through the other dispatched kernels, so
+# agreement between backends lands in the fp-noise branch — that is a real
+# verdict, not a regression, and the checks below report it as such.
+# Scope: this container is 4 layers / 3 MoE, so the arm bounds gross
+# kernel errors; it does not and cannot bound the depth-amplified
+# discontinuity mode (a real index_bits 6 container shows max diff
+# ~0.58 at 27 layers with the kernel working correctly). Do not read a
+# green run here as more than that. The container is a few MB and
+# builds in milliseconds, so the arm runs on every host and in CI.
+VQ4P="$TMP/tiny6.waste"
+P6_IDS=3,7,11,5,9,13,2,17,4,8,19,23,6,29,12,31
+if python3 tools/make_test_container.py --index-bits 6 "$VQ4P" \
+        >/dev/null 2>&1; then
+    # Same struct check as above, on records whose payload is three packed
+    # bytes per row instead of four whole ones — the layout has to be the
+    # one test_container reads regardless of the packing.
+    banks=0; recs=0; bad=0
+    for bank in "$VQ4P"/experts-L*.bin; do
+        [ -f "$bank" ] || continue
+        banks=$((banks + 1))
+        out=$(./test_container "$bank" 2 2>/dev/null) || { bad=1; continue; }
+        n=$(printf '%s' "$out" | sed -n 's/^\([0-9]*\) records read, \([0-9]*\) problems$/\1 \2/p')
+        set -- $n
+        [ "${1:-0}" -gt 0 ] || bad=1
+        [ "${2:-1}" -eq 0 ] || bad=1
+        recs=$((recs + ${1:-0}))
+    done
+    if [ "$banks" -gt 0 ] && [ "$bad" = 0 ]; then
+        ok "VQ4P records read through the C structs ($recs records over $banks banks)"
+    else
+        no "VQ4P record layout"
+    fi
+
+    ./test_forward "$VQ4P" "$P6_IDS" "$TMP/p6_seq.bin" 0 >/dev/null 2>&1
+    WASTE_CHUNK=1 ./test_forward "$VQ4P" "$P6_IDS" "$TMP/p6_chunk.bin" 0 \
+        >/dev/null 2>&1
+    if python3 - "$TMP/p6_seq.bin" "$TMP/p6_chunk.bin" <<'PY'
+import struct, sys
+def L(p):
+    b = open(p, "rb").read()
+    return struct.unpack(f"<{len(b)//4}f", b)
+a, b = L(sys.argv[1]), L(sys.argv[2])
+d = max(abs(x - y) for x, y in zip(a, b))
+sys.exit(0 if d < 1e-3 and a.index(max(a)) == b.index(max(b)) else 1)
+PY
+    then ok "VQ4P chunked prefill == token-at-a-time"
+    else no "VQ4P chunked prefill diverges"
+    fi
+
+    WASTE_BACKEND=cpu ./test_forward "$VQ4P" "$P6_IDS" "$TMP/p6_cpu.bin" 0 \
+        >/dev/null 2>&1
+    if cmp -s "$TMP/p6_seq.bin" "$TMP/p6_cpu.bin"; then
+        ok "VQ4P SIMD backend bit-identical to the CPU baseline"
+    else
+        # same tolerance fallback as the VQ3R arm above. 1e-5, not 1e-3:
+        # the mutation table in the PR review puts the intact kernel at
+        # 9.54e-07 and every single-edit break at 0.002-0.003, so 1e-5
+        # leaves 10x headroom over noise and 300x under the break signal.
+        if python3 - "$TMP/p6_seq.bin" "$TMP/p6_cpu.bin" <<'PY'
+import struct, sys
+def L(p):
+    b = open(p, "rb").read()
+    return struct.unpack(f"<{len(b)//4}f", b)
+a, b = L(sys.argv[1]), L(sys.argv[2])
+sys.exit(0 if max(abs(x - y) for x, y in zip(a, b)) < 1e-5 else 1)
+PY
+        then ok "VQ4P SIMD backend matches the CPU baseline (within fp noise)"
+        else no "VQ4P SIMD backend diverges from the CPU baseline"
+        fi
+    fi
+
+    WASTE_CACHE_MB=512 ./test_forward "$VQ4P" "$P6_IDS" "$TMP/p6_cache.bin" 0 \
+        >/dev/null 2>&1
+    # same() + the 0/1/* case, not `cmp -s`: this is #42's own rule, and the
+    # same call site by name as the VQ3R cache check above it. An unguarded
+    # `cmp -s` on a PATH without diffutils (fresh MSYS2 UCRT64) is the one
+    # false FAIL on an otherwise clean board.
+    same "$TMP/p6_seq.bin" "$TMP/p6_cache.bin"
+    case $? in
+        0) ok "VQ4P expert cache is bit-identical to no cache" ;;
+        1) no "VQ4P expert cache changes results" ;;
+        *) sk "VQ4P expert cache is bit-identical to no cache" "$NO_CMP" ;;
+    esac
+else
+    sk "VQ4P engine" "cannot build a synthetic index_bits 6 container"
+fi
+
 # --------------------------------------------------------------- rotary ----
 head_ "rotary (MLA on a model that is not NoPE)"
 
