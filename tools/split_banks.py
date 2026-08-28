@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SQLite Cloud, Inc.
 """split_banks.py — split a WASTE container's expert banks into N shard sets.
 
 Round-robin placement matching src/model.c bank_fetch: expert e lives on
