@@ -182,19 +182,20 @@ REPORTPY
 }
 
 route_verdict() {
-    # $1 the other path's route trace, $2 the check's name
-    if [ ! -s "$TMP/seq.route" ] || [ ! -s "$1" ] || [ ! -s "$TMP/seq.scores" ]; then
-        no "$2 diverges"
+    # $1 reference route trace, $2 its score trace, $3 the other path's
+    # route trace, $4 the check's name
+    if [ ! -s "$1" ] || [ ! -s "$2" ] || [ ! -s "$3" ]; then
+        no "$4 diverges"
         printf "        beyond %s max-abs, and no route trace to say why\n" "$LOGIT_EPS"
         return
     fi
-    why=$(python3 tests/route_diff.py --ref "$TMP/seq.route" --other "$1" \
-                  --scores "$TMP/seq.scores" 2>&1)
+    why=$(python3 tests/route_diff.py --ref "$1" --other "$3" \
+                  --scores "$2" 2>&1)
     case $? in
-        2) ok "$2 (differs only past a routing tie)" ;;
-        0) no "$2 diverges with the routing unchanged"
+        2) ok "$4 (differs only past a routing tie)" ;;
+        0) no "$4 diverges with the routing unchanged"
            why="same experts throughout, so the arithmetic itself moved" ;;
-        *) no "$2 diverges" ;;
+        *) no "$4 diverges" ;;
     esac
     printf "        %s\n" "$why"
 }
@@ -678,7 +679,8 @@ if [ -d "$MODEL" ]; then
     logitcmp "$TMP/seq.bin" "$TMP/chunk.bin"
     case $? in
         0) ok "chunked prefill == token-at-a-time" ;;
-        2) route_verdict "$TMP/chunk.route" "chunked prefill" ;;
+        2) route_verdict "$TMP/seq.route" "$TMP/seq.scores" \
+               "$TMP/chunk.route" "chunked prefill" ;;
         *) no "chunked prefill diverges" ;;
     esac
 
@@ -747,7 +749,8 @@ PY
         logitcmp "$TMP/seq.bin" "$TMP/cpu.bin"
         case $? in
             0) ok "SIMD backend matches the CPU baseline (within fp noise)" ;;
-            2) route_verdict "$TMP/cpu.route" "SIMD backend" ;;
+            2) route_verdict "$TMP/seq.route" "$TMP/seq.scores" \
+                   "$TMP/cpu.route" "SIMD backend" ;;
             *) no "SIMD backend diverges from the CPU baseline" ;;
         esac
     fi
@@ -1087,42 +1090,30 @@ if python3 tools/make_test_container.py --index-bits 6 "$VQ4P" \
         no "VQ4P record layout"
     fi
 
-    ./test_forward "$VQ4P" "$P6_IDS" "$TMP/p6_seq.bin" 0 >/dev/null 2>&1
-    WASTE_CHUNK=1 ./test_forward "$VQ4P" "$P6_IDS" "$TMP/p6_chunk.bin" 0 \
-        >/dev/null 2>&1
-    if python3 - "$TMP/p6_seq.bin" "$TMP/p6_chunk.bin" <<'PY'
-import struct, sys
-def L(p):
-    b = open(p, "rb").read()
-    return struct.unpack(f"<{len(b)//4}f", b)
-a, b = L(sys.argv[1]), L(sys.argv[2])
-d = max(abs(x - y) for x, y in zip(a, b))
-sys.exit(0 if d < 1e-3 and a.index(max(a)) == b.index(max(b)) else 1)
-PY
-    then ok "VQ4P chunked prefill == token-at-a-time"
-    else no "VQ4P chunked prefill diverges"
-    fi
+    WASTE_DUMP_ROUTE="$TMP/p6_seq.route" WASTE_DUMP_SCORES="$TMP/p6_seq.scores" \
+        ./test_forward "$VQ4P" "$P6_IDS" "$TMP/p6_seq.bin" 0 >/dev/null 2>&1
+    WASTE_CHUNK=1 WASTE_DUMP_ROUTE="$TMP/p6_chunk.route" \
+        ./test_forward "$VQ4P" "$P6_IDS" "$TMP/p6_chunk.bin" 0 >/dev/null 2>&1
+    logitcmp "$TMP/p6_seq.bin" "$TMP/p6_chunk.bin"
+    case $? in
+        0) ok "VQ4P chunked prefill == token-at-a-time" ;;
+        2) route_verdict "$TMP/p6_seq.route" "$TMP/p6_seq.scores" \
+                         "$TMP/p6_chunk.route" "VQ4P chunked prefill" ;;
+        *) no "VQ4P chunked prefill diverges" ;;
+    esac
 
-    WASTE_BACKEND=cpu ./test_forward "$VQ4P" "$P6_IDS" "$TMP/p6_cpu.bin" 0 \
-        >/dev/null 2>&1
-    if cmp -s "$TMP/p6_seq.bin" "$TMP/p6_cpu.bin"; then
+    WASTE_BACKEND=cpu WASTE_DUMP_ROUTE="$TMP/p6_cpu.route" \
+        ./test_forward "$VQ4P" "$P6_IDS" "$TMP/p6_cpu.bin" 0 >/dev/null 2>&1
+    if same "$TMP/p6_seq.bin" "$TMP/p6_cpu.bin"; then
         ok "VQ4P SIMD backend bit-identical to the CPU baseline"
     else
-        # same tolerance fallback as the VQ3R arm above. 1e-5, not 1e-3:
-        # the mutation table in the PR review puts the intact kernel at
-        # 9.54e-07 and every single-edit break at 0.002-0.003, so 1e-5
-        # leaves 10x headroom over noise and 300x under the break signal.
-        if python3 - "$TMP/p6_seq.bin" "$TMP/p6_cpu.bin" <<'PY'
-import struct, sys
-def L(p):
-    b = open(p, "rb").read()
-    return struct.unpack(f"<{len(b)//4}f", b)
-a, b = L(sys.argv[1]), L(sys.argv[2])
-sys.exit(0 if max(abs(x - y) for x, y in zip(a, b)) < 1e-5 else 1)
-PY
-        then ok "VQ4P SIMD backend matches the CPU baseline (within fp noise)"
-        else no "VQ4P SIMD backend diverges from the CPU baseline"
-        fi
+        LOGIT_EPS=1e-5 logitcmp "$TMP/p6_seq.bin" "$TMP/p6_cpu.bin"
+        case $? in
+            0) ok "VQ4P SIMD backend matches the CPU baseline (within fp noise)" ;;
+            2) LOGIT_EPS=1e-5 route_verdict "$TMP/p6_seq.route" \
+                   "$TMP/p6_seq.scores" "$TMP/p6_cpu.route" "VQ4P SIMD backend" ;;
+            *) no "VQ4P SIMD backend diverges from the CPU baseline" ;;
+        esac
     fi
 
     WASTE_CACHE_MB=512 ./test_forward "$VQ4P" "$P6_IDS" "$TMP/p6_cache.bin" 0 \
@@ -1137,6 +1128,8 @@ PY
         1) no "VQ4P expert cache changes results" ;;
         *) sk "VQ4P expert cache is bit-identical to no cache" "$NO_CMP" ;;
     esac
+elif [ -n "$PY_MISS" ]; then
+    sk "VQ4P engine" "$PY_MISS"
 else
     sk "VQ4P engine" "cannot build a synthetic index_bits 6 container"
 fi
@@ -1228,15 +1221,9 @@ PY
         logitcmp "$TMP/rope_seq.bin" "$TMP/rope_chunk.bin"
         case $? in
             0) ok "chunked prefill == token-at-a-time with rotation" ;;
-            2) rwhy=$(python3 tests/route_diff.py \
-                          --ref "$TMP/rope_seq.route" \
-                          --other "$TMP/rope_chunk.route" \
-                          --scores "$TMP/rope_seq.scores" 2>&1)
-               if [ $? = 2 ]
-               then ok "chunked prefill with rotation (differs only past a routing tie)"
-               else no "chunked prefill diverges on a rotated model"
-               fi
-               printf "        %s\n" "$rwhy" ;;
+            2) route_verdict "$TMP/rope_seq.route" "$TMP/rope_seq.scores" \
+                             "$TMP/rope_chunk.route" \
+                             "chunked prefill with rotation" ;;
             *) no "chunked prefill diverges on a rotated model" ;;
         esac
 
