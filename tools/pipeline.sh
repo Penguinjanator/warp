@@ -39,6 +39,28 @@
 # be downloaded again — so it stays something the caller asks for.
 
 set -uo pipefail
+
+# python3, resolved by RUNNING a candidate rather than by looking one up.
+# On Windows the name on PATH is usually the Microsoft Store App Execution
+# Alias: a zero-byte reparse point that exists, exits 49, and prints an
+# advert for the Store instead of running anything. Same finding as
+# tests/run.sh, which shims PATH because it has 49 call sites and
+# subprocesses to cover; the handful here get a name and pass it down.
+#
+# Windows installs the versionless `python`, and `py` besides, so a working
+# interpreter is normally there under another name. If none answers, this
+# stays `python3` and the script fails loudly at first use, which is right
+# here: unlike the suite there is nothing to skip, and a run that cannot
+# read its own index must stop rather than carry on.
+# Exported rather than local, so the fetch_weights.sh this drives inherits
+# the same answer instead of resolving it again per stage.
+if [ -z "${PY:-}" ]; then
+    for _cand in python3 python py; do
+        "$_cand" -c '' >/dev/null 2>&1 && { PY="$_cand"; break; }
+    done
+    : "${PY:=python3}"
+fi
+export PY
 cd "$(dirname "$0")/.."
 
 SRC="${SRC:-/Volumes/WasteDisk/k3}"
@@ -61,7 +83,7 @@ say "=== pipeline start ==="
 say "src $SRC -> out $OUT, $JOBS conversion processes"
 
 # ---- 1. download ---------------------------------------------------------
-NEED=$(python3 -c "
+NEED=$("$PY" -c "
 import json;print(len(set(json.load(open('$SRC/model.safetensors.index.json'))['weight_map'].values())))" 2>/dev/null || echo 0)
 [ "$NEED" -gt 0 ] || die "download (no index at $SRC)"
 
@@ -83,7 +105,7 @@ say "stage 2: probe — ${FREE} GB free on the target volume"
 
 # The first MoE layer. K3 nests the text model, and the dense prefix has no
 # experts to round-trip, so neither is a detail this can guess at.
-PROBE=$(python3 -c "
+PROBE=$("$PY" -c "
 import json
 c = json.load(open('$SRC/config.json'))
 c = c.get('text_config', c)
@@ -91,7 +113,7 @@ print(c.get('first_k_dense_replace', 0))" 2>/dev/null || echo "")
 [ -n "$PROBE" ] || die "probe (no config.json at $SRC)"
 
 probe_done() {
-    python3 -c "
+    "$PY" -c "
 import json, sys
 try:
     m = json.load(open('$OUT/manifest.json'))
@@ -156,7 +178,7 @@ say "  prompt ids: $IDS"
 $UV tools/kimi_ref.py --container "$OUT" --tokens 0 --prompt-ids "$IDS" \
     --dump "$RUN/logits_ref.bin" >>"$LOG" 2>&1 || die "oracle"
 
-python3 - "$RUN/logits_c.bin" "$RUN/logits_ref.bin" > "$RUN/diff.txt" <<'PY'
+"$PY" - "$RUN/logits_c.bin" "$RUN/logits_ref.bin" > "$RUN/diff.txt" <<'PY'
 import struct, sys
 def L(p):
     b = open(p, "rb").read()

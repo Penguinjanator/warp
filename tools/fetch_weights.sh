@@ -33,6 +33,26 @@
 
 set -uo pipefail
 
+# python3, resolved by RUNNING a candidate rather than by looking one up.
+# On Windows the name on PATH is usually the Microsoft Store App Execution
+# Alias: a zero-byte reparse point that exists, exits 49, and prints an
+# advert for the Store instead of running anything. Same finding as
+# tests/run.sh, which shims PATH because it has 49 call sites and
+# subprocesses to cover; the handful here get a name and pass it down.
+#
+# Windows installs the versionless `python`, and `py` besides, so a working
+# interpreter is normally there under another name. If none answers, this
+# stays `python3` and the script fails loudly at first use, which is right
+# here: unlike the suite there is nothing to skip, and a run that cannot
+# read its own index must stop rather than carry on.
+if [ -z "${PY:-}" ]; then
+    for _cand in python3 python py; do
+        "$_cand" -c '' >/dev/null 2>&1 && { PY="$_cand"; break; }
+    done
+    : "${PY:=python3}"
+fi
+export PY
+
 REPO="${REPO:-moonshotai/Kimi-K3}"
 DEST="${DEST:-/Volumes/WasteDisk/k3}"
 JOBS="${JOBS:-3}"
@@ -188,7 +208,7 @@ if [ "$DRY" = 0 ] && [ "$CHECK_ONLY" = 0 ]; then
     # missed preprocessor_config.json, so the image normalization was the
     # CLIP convention for a day when the release states mean = std = 0.5.
     # A whitelist cannot report what it never knew to ask for.
-    SMALL=$(hcurl -sfL --max-time 60 "$API" 2>/dev/null | python3 -c '
+    SMALL=$(hcurl -sfL --max-time 60 "$API" 2>/dev/null | "$PY" -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -250,14 +270,14 @@ fi
 # build that cannot be tested from here, and deleting a byte that must never
 # appear in a safetensors filename is checkable by reading. It is a no-op
 # everywhere else.
-python3 - "$DEST/model.safetensors.index.json" <<'PY' | tr -d '\r' > "$DEST/.shards"
+"$PY" - "$DEST/model.safetensors.index.json" <<'PY' | tr -d '\r' > "$DEST/.shards"
 import json, sys
 idx = json.load(open(sys.argv[1]))
 for s in sorted(set(idx["weight_map"].values())):
     print(s)
 PY
 TOTAL=$(wc -l < "$DEST/.shards" | tr -d ' ')
-TOTAL_BYTES=$(python3 - "$DEST/model.safetensors.index.json" <<'PY' | tr -d '\r'
+TOTAL_BYTES=$("$PY" - "$DEST/model.safetensors.index.json" <<'PY' | tr -d '\r'
 import json, sys
 print(json.load(open(sys.argv[1])).get("metadata", {}).get("total_size", 0))
 PY
@@ -275,7 +295,7 @@ while read -r f; do
 done < "$DEST/.shards"
 
 log "repo $REPO -> $DEST  (stat: $STAT_MODE)"
-python3 - "$TOTAL_BYTES" "$have_bytes" "$(free_kb)" "$TOTAL" "$have" <<'PY'
+"$PY" - "$TOTAL_BYTES" "$have_bytes" "$(free_kb)" "$TOTAL" "$have" <<'PY'
 import sys
 tot, got, availkb, n, nhave = (int(x) for x in sys.argv[1:6])
 g = 1 << 30
