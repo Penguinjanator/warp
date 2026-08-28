@@ -9,10 +9,35 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 MODEL="${1:-$HOME/models/kimi-linear.waste}"
 BUDGET_GB="${2:-6}"
+
+# The interpreter this script measures through, resolved by RUNNING a
+# candidate rather than by looking one up — #51's finding, applied to the
+# subprocess it could not reach. On Windows the name `python3` on PATH is
+# usually the Microsoft Store App Execution Alias: present, exits 49, and
+# advertises instead of running. run.sh shims PATH before it gets here, so
+# this normally inherits an answer; the probe is for the standalone run,
+# which is how this script is meant to be usable.
+#
+# If nothing answers, that is the same shape as the platform with no
+# peak-RSS interface directly below: a measurement that never happened.
+# It says UNMEASURABLE and exits 77, and both call sites in run.sh already
+# turn 77 into a loud SKIP. Reporting it as an overrun would accuse the
+# engine of breaking its most central claim because an interpreter is
+# missing — which is exactly what #36 did on Windows, and what this exit
+# code was introduced to stop.
+if [ -z "${PY:-}" ]; then
+    for _cand in python3 python py; do
+        "$_cand" -c '' >/dev/null 2>&1 && { PY="$_cand"; break; }
+    done
+fi
+if [ -z "${PY:-}" ]; then
+    echo "BUDGET UNMEASURABLE: no working python3 (the name on PATH is not an interpreter)"
+    exit 77
+fi
 # A short prompt never allocates the chunked-prefill scratch, which is the
 # largest single thing the plan has to size. Pass "long" to force a chunk.
 case "${3:-}" in
-    long) PROMPT=$(python3 -c "print(' '.join(['token'] * 90))");;
+    long) PROMPT=$("$PY" -c "print(' '.join(['token'] * 90))");;
     *)    PROMPT="hello";;
 esac
 
@@ -28,7 +53,7 @@ esac
 # loudly and is never a silent pass; it should equally never be a failure.
 # So Windows gets the real measurement through PeakWorkingSetSize, and
 # anything that still cannot measure says UNMEASURABLE and exits 77.
-RSS=$(python3 -c '
+RSS=$("$PY" -c '
 import subprocess, sys
 
 cmd = ["./waste", "run", sys.argv[1], sys.argv[2], "-n", "2",
@@ -76,7 +101,7 @@ if [ -z "$RSS" ]; then
     exit 77
 fi
 
-python3 - "$RSS" "$BUDGET_GB" <<'PY'
+"$PY" - "$RSS" "$BUDGET_GB" <<'PY'
 import sys
 rss = int(sys.argv[1]); budget = float(sys.argv[2]) * (1 << 30)
 # Allow the process image itself (binary, libc, thread stacks) on top of

@@ -1500,6 +1500,10 @@ head_ "RAM budget"
 # record of slot rounding. Filling the cap instead is what put a 27 GB
 # cache on a 64 GB machine and cost 8x throughput — docs/LEARNED.md §16.
 default_budget() {
+    # No interpreter, no measurement. 77 is check_budget.sh's
+    # "unmeasurable", and it is a SKIP at every call site rather than a
+    # verdict about the container.
+    [ -n "$PY_MISS" ] && return 77
     python3 - "$1" <<'PY'
 import json, os, subprocess, sys
 
@@ -1562,6 +1566,10 @@ PY
 # 3 bits per weight the experts have to fit their bank, give or take one
 # fp16 scale per output row and the record's 4 KiB alignment.
 params_rule() {
+    # No interpreter, no measurement. 77 is check_budget.sh's
+    # "unmeasurable", and it is a SKIP at every call site rather than a
+    # verdict about the container.
+    [ -n "$PY_MISS" ] && return 77
     python3 - "$1" <<'PY'
 import json, os, subprocess, sys
 
@@ -1624,11 +1632,12 @@ if [ -d "$MODEL" ]; then
         no "under-floor budget not refused"
     fi
 
-    if out=$(default_budget "$MODEL" 2>/dev/null); then
-        ok "no --budget picks a ceiling the machine can hold ($out)"
-    else
-        no "default budget off the rule (${out:-no output})"
-    fi
+    out=$(default_budget "$MODEL" 2>/dev/null); rc=$?
+    case $rc in
+        0)  ok "no --budget picks a ceiling the machine can hold ($out)" ;;
+        77) sk "the default budget rule" "$PY_MISS" ;;
+        *)  no "default budget off the rule (${out:-no output})" ;;
+    esac
     # A container from a future layout must be refused, not read against the
     # old rules — the field was written from the first converter and read by
     # nobody until it was wired up.
@@ -1708,11 +1717,12 @@ if [ -f "$BIG/manifest.json" ]; then
     # rather than the floor + 3x = 80.63 GB asked for. On a host large
     # enough to hold the recommendation this still passes — it checks the
     # rule, not the clamp.
-    if out=$(default_budget "$BIG" 2>/dev/null); then
-        ok "no --budget is capped to the machine on K3 ($out)"
-    else
-        no "default budget not capped on K3 (${out:-no output})"
-    fi
+    out=$(default_budget "$BIG" 2>/dev/null); rc=$?
+    case $rc in
+        0)  ok "no --budget is capped to the machine on K3 ($out)" ;;
+        77) sk "the default budget rule on K3" "$PY_MISS" ;;
+        *)  no "default budget not capped on K3 (${out:-no output})" ;;
+    esac
 else
     sk "K3 budget check" "no container at $BIG"
 fi
@@ -1726,6 +1736,10 @@ head_ "parameter counts"
 # now, so check them against the manifest — the architecture K3 records
 # under `_outer`, and every trunk format the language model actually uses.
 info_rule() {
+    # No interpreter, no measurement. 77 is check_budget.sh's
+    # "unmeasurable", and it is a SKIP at every call site rather than a
+    # verdict about the container.
+    [ -n "$PY_MISS" ] && return 77
     python3 - "$1" <<'PY'
 import json, os, subprocess, sys
 
@@ -1753,16 +1767,18 @@ PY
 }
 
 if [ -d "$MODEL" ]; then
-    if out=$(info_rule "$MODEL" 2>/dev/null); then
-        ok "info describes the container it opened ($out)"
-    else
-        no "info describes something else (${out:-no output})"
-    fi
-    if out=$(params_rule "$MODEL" 2>/dev/null); then
-        ok "params_total is what the container holds ($out)"
-    else
-        no "params_total off the rule (${out:-no output})"
-    fi
+    out=$(info_rule "$MODEL" 2>/dev/null); rc=$?
+    case $rc in
+        0)  ok "info describes the container it opened ($out)" ;;
+        77) sk "info describes the container it opened" "$PY_MISS" ;;
+        *)  no "info describes something else (${out:-no output})" ;;
+    esac
+    out=$(params_rule "$MODEL" 2>/dev/null); rc=$?
+    case $rc in
+        0)  ok "params_total is what the container holds ($out)" ;;
+        77) sk "params_total against the rule" "$PY_MISS" ;;
+        *)  no "params_total off the rule (${out:-no output})" ;;
+    esac
 else
     sk "parameter counts" "no container at $MODEL"
 fi
@@ -1771,16 +1787,18 @@ fi
 # here: without it the expert width and the hidden never differ, and the
 # two descriptive fields pass on the constants they used to be.
 if [ -f "$BIG/manifest.json" ]; then
-    if out=$(info_rule "$BIG" 2>/dev/null); then
-        ok "info names K3 and its trunk, not the model before it ($out)"
-    else
-        no "info describes something else on K3 (${out:-no output})"
-    fi
-    if out=$(params_rule "$BIG" 2>/dev/null); then
-        ok "params_total counts K3's experts at the latent ($out)"
-    else
-        no "params_total off the rule on K3 (${out:-no output})"
-    fi
+    out=$(info_rule "$BIG" 2>/dev/null); rc=$?
+    case $rc in
+        0)  ok "info names K3 and its trunk, not the model before it ($out)" ;;
+        77) sk "info names K3 and its trunk" "$PY_MISS" ;;
+        *)  no "info describes something else on K3 (${out:-no output})" ;;
+    esac
+    out=$(params_rule "$BIG" 2>/dev/null); rc=$?
+    case $rc in
+        0)  ok "params_total counts K3's experts at the latent ($out)" ;;
+        77) sk "params_total against the rule on K3" "$PY_MISS" ;;
+        *)  no "params_total off the rule on K3 (${out:-no output})" ;;
+    esac
 else
     sk "K3 parameter counts" "no container at $BIG"
 fi
@@ -1794,6 +1812,10 @@ head_ "vision preprocessing"
 # in preprocessor_config.json — a wrong constant that every existing check
 # was structurally blind to. Assert the container against the source.
 vision_norm() {
+    # No interpreter, no measurement. 77 is check_budget.sh's
+    # "unmeasurable", and it is a SKIP at every call site rather than a
+    # verdict about the container.
+    [ -n "$PY_MISS" ] && return 77
     python3 - "$1" "$2" <<'PY'
 import json, os, sys
 cont, src = sys.argv[1], sys.argv[2]
@@ -1812,7 +1834,9 @@ PY
 
 if [ -d "$MODEL" ] && [ -d "$SRC" ]; then
     out=$(vision_norm "$MODEL" "$SRC"); rc=$?
-    if [ "$rc" = 2 ]; then
+    if [ "$rc" = 77 ]; then
+        sk "image normalization vs the release" "$PY_MISS"
+    elif [ "$rc" = 2 ]; then
         sk "image normalization vs the release" "no vision tower in this container"
     elif [ "$rc" = 0 ]; then
         ok "image normalization is the release's ($out)"
@@ -1825,7 +1849,9 @@ fi
 
 if [ -f "$BIG/manifest.json" ] && [ -d "${BIG_SRC:-/Volumes/WasteDisk/k3}" ]; then
     out=$(vision_norm "$BIG" "${BIG_SRC:-/Volumes/WasteDisk/k3}"); rc=$?
-    if [ "$rc" = 2 ]; then
+    if [ "$rc" = 77 ]; then
+        sk "K3 image normalization" "$PY_MISS"
+    elif [ "$rc" = 2 ]; then
         sk "K3 image normalization" "no vision.json or no preprocessor config"
     elif [ "$rc" = 0 ]; then
         ok "K3 image normalization is the release's ($out)"
@@ -1935,8 +1961,8 @@ fi
 # the wrong layers, generation stops on nothing. Neither is visible to the
 # oracle diff above — the oracle reads the same manifest and would be wrong
 # the same way — so it is checked against what the release says instead.
-if ! command -v python3 >/dev/null 2>&1; then
-    sk "convert.py GLM config" "python3 not installed"
+if [ -n "$PY_MISS" ]; then
+    sk "convert.py GLM config" "$PY_MISS"
 elif out=$(python3 tests/test_convert_glm.py 2>&1); then
     ok "GLM's 0-based layer mix, its eos list and its unread tensors are converted"
 else
@@ -1999,7 +2025,9 @@ fi
 # weights directory is present. That is the check that says our port of
 # encoding_k3.py is K3's format and not merely self-consistent.
 K3_SRC="${K3_DIR:-/Volumes/WasteDisk/k3}"
-if [ -f "$K3_SRC/encoding_k3.py" ]; then
+if [ -f "$K3_SRC/encoding_k3.py" ] && [ -n "$PY_MISS" ]; then
+    sk "XTML vs encoding_k3.py" "$PY_MISS"
+elif [ -f "$K3_SRC/encoding_k3.py" ]; then
     if K3_DIR="$K3_SRC" python3 -m unittest \
            tests.serve.test_xtml.TestAgainstUpstream 2>&1 | tail -3 | grep -q "^OK"; then
         ok "XTML prompts match the release's encoding_k3.py, segment for segment"
