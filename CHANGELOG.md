@@ -8,6 +8,135 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
+## 0.7.2 — 2026-08-28
+
+Six pull requests and two issues, and one theme running through all of
+them: **a test that compares a thing to itself is not a weak oracle, it is
+not an oracle.** Three of the defects this release fixes were sitting under
+green boards, and each one was found by diffing against something outside
+the code rather than by a check inside it.
+
+No ABI move — `src/waste.h` is untouched — and no measured number in the
+docs changes. The engine gains one optional capability, bank striping, and
+two refusals.
+
+### Added
+
+- **Bank striping across N devices** (#53). `WASTE_BANK_SHARDS=/mnt/a,/mnt/b`
+  reopens each layer's bank as N shard files; expert `e` lives on shard
+  `e % N` at offset `(e / N) * rec_bytes`. Round-robin rather than
+  per-layer because the per-token demand is k experts of *one* layer, so
+  layer-granularity placement would leave every read of a token on one
+  drive. `tools/split_banks.py` produces and byte-verifies the shard sets.
+  Unset is the N=1 case of the same code path, and no container format
+  changes. Striped and unstriped logits are byte-identical, under
+  ASan/UBSan too.
+
+  **No bandwidth number**, deliberately: that needs a multi-drive rig with
+  a real container, and this is the mechanism. The 1.8-2x it targets is a
+  prediction, not a measurement, and is recorded as one.
+
+- **Kimi K2 native tool calling for containers served from `chat.json`**
+  (#50), in `serve/kimitools.py` — its own module beside `xtml.py`,
+  because it is neither of the two formats `serve/` renders: it is carried
+  in a container's *tokenizer* while that container's `chat.json` says
+  nothing about it. Kimi-Linear carries the five markers; GLM does not and
+  is still refused by name. The split is by subject: whether a container
+  can do tools is a fact about its `chat.json`, so `chatfmt.py` decides it;
+  how a call is spelled is a fact about the protocol, so `kimitools.py`
+  owns it and raises its own `KimiToolError`, the same shape `xtml.py` has.
+
+- **`tests/serve/test_chatfmt_upstream.py`**, the oracle that made the
+  above trustworthy (`docs/LEARNED.md` §73). The 438 lines of tests that
+  came with #50 all passed and the rendering was still wrong: they fed the
+  renderer's output to the parser, which agrees with itself whatever the
+  format is, and one of them *pinned* the defect. Diffed against K2's
+  published `chat_template.jinja`, everything matched byte for byte except
+  the turn a tool result opens. `K2_DIR` names the release; the check needs
+  no weights and no container, which makes it the cheapest oracle here.
+
+- **A container the suite can reach at `index_bits 6`** (#48).
+  `vq_rows_p6` had none — the synthetic container was always `index_bits 8`
+  and a real conversion costs hours — so every green run covered VQ3R and
+  nothing covered VQ4P, on any platform, which `CLAUDE.md` warns about by
+  name. Four checks, and the arm is not decorative: swapping `T1`/`T2` in
+  `vq_rows_p6_neon` fails it, naming the specific verdict.
+
+- **`tests/test_vq4p_packing.py`** (#56), which runs
+  `make_test_container.py`'s VQ4P packing against `convert.py`'s. The arm
+  above cannot: it compares the engine against itself, so a generator that
+  packed differently would produce a container both backends decode the
+  same wrong way and all four checks would pass. Verified not to be
+  decoration by breaking the generator two ways.
+
+### Fixed
+
+- **A `python3` that exists and is not an interpreter said the engine was
+  broken** (#51, #52). On Windows the name on PATH is usually the Microsoft
+  Store App Execution Alias: a zero-byte reparse point that `command -v`
+  finds, that exits 49, and that prints an advert instead of running
+  anything. Every guard in the suite was written for an *absent*
+  interpreter. Measured on a stock Windows box: **7 passed / 7 failed / 16
+  skipped before, 44 / 0 / 13 after**, with the Store's advertisement text
+  appearing verbatim inside failure messages. The suite shims PATH; the
+  Makefile and the two shell tools resolve a name.
+
+- **The other half of that** (#54): seven checks still reported the engine,
+  the budget, the converter and the release's own preprocessing config
+  broken when *no* interpreter answered. 14 failures before #51, 7 after,
+  **0 now**, with every skip naming the interpreter. 77 rather than a new
+  number — `tests/check_budget.sh` already meant "could not measure, skip
+  loudly" by it.
+
+- **The turn a tool result opens is named for the tool**, `name or "tool"`,
+  never `system`. K2's own template renders
+  `<|im_system|>{{ message.get('name') or message['role'] }}<|im_middle|>`.
+
+- **Two claims about shards that were not true.** #53's comment promised
+  that a short or long shard fails the load; `bank_open`'s `rec_bytes`
+  parameter is `(void)`-ed and nothing measured anything. A shard short by
+  one record **loaded, ran, and produced correct logits** — correct because
+  the missing expert simply was not routed to in an 8-token prompt, which
+  is the hazard rather than the reprieve. #55 then added the size check at
+  open, which is what should have been written in the first place:
+  `waste_file_size` has been in `platform.h` all along.
+
+  Its own justification is corrected too. A misplaced record cannot be
+  served as another expert's — every record carries the expert it belongs
+  to and `record_check` reads it, and two shards padded to the right sizes
+  but carrying another split's records refuse on the first read. What the
+  check buys is *when*: a long shard loaded happily and generated correct
+  output, and a short one waited for the router to reach the missing
+  expert.
+
+- **`WASTE_BANK_SHARDS` truncated at 1024 bytes was ignored**, silently
+  dropping shards. A shard count that disagrees with the split that
+  produced them is a different layout, not a smaller one. Refused.
+
+- **The `O_DIRECT` probe used a stack buffer**, which broke every container
+  load on `linux-arm64` — 25 passed, 29 failed. `O_DIRECT` rejects a
+  transfer whose *buffer* is unaligned, not only its offset and length.
+  It passed on macOS, whose `F_NOCACHE` has no such requirement, and on the
+  x86_64 runner, whose filesystem declines `O_DIRECT` and falls back to
+  buffered: **56 passed / 0 failed on the same code and the same OS as the
+  job that failed**. Two platforms agreeing is not coverage when only the
+  third exercises the path. `main` was red for one commit.
+
+- **A refusal check had two outcomes where it needed three.**
+  `rope_refused` called anything that was not the expected message "loaded
+  instead of being refused", so a `test_forward` that was killed — which
+  says nothing — was reported as a container loading that should have been
+  rejected.
+
+### Also
+
+CI's SPDX glob gained `tests/*.py`, `tests/*.sh`, `tests/serve/*.py` and
+`serve/*.py`. Every file in those directories already carried the header;
+the glob had simply never looked, three separate times this release.
+
+`route_verdict` takes its reference as a parameter, so the three arms that
+ask it — VQ3R, rotated, VQ4P — share one copy instead of open-coding it.
+
 ## 0.7.1 — 2026-08-27
 
 **0.7.0 did not build on x86_64 Linux, on Windows, or under ASan.** That is
