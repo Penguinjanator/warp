@@ -2122,5 +2122,29 @@ else
     sk "XTML vs encoding_k3.py" "no release at $K3_SRC (set K3_DIR)"
 fi
 
+# The same question for the other format serve/ renders. Kimi-Linear's
+# tokenizer carries Kimi K2's five tool-call tokens and its release ships
+# no chat_template at all, so the vocabulary is stated and the grammar is
+# not — the grammar is K2's, and K2 publishes it. Without this the tool
+# rendering is checked only against a parser that reads back what the
+# renderer wrote, which agrees with itself whatever the format is.
+K2_SRC="${K2_DIR:-/Volumes/WasteDisk/kimi-k2}"
+if [ ! -f "$K2_SRC/chat_template.jinja" ] && [ ! -f "$K2_SRC/tokenizer_config.json" ]; then
+    sk "chat.json tools vs K2's chat_template" \
+       "no template at $K2_SRC (set K2_DIR; only chat_template.jinja is needed)"
+elif [ -n "$PY_MISS" ]; then
+    sk "chat.json tools vs K2's chat_template" "$PY_MISS"
+elif ! command -v uv >/dev/null 2>&1; then
+    sk "chat.json tools vs K2's chat_template" "uv not installed (needs jinja2)"
+else
+    if K2_DIR="$K2_SRC" run_uv run --no-project --with jinja2 \
+           python -m unittest tests.serve.test_chatfmt_upstream 2>&1 \
+           | tail -3 | grep -q "^OK"; then
+        ok "chat.json tool rendering matches K2's own chat_template"
+    else
+        no "chat.json tool rendering differs from K2's chat_template"
+    fi
+fi
+
 printf "\n\033[1m%d passed, %d failed, %d skipped\033[0m\n" "$pass" "$fail" "$skip"
 [ "$fail" -eq 0 ]

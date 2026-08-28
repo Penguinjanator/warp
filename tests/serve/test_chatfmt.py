@@ -248,12 +248,22 @@ class TestRender(Base):
 
         rendered = "".join(s.text for s in segs)
 
-        self.assertIn(
-            "<|im_system|>system<|im_middle|>",
-            rendered,
-        )
+        self.assertIn("<|im_system|>tool<|im_middle|>", rendered)
+        self.assertNotIn("<|im_system|>system<|im_middle|>", rendered)
         self.assertIn("## Return of a\n42", rendered)
         self.assertIn("<|im_end|>", rendered)
+
+    def test_a_named_tool_result_turn(self):
+        """The name the client sends is the name the turn opens with."""
+        segs = self.render([
+            {"role": "tool", "content": "42", "tool_call_id": "a",
+             "name": "get_weather"}
+        ])
+
+        rendered = "".join(s.text for s in segs)
+
+        self.assertIn("<|im_system|>get_weather<|im_middle|>", rendered)
+        self.assertIn("## Return of a\n42", rendered)
 
     def test_an_assistant_turn_carrying_tool_calls(self):
         segs = self.render([

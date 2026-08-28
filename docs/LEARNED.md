@@ -5358,3 +5358,57 @@ The general form, and it is not about ties: **a check that reports only a
 verdict makes the next person re-derive the evidence.** Two of these three
 were investigated for hours against a bare FAIL. The fix each time was four
 numbers the check already had in hand.
+
+## 73. A protocol checked only against itself (2026-08-28)
+
+PR #50 added Kimi K2's native tool-call rendering to `serve/chatfmt.py`,
+with 438 lines of tests. Every one of them passed. The rendering was wrong.
+
+The tests were self-consistent: they fed the renderer's output to the
+parser and asserted the parser read back what the renderer wrote. That
+agrees with itself whatever the format is, which is the whole problem —
+`test_chatfmt.py` even *pinned* the defect, asserting
+`<|im_system|>system<|im_middle|>` for a tool result turn.
+
+K2's published `chat_template.jinja` says
+`<|im_system|>{{ message.get('name') or message['role'] }}<|im_middle|>`.
+So a result carrying `name` opens a turn named for the **function**, one
+without it opens `tool`, and never `system` — which is what `chat.json`'s
+system prefix carries and what the PR substituted for it. Rendering the
+same conversation both ways, everything else was **byte-identical**: the
+`tool_declare` turn with compact separators, the id alone after
+`<|tool_call_begin|>`, the arguments, the section close, the generation
+prompt. One line out of the protocol, and no self-consistent test could
+ever see it.
+
+The reason this needed an oracle at all is worth stating, because it is
+backwards from the usual case. **Kimi-Linear's release ships the five
+tool-call tokens and no `chat_template` whatsoever.** The vocabulary is
+declared and the grammar is not. `chatfmt.py`'s own docstring had said so
+and refused to guess ("the markup Kimi-Linear's tokenizer carries for it is
+not transcribed anywhere in this repo"). The grammar is K2's, K2 publishes
+it, and `tests/serve/test_chatfmt_upstream.py` now diffs against it — the
+same thing `test_xtml.TestAgainstUpstream` does for K3, and the cheapest
+oracle in the repo: a 2 KB template plus `examples/chat-kimi-linear.json`,
+no weights and no container.
+
+Evidence that the two formats are the same family, which is the part
+nothing can prove outright: `chat-kimi-linear.json` was written
+independently from Kimi-Linear's own specials, and renders plain
+conversation **byte-identically** to K2's template. Two formats that agree
+exactly on the part that is checkable are good reason to believe they agree
+on the part that is not.
+
+One divergence is deliberate and asserted rather than fixed: with no system
+turn first, K2's template inserts Moonshot's own system prompt. A server
+rendering an arbitrary container's `chat.json` has no business inventing
+that, so the test states the difference instead of forbidding it.
+
+The differential also caught a defect of *mine* within minutes of existing.
+Resolving the merge left `segments: list[Segment] = []` running after the
+tool declaration had been appended to it, so a declared tool rendered as
+nothing at all — silently, since the conversation still came out valid.
+§71 and §72 were about checks that report a verdict without evidence; this
+is the other half. **A test that only compares a thing to itself is not a
+weak oracle, it is not an oracle**, and the three protocols this repo
+renders now each have one.
