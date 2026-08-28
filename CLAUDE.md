@@ -69,7 +69,10 @@ the same token ids run.sh uses**, or a mismatched dump looks exactly like an
 engine bug; setting it also turns off both generating an oracle from the
 container and the provenance check on the shipped fixture, so it is the one
 way to compare against weights that are not the ones under test), `K3_DIR`
-(the K3 release directory, for the XTML differential).
+(the K3 release directory, for the XTML differential), `K2_DIR`
+(a Kimi-K2 release directory — only its `chat_template.jinja` is
+read, and it is the grammar for the tool markers Kimi-Linear's
+tokenizer carries and its own release never spells out).
 
 **On a MoE, never compare two paths by the distance between their logits
 alone.** A top-K router turns an arbitrarily small arithmetic difference
@@ -103,6 +106,7 @@ tests/route_diff.py --ref a.route --other b.route --scores a.scores
 python3 -m unittest discover -s tests/serve -t . -p "test_*.py"   # all serve tests
 python3 -m unittest tests.serve.test_regions -t .                 # one module
 K3_DIR=... python3 -m unittest tests.serve.test_xtml.TestAgainstUpstream -t .
+K2_DIR=... uv run --with jinja2 python -m unittest tests.serve.test_chatfmt_upstream
 ```
 
 Python reference checks run through `uv run --with torch --no-project` —

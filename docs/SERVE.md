@@ -136,17 +136,39 @@ startup the server asks for the richer format first and falls back:
 
 ```
 chat     from ~/models/kimi-linear.waste/chat.json — plain conversation, no reasoning channel,
-         no images, no tools
+         no images, native tools
 chat     from ~/models/glm53.waste/chat.json — plain conversation, a reasoning channel,
          images, no tools
 ```
 
-Plain means plain: system / user / assistant turns, blocking and streaming.
-Everything the format cannot express is refused with a 400 that names the
-field — `tools`, a tool result turn, an image part on a format with no
-`image` block. None of it is silently
-dropped; a server that ignores `reasoning_effort` reports a different
-amount of reasoning than it did.
+The three capabilities are read from the container, never assumed: the
+channel and the images from `chat.json`, the tools from whether the
+tokenizer carries **all five** of Kimi's native tool-call markers as single
+tokens. Kimi-Linear does; GLM does not, and is refused by name.
+
+That last one is a rendering `chat.json` itself cannot describe — four
+prefix/suffix strings say nothing about a tool declaration or an argument
+list — so the protocol lives in `serve/chatfmt.py` and is enabled only when
+the whole marker set resolves. **It is Kimi K2's**, and it is checked
+against K2's own published `chat_template.jinja` rather than transcribed
+from memory: `tests/serve/test_chatfmt_upstream.py`, which `tests/run.sh`
+runs whenever `K2_DIR` names a release directory, the same discipline
+`test_xtml.TestAgainstUpstream` applies to K3 with `K3_DIR`. Kimi-Linear's
+own release carries the five tokens and **no chat template at all**, which
+is why the grammar has to come from K2 and why an oracle for it matters
+more than usual.
+
+One difference from that template is deliberate and asserted rather than
+fixed: with no system turn first, K2's template inserts Moonshot's own
+system prompt. A server rendering an arbitrary container's `chat.json` has
+no business inventing that.
+
+Plain conversation otherwise means plain: system / user / assistant turns,
+blocking and streaming. Everything the format cannot express is refused
+with a 400 that names the field — `tools` on a container without the
+markers, an image part on a format with no `image` block. None of it is
+silently dropped; a server that ignores `reasoning_effort` reports a
+different amount of reasoning than it did.
 
 Three of the fields exist because GLM's format cannot be written without
 them, and each is optional and absent on both Kimi formats:

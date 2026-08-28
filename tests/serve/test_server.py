@@ -845,3 +845,159 @@ class TestConcurrency(ServerTestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+# Kimi K2 native tool protocol over the real HTTP surface
+# ---------------------------------------------------------------------------
+
+class TestKimiK2ToolsFromChatJson(TestChatFromChatJson):
+
+    KIMI_K2_MARKERS = {
+        **LINEAR_MARKERS,
+        21: "<|tool_calls_section_begin|>",
+        22: "<|tool_calls_section_end|>",
+        23: "<|tool_call_begin|>",
+        24: "<|tool_call_argument_begin|>",
+        25: "<|tool_call_end|>",
+    }
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="serve-kimi-k2-tools-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+        shutil.copyfile(
+            REPO / "examples" / "chat-kimi-linear.json",
+            Path(self.dir) / "chat.json",
+        )
+
+        self.engine_kwargs = {
+            "no_markers": True,
+            "model_path": self.dir,
+            "markers": dict(self.KIMI_K2_MARKERS),
+        }
+
+        ServerTestCase.setUp(self)
+
+    def test_tools_are_refused_by_name(self):
+        """Kimi K2 overrides the base refusal: native markers enable tools."""
+        self.engine.reply = self.kimi_tool_reply()
+
+        status, body = self.chat(tools=[{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object"},
+            },
+        }])
+
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body["choices"][0]["finish_reason"],
+            "tool_calls",
+        )
+
+    @staticmethod
+    def kimi_tool_reply():
+        return (
+            "I'll check the weather."
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>"
+            "functions.get_weather:0"
+            "<|tool_call_argument_begin|>"
+            '{"city":"Paris"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+            "<|im_end|>"
+        )
+
+    def test_kimi_k2_tool_call_non_streaming(self):
+        self.engine.reply = self.kimi_tool_reply()
+
+        status, body = self.chat(tools=[{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object"},
+            },
+        }])
+
+        self.assertEqual(status, 200)
+
+        choice = body["choices"][0]
+
+        self.assertEqual(
+            choice["finish_reason"],
+            "tool_calls",
+        )
+
+        self.assertEqual(
+            choice["message"]["content"],
+            "I'll check the weather.",
+        )
+
+        calls = choice["message"]["tool_calls"]
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0]["function"]["name"],
+            "get_weather",
+        )
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]),
+            {"city": "Paris"},
+        )
+
+    def test_kimi_k2_tool_call_streaming(self):
+        self.engine.reply = self.kimi_tool_reply()
+
+        events = self.stream(tools=[{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object"},
+            },
+        }])
+
+        content = ""
+        name = None
+        arguments = ""
+        index = None
+
+        for event in events[:-1]:
+            for choice in event.get("choices", []):
+                delta = choice.get("delta", {})
+
+                content += delta.get("content", "")
+
+                for call in delta.get("tool_calls", []):
+                    index = call.get("index", index)
+
+                    fn = call.get("function", {})
+
+                    if fn.get("name"):
+                        name = fn["name"]
+
+                    arguments += fn.get("arguments", "")
+
+        self.assertEqual(
+            content,
+            "I'll check the weather.",
+        )
+        self.assertEqual(index, 0)
+        self.assertEqual(name, "get_weather")
+        self.assertEqual(
+            json.loads(arguments),
+            {"city": "Paris"},
+        )
+
+        reasons = [
+            choice["finish_reason"]
+            for event in events[:-1]
+            if isinstance(event, dict)
+            for choice in event.get("choices", [])
+            if choice.get("finish_reason")
+        ]
+
+        self.assertEqual(reasons, ["tool_calls"])
+        self.assertEqual(events[-1], "[DONE]")

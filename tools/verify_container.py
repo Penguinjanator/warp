@@ -109,8 +109,27 @@ def main():
         bank = open(os.path.join(args.container, meta["file"]), "rb").read()
         assert len(bank) == meta["bytes"]
         shapes = []
-        for _kind, tag in KINDS:
-            t = sr.tensor(f"{prefix}model.layers.{L}.block_sparse_moe.experts.0.{tag}.weight")
+
+        deepseek_probe = (
+            f"{prefix}model.layers.{L}.mlp.experts.0.gate_proj.weight"
+        )
+        use_deepseek_names = sr.have(deepseek_probe)
+
+        if use_deepseek_names:
+            src_kinds = (
+                ("gate", "gate_proj"),
+                ("up", "up_proj"),
+                ("down", "down_proj"),
+            )
+            moe_segment = "mlp"
+        else:
+            src_kinds = KINDS
+            moe_segment = "block_sparse_moe"
+
+        for _kind, tag in src_kinds:
+            t = sr.tensor(
+                f"{prefix}model.layers.{L}.{moe_segment}.experts.0.{tag}.weight"
+            )
             shapes.append(tuple(t.shape))
 
         off, checked = 0, 0
@@ -119,8 +138,10 @@ def main():
                                            meta["codebook_base"], stages, shapes,
                                            man["expert_quant"].get("index_block", 0))
             assert off % ALIGN == 0, f"record {eid} not 4 KiB aligned"
-            for i, (kind, tag) in enumerate(KINDS):
-                W = sr.tensor(f"{prefix}model.layers.{L}.block_sparse_moe.experts.{eid}.{tag}.weight")
+            for i, (kind, tag) in enumerate(src_kinds):
+                W = sr.tensor(
+                    f"{prefix}model.layers.{L}.{moe_segment}.experts.{eid}.{tag}.weight"
+                )
                 err = (W - rec[kind]).norm() / W.norm()
                 flag = "ok " if err < 0.30 else "BAD"
                 if err >= 0.30:
