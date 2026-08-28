@@ -2012,12 +2012,32 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                                     &m->direct_io);
                 if (sfd < 0) { js_free(&d); free(src); return -1; }
                 /* Experts round-robin, so shard s holds ids s, s+N, s+2N ...
-                 * and that is ceil((n_experts - s) / N) records. */
+                 * and that is ceil((n_experts - s) / N) records.
+                 *
+                 * waste_dio_alloc, not a stack array. O_DIRECT rejects every
+                 * transfer whose *buffer* is unaligned, not only its offset
+                 * and length — the rule bank_probe below is written for, and
+                 * the reason it allocates rather than declaring. A stack
+                 * buffer here passed on macOS, whose F_NOCACHE has no buffer
+                 * requirement, and on the x86_64 CI runner, whose filesystem
+                 * declines O_DIRECT and falls back to buffered. On
+                 * linux-arm64, where the bypass is real, it turned every
+                 * container load into an I/O error: 25 passed, 29 failed.
+                 * Two platforms agreeing is not coverage when only the third
+                 * exercises the path.
+                 *
+                 * Skipped unless a record is a whole number of blocks, since
+                 * then the offset itself is one O_DIRECT would refuse, and a
+                 * refusal the device made is not evidence about the shard. */
                 const int recs = (m->bank[L].n_experts - s + n_sh - 1) / n_sh;
-                if (recs > 0) {
-                    uint8_t probe[WASTE_ALIGN];
+                if (recs > 0 && m->bank[L].rec_bytes >= (int64_t)WASTE_ALIGN &&
+                    m->bank[L].rec_bytes % (int64_t)WASTE_ALIGN == 0) {
+                    void *probe = waste_dio_alloc(WASTE_ALIGN);
+                    if (!probe) { close(sfd); js_free(&d); free(src); return -1; }
                     const int64_t last = (int64_t)(recs - 1) * m->bank[L].rec_bytes;
-                    if (waste_pread(sfd, probe, WASTE_ALIGN, last) != WASTE_ALIGN) {
+                    const int64_t got = waste_pread(sfd, probe, WASTE_ALIGN, last);
+                    waste_dio_free(probe);
+                    if (got != (int64_t)WASTE_ALIGN) {
                         close(sfd);
                         js_free(&d); free(src); return -1;
                     }
