@@ -42,8 +42,8 @@
 
 /* ---- lightweight phase profiling (WASTE_PROFILE=1) --------------------- */
 #include <time.h>
-double waste_prof[16];
-uint64_t waste_prof_n[16];
+double waste_prof[32];
+uint64_t waste_prof_n[32];
 uint64_t waste_tmv_bytes;
 int *waste_route_cap; int waste_route_n, waste_route_cap_n;
 /* WASTE_TRUNK_CHECK=1: run the f32 reference beside whichever quantized
@@ -58,8 +58,18 @@ unsigned long long waste_tcheck_n;
 /* matvec_t by call size: [<1MB, <8MB, <32MB, rest] */
 double waste_tmv_t[4];
 uint64_t waste_tmv_b[4], waste_tmv_c[4];
+/* Slots are read by number in tests/test_forward.c and tests/sweep.c, so a
+ * phase is appended, never inserted. Qwen reuses the roles it shares with
+ * Kimi — P_KDA is its recurrent layer (GDN), P_MLA its attention layer
+ * (QSA), P_KDAK the recurrence inside the first, P_ROUTE the whole MoE —
+ * and gets slots of its own for the pieces nothing else has. */
 enum { P_LUTB, P_KDA, P_MLA, P_ROUTE, P_EDEQ, P_EMM, P_HEAD, P_LUTA, P_MM,
-       P_TMV, P_KDAK };
+       P_TMV, P_KDAK,
+       P_QHC,     /* HyperConnection mixes and combines, final mixer too */
+       P_QPLE,    /* n-gram embedding: row reads, projections, conv      */
+       P_QSHX,    /* shared expert and its gate                          */
+       P_QSAK,    /* QSA block selection, K/V gather, attention          */
+       P_QRTR };  /* router projection and top-k                         */
 static int prof_on = -1;
 static pthread_mutex_t prof_mu = PTHREAD_MUTEX_INITIALIZER;
 static double pnow(void)
@@ -6097,11 +6107,13 @@ static void qwen_gdn_layer(waste_model *m, int L, const float *in, float *out)
     const waste_tensor *tdt = waste_find(m, tname("%smodel.layers.%d.linear_attn.dt_bias",
                                                   c->prefix, L));
     if (!tA || !tA->data || !tdt || !tdt->data) return;
+    PROF_START(P_KDAK);
     waste_qwen_gdn_decay(a, tA->data, tdt->data, Hv, m->gdn_g);
     const float *q = conv_y;
     const float *k = conv_y + Hk * Dk;
     const float *v = conv_y + 2 * Hk * Dk;
     waste_qwen_gdn_step(Hk, Hv, Dk, Dv, q, k, v, m->gdn_g, b, m->S[L], core, m->att);
+    PROF_END(P_KDAK);
     const waste_tensor *tnw = waste_find(m, tname("%smodel.layers.%d.linear_attn.norm.weight",
                                                   c->prefix, L));
     if (!tnw || !tnw->data) return;
@@ -6188,6 +6200,7 @@ static void qwen_qsa_layer(waste_model *m, int L, const float *in, float *out, i
     m->n_qsa_blk[L] = compress > 0 ? T / compress : 0;
     m->n_qsa_tail[L] = compress > 0 ? T % compress : 0;
 
+    PROF_START(P_QSAK);
     const int block_topk = c->idx_budget / compress;
     float *full_cos = m->qsa_cs;
     float *full_sin = m->qsa_cs + (size_t)m->kv_cap * (rot > 0 ? rot : 1);
@@ -6215,6 +6228,7 @@ static void qwen_qsa_layer(waste_model *m, int L, const float *in, float *out, i
                             1.0f / sqrtf((float)D), attn, scr);
     else
         memset(attn, 0, (size_t)qd * sizeof(float));
+    PROF_END(P_QSAK);
     for (int i = 0; i < qd; i++)
         attn[i] *= 1.0f / (1.0f + expf(-gate[i]));
     matvec_t(m, out, waste_find(m, tname("%smodel.layers.%d.self_attn.o_proj.weight",
@@ -6226,11 +6240,15 @@ static void qwen_moe_layer(waste_model *m, int L, const float *in, float *out, i
     const waste_config *c = &m->cfg;
     const int E = c->n_experts, K = c->top_k, hid = c->hidden, inter = c->moe_inter;
     float *sc = m->att + WASTE_ATT_ROUTER_OFF;
-    matvec_t(m, sc, waste_find(m, tname("%smodel.layers.%d.mlp.gate.weight",
-                                        c->prefix, L)), in, E, hid);
     int idx[64];
     float w[64];
-    if (waste_qwen_moe_route(sc, E, K, c->renorm, idx, w, m->moe_prob, m->moe_used) != 0) {
+    PROF_START(P_QRTR);
+    matvec_t(m, sc, waste_find(m, tname("%smodel.layers.%d.mlp.gate.weight",
+                                        c->prefix, L)), in, E, hid);
+    const int route_rc = waste_qwen_moe_route(sc, E, K, c->renorm, idx, w,
+                                              m->moe_prob, m->moe_used);
+    PROF_END(P_QRTR);
+    if (route_rc != 0) {
         memset(out, 0, (size_t)hid * sizeof(float));
         return;
     }
@@ -6298,11 +6316,13 @@ static void qwen_moe_layer(waste_model *m, int L, const float *in, float *out, i
         if (ok) {
             /* Summed in j order, so the total does not depend on the
              * thread count or the batch size. */
+            PROF_START(P_EMM);
             for (int j = 0; j < K; j++) {
                 const float *accj = m->xacc + (size_t)j * hid;
                 const float wj = w[j];
                 for (int i = 0; i < hid; i++) out[i] += wj * accj[i];
             }
+            PROF_END(P_EMM);
             goto qwen_moe_done;
         }
         /* Something did not read: let go of what was held and fall through
@@ -6312,10 +6332,13 @@ static void qwen_moe_layer(waste_model *m, int L, const float *in, float *out, i
 
     int lut_ready = 0;
     for (int j = 0; j < K; j++) {
+        PROF_START(P_EDEQ);
         const uint8_t *rec = read_expert(m, L, idx[j]);
+        PROF_END(P_EDEQ);
         if (!rec) break;
         const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
         const uint16_t *corr = (const uint16_t *)(rec + h->chan_corr_off);
+        PROF_START(P_EMM);
         if (!lut_ready) {
             vq_build_lut(m, lut_gate, h->codebook_id + 0 * m->stages,
                          in, hid, m->stages, m->cb_entries, m->vec_dim, NULL, NULL);
@@ -6330,8 +6353,10 @@ static void qwen_moe_layer(waste_model *m, int L, const float *in, float *out, i
                   h->codebook_id + 2 * m->stages, lut_down, NULL, NULL);
         const float wj = w[j];
         for (int i = 0; i < hid; i++) out[i] += wj * acc[i];
+        PROF_END(P_EMM);
     }
 qwen_moe_done: ;
+    PROF_START(P_QSHX);
     const int shared = c->shared_inter ? c->shared_inter : inter;
     ffn(m,
         waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.gate_proj.weight", c->prefix, L)),
@@ -6347,6 +6372,7 @@ qwen_moe_done: ;
                                          c->prefix, L)), in, 1, hid);
     sg = 1.0f / (1.0f + expf(-sg));
     for (int i = 0; i < hid; i++) out[i] += sg * acc[i];
+    PROF_END(P_QSHX);
 }
 
 static const float *qwen_step(waste_model *m, int token, int pos, int *routed)
@@ -6365,26 +6391,55 @@ static const float *qwen_step(waste_model *m, int token, int pos, int *routed)
     float *block = m->h;
     for (int L = 0; L < c->n_layers; L++) {
         if (m->read_error) break;
-        if (L == c->ple_layer) qwen_ple_inject(m, token);
+        if (L == c->ple_layer) {
+            PROF_START(P_QPLE);
+            qwen_ple_inject(m, token);
+            PROF_END(P_QPLE);
+        }
         float inj[16];
-        qwen_hc_mix_t(m, m->hcx,
-            waste_find(m, tname("%smodel.layers.%d.attn_hyper_connection.hc_norm.weight", c->prefix, L)),
-            waste_find(m, tname("%smodel.layers.%d.attn_hyper_connection.input_mix_weight_down.weight", c->prefix, L)),
-            waste_find(m, tname("%smodel.layers.%d.attn_hyper_connection.input_mix_weight_up.weight", c->prefix, L)),
-            waste_find(m, tname("%smodel.layers.%d.attn_hyper_connection.block_inject_weight.weight", c->prefix, L)),
-            1, m->x, inj);
-        if (!c->qwen_full[L]) qwen_gdn_layer(m, L, m->x, block);
-        else qwen_qsa_layer(m, L, m->x, block, pos);
-        waste_qwen_hc_combine(m->hcx, block, inj, hc, hid, m->hcx);
-
-        qwen_hc_mix_t(m, m->hcx,
-            waste_find(m, tname("%smodel.layers.%d.mlp_hyper_connection.hc_norm.weight", c->prefix, L)),
-            waste_find(m, tname("%smodel.layers.%d.mlp_hyper_connection.input_mix_weight_down.weight", c->prefix, L)),
-            waste_find(m, tname("%smodel.layers.%d.mlp_hyper_connection.input_mix_weight_up.weight", c->prefix, L)),
-            waste_find(m, tname("%smodel.layers.%d.mlp_hyper_connection.block_inject_weight.weight", c->prefix, L)),
-            1, m->x, inj);
-        qwen_moe_layer(m, L, m->x, block, routed ? routed + (size_t)L * c->top_k : NULL);
-        waste_qwen_hc_combine(m->hcx, block, inj, hc, hid, m->hcx);
+        /* The braces are for PROF_START, which declares its start time:
+         * HyperConnection is timed in three pieces per layer, and each
+         * needs a scope of its own. */
+        {
+            PROF_START(P_QHC);
+            qwen_hc_mix_t(m, m->hcx,
+                waste_find(m, tname("%smodel.layers.%d.attn_hyper_connection.hc_norm.weight", c->prefix, L)),
+                waste_find(m, tname("%smodel.layers.%d.attn_hyper_connection.input_mix_weight_down.weight", c->prefix, L)),
+                waste_find(m, tname("%smodel.layers.%d.attn_hyper_connection.input_mix_weight_up.weight", c->prefix, L)),
+                waste_find(m, tname("%smodel.layers.%d.attn_hyper_connection.block_inject_weight.weight", c->prefix, L)),
+                1, m->x, inj);
+            PROF_END(P_QHC);
+        }
+        if (!c->qwen_full[L]) {
+            PROF_START(P_KDA);
+            qwen_gdn_layer(m, L, m->x, block);
+            PROF_END(P_KDA);
+        } else {
+            PROF_START(P_MLA);
+            qwen_qsa_layer(m, L, m->x, block, pos);
+            PROF_END(P_MLA);
+        }
+        {
+            PROF_START(P_QHC);
+            waste_qwen_hc_combine(m->hcx, block, inj, hc, hid, m->hcx);
+            qwen_hc_mix_t(m, m->hcx,
+                waste_find(m, tname("%smodel.layers.%d.mlp_hyper_connection.hc_norm.weight", c->prefix, L)),
+                waste_find(m, tname("%smodel.layers.%d.mlp_hyper_connection.input_mix_weight_down.weight", c->prefix, L)),
+                waste_find(m, tname("%smodel.layers.%d.mlp_hyper_connection.input_mix_weight_up.weight", c->prefix, L)),
+                waste_find(m, tname("%smodel.layers.%d.mlp_hyper_connection.block_inject_weight.weight", c->prefix, L)),
+                1, m->x, inj);
+            PROF_END(P_QHC);
+        }
+        {
+            PROF_START(P_ROUTE);
+            qwen_moe_layer(m, L, m->x, block, routed ? routed + (size_t)L * c->top_k : NULL);
+            PROF_END(P_ROUTE);
+        }
+        {
+            PROF_START(P_QHC);
+            waste_qwen_hc_combine(m->hcx, block, inj, hc, hid, m->hcx);
+            PROF_END(P_QHC);
+        }
         /* Same role as the Kimi dump in waste_model_step: one residual
          * stream after every layer. Qwen's stream is the hc hyper-state. */
         const char *dump_hidden = getenv("WASTE_DUMP_HIDDEN");
@@ -6396,13 +6451,17 @@ static const float *qwen_step(waste_model *m, int token, int pos, int *routed)
             }
         }
     }
+    PROF_START(P_QHC);
     qwen_hc_mix_t(m, m->hcx,
         waste_find(m, tname("%smodel.hyper_connection_mixer.hc_norm.weight", c->prefix)),
         waste_find(m, tname("%smodel.hyper_connection_mixer.input_mix_weight_down.weight", c->prefix)),
         waste_find(m, tname("%smodel.hyper_connection_mixer.input_mix_weight_up.weight", c->prefix)),
         NULL, 0, m->x, NULL);
+    PROF_END(P_QHC);
+    PROF_START(P_HEAD);
     matvec_t(m, m->logits, waste_find(m, tname("%slm_head.weight", c->prefix)), m->x,
              c->vocab, hid);
+    PROF_END(P_HEAD);
     return m->read_error ? NULL : m->logits;
 }
 

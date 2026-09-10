@@ -152,6 +152,12 @@ int8 lookup table raises the bar that far.
 
 Profiling a decode step:
 `WASTE_PROFILE=1 WASTE_CACHE_MB=17735 ./test_forward MODEL ids out.bin 5`.
+`WASTE_PROFILE=decode` leaves the prompt steps out — they are the ones that
+find the cache empty, so on a short run they are most of the expert I/O. A
+Qwen container prints its own phase tree (HyperConnection, PLE, GDN, QSA,
+router, shared expert) with ms/step; the gap between `wall` and `accounted`
+is what no phase covers, and more than a few percent means a phase is
+missing.
 
 ## Architecture
 

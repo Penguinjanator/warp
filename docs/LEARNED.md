@@ -5466,3 +5466,97 @@ into a tolerance: 4e-3 is close to bf16's epsilon and nothing in that path
 should be rounding to bf16. The suite gates at the measured value so the
 number cannot grow while nobody is looking, which is the least a check can
 do about a thing it does not understand.
+
+## 75. Where a Qwen decode step goes, and a cache curve that climbs to 17 GiB (2026-09-11)
+
+`WASTE_PROFILE` stopped at Qwen's door. The forward pass had timers only
+in the expert-parallel branch of its MoE, so §74 could say how fast a token
+was and not where it went. It now times HyperConnection, PLE, GDN with its
+recurrence as a sub-phase, QSA with block selection and attention as a
+sub-phase, the router, the shared expert and the head, and both routed
+expert paths rather than one. The new phases take slots after the old ones
+— `tests/sweep.c` reads slots by number — and `test_forward` prints Qwen's
+as a tree with ms/step and a `wall` line. `WASTE_PROFILE=decode` leaves
+out the prompt steps, which are the ones that find the cache empty.
+
+The timers change nothing they time: final logits and every generated token
+are byte-identical with profiling on and off, on both MoE paths of the
+synthetic Qwen fixture. Their cost is inside run-to-run noise — 7.03 against
+7.01 tok/s at a 16 GiB cache and 6.35 against 6.33 at 8 GiB, profile on
+first — and the phases account for 99.9–100% of wall time on the real
+container, so the tree is not missing a branch.
+
+Everything below: the pinned checkpoint, an M4 Pro with 8 performance and
+4 efficiency cores, 48 GiB, the container on the internal SSD; an 18-token
+prompt, 200 greedy decode tokens, `WASTE_THREADS=8`, `test_forward`, one
+process per arm.
+
+**Where 141.5 ms goes**, at a 16 GiB cache and 7.03 tok/s:
+
+| phase | ms/step |
+|---|---:|
+| MoE, all of it | 67.5 |
+| ├ routed expert arithmetic | 52.2 |
+| ├ routed expert I/O | 6.6 |
+| ├ shared expert | 6.4 |
+| └ router | 2.1 |
+| GDN | 35.7 |
+| └ recurrence | 5.4 |
+| HyperConnection | 18.0 |
+| QSA | 13.3 |
+| └ selection and attention | 4.0 |
+| lm_head | 6.5 |
+| PLE | 0.6 |
+
+Expert I/O is 5% of that step, and 11% (17.3 ms) of the same step at 8 GiB.
+At either size Qwen on this machine is bound by arithmetic, not by the disk.
+
+Two rows are not what their names suggest. Only 5.4 of GDN's 35.7 ms is the
+recurrence; the rest is five projections, a short conv and a gated norm.
+And the trunk matvecs, spread across every row, are 154,600 calls in 200
+steps — 500 GB at 37.4 GB/s overall, but 17.1 GB/s below 1 MB, 31.0 from 1
+to 8 MB, 39.0 from 8 to 32 MB, and 98.3 for the head alone above that. The
+small calls are slow per byte, and `WASTE_WIDE_MIN` is not why: with eight
+threads on eight performance cores the fast group is the whole pool. What
+they have in common is a dispatch each. GDN's four input projections read
+the same vector, as do HyperConnection's down and inject projections, and
+they are four and two dispatches where one would do.
+
+**The cache curve**, profile off; hit rates and bytes are the whole run,
+prompt included:
+
+| expert cache | tok/s | hit rate | evictions | read | peak RSS |
+|---:|---:|---:|---:|---:|---:|
+| 8 GiB | 6.33 | 80.3% | 16,013 | 35.61 GB | — |
+| 12 GiB | 6.86 | 88.0% | 5,637 | 21.72 GB | 15.70 GB |
+| 16 GiB | 7.01 | 90.3% | 914 | 17.58 GB | 20.01 GB |
+| 20 GiB | 7.06 | 90.4% | 0 | 17.33 GB | 21.46 GB |
+| 24 GiB | 7.07 | 90.4% | 0 | 17.33 GB | 21.48 GB |
+
+`WASTE_DUMP_ROUTE` over the same run gives the number the curve bends at:
+10,049 distinct records, 17.33 GiB. At 8 GiB, 10,603 of the 20,652 misses
+were re-reads of records the cache had evicted; at 16 GiB, 144 of 10,193.
+Past the distinct set nothing is left to miss but first use, which is why
+20 and 24 GiB read exactly the same 17.33 GB.
+
+That set belongs to the session, not the architecture. New records per
+token: 188 across the prompt, 74 over decode tokens 0–49, 29 over 50–99,
+and 15 over both 100–149 and 150–199 — still about 28 MB a token when the
+run stopped. The pre-rewrite branch
+(`archive/qwen38-flash-next-pre-rewrite-20260904`) measured 95.39% at 8 GiB
+over 216 tokens of a different prompt that touched 4,783 records; the same
+cache size is 95% or 80% depending on what is being written. On 48 GiB a
+20 GiB cache peaked at 21.5 GB resident with no swap, so this machine holds
+the whole distinct set of a run this long, and a longer one will keep
+asking for more.
+
+**§74's flat top does not survive a longer run.** §74 measured 4.97 tok/s
+at 8 GiB and 4.92 at 16 over 48 tokens and concluded that above 8 GiB a
+better hit rate buys nothing. Over 200 tokens the same step is worth 11%
+(6.33 to 7.01). The runs differ in length, prompt and thread count, and
+this entry does not isolate which of those flattened §74's curve.
+
+**The first PLE number was a cold page cache.** 3.54 ms/step on the first
+run after the container came back from network storage, 0.58 on every run
+after it. `trunk.bin` is opened without `F_NOCACHE`, unlike the expert
+banks, so on-disk n-gram rows go through the page cache.
