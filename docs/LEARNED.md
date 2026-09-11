@@ -5560,3 +5560,69 @@ this entry does not isolate which of those flattened §74's curve.
 run after the container came back from network storage, 0.58 on every run
 after it. `trunk.bin` is opened without `F_NOCACHE`, unlike the expert
 banks, so on-disk n-gram rows go through the page cache.
+
+## 76. One dispatch per Qwen layer, when the cache already holds it (2026-09-11)
+
+The pre-rewrite branch had two measured Qwen CPU defaults that the rewrite
+dropped: the expert-parallel path forced on at a batch of four (+12.8%),
+and a "one-join layer job" that held all ten routed records and ran them in
+one pool dispatch (+10.9% on top). Both were measured at a 95.39% hit rate,
+and neither ports as it was.
+
+The layer job needs no port at all. Its CPU half holds all K records,
+builds the gate and up tables once and hands all K to one
+`waste_parallel_for` — which is this branch's expert-parallel loop with a
+batch of K. Its struct was a seam for a Metal backend; the CPU speed was
+the batch. So both changes could be measured from the environment before
+writing any code, on §75's protocol, 16 GiB arms alternated:
+
+| arm | 16 GiB tok/s | 8 GiB tok/s |
+|---|---:|---:|
+| cache decides, batch 4 (the default) | 7.00, 6.94, 7.10, 7.01 | 6.35 |
+| forced on, batch 4 | 6.85, 6.87 | — |
+| forced on, batch 10 | 7.34, 7.32 | 5.97 |
+| cache decides, batch 10 | 7.60, 7.48 | 6.52 |
+
+**Forcing the path is §44's barrier, measured on a third model.** Forced
+at batch 10 and 16 GiB, expert arithmetic fell from 52 to 34 ms a step and
+expert I/O rose from 6.3 to 19.3 ms, for 5%. At 8 GiB, where a fifth of the
+records miss, the same arm's I/O was 45.6 ms against 17.3 and the step lost
+6%. Forced at batch 4 it lost at 16 GiB as well. The archive's gains were
+real at 95% and are not a property of the model: at a lower hit rate the
+hold waits on reads that the row split would have overlapped.
+
+Letting the cache decide and then taking all ten keeps the arithmetic
+without the wait, because a layer only gets there with every record
+already held. It is now the Qwen default: `qwen_moe_layer` uses a batch of
+K when the cache chose the path, and a forced `WASTE_XPAR=1` or an explicit
+`WASTE_XPAR_BATCH` keeps the batch it was given. On that build, against
+`WASTE_XPAR_BATCH=4` in the same binary:
+
+| ms/step unless stated | 16 GiB | 16 GiB | 8 GiB |
+|---|---:|---:|---:|
+| tok/s, batch 4 → K | 7.08 → 7.65 | 7.02 → 7.50 | 6.34 → 6.52 |
+| MoE | 67.3 → 57.4 | 67.6 → 58.5 | 82.6 → 79.3 |
+| ├ expert arithmetic | 51.9 → 42.0 | 52.2 → 43.0 | 56.2 → 52.9 |
+| └ expert I/O | 6.6 → 6.6 | 6.5 → 6.4 | 17.3 → 17.2 |
+
++7.4% at 16 GiB and +2.8% at 8 GiB, the same bytes read, and no other phase
+moved by more than 0.6 ms. The gain is smaller at 8 GiB because fewer
+layers find all ten resident, and the path those layers take is unchanged.
+Kimi's and GLM's `moe_layer` keep a batch of four: the reasoning carries
+over, but nobody has measured it there.
+
+All 27 real-container runs in §75 and here generated the same 200 tokens.
+
+**Two harness mistakes, neither of which changed a conclusion.** The
+synthetic Qwen fixture opens with no expert cache under `test_forward`'s
+defaults, and the expert-parallel path needs four slots per routed expert.
+So every "both paths" comparison made on it — §75's profiling check and
+the first version of this entry's suite check — compared the row split with
+itself. With `WASTE_CACHE_MB=1`, 256 slots and the whole bank, the row
+split, forced batches of 4 and 64 and the default give identical logits and
+generated tokens with profiling on and off, and the forced arms record no
+LUT apply at all, which is how we know they took the parallel path. The
+suite check now sets that cache. And the token comparisons read the second
+whitespace field of `[  0] 248068`, which below step 100 is the step index,
+so they compared 100 tokens rather than 200. Re-read from the saved logs
+with the index stripped, all 200 agree in every run.

@@ -246,6 +246,7 @@ static inline void pf_wide(int bit, int n, int min_chunk, waste_range_fn fn,
     else waste_parallel_for(n, min_chunk, fn, arg);
 }
 static int xpar_batch = 4;             /* WASTE_XPAR_BATCH, see moe_layer  */
+static int xpar_batch_set = 0;         /* given explicitly; qwen_moe_layer */
 static pthread_once_t model_opts_once = PTHREAD_ONCE_INIT;
 
 static void model_opts_init(void)
@@ -355,6 +356,7 @@ static void model_opts_init(void)
     /* Experts held — and so barriered — at a time. Small keeps the reads
      * overlapping the arithmetic; large gives the pool more to chew on. */
     { const char *e2 = getenv("WASTE_XPAR_BATCH");
+      xpar_batch_set = e2 != NULL;
       xpar_batch = e2 ? atoi(e2) : 4;
       if (xpar_batch < 1) xpar_batch = 1;
       if (xpar_batch > WASTE_PF_MAX) xpar_batch = WASTE_PF_MAX; }
@@ -6275,16 +6277,27 @@ static void qwen_moe_layer(waste_model *m, int L, const float *in, float *out, i
      * already resident, and loses when holding a batch barriers the
      * read-ahead. Asked per layer and per token from the cache, not from
      * the architecture — see moe_layer, which explains what it decides on.
-     * WASTE_XPAR=0/1 still forces it either way. */
+     * WASTE_XPAR=0/1 still forces it either way.
+     *
+     * When it is the cache that said yes, every record is already there,
+     * so a batch has no barrier left to limit: all K go to the pool in one
+     * dispatch rather than three. At a 16 GiB cache that is 7.58 against
+     * 7.05 tok/s with the same bytes read, and 6.52 against 6.34 at 8 GiB
+     * (LEARNED §76). Forcing the path does not get the same thing: holding
+     * all ten before any arithmetic, whatever the cache holds, gained 5% at
+     * 16 GiB and lost 6% at 8, the I/O wait growing faster than the
+     * arithmetic shrank. A forced path, or an explicit WASTE_XPAR_BATCH,
+     * keeps the batch it was given. */
     const int xpar_here = xpar_on >= 0
         ? xpar_on
         : waste_ecache_resident_all(&m->cache, L, idx, K);
+    const int batch = xpar_on < 0 && !xpar_batch_set ? K : xpar_batch;
     if (xpar_here && m->xga && K > 1 && K <= WASTE_PF_MAX &&
         m->cache.n_slots >= 4 * K) {
         const uint8_t *recs[WASTE_PF_MAX];
         int lut_done = 0, ok = 1;
-        for (int j0 = 0; j0 < K; j0 += xpar_batch) {
-            int j1 = j0 + xpar_batch;
+        for (int j0 = 0; j0 < K; j0 += batch) {
+            int j1 = j0 + batch;
             if (j1 > K) j1 = K;
             PROF_START(P_EDEQ);
             int n = j0;

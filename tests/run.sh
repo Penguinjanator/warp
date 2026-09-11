@@ -1643,6 +1643,32 @@ else
         no "Qwen chunked prefill disagrees with sequential decode"
     fi
 
+    # Which way a Qwen layer's routed experts are scheduled — the row
+    # split, a batch of four, or every one of them in a single dispatch,
+    # which is what the default does once the cache holds them — is not a
+    # numerical choice, and must not become one: the answer would then
+    # depend on how warm the cache happened to be.
+    #
+    # The cache is set on purpose. test_forward's default is no cache at
+    # all, and the expert-parallel path needs four slots per routed expert,
+    # so without one every arm below runs the row split and the comparison
+    # is of a path against itself — which is how this check first passed.
+    # One MB is 256 slots on the fixture, its whole bank, preloaded.
+    QXIDS=3,7,11,5,3,7,11,5,3,7,11,5
+    WASTE_CACHE_MB=1 ./test_forward "$QWENC" "$QXIDS" "$TMP/qwen_xdef.bin" 0 >/dev/null 2>&1
+    WASTE_CACHE_MB=1 WASTE_XPAR=0 ./test_forward "$QWENC" "$QXIDS" "$TMP/qwen_xrows.bin" 0 >/dev/null 2>&1
+    WASTE_CACHE_MB=1 WASTE_XPAR=1 WASTE_XPAR_BATCH=4 ./test_forward "$QWENC" "$QXIDS" "$TMP/qwen_x4.bin" 0 >/dev/null 2>&1
+    WASTE_CACHE_MB=1 WASTE_XPAR=1 WASTE_XPAR_BATCH=64 ./test_forward "$QWENC" "$QXIDS" "$TMP/qwen_xall.bin" 0 >/dev/null 2>&1
+    if [ ! -s "$TMP/qwen_xdef.bin" ]; then
+        no "the Qwen expert-schedule comparison did not run"
+    elif cmp -s "$TMP/qwen_xdef.bin" "$TMP/qwen_xrows.bin" &&
+         cmp -s "$TMP/qwen_xdef.bin" "$TMP/qwen_x4.bin" &&
+         cmp -s "$TMP/qwen_xdef.bin" "$TMP/qwen_xall.bin"; then
+        ok "Qwen's row split, a batch of four and one dispatch per layer give the default's logits"
+    else
+        no "a Qwen expert schedule changes the logits"
+    fi
+
     # The hyper-state dump is what the container-native oracle diffs
     # against, so its shape is checked on its own: a dump of the wrong
     # length would make that comparison read the wrong layer.
