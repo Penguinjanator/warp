@@ -136,6 +136,13 @@ class TestLoad(Base):
         vocabulary. Serving it would answer plausibly and wrongly."""
         self.refuses(CHATML, contains="<|im_start|>")
 
+    def test_stop_marker_absent_from_role_strings_is_validated(self):
+        raw = json.loads(SHIPPED.read_text())
+        raw["stop"] = "<|separate_stop|>"
+        fmt = self.load(raw, markers={**LINEAR_MARKERS, 99: "<|separate_stop|>"})
+        self.assertEqual(fmt.stop_id, 99)
+        self.refuses(raw, contains="<|separate_stop|>")
+
     def test_a_missing_file_says_so(self):
         self.refuses(None, contains="no chat.json")
 
@@ -259,6 +266,7 @@ class TestRender(Base):
                      response_format={"type": "json_object"})
 
     def test_a_tool_result_turn(self):
+        self.fmt = self.load(SHIPPED, markers=KIMI_K2_MARKERS)
         segs = self.render([
             {"role": "tool", "content": "42", "tool_call_id": "a"}
         ])
@@ -272,6 +280,7 @@ class TestRender(Base):
 
     def test_a_named_tool_result_turn(self):
         """The name the client sends is the name the turn opens with."""
+        self.fmt = self.load(SHIPPED, markers=KIMI_K2_MARKERS)
         segs = self.render([
             {"role": "tool", "content": "42", "tool_call_id": "a",
              "name": "get_weather"}
@@ -283,6 +292,7 @@ class TestRender(Base):
         self.assertIn("## Return of a\n42", rendered)
 
     def test_an_assistant_turn_carrying_tool_calls(self):
+        self.fmt = self.load(SHIPPED, markers=KIMI_K2_MARKERS)
         segs = self.render([
             {
                 "role": "assistant",
