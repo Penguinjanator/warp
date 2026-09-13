@@ -25,13 +25,13 @@ void waste_qwen_gdn_decay(const float *a, const float *A_log, const float *dt,
     }
 }
 
-static void gdn_one(int Hv, int Dk, int Dv, int group,
-                    const float *q, const float *k, const float *v,
-                    const float *g_log, const float *beta,
-                    float *S, float *o, float *u)
+static void gdn_heads(int h0, int h1, int Dk, int Dv, int group,
+                      const float *q, const float *k, const float *v,
+                      const float *g_log, const float *beta,
+                      float *S, float *o, float *u)
 {
     const float qscale = 1.0f / sqrtf((float)Dk);
-    for (int h = 0; h < Hv; h++) {
+    for (int h = h0; h < h1; h++) {
         const int src = h / group;
         const float *qh = q + (size_t)src * Dk;
         const float *kh = k + (size_t)src * Dk;
@@ -65,8 +65,18 @@ void waste_qwen_gdn_step(int Hk, int Hv, int Dk, int Dv,
                          const float *g_log, const float *beta,
                          float *S, float *o, float *scratch)
 {
+    waste_qwen_gdn_step_heads(0, Hv, Hk, Hv, Dk, Dv, q, k, v, g_log, beta,
+                              S, o, scratch);
+}
+
+void waste_qwen_gdn_step_heads(int h0, int h1, int Hk, int Hv, int Dk, int Dv,
+                               const float *q, const float *k, const float *v,
+                               const float *g_log, const float *beta,
+                               float *S, float *o, float *scratch)
+{
     const int group = Hk > 0 ? Hv / Hk : 1;
-    gdn_one(Hv, Dk, Dv, group > 0 ? group : 1, q, k, v, g_log, beta, S, o, scratch);
+    gdn_heads(h0, h1, Dk, Dv, group > 0 ? group : 1, q, k, v, g_log, beta,
+              S, o, scratch);
 }
 
 void waste_qwen_gdn_forward(int T, int Hk, int Hv, int Dk, int Dv,

@@ -6225,6 +6225,22 @@ static void qwen_ple_inject(waste_model *m, int token)
     if (ctxn > 0) m->ple_prev[ctxn - 1] = token;
 }
 
+typedef struct {
+    int Hk, Hv, Dk, Dv;
+    const float *q, *k, *v, *g_log, *beta;
+    float *S, *o;
+} gdn_arg;
+
+enum { GDN_SCRATCH = 1024 };
+
+static void gdn_heads_range(int b, int e, void *p)
+{
+    const gdn_arg *a = (const gdn_arg *)p;
+    float u[GDN_SCRATCH];
+    waste_qwen_gdn_step_heads(b, e, a->Hk, a->Hv, a->Dk, a->Dv, a->q, a->k, a->v,
+                              a->g_log, a->beta, a->S, a->o, u);
+}
+
 static void qwen_gdn_layer(waste_model *m, int L, const float *in, float *out)
 {
     const waste_config *c = &m->cfg;
@@ -6264,7 +6280,19 @@ static void qwen_gdn_layer(waste_model *m, int L, const float *in, float *out)
     const float *q = conv_y;
     const float *k = conv_y + Hk * Dk;
     const float *v = conv_y + 2 * Hk * Dk;
-    waste_qwen_gdn_step(Hk, Hv, Dk, Dv, q, k, v, m->gdn_g, b, m->S[L], core, m->att);
+    /* One task per value head's range. On the calling thread this was 5.3 ms
+     * of a step — 147 us a layer, eighteen times the 8 us a pool worker waits
+     * before parking — between in_proj_qkv and out_proj, so it both ran on
+     * one core and put the pool to sleep for the projection after it. The
+     * heads share nothing but the QK rows they read (see qwen_gdn.h), and
+     * each runs the same code in the same order, so the state and output are
+     * the serial loop's bit for bit. */
+    if (Dv <= GDN_SCRATCH) {
+        gdn_arg ga = { Hk, Hv, Dk, Dv, q, k, v, m->gdn_g, b, m->S[L], core };
+        waste_parallel_for_fast(Hv, 1, gdn_heads_range, &ga);
+    } else {
+        waste_qwen_gdn_step(Hk, Hv, Dk, Dv, q, k, v, m->gdn_g, b, m->S[L], core, m->att);
+    }
     PROF_END(P_KDAK);
     const waste_tensor *tnw = waste_find(m, tname("%smodel.layers.%d.linear_attn.norm.weight",
                                                   c->prefix, L));

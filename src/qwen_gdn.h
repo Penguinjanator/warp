@@ -33,6 +33,15 @@ void waste_qwen_gdn_step(int Hk, int Hv, int Dk, int Dv,
                          const float *g_log, const float *beta,
                          float *S, float *o, float *scratch);
 
+/* Value heads [h0, h1) of one decode step; waste_qwen_gdn_step is this over
+ * [0, Hv). A head reads its own rows of v, g_log, beta and S (and the QK head
+ * it is repeated from) and writes only its own rows of S and o, so disjoint
+ * ranges may run at once — each with its own scratch of >= Dv. */
+void waste_qwen_gdn_step_heads(int h0, int h1, int Hk, int Hv, int Dk, int Dv,
+                               const float *q, const float *k, const float *v,
+                               const float *g_log, const float *beta,
+                               float *S, float *o, float *scratch);
+
 /* T decode steps, time-major inputs [T][H][*]. */
 void waste_qwen_gdn_forward(int T, int Hk, int Hv, int Dk, int Dv,
                             const float *q, const float *k, const float *v,

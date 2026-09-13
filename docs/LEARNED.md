@@ -5837,3 +5837,43 @@ One harness note, for whoever measures this next: the session scratchpad
 was emptied twice mid-session and took reference logs with it. Every
 comparison above ran in one command against a build of `HEAD` made with
 `git archive`, so none of it depends on a file surviving between runs.
+
+## 79. GDN's recurrence, one value head per task (2026-09-14)
+
+§78 ended on the largest serial stretch left in a Qwen decode step: GDN's
+recurrence, 5.3 ms a step on the calling thread — 147 µs in each of 36
+layers, between `in_proj_qkv` and `out_proj`. Its 48 value heads share
+nothing they write. A head reads its own rows of `v`, the decay and `beta`
+and of `S`, plus the QK head it is repeated from, and writes only its own
+rows of `S` and the output; the one shared buffer was a `Dv`-float scratch.
+
+So `qwen_gdn.c` stays the kernel file, now with
+`waste_qwen_gdn_step_heads(h0, h1, ...)` for a range of value heads, and
+`waste_qwen_gdn_step` is that range over all of them — the reference check
+in `tests/test_qwenparts.c` still calls the whole step and still passes.
+`qwen_gdn_layer` hands the heads to the fast group, each task with its own
+scratch on its stack. Same code per head in the same order, so the state
+and output are the serial loop's bit for bit.
+
+Against a build of the previous commit, unprofiled, 200 decode tokens,
+16 GiB cache, eight threads:
+
+| | three runs, tok/s | mean | CPU s/token |
+|---|---|---:|---:|
+| before | 9.96, 9.86, 9.93 | 9.92 | 0.505 |
+| after | 10.31, 10.21, 10.15 | 10.22 | 0.509 |
+
++3.1%, every run above every run before, tokens identical in all seven
+runs including the profiled one, and CPU per token within 1% — this one is
+parallel work, not a worker spinning. Profiled, the recurrence went from
+5.3 to 1.64 ms a step and GDN from 19.8 to 15.7, which is the same 3.7 ms.
+
+What it did not do is the other half of the reason given for it. GDN's
+`out_proj`, which followed the serial recurrence and so was expected to be
+paying for a parked pool, measured about 88 GB/s against 86 before. That
+projection is 7.9 MB and was already long enough to hide a wake; the gaps
+§78 found were costly in front of HyperConnection's 1.6 MB matvecs, not
+in front of every matvec.
+
+The largest serial stretch left is QSA's block selection and attention,
+4 ms a step across 12 layers.
