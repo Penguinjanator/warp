@@ -642,10 +642,10 @@ static void mvq4_rows_smlal(int b, int e, void *p)
  * Inside the same guard as its only caller, or -Wunused-function fires on
  * every build that cannot reach it. */
 #if defined(__ARM_NEON) || defined(__aarch64__)
-static void quant_act4_mm(const float *x, int n, int g, int8_t *q, float *sc)
+static void quant_act4_mm_group(const float *x, int n, int g, int k,
+                                int8_t *q, float *sc)
 {
-    const int ng = (n + g - 1) / g;
-    for (int k = 0; k < ng; k++) {
+    {
         const int beg = k * g, end = (beg + g < n) ? beg + g : n;
         float amax = 0;
         for (int i = beg; i < end; i++) {
@@ -672,6 +672,28 @@ static void quant_act4_mm(const float *x, int n, int g, int8_t *q, float *sc)
             pl[(h >> 3) * 16 + 8 + (h & 7)] = (int8_t)lo;
         }
     }
+}
+
+typedef struct { const float *x; int n, g; int8_t *q; float *sc; } qa4_arg;
+
+static void quant_act4_mm_range(int b, int e, void *p)
+{
+    const qa4_arg *a = (const qa4_arg *)p;
+    for (int k = b; k < e; k++) quant_act4_mm_group(a->x, a->n, a->g, k, a->q, a->sc);
+}
+
+/* Every group reads its own activations and writes its own planes and
+ * scale, so the groups go to the pool as they are and the bytes are the
+ * serial loop's. Serially this sat on the calling thread in front of every
+ * i8mm matvec — about 15 us before Qwen's 10,240-wide HyperConnection down
+ * projection, twice a pool worker's 8 us spin, so that matvec started by
+ * waking the pool. Below 32 groups the dispatch is not worth it. */
+static void quant_act4_mm(const float *x, int n, int g, int8_t *q, float *sc)
+{
+    const int ng = (n + g - 1) / g;
+    qa4_arg a = { x, n, g, q, sc };
+    if (ng >= 32) waste_parallel_for_fast(ng, 4, quant_act4_mm_range, &a);
+    else quant_act4_mm_range(0, ng, &a);
 }
 
 #endif
@@ -813,6 +835,9 @@ static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
  * is why "kda 29%" was being read as if it were all recurrence. */
 waste_tmv_role waste_tmv_roles[WASTE_TMV_ROLES];
 int waste_tmv_nroles;
+/* The quantization inside the matvec call being timed. Only matvec_t's
+ * calling thread writes it, and only under WASTE_PROFILE. */
+static double tmv_quant_dt;
 
 /* "model.layers.17.linear_attn.in_proj_z.weight" -> "linear_attn.in_proj_z" */
 static void tmv_role_name(const char *name, char *dst, size_t cap)
@@ -835,6 +860,7 @@ static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
                      const float *x, int out, int in)
 {
     if (!prof_on) { matvec_t_inner(m, y, t, x, out, in); return; }
+    tmv_quant_dt = 0;
     const double t0 = pnow();
     matvec_t_inner(m, y, t, x, out, in);
     const double dt = pnow() - t0;
@@ -868,6 +894,7 @@ static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
             r->calls++;
             r->bytes += t->q ? nb : (uint64_t)out * (uint64_t)in * sizeof(float);
             r->t += dt;
+            r->tq += tmv_quant_dt;
         }
     }
     pthread_mutex_unlock(&prof_mu);
@@ -905,6 +932,7 @@ static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
         mvq4_arg a = { y, (const uint8_t *)t->q, t->qs, m->xq, m->xs,
                        in, ng, g, sdot4_sg, g / sdot4_sg, t->rowbytes };
         waste_range_fn fn = NULL;
+        const double tq0 = prof_on ? pnow() : 0;
         if (trunk_kern == TK_SDOT && g % sdot4_sg == 0) {
             quant_act4(x, in, g, sdot4_sg, m->xq, m->xs);
             fn = mvq4_rows_sdot;
@@ -917,6 +945,7 @@ static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
             quant_act4_16(x, in, g, m->xq, m->xs);
             fn = mvq4_rows_smlal;
         }
+        if (prof_on) tmv_quant_dt = pnow() - tq0;
         if (fn) {
             waste_parallel_for_work(out, mc, fn, &a,
                                     (size_t)out * t->rowbytes);
@@ -6036,6 +6065,26 @@ static void qwen_rope_cs(const waste_config *c, int pos, float *cos, float *sin)
     }
 }
 
+typedef struct { float *o; const float *x, *w; int group; float eps; } hcn_arg;
+
+static void hc_norm_range(int b, int e, void *p)
+{
+    const hcn_arg *a = (const hcn_arg *)p;
+    for (int s = b; s < e; s++) {
+        const size_t off = (size_t)s * (size_t)a->group;
+        waste_qwen_rmsnorm(a->o + off, a->x + off, a->w + off,
+                           a->group, a->group, a->eps);
+    }
+}
+
+typedef struct { float *v; } sig_arg;
+
+static void sigmoid_range(int b, int e, void *p)
+{
+    float *v = ((const sig_arg *)p)->v;
+    for (int i = b; i < e; i++) v[i] = 1.0f / (1.0f + expf(-v[i]));
+}
+
 static void qwen_hc_mix_t(waste_model *m, const float *hyper,
                           const waste_tensor *nw, const waste_tensor *down,
                           const waste_tensor *up, const waste_tensor *inject,
@@ -6052,11 +6101,25 @@ static void qwen_hc_mix_t(waste_model *m, const float *hyper,
     float *normed = m->tmp;
     float *lo = normed + H;
     float *gate = lo + rank;
-    waste_qwen_rmsnorm(normed, hyper, nw->data, H, hid, c->eps);
+    /* The norm before the down projection and the sigmoid after the up are
+     * each about 10 us of a mix that is otherwise matvec, and a pool worker
+     * parks after 8 us without a job (WASTE_SPIN's 20,000 iterations). On
+     * the calling thread they left both matvecs that follow them — the down
+     * projection, and the next block's first projection — to start by
+     * waking the pool. On it, they keep it awake. Each stream is normalized
+     * and each element squashed by the same function in the same order, so
+     * the results are the serial loops' bit for bit. */
+    {
+        hcn_arg na = { normed, hyper, nw->data, hid, c->eps };
+        waste_parallel_for_fast(hc, 1, hc_norm_range, &na);
+    }
     matvec_t(m, lo, down, normed, rank, H);
     for (int i = 0; i < rank; i++) lo[i] = silu(lo[i] / (float)hc);
     matvec_t(m, gate, up, lo, H, rank);
-    for (int i = 0; i < H; i++) gate[i] = 1.0f / (1.0f + expf(-gate[i]));
+    {
+        sig_arg sa = { gate };
+        waste_parallel_for_fast(H, 256, sigmoid_range, &sa);
+    }
     for (int d = 0; d < hid; d++) {
         float s = 0.0f;
         for (int b = 0; b < hc; b++) s += gate[b * hid + d] * normed[b * hid + d];

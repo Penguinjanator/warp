@@ -5756,3 +5756,84 @@ unmeasured.
 `sweep`'s route columns read 0% on Qwen: `qwen_moe_layer` does not write
 the capture it compares. `kernel_kl` reads routes from
 `waste_model_step`'s own argument instead.
+
+## 78. HyperConnection's down projection was waiting for the pool to wake (2026-09-13)
+
+§77 left HyperConnection's 320×10,240 down projection at 31.6 GB/s under
+i8mm, a third of `in_proj_qkv`'s 99. Two explanations fit that: the
+activation quantizer, scalar and on the calling thread, has four times the
+input to chew on at that shape; or the kernel is slower there. The profile
+now charges each tensor the time spent quantizing its activation and
+prints the kernel's speed with that taken out, and one thread against
+eight separates the kernel from the dispatch:
+
+| tensor | kernel GB/s, 1 thread | 8 threads | scaling | quantizing, ms/step |
+|---|---:|---:|---:|---:|
+| `in_proj_qkv` 13.1 MB | 16.5 | 81.1 | 4.9× | 0.14 |
+| GDN `out_proj` 7.9 MB | 16.1 | 70.8 | 4.4× | 0.33 |
+| HyperConnection up 2.0 MB | 16.6 | 47.3 | 2.9× | 0.03 |
+| HyperConnection down 1.6 MB | 16.1 | 37.3 | 2.3× | 0.75 |
+| shared expert gate 0.8 MB | 16.3 | 27.6 | 1.7× | 0.19 |
+
+The kernel is 16 GB/s a core at every shape. What falls off is how much
+eight threads get out of a small call, and HyperConnection down's
+quantization is a quarter of its time but not the rest of it.
+
+**A pool worker parks after 8 µs.** `WASTE_SPIN`'s default is 20,000
+iterations of an atomic load and `yield`, and the loop alone measures 6–8
+µs on this machine (50,000: 19; 100,000: 32–47; 200,000: 60–76). The number
+was chosen in iterations against a 54 µs wake measured on another model
+(§67). In front of the down projection sit a combine over 4×2,560, an
+RMSNorm over 10,240 and the quantization — timed alone, 2, 9 and 4 µs (to
+the 1 µs the clock resolves; about 15 µs inside the engine) — so that
+matvec always found the pool asleep. After the up projection, a sigmoid
+over 10,240 through `expf` (11 µs) did the same to the next block's first
+projection.
+
+Spinning longer confirms it and is not the fix. Profiled, one run each:
+0 → 8.95 tok/s, 20,000 → 9.68, 100,000 → 10.81 with HyperConnection down
+at 89.1 GB/s, 400,000 → 10.43. Unprofiled, two runs each, with user+system
+CPU seconds per token as the only energy measure available without root:
+
+| `WASTE_SPIN` | tok/s | CPU s/token |
+|---:|---|---:|
+| 20,000 | 9.78, 9.90 | 0.49 |
+| 50,000 | 10.10, 10.30 | 0.52 |
+| 100,000 | 10.10, 10.42 | 0.56 |
+| 200,000 | 10.33, 10.82 | 0.58 |
+
+At 200,000, 7.5% more speed costs 17% more CPU — fewer tokens per
+CPU-second, which is the trade §67 bounded the spin to avoid. The profiled
+sweep's 11.7% was the profiler's own doing: a lock and two clock reads on
+every matvec lengthen exactly the gaps being measured, so it inflates
+anything that keeps workers awake. Judge those unprofiled, with repeats.
+
+**The change is to stop leaving the gaps.** HyperConnection's RMSNorm now
+runs one stream per task and its sigmoid in ranges, on the fast group, and
+`quant_act4_mm` quantizes one weight group per task once an input has 32
+or more (4,096 activations; GDN's 2,560-wide inputs stay serial). Each
+element goes through the same function in the same order, so the bytes
+are the serial loops' — tokens identical in every run. Profiled,
+HyperConnection went 12.0 → 9.5 ms a step, its down projection 43.5 → 76
+GB/s and its up 47 → 88. Unprofiled, against a build of the previous
+commit in the same process sequence:
+
+| | default spin, three runs | CPU s/token | spin 200,000 |
+|---|---|---:|---:|
+| before | 9.80, 9.84, 9.91 | 0.487 | 10.64 |
+| after | 10.07, 10.00, 10.07 | 0.501 | 11.19 |
+
++2.0%, every run of the new build above every run of the old, for 3% more
+CPU a token. Smaller than the profile said, and cheaper than the spin that
+bought 3.7% for 7%.
+
+**What is left is not HyperConnection.** The new build is still 11% faster
+at spin 200,000, so other serial stretches still put the pool to sleep. The
+largest is GDN's recurrence, 5.3 ms a step on the calling thread — 147 µs a
+layer, sitting between `in_proj_qkv` and `out_proj` — then QSA's selection
+and attention at 4 ms.
+
+One harness note, for whoever measures this next: the session scratchpad
+was emptied twice mid-session and took reference logs with it. Every
+comparison above ran in one command against a build of `HEAD` made with
+`git archive`, so none of it depends on a file surviving between runs.

@@ -134,7 +134,7 @@ int main(int argc, char **argv)
         /* Counters only: the tensors already hold their row numbers. */
         for (int r = 0; r < waste_tmv_nroles; r++) {
             waste_tmv_roles[r].calls = waste_tmv_roles[r].bytes = 0;
-            waste_tmv_roles[r].t = 0;
+            waste_tmv_roles[r].t = waste_tmv_roles[r].tq = 0;
         }
         waste_tmv_bytes = 0;
         memset(waste_tmv_t, 0, sizeof waste_tmv_t);
@@ -241,12 +241,17 @@ int main(int argc, char **argv)
           for (int k = 0; k < waste_tmv_nroles && k < 20; k++) {
               const waste_tmv_role *r = &waste_tmv_roles[ord[k]];
               if (!r->calls) continue;
-              printf("    %-46s %5dx%-5d q%-2d %6.2f ms/step %5.1f calls %6.2f MB %6.1f GB/s\n",
+              /* The last two: how much of the row was quantizing the
+               * activation, and the kernel's speed with that taken out. */
+              printf("    %-46s %5dx%-5d q%-2d %6.2f ms/step %5.1f calls %6.2f MB %6.1f GB/s"
+                     " | quant %5.2f ms, kernel %6.1f GB/s\n",
                      r->role, r->out, r->in, r->bits,
                      steps ? 1e3 * r->t / steps : 0.0,
                      steps ? (double)r->calls / steps : 0.0,
                      r->bytes / (double)r->calls / 1e6,
-                     r->t > 0 ? r->bytes / r->t / 1e9 : 0.0);
+                     r->t > 0 ? r->bytes / r->t / 1e9 : 0.0,
+                     steps ? 1e3 * r->tq / steps : 0.0,
+                     r->t > r->tq ? r->bytes / (r->t - r->tq) / 1e9 : 0.0);
           }
           const char *bn[4] = {"   <1MB","  1-8MB"," 8-32MB","  >32MB"};
           for (int k = 0; k < 4; k++)

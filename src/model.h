@@ -58,6 +58,7 @@ typedef struct {
     int out, in, bits;          /* bits 32: an F32 tensor                    */
     uint64_t calls, bytes;
     double t;
+    double tq;                  /* of t: quantizing the activation, serial */
 } waste_tmv_role;
 #define WASTE_TMV_ROLES 96
 extern waste_tmv_role waste_tmv_roles[WASTE_TMV_ROLES];
