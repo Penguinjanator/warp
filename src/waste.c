@@ -630,7 +630,8 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
         sc += (uint64_t)(Hv > 0 ? Hv : 1) * 4u;
         sc += (uint64_t)nheads * Hd * 3u * 4u;
         sc += (uint64_t)max_sel * nkv * Hd * 2u * 4u;
-        sc += (uint64_t)max_sel * 4u;
+        /* attention scores, one row per query head (model.c qsa_scr) */
+        sc += (uint64_t)max_sel * (uint64_t)(nheads > 0 ? nheads : 1) * 4u;
         sc += (uint64_t)max_sel * 4u;
         sc += ((uint64_t)nblk * idim + (uint64_t)nblk + (uint64_t)idim) * 4u;
         sc += (uint64_t)nblk * 4u;

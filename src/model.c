@@ -74,7 +74,14 @@ enum { P_LUTB, P_KDA, P_MLA, P_ROUTE, P_EDEQ, P_EMM, P_HEAD, P_LUTA, P_MM,
        P_QPLE,    /* n-gram embedding: row reads, projections, conv      */
        P_QSHX,    /* shared expert and its gate                          */
        P_QSAK,    /* QSA block selection, K/V gather, attention          */
-       P_QRTR };  /* router projection and top-k                         */
+       P_QRTR,    /* router projection and top-k                         */
+       /* Inside P_QSAK. Three of the four grow with the context rather
+        * than the token, so which one matters depends on how long the
+        * context is, and a short-prompt profile cannot say. */
+       P_QSAR,    /* the RoPE cos/sin table the block scores rotate by   */
+       P_QSAS,    /* block pooling, scoring and top-k                    */
+       P_QSAG,    /* selected K/V, BF16 to F32                           */
+       P_QSAA };  /* attention over the selection                        */
 static int prof_on = -1;
 static pthread_mutex_t prof_mu = PTHREAD_MUTEX_INITIALIZER;
 static double pnow(void)
@@ -2483,7 +2490,11 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
             const size_t compact = (size_t)(max_sel > 0 ? max_sel : 1) * (size_t)nkv * hd;
             m->qsa_kf = (float *)calloc(compact > 0 ? compact : 1, sizeof(float));
             m->qsa_vf = (float *)calloc(compact > 0 ? compact : 1, sizeof(float));
-            m->qsa_scr = (float *)calloc((size_t)(max_sel > 0 ? max_sel : 1), sizeof(float));
+            /* One row of scores per query head, so the heads can attend at
+             * once (qwen_qsa_layer). src/waste.c plans the same size. */
+            m->qsa_scr = (float *)calloc((size_t)(max_sel > 0 ? max_sel : 1) *
+                                         (size_t)(c->n_heads > 0 ? c->n_heads : 1),
+                                         sizeof(float));
             m->qsa_sel = (int *)calloc((size_t)(max_sel > 0 ? max_sel : 1), sizeof(int));
             const size_t work = (size_t)nblk * idim + (size_t)nblk + (size_t)idim;
             m->qsa_work = (float *)calloc(work > 0 ? work : 1, sizeof(float));
@@ -6305,6 +6316,24 @@ static void qwen_gdn_layer(waste_model *m, int L, const float *in, float *out)
                                          c->prefix, L)), normed, hid, Hv * Dv);
 }
 
+typedef struct {
+    const float *q, *k, *v;
+    const int *sel;
+    float *out, *scr;
+    int Hq, D, Hkv, n_sel;
+    float scale;
+} qsaa_arg;
+
+/* Each head gets the row of scr at h * n_sel, which qsa_scr is sized for. */
+static void qsa_attn_range(int b, int e, void *p)
+{
+    const qsaa_arg *a = (const qsaa_arg *)p;
+    for (int h = b; h < e; h++)
+        waste_qwen_qsa_attn_heads(h, h + 1, a->q, a->Hq, a->D, a->k, a->v, a->Hkv,
+                                  a->n_sel, a->sel, a->n_sel, a->scale, a->out,
+                                  a->scr + (size_t)h * (size_t)a->n_sel);
+}
+
 static void qwen_qsa_layer(waste_model *m, int L, const float *in, float *out, int pos)
 {
     const waste_config *c = &m->cfg;
@@ -6384,14 +6413,19 @@ static void qwen_qsa_layer(waste_model *m, int L, const float *in, float *out, i
     const int block_topk = c->idx_budget / compress;
     float *full_cos = m->qsa_cs;
     float *full_sin = m->qsa_cs + (size_t)m->kv_cap * (rot > 0 ? rot : 1);
+    PROF_START(P_QSAR);
     if (full_cos && rot > 0) {
         for (int t = 0; t < T; t++)
             qwen_rope_cs(c, t, full_cos + (size_t)t * rot, full_sin + (size_t)t * rot);
     }
+    PROF_END(P_QSAR);
+    PROF_START(P_QSAS);
     int nsel = waste_qwen_qsa_select(q_idx, c->idx_n_heads, Dk, m->qsa_rawk[L], T, pos,
                                      full_cos, full_sin, rot, tkln->data, c->eps,
                                      compress, block_topk, m->qsa_sel, m->qsa_work,
                                      m->qsa_taken);
+    PROF_END(P_QSAS);
+    PROF_START(P_QSAG);
     float *kf = m->qsa_kf, *vf = m->qsa_vf, *attn = m->qsa_attn, *scr = m->qsa_scr;
     for (int i = 0; i < nsel; i++) {
         const int t = m->qsa_sel[i];
@@ -6403,11 +6437,22 @@ static void qwen_qsa_layer(waste_model *m, int L, const float *in, float *out, i
             vf[(size_t)i * kvd + j] = (t >= 0 && t < T) ? bf16_to_f32(vb[j]) : 0.0f;
         }
     }
-    if (nsel > 0)
-        waste_qwen_qsa_attn(q, Hq, D, kf, vf, Hkv, nsel, m->qsa_sel, nsel,
-                            1.0f / sqrtf((float)D), attn, scr);
-    else
+    PROF_END(P_QSAG);
+    PROF_START(P_QSAA);
+    /* One task per query head. Serial this was 3.4 ms of a step at a 220
+     * token context and 58 ms at 2,800 — a third of the step, on one core,
+     * and it stops growing only when the selection fills its budget. A head
+     * reads its own query and its KV head's rows and writes its own row of
+     * attn (qwen_qsa.h), with its own row of scores, so the output is the
+     * serial loop's bit for bit. */
+    if (nsel > 0) {
+        qsaa_arg aa = { q, kf, vf, m->qsa_sel, attn, scr, Hq, D, Hkv, nsel,
+                        1.0f / sqrtf((float)D) };
+        waste_parallel_for_fast(Hq, 1, qsa_attn_range, &aa);
+    } else {
         memset(attn, 0, (size_t)qd * sizeof(float));
+    }
+    PROF_END(P_QSAA);
     PROF_END(P_QSAK);
     for (int i = 0; i < qd; i++)
         attn[i] *= 1.0f / (1.0f + expf(-gate[i]));

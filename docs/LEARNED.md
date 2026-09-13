@@ -5877,3 +5877,61 @@ in front of every matvec.
 
 The largest serial stretch left is QSA's block selection and attention,
 4 ms a step across 12 layers.
+
+## 80. QSA's attention was a third of a long-context step, on one core (2026-09-14)
+
+Every profile until now ran at a context of about 220 tokens, and at that
+length QSA's selection and attention looked like the 4 ms §79 ended on.
+Three of its four parts grow with the context rather than the token, so
+that number could not say what a long conversation costs. The profile now
+splits it into the RoPE table the block scores rotate by, block pooling
+and top-k, the BF16-to-F32 gather of the selected K/V, and the attention
+itself, and was run at both lengths — the same 18-token prompt with 200
+decode tokens, and `docs/QWEN.md` (2,801 tokens) with 32:
+
+| ms/step | ~220-token context | ~2,830-token context |
+|---|---:|---:|
+| RoPE table | 0.13 | 4.3 |
+| block pooling and top-k | 0.13 | 5.2 |
+| K/V gather | 0.30 | 5.3 |
+| attention | 3.4 | 58.1 |
+| QSA, all of it | 8.3 | 77.7 |
+| the step | 96.7 (10.34 tok/s) | 170 (5.88 tok/s) |
+
+Nothing else in the step moved with the context — MoE, GDN and
+HyperConnection cost the same at both lengths. At 2,830 tokens QSA was 46%
+of the step and its attention alone a third: 24 query heads, each over
+every selected token at dimension 256, one after another on the calling
+thread. Its cost stops rising only when the selection fills its 2,048-token
+budget, so a long context sits near that figure.
+
+The heads are independent. A head reads its own query row and its KV head's
+keys and values and writes its own row of the output; the one thing they
+shared was a buffer of scores the width of the selection. `qwen_qsa.c`
+gains `waste_qwen_qsa_attn_heads(h0, h1, ...)`, `waste_qwen_qsa_attn` is
+that over every head (so `test_qwenparts` still checks the whole thing
+against the reference), and `qwen_qsa_layer` runs one head per task with
+its own row of scores. `qsa_scr` is therefore `n_heads` rows of the maximum
+selection — about 200 KB on this model — and `waste_plan_memory` counts
+the same, so the floor still describes what the load allocates.
+
+Against a build of the previous commit, unprofiled, 16 GiB cache, eight
+threads:
+
+| | before | after |
+|---|---:|---:|
+| ~220-token context, decode, two runs | 10.33, 10.24 | 10.65, 10.36 |
+| 2,801-token context, decode | 5.95 | 8.58 (+44%) |
+| 2,801-token context, reading the prompt | 7.25 | 9.39 (+30%) |
+
+The first-position logits are byte-identical and every generated token
+the same in all six runs. The long-context rows are one run a build; the
+gap is fifteen times the run-to-run spread measured so far. Profiled at the
+short context, attention went from 3.4 to 0.74 ms a step.
+
+What is left grows with the context and has not been touched: at 2,830
+tokens, 15 ms a step between the RoPE table (every past position's row
+recomputed every token, though a row never changes), block pooling (every
+complete block re-pooled, though a full block never changes, then a top-k
+that rescans every block once per block kept) and the gather (the whole
+selection converted on one core).

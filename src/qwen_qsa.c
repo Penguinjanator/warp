@@ -125,11 +125,21 @@ void waste_qwen_qsa_attn(const float *q, int Hq, int D,
                          const int *sel, int n_sel, float scale,
                          float *out, float *scratch)
 {
+    waste_qwen_qsa_attn_heads(0, Hq, q, Hq, D, k, v, Hkv, T, sel, n_sel, scale,
+                              out, scratch);
+}
+
+void waste_qwen_qsa_attn_heads(int h0, int h1, const float *q, int Hq, int D,
+                               const float *k, const float *v, int Hkv, int T,
+                               const int *sel, int n_sel, float scale,
+                               float *out, float *scratch)
+{
     const int n_rep = Hkv > 0 ? Hq / Hkv : 1;
     float *scores = scratch;
-    memset(out, 0, (size_t)Hq * D * sizeof(float));
+    if (h1 > h0)
+        memset(out + (size_t)h0 * D, 0, (size_t)(h1 - h0) * D * sizeof(float));
     if (!q || !k || !v || !sel || !scratch || n_sel < 1) return;
-    for (int h = 0; h < Hq; h++) {
+    for (int h = h0; h < h1; h++) {
         const int hv = h / (n_rep > 0 ? n_rep : 1);
         const float *qh = q + (size_t)h * D;
         float m = -1e30f;

@@ -181,6 +181,8 @@ int main(int argc, char **argv)
                 {12, 0, "ple"},           {11, 0, "hyperconnection"},
                 {1,  0, "gdn"},           {10, 1, "  recurrence"},
                 {2,  0, "qsa"},           {14, 1, "  select+attend"},
+                {16, 1, "    rope table"},  {17, 1, "    block select"},
+                {18, 1, "    K/V gather"},  {19, 1, "    attention"},
                 {3,  0, "moe(all)"},      {15, 1, "  router"},
                 {4,  1, "  expert I/O"},  {5,  1, "  expert mm"},
                 {0,  1, "    LUT build"}, {7,  1, "    LUT apply"},

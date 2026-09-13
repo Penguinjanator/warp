@@ -50,6 +50,15 @@ void waste_qwen_qsa_attn(const float *q, int Hq, int D,
                          const int *sel, int n_sel, float scale,
                          float *out, float *scratch);
 
+/* Query heads [h0, h1) of the same attention; waste_qwen_qsa_attn is this
+ * over [0, Hq). A head reads its own query row and its KV head's keys and
+ * values and writes only its own row of out, so disjoint ranges may run at
+ * once — each with its own scratch of >= n_sel. */
+void waste_qwen_qsa_attn_heads(int h0, int h1, const float *q, int Hq, int D,
+                               const float *k, const float *v, int Hkv, int T,
+                               const int *sel, int n_sel, float scale,
+                               float *out, float *scratch);
+
 #ifdef __cplusplus
 }
 #endif
