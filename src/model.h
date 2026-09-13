@@ -292,6 +292,7 @@ typedef struct {
     float    *qsa_q, *qsa_gate, *qsa_attn;       /* [Hq][D]                             */
     float    *qsa_kf, *qsa_vf, *qsa_scr, *qsa_work;
     float    *qsa_cs;                            /* cos then sin, each [kv_cap][rot]    */
+    int       qsa_cs_n;                          /* rows of qsa_cs already filled       */
     int      *qsa_sel, *qsa_taken;
     float    *moe_prob;
     uint8_t  *moe_used;

@@ -5935,3 +5935,51 @@ recomputed every token, though a row never changes), block pooling (every
 complete block re-pooled, though a full block never changes, then a top-k
 that rescans every block once per block kept) and the gather (the whole
 selection converted on one core).
+
+## 81. The rest of QSA: work redone every token, and an argmax per block (2026-09-14)
+
+§80 left 15 ms a step of QSA at 2,830 tokens that grows with the context.
+All three parts are now bit-identical rewrites; none adds state.
+
+**The RoPE table.** Every token, every QSA layer rewrote the cos/sin rows
+for all T positions. A row is a function of its position alone, so once
+written it is right for every later token, every layer and any session a
+reset or restore produces. The model counts the rows it has filled
+(`qsa_cs_n`) and writes only those past it: 4.3 ms a step → 0.00.
+
+**Block selection.** `waste_qwen_qsa_select` is now `score_blocks`, which
+pools, rotates and scores a range of blocks — each block writes only its
+own pooled row and its own score, so `qwen_qsa_layer` scores them on the
+pool once there are 32 — followed by `pick`. The pick was a pass over every
+block for each block kept, about 360,000 comparisons a layer at this
+length; it is now a heapsort in the order that argmax took: the higher
+score first, and a tie to the earlier block, over exactly the scores it
+could ever have taken (above -1e30, which leaves out NaN). The order is the
+point — attention sums the selected tokens in it, so the same set in a
+different sequence would move the bits. `tests/test_qsa_pick.c` holds the
+old loop verbatim and compares it with the new one over 4,000 cases built
+to break an ordering: ties everywhere, NaN, -1e30 and -inf scores, and a
+budget below, at and above the block count. Pooling was kept per token
+rather than cached: a cache of pooled blocks would have been one more
+thing a reset, a restore and a rewound position all had to invalidate, and
+scoring them at once already took the part to 1.3 ms from 5.2.
+
+**The gather.** Each selected index writes its own rows of the F32 K/V
+and its own slot of the selection, so the BF16 conversion goes in ranges:
+5.3 → 1.2 ms.
+
+Against a build of §80's commit, unprofiled:
+
+| | before | after |
+|---|---:|---:|
+| ~220-token context, decode, two runs | 10.51, 10.53 | 10.74, 10.66 |
+| 2,801-token context, decode | 8.53 | 9.47 (+11%) |
+| 2,801-token context, reading the prompt | 9.37 | 9.83 (+5%) |
+
+First-position logits byte-identical and every token the same in all seven
+runs. Across §80 and §81, decode at 2,801 tokens went from 5.95 to 9.47
+tok/s and QSA at that length from 77.7 ms a step to 15.0, of which the
+attention — on the pool now — is 8.3.
+
+The step at either length is now mostly MoE: 57 ms of it at 2,801 tokens,
+and its expert arithmetic the largest single part.

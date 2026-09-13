@@ -43,6 +43,25 @@ int waste_qwen_qsa_select(const float *q_heads, int Hq, int Dk,
                           int compress, int block_topk,
                           int *sel, float *work, int *taken);
 
+/* The two halves of waste_qwen_qsa_select, which is score_blocks over every
+ * complete block followed by pick.
+ *
+ * score_blocks pools, rotates and scores blocks [b0, b1): block b writes only
+ * pooled[b][Dk] and scores[b], so disjoint ranges may run at once — the
+ * select call lays pooled at work and scores at work + n_complete * Dk.
+ *
+ * pick writes the selection in order: complete blocks by score, highest
+ * first and a tie to the earlier block, at most block_topk of them, each as
+ * its compress token indices; then the n_tail tail tokens. order needs room
+ * for n_complete ints. Returns the count. */
+void waste_qwen_qsa_score_blocks(int b0, int b1, const float *q_heads, int Hq,
+                                 int Dk, const float *raw_k,
+                                 const float *full_cos, const float *full_sin,
+                                 int rotary_dim, const float *k_ln_w, float eps,
+                                 int compress, float *pooled, float *scores);
+int waste_qwen_qsa_pick(const float *scores, int n_complete, int block_topk,
+                        int compress, int n_tail, int *sel, int *order);
+
 /* Causal softmax attention over selected tokens. q [Hq][D], k/v [T][Hkv][D],
  * n_rep = Hq/Hkv, scaling = 1/sqrt(D). sel[n_sel] are token indices. */
 void waste_qwen_qsa_attn(const float *q, int Hq, int D,

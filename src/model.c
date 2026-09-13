@@ -6324,6 +6324,44 @@ typedef struct {
     float scale;
 } qsaa_arg;
 
+typedef struct {
+    const float *q_idx, *raw_k, *cos, *sin, *k_ln_w;
+    float *pooled, *scores;
+    int Hq, Dk, rot, compress;
+    float eps;
+} qsas_arg;
+
+static void qsa_score_range(int b, int e, void *p)
+{
+    const qsas_arg *a = (const qsas_arg *)p;
+    waste_qwen_qsa_score_blocks(b, e, a->q_idx, a->Hq, a->Dk, a->raw_k, a->cos, a->sin,
+                                a->rot, a->k_ln_w, a->eps, a->compress, a->pooled,
+                                a->scores);
+}
+
+typedef struct {
+    const uint16_t *kq, *vq;
+    float *kf, *vf;
+    int *sel;
+    int Hkv, D, kvd, T;
+} qsag_arg;
+
+static void qsa_gather_range(int b, int e, void *p)
+{
+    const qsag_arg *a = (const qsag_arg *)p;
+    for (int i = b; i < e; i++) {
+        const int t = a->sel[i];
+        a->sel[i] = i;
+        const int in = t >= 0 && t < a->T;
+        const uint16_t *kb = in ? a->kq + (size_t)t * a->Hkv * a->D : NULL;
+        const uint16_t *vb = in ? a->vq + (size_t)t * a->Hkv * a->D : NULL;
+        for (int j = 0; j < a->kvd; j++) {
+            a->kf[(size_t)i * a->kvd + j] = in ? bf16_to_f32(kb[j]) : 0.0f;
+            a->vf[(size_t)i * a->kvd + j] = in ? bf16_to_f32(vb[j]) : 0.0f;
+        }
+    }
+}
+
 /* Each head gets the row of scr at h * n_sel, which qsa_scr is sized for. */
 static void qsa_attn_range(int b, int e, void *p)
 {
@@ -6414,28 +6452,50 @@ static void qwen_qsa_layer(waste_model *m, int L, const float *in, float *out, i
     float *full_cos = m->qsa_cs;
     float *full_sin = m->qsa_cs + (size_t)m->kv_cap * (rot > 0 ? rot : 1);
     PROF_START(P_QSAR);
+    /* A row of the table is a function of its position and nothing else, so
+     * once written it is right for every later token, every layer and every
+     * session — a reset or a restore leaves it valid. Rewriting all T rows
+     * every token in every QSA layer was 4.3 ms a step at 2,830 tokens and
+     * growing with the context; only the rows past the last one filled are
+     * ever new. */
     if (full_cos && rot > 0) {
-        for (int t = 0; t < T; t++)
+        for (int t = m->qsa_cs_n; t < T; t++)
             qwen_rope_cs(c, t, full_cos + (size_t)t * rot, full_sin + (size_t)t * rot);
+        if (T > m->qsa_cs_n) m->qsa_cs_n = T;
     }
     PROF_END(P_QSAR);
     PROF_START(P_QSAS);
-    int nsel = waste_qwen_qsa_select(q_idx, c->idx_n_heads, Dk, m->qsa_rawk[L], T, pos,
-                                     full_cos, full_sin, rot, tkln->data, c->eps,
-                                     compress, block_topk, m->qsa_sel, m->qsa_work,
-                                     m->qsa_taken);
+    /* waste_qwen_qsa_select, taken apart so the blocks can be scored at once:
+     * each writes its own pooled row and its own score (qwen_qsa.h). The pick
+     * is a sort in the order the argmax chose, not a pass per block kept, and
+     * together they were 5.2 ms a step at 2,830 tokens. */
+    int nsel = 0;
+    if (T >= 1) {
+        const int qp = pos < 0 ? 0 : (pos >= T ? T - 1 : pos);
+        const int n_complete = (qp + 1) / compress;
+        const int n_tail = qp + 1 - n_complete * compress;
+        const float *scores = m->qsa_work + (size_t)n_complete * Dk;
+        if (n_complete > 0) {
+            qsas_arg sa = { q_idx, m->qsa_rawk[L], full_cos, full_sin, tkln->data,
+                            m->qsa_work, m->qsa_work + (size_t)n_complete * Dk,
+                            c->idx_n_heads, Dk, rot, compress, c->eps };
+            if (n_complete >= 32)
+                waste_parallel_for_fast(n_complete, 4, qsa_score_range, &sa);
+            else
+                qsa_score_range(0, n_complete, &sa);
+        }
+        nsel = waste_qwen_qsa_pick(n_complete > 0 ? scores : NULL, n_complete, block_topk,
+                                   compress, n_tail, m->qsa_sel, m->qsa_taken);
+    }
     PROF_END(P_QSAS);
     PROF_START(P_QSAG);
     float *kf = m->qsa_kf, *vf = m->qsa_vf, *attn = m->qsa_attn, *scr = m->qsa_scr;
-    for (int i = 0; i < nsel; i++) {
-        const int t = m->qsa_sel[i];
-        m->qsa_sel[i] = i;
-        const uint16_t *kb = m->qsa_k[L] + (size_t)t * Hkv * D;
-        const uint16_t *vb = m->qsa_v[L] + (size_t)t * Hkv * D;
-        for (int j = 0; j < kvd; j++) {
-            kf[(size_t)i * kvd + j] = (t >= 0 && t < T) ? bf16_to_f32(kb[j]) : 0.0f;
-            vf[(size_t)i * kvd + j] = (t >= 0 && t < T) ? bf16_to_f32(vb[j]) : 0.0f;
-        }
+    /* Each selected index writes its own rows of kf and vf and its own slot of
+     * sel, so the conversion goes in ranges: 5.3 ms a step at 2,830 tokens on
+     * one core. */
+    {
+        qsag_arg ga = { m->qsa_k[L], m->qsa_v[L], kf, vf, m->qsa_sel, Hkv, D, kvd, T };
+        waste_parallel_for_fast(nsel, 16, qsa_gather_range, &ga);
     }
     PROF_END(P_QSAG);
     PROF_START(P_QSAA);

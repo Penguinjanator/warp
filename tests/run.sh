@@ -1759,6 +1759,16 @@ PYQ
         no "a Qwen component diverges from tools/qwenparts_ref.py"
     fi
 
+    # QSA's block top-k is a sort now, and the order it writes is the order
+    # attention sums in — so it is checked against the argmax it replaced,
+    # over ties, NaN and every budget, not only at the reference's one case.
+    # Plain C: it runs where uv does not.
+    if ./test_qsa_pick >/dev/null 2>&1; then
+        ok "QSA's block pick writes the selection in the argmax's order"
+    else
+        no "QSA's block pick orders the selection differently from the argmax"
+    fi
+
     # The container-native oracle: the same container read by a PyTorch
     # implementation of the same forward pass. Routes must match exactly
     # and the argmax must match; the residual is gated at what this fixture

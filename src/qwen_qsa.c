@@ -78,42 +78,88 @@ int waste_qwen_qsa_select(const float *q_heads, int Hq, int Dk,
 
     if (n_complete > 0) {
         if (!work || !taken || !q_heads || !raw_k || !k_ln_w) return 0;
-        float *pooled = work;
-        float *scores = work + (size_t)n_complete * Dk;
-        const float inv_sqrt = 1.0f / sqrtf((float)Dk);
-        for (int b = 0; b < n_complete; b++) {
-            float *po = pooled + (size_t)b * Dk;
-            waste_qwen_qsa_pool_block(raw_k + (size_t)b * compress * Dk,
-                                      compress, Dk, k_ln_w, eps, po);
-            if (full_cos && full_sin && rotary_dim > 0)
-                waste_qwen_rope_apply(po, Dk,
-                                      full_cos + (size_t)(b * compress) * rotary_dim,
-                                      full_sin + (size_t)(b * compress) * rotary_dim,
-                                      rotary_dim);
-            float s = 0.0f;
-            for (int h = 0; h < Hq; h++) {
-                float dot = 0.0f;
-                const float *qh = q_heads + (size_t)h * Dk;
-                for (int d = 0; d < Dk; d++) dot += qh[d] * po[d];
-                if (dot < 0.0f) dot = 0.0f;
-                s += dot;
-            }
-            scores[b] = s * inv_sqrt;
-            taken[b] = 0;
+        waste_qwen_qsa_score_blocks(0, n_complete, q_heads, Hq, Dk, raw_k,
+                                    full_cos, full_sin, rotary_dim, k_ln_w, eps,
+                                    compress, work, work + (size_t)n_complete * Dk);
+    }
+    (void)nsel;
+    return waste_qwen_qsa_pick(n_complete > 0 ? work + (size_t)n_complete * Dk : NULL,
+                               n_complete, block_topk, compress, n_tail, sel, taken);
+}
+
+void waste_qwen_qsa_score_blocks(int b0, int b1, const float *q_heads, int Hq,
+                                 int Dk, const float *raw_k,
+                                 const float *full_cos, const float *full_sin,
+                                 int rotary_dim, const float *k_ln_w, float eps,
+                                 int compress, float *pooled, float *scores)
+{
+    const float inv_sqrt = 1.0f / sqrtf((float)Dk);
+    for (int b = b0; b < b1; b++) {
+        float *po = pooled + (size_t)b * Dk;
+        waste_qwen_qsa_pool_block(raw_k + (size_t)b * compress * Dk,
+                                  compress, Dk, k_ln_w, eps, po);
+        if (full_cos && full_sin && rotary_dim > 0)
+            waste_qwen_rope_apply(po, Dk,
+                                  full_cos + (size_t)(b * compress) * rotary_dim,
+                                  full_sin + (size_t)(b * compress) * rotary_dim,
+                                  rotary_dim);
+        float s = 0.0f;
+        for (int h = 0; h < Hq; h++) {
+            float dot = 0.0f;
+            const float *qh = q_heads + (size_t)h * Dk;
+            for (int d = 0; d < Dk; d++) dot += qh[d] * po[d];
+            if (dot < 0.0f) dot = 0.0f;
+            s += dot;
+        }
+        scores[b] = s * inv_sqrt;
+    }
+}
+
+/* Whether block a comes before block b in the selection: the higher score,
+ * and on a tie the earlier block. That is the order the repeated argmax this
+ * replaced produced — it took the first strictly greater score each pass. */
+static int qsa_before(const float *s, int a, int b)
+{
+    return s[a] > s[b] || (s[a] == s[b] && a < b);
+}
+
+static void qsa_sift(const float *s, int *o, int i, int n)
+{
+    for (;;) {
+        int w = i;
+        const int l = 2 * i + 1, r = l + 1;
+        if (l < n && qsa_before(s, o[w], o[l])) w = l;
+        if (r < n && qsa_before(s, o[w], o[r])) w = r;
+        if (w == i) return;
+        const int tmp = o[i]; o[i] = o[w]; o[w] = tmp;
+        i = w;
+    }
+}
+
+int waste_qwen_qsa_pick(const float *scores, int n_complete, int block_topk,
+                        int compress, int n_tail, int *sel, int *order)
+{
+    int nsel = 0;
+    if (n_complete > 0 && scores && order) {
+        /* The argmax only ever took a score above -1e30, which also leaves
+         * out a NaN; the ordering below is total over what remains. */
+        int n = 0;
+        for (int b = 0; b < n_complete; b++)
+            if (scores[b] > -1e30f) order[n++] = b;
+        /* Heapsort with the latest block in selection order at the root:
+         * each pass moves the worst remaining block to the end, so the
+         * array finishes best first — O(n log n), where the argmax was a
+         * pass over every block for every block kept. */
+        for (int i = n / 2 - 1; i >= 0; i--) qsa_sift(scores, order, i, n);
+        for (int end = n - 1; end > 0; end--) {
+            const int tmp = order[0]; order[0] = order[end]; order[end] = tmp;
+            qsa_sift(scores, order, 0, end);
         }
         const int keep = n_complete < block_topk ? n_complete : block_topk;
-        for (int j = 0; j < keep; j++) {
-            int best = -1;
-            float bv = -1e30f;
-            for (int b = 0; b < n_complete; b++) {
-                if (taken[b]) continue;
-                if (scores[b] > bv) { bv = scores[b]; best = b; }
-            }
-            if (best < 0) break;
-            taken[best] = 1;
+        const int take = keep < n ? keep : n;
+        for (int j = 0; j < take; j++)
             for (int t = 0; t < compress; t++)
-                sel[nsel++] = best * compress + t;
-        }
+                sel[nsel++] = order[j] * compress + t;
     }
     for (int t = 0; t < n_tail; t++)
         sel[nsel++] = n_complete * compress + t;
