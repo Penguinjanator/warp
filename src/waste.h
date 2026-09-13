@@ -293,9 +293,9 @@ waste_status waste_memory_used(const waste_ctx *ctx, waste_memplan *out);
  * valid until the next eval or generate on it.
  *
  * Also set after a *successful* waste_generate that stopped because the
- * context filled rather than because the model finished or max_tokens
- * ran out. That is not an error — the tokens produced are good — but it
- * is the one ending a host cannot tell from the others by the status
+ * context filled or max_tokens ran out rather than because the model
+ * finished. That is not an error — the tokens produced are good — but
+ * these endings cannot be distinguished from completion by the status
  * alone, and a UI that says "the answer is complete" when it is not is
  * worse than one that says nothing.
  *

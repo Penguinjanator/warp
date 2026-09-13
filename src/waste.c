@@ -1250,6 +1250,12 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
          * whether or not the answer happened to be finished. */
         if (!lg) { st = read_error_report(c); break; }
         if (stop) break;
+        if (t == p.max_tokens - 1) {
+            snprintf(c->detail, sizeof c->detail,
+                     "generation reached max_tokens (%u); the response may be incomplete",
+                     p.max_tokens);
+            break;
+        }
         cur = sample(lg, c->m.cfg.vocab, &p, &rng);
     }
     c->stats.experts_hit += c->m.cache.hits - h0;

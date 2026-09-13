@@ -862,13 +862,18 @@ static int run_segs(waste_ctx *c, const opts *o, const seg *segs, int ns,
     printf("\n");
     if (s.oom) return fail("stop matcher", WASTE_E_OOM);
     if (st != WASTE_OK && st != WASTE_E_CANCELLED) return fail_ctx("generate", st, c);
-    /* A generation that ran out of context returns OK — the tokens it
+    /* A generation that ran out of context or tokens returns OK — the tokens it
      * produced are good — and stops mid-answer. Silence there reads as a
      * model that had nothing more to say, which is the wrong thing to
      * conclude. To stderr, so a piped run is still just the generation. */
     if (st == WASTE_OK) {
         const char *why = waste_error_detail(c);
-        if (why) fprintf(stderr, "\nwaste: %s\n", why);
+        if (why) {
+            fprintf(stderr, "\nwaste: %s\n", why);
+            if (strstr(why, "max_tokens"))
+                fprintf(stderr, "  Use a larger -n value for longer responses "
+                                "(reasoning tokens count toward this limit).\n");
+        }
     }
 
     if (show_stats && s.n) {
@@ -1002,6 +1007,8 @@ static int cmd_chat(int argc, char **argv)
                "instruct model is being asked to continue text rather than "
                "to answer.\n  Copy one in — examples/ has K3's — or pass "
                "--raw to say you meant it\n");
+    printf("generation limit: %u tokens per reply, including reasoning "
+           "(change with -n)\n", o.max_tokens);
     printf("/reset clears state, /save FILE and /load FILE persist it, "
            "/image FILE attaches a picture, /stats prints counters, "
            "Ctrl-D exits\n");
