@@ -1715,6 +1715,8 @@ PYQ
             'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"].pop("layer_types");json.dump(m,open(p,"w"))'
         qwen_refused "a layer_types shorter than num_hidden_layers" \
             'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"]["layer_types"]=m["config"]["layer_types"][:1];json.dump(m,open(p,"w"))'
+        qwen_refused "a PLE conv kernel the ring cannot hold" \
+            'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"]["ple_conv_kernel_size"]=0;json.dump(m,open(p,"w"))'
     fi
 
     # The isolated ops against an independent PyTorch reference written
