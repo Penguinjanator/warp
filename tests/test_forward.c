@@ -23,6 +23,7 @@
 /* model.c's profile counters, indexed by its P_* enum */
 extern double waste_prof[32];
 extern uint64_t waste_prof_n[32];
+extern double waste_prof_tmv[32];
 extern uint64_t waste_tmv_bytes;
 extern double waste_tmv_t[4];
 extern uint64_t waste_tmv_b[4], waste_tmv_c[4];
@@ -129,6 +130,12 @@ int main(int argc, char **argv)
     if (prof_decode) {
         memset(waste_prof, 0, sizeof waste_prof);
         memset(waste_prof_n, 0, sizeof waste_prof_n);
+        memset(waste_prof_tmv, 0, sizeof waste_prof_tmv);
+        /* Counters only: the tensors already hold their row numbers. */
+        for (int r = 0; r < waste_tmv_nroles; r++) {
+            waste_tmv_roles[r].calls = waste_tmv_roles[r].bytes = 0;
+            waste_tmv_roles[r].t = 0;
+        }
         waste_tmv_bytes = 0;
         memset(waste_tmv_t, 0, sizeof waste_tmv_t);
         memset(waste_tmv_b, 0, sizeof waste_tmv_b);
@@ -183,11 +190,15 @@ int main(int argc, char **argv)
             const int nrows = (int)(sizeof rows / sizeof rows[0]);
             for (int r = 0; r < nrows; r++)
                 if (!rows[r].sub) tot += waste_prof[rows[r].slot];
+            /* The last column is how much of each row was trunk matvec,
+             * so the rest of the row is everything between projections. */
             for (int r = 0; r < nrows; r++) {
                 const double s = waste_prof[rows[r].slot];
                 if (s > 0)
-                    printf("  %-16s %7.2f  %5.1f%%  %7.2f ms/step\n", rows[r].name,
-                           s, 100.0 * s / wall, steps ? 1e3 * s / steps : 0.0);
+                    printf("  %-16s %7.2f  %5.1f%%  %7.2f ms/step  %7.2f matvec\n",
+                           rows[r].name, s, 100.0 * s / wall,
+                           steps ? 1e3 * s / steps : 0.0,
+                           steps ? 1e3 * waste_prof_tmv[rows[r].slot] / steps : 0.0);
             }
             printf("  %-16s %7.2f  %5.1f%%\n", "accounted", tot, 100.0 * tot / wall);
         } else {
@@ -218,6 +229,25 @@ int main(int argc, char **argv)
                  (unsigned long long)waste_prof_n[9],
                  waste_tmv_bytes / 1e9,
                  waste_prof[9] > 0 ? waste_tmv_bytes / waste_prof[9] / 1e9 : 0.0);
+          /* By tensor, heaviest first: the size buckets below cannot say
+           * which projection a millisecond was in. */
+          int ord[WASTE_TMV_ROLES];
+          for (int k = 0; k < waste_tmv_nroles; k++) ord[k] = k;
+          for (int k = 1; k < waste_tmv_nroles; k++)
+              for (int j = k; j > 0 &&
+                   waste_tmv_roles[ord[j]].t > waste_tmv_roles[ord[j - 1]].t; j--) {
+                  const int sw = ord[j]; ord[j] = ord[j - 1]; ord[j - 1] = sw;
+              }
+          for (int k = 0; k < waste_tmv_nroles && k < 20; k++) {
+              const waste_tmv_role *r = &waste_tmv_roles[ord[k]];
+              if (!r->calls) continue;
+              printf("    %-46s %5dx%-5d q%-2d %6.2f ms/step %5.1f calls %6.2f MB %6.1f GB/s\n",
+                     r->role, r->out, r->in, r->bits,
+                     steps ? 1e3 * r->t / steps : 0.0,
+                     steps ? (double)r->calls / steps : 0.0,
+                     r->bytes / (double)r->calls / 1e6,
+                     r->t > 0 ? r->bytes / r->t / 1e9 : 0.0);
+          }
           const char *bn[4] = {"   <1MB","  1-8MB"," 8-32MB","  >32MB"};
           for (int k = 0; k < 4; k++)
               if (waste_tmv_c[k])

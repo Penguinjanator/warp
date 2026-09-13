@@ -138,6 +138,23 @@ existing per-layer decision: one task per expert when the records are
 already resident, one task per row range when holding a batch would
 barrier the read-ahead. `WASTE_XPAR=0/1` still forces it.
 
+The throughput above was measured with the f32 trunk kernel, before the
+two changes that moved it most; LEARNED §75–77 have the numbers since, and
+the table stands as what that commit measured.
+
+### Trunk kernel
+
+A Qwen load runs the 4-bit trunk through **i8mm** unless
+`WASTE_TRUNK_KERNEL` is set — 0 pins the exact f32 arithmetic, 2 i8mm,
+3 SMLAL. Against f32 on this machine, 16 GiB cache and eight threads: 9.91
+tok/s against 7.70 over 200 decode tokens, and 11% at a 6K-token context.
+It is not the exact arithmetic. Over a 5,918-token prompt of real text
+i8mm's next-token perplexity is 3.698 against f32's 3.712, top-1
+agreement 96.5%, 97.65% of routed experts the same, and nothing grows past
+QSA's 2,048-token selection budget; `tests/kernel_kl.c` is the harness and
+LEARNED §77 the measurement. The kernel is process-wide: a process that
+loads Qwen and then another architecture keeps i8mm for both.
+
 ## Correctness
 
 * **Components.** `tests/test_qwenparts.c` dumps every intermediate of the

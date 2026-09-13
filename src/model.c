@@ -44,6 +44,11 @@
 #include <time.h>
 double waste_prof[32];
 uint64_t waste_prof_n[32];
+/* How much of each phase was trunk matvec: P_TMV's total as it moved while
+ * the phase ran. A phase that is mostly projections and a phase that is
+ * mostly the loops between them look the same in waste_prof, and they are
+ * not fixed the same way. */
+double waste_prof_tmv[32];
 uint64_t waste_tmv_bytes;
 int *waste_route_cap; int waste_route_n, waste_route_cap_n;
 /* WASTE_TRUNK_CHECK=1: run the f32 reference beside whichever quantized
@@ -77,9 +82,11 @@ static double pnow(void)
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + t.tv_nsec / 1e9;
 }
-#define PROF_START(b) double _t##b = prof_on ? pnow() : 0
+#define PROF_START(b) double _t##b = prof_on ? pnow() : 0, \
+    _m##b = prof_on ? waste_prof[P_TMV] : 0
 #define PROF_END(b)   do { if (prof_on) { pthread_mutex_lock(&prof_mu); \
     waste_prof[b] += pnow() - _t##b; waste_prof_n[b]++; \
+    waste_prof_tmv[b] += waste_prof[P_TMV] - _m##b; \
     pthread_mutex_unlock(&prof_mu); } } while (0)
 
 static char *slurp(const char *path, size_t *len)
@@ -199,6 +206,7 @@ static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
  * costs in accuracy. */
 enum { TK_F32 = 0, TK_SDOT = 1, TK_I8MM = 2, TK_SMLAL = 3 };
 static int trunk_kern = TK_F32;   /* WASTE_TRUNK_KERNEL                   */
+static int trunk_kern_env = 0;    /* set explicitly; waste_model_load     */
 static int sdot4_sg = 32;  /* TK_SDOT only: activations per int8 scale    */
 static int i8mm_on = 0;    /* SMMLA batched matmul; costs activation int8 */
 static const char *dump_route = NULL;  /* WASTE_DUMP_ROUTE, see moe_layer */
@@ -287,6 +295,7 @@ static void model_opts_init(void)
      * is also why the same kernel measures KL 0.0013 on Kimi-Linear's 27
      * layers. i8mm buys 43x the accuracy for 83% of the speed. */
     e = getenv("WASTE_TRUNK_KERNEL");
+    trunk_kern_env = e != NULL;
     trunk_kern = e ? atoi(e) : TK_F32;
     if (trunk_kern < 0 || trunk_kern > TK_SMLAL) trunk_kern = TK_F32;
     if ((trunk_kern == TK_SDOT || trunk_kern == TK_I8MM) &&
@@ -802,6 +811,26 @@ static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
  * Q4G read once per token — the single largest byte term in a decode step
  * (docs/LEARNED.md §59). It has no bucket of its own in the profile, which
  * is why "kda 29%" was being read as if it were all recurrence. */
+waste_tmv_role waste_tmv_roles[WASTE_TMV_ROLES];
+int waste_tmv_nroles;
+
+/* "model.layers.17.linear_attn.in_proj_z.weight" -> "linear_attn.in_proj_z" */
+static void tmv_role_name(const char *name, char *dst, size_t cap)
+{
+    const char *p = strstr(name, "layers.");
+    if (p) {
+        p += 7;
+        while (*p >= '0' && *p <= '9') p++;
+        if (*p == '.') p++;
+    } else {
+        p = name;
+        if (!strncmp(p, "model.", 6)) p += 6;
+    }
+    snprintf(dst, cap, "%s", p);
+    const size_t n = strlen(dst);
+    if (n > 7 && !strcmp(dst + n - 7, ".weight")) dst[n - 7] = 0;
+}
+
 static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
                      const float *x, int out, int in)
 {
@@ -815,7 +844,54 @@ static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
     waste_prof[P_TMV] += dt; waste_prof_n[P_TMV]++;
     waste_tmv_bytes += nb;
     waste_tmv_t[bk] += dt; waste_tmv_b[bk] += nb; waste_tmv_c[bk]++;
+    if (t) {
+        /* The slot is the profiler's own cache on a struct the model owns,
+         * so writing through the const is writing to what was calloc'd. */
+        waste_tensor *tw = (waste_tensor *)t;
+        int si = tw->prof_slot - 1;
+        if (si < 0) {
+            char role[96];
+            tmv_role_name(t->name, role, sizeof role);
+            for (si = 0; si < waste_tmv_nroles; si++)
+                if (!strcmp(waste_tmv_roles[si].role, role)) break;
+            if (si == waste_tmv_nroles && si < WASTE_TMV_ROLES) {
+                waste_tmv_role *r = &waste_tmv_roles[si];
+                memset(r, 0, sizeof *r);
+                snprintf(r->role, sizeof r->role, "%s", role);
+                r->out = out; r->in = in; r->bits = t->q ? t->bits : 32;
+                waste_tmv_nroles++;
+            }
+            if (si < WASTE_TMV_ROLES) tw->prof_slot = si + 1;
+        }
+        if (si >= 0 && si < WASTE_TMV_ROLES) {
+            waste_tmv_role *r = &waste_tmv_roles[si];
+            r->calls++;
+            r->bytes += t->q ? nb : (uint64_t)out * (uint64_t)in * sizeof(float);
+            r->t += dt;
+        }
+    }
     pthread_mutex_unlock(&prof_mu);
+}
+
+/* Rows per matvec chunk. A floor of 64 rows was right for wide calls and
+ * starved narrow ones, because the pool rounds a chunk up to a multiple of
+ * its floor: on eight threads Qwen's 320-row HyperConnection down
+ * projection split into five chunks, the shared expert's 640 rows into
+ * five, and GDN's 48-row in_proj_a never left the calling thread. Sized by
+ * bytes instead, about 16 KB of weights a chunk, and kept a power of two
+ * of at least two — so every chunk but the last has an even row count and
+ * i8mm's two-row tiles fall on exactly the rows they did before.
+ *
+ * Below 256 KB of weights the whole call stays on the calling thread, as
+ * those 48 rows always had: split up, in_proj_a measured 2.7 GB/s against
+ * 7.5 left alone, the dispatch costing more than the work it shared. */
+static int mv_chunk(int out, size_t rowbytes)
+{
+    if ((size_t)out * rowbytes < ((size_t)256 << 10)) return out > 0 ? out : 1;
+    const size_t per = rowbytes ? ((size_t)16 << 10) / rowbytes : 64;
+    int c = 2;
+    while (c < 64 && (size_t)c * 2 <= per) c *= 2;
+    return c;
 }
 
 static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
@@ -824,6 +900,7 @@ static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
     if (!t || (!t->q && !t->data)) { memset(y, 0, (size_t)out * sizeof(float)); return; }
     if (!t->q) { matvec(y, t->data, x, out, in); return; }
     const int g = t->group, ng = (in + g - 1) / g;
+    const int mc = mv_chunk(out, t->rowbytes);
     if (trunk_kern != TK_F32 && t->bits == 4 && (g & 31) == 0) {
         mvq4_arg a = { y, (const uint8_t *)t->q, t->qs, m->xq, m->xs,
                        in, ng, g, sdot4_sg, g / sdot4_sg, t->rowbytes };
@@ -841,7 +918,7 @@ static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
             fn = mvq4_rows_smlal;
         }
         if (fn) {
-            waste_parallel_for_work(out, 64, fn, &a,
+            waste_parallel_for_work(out, mc, fn, &a,
                                     (size_t)out * t->rowbytes);
             if (trunk_check) {
                 float *ref = (float *)malloc((size_t)out * sizeof(float));
@@ -869,11 +946,11 @@ static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
     if (sdot_on && t->bits == 8) {
         quant_act(x, in, g, m->xq, m->xs);
         mvq_arg a = { y, t->q, t->qs, m->xq, m->xs, in, ng, g, 8, (size_t)ng * g };
-        waste_parallel_for_work(out, 64, mvq_rows, &a,
+        waste_parallel_for_work(out, mc, mvq_rows, &a,
                                 (size_t)out * t->rowbytes);
     } else {
         mvq_arg a = { y, t->q, t->qs, NULL, x, in, ng, g, t->bits, t->rowbytes };
-        run_rows(out, 64, waste_k.mvq_rows_f32, &a,
+        run_rows(out, mc, waste_k.mvq_rows_f32, &a,
                  (size_t)out * t->rowbytes);
     }
 }
@@ -1944,6 +2021,16 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         js_free(&d); free(src);
         return -2;                        /* -> WASTE_E_FORMAT */
     }
+    /* Qwen's 4-bit trunk goes through i8mm unless WASTE_TRUNK_KERNEL says
+     * otherwise. It is not the exact arithmetic, and the error is not the
+     * K3 kind that a recurrence carries forward: against f32 over 5,918
+     * tokens of real text, perplexity 3.712 against 3.698, no growth past
+     * QSA's 2,048-token selection budget, for 7.57 -> 9.59 tok/s
+     * (LEARNED §77). The kernel is one setting for the whole process, so a
+     * process that loads Qwen and then another architecture keeps i8mm for
+     * both; the variable pins it either way. */
+    if (m->cfg.arch_qwen && !trunk_kern_env)
+        waste_model_set_sdot4(TK_I8MM, sdot4_sg);
     /* rope_init leaves no table for a shape it does not implement. Running
      * anyway would apply no rotation, which is not a degraded result but an
      * unordered one, so refuse instead. */

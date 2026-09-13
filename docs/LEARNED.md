@@ -5626,3 +5626,133 @@ suite check now sets that cache. And the token comparisons read the second
 whitespace field of `[  0] 248068`, which below step 100 is the step index,
 so they compared 100 tokens rather than 200. Re-read from the saved logs
 with the index stripped, all 200 agree in every run.
+
+## 77. Qwen's trunk through i8mm: 29% for a difference the text cannot see (2026-09-13)
+
+§75 left GDN at 35.7 ms a step and HyperConnection at 18.0. Both looked
+like places for NEON loops — HyperConnection alone runs a sigmoid over
+10,240 values 96 times a token. They are not. `WASTE_PROFILE` now splits
+every phase into how much of it was trunk matvec (`PROF_START` notes the
+matvec total and `PROF_END` charges the difference) and prints matvec time
+by tensor role, a tensor's name with its layer number taken out, because
+the size buckets could not tell GDN's `out_proj` from QSA's `o_proj`. At
+f32, 7.33 tok/s:
+
+| phase | ms/step | of which matvec |
+|---|---:|---:|
+| HyperConnection | 19.1 | 16.1 |
+| GDN (recurrence 5.3) | 35.4 | 27.8 |
+| QSA | 13.0 | 8.6 |
+| shared expert | 6.5 | 6.2 |
+| lm_head | 6.3 | 6.3 |
+
+HyperConnection's loops are 3 ms; the rest of both phases is 4-bit
+projections. By tensor, at f32 and 7.57 tok/s: `in_proj_qkv` 11.9 ms at
+39.8 GB/s, `in_proj_z` 7.5 at 37.6, GDN `out_proj` 7.5 at 37.8,
+HyperConnection's down projections 9.1 at 17.1 and its up projections 6.0
+at 31.3, the shared expert's three 5.9 at 18–21, the router 1.8 at 17.3,
+and GDN's 48-row `in_proj_a`/`in_proj_b` 0.8 at 5.3. The large shapes run
+at about 5 GB/s a core on eight cores — compute-bound, not bandwidth-bound —
+and the small ones below that.
+
+**The kernel.** `WASTE_TRUNK_KERNEL` already had three alternatives to
+the f32 path. `sweep trunk=0,2,3,1`, one process, two repeats, 200 tokens
+teacher-forced against f32, 16 GiB cache and eight threads:
+
+| kernel | tok/s | KL vs f32 | top-10 | argmax |
+|---|---:|---:|---:|---:|
+| f32 | 7.45, 7.42 | — (second repeat: 0) | | |
+| i8mm | 9.54, 9.51 | 1.9e-4 | 99.1% | 199/200 |
+| SMLAL | 9.02, 9.02 | 1.3e-4 | 99.1% | 199/200 |
+| SDOT | 9.73, 9.91 | 6.1e-3 | 95.0% | 197/200 |
+
+f32 scoring exactly zero against itself on the second repeat is the check
+that `waste_model_reset` clears Qwen's state between arms. i8mm takes
+`in_proj_qkv` from 39.8 to 98.9 GB/s and GDN from 35.3 to 19.7 ms. Over
+512 positions i8mm's KL is 2.1e-4 (511/512) and SMLAL's 1.4e-4 (510/512).
+SDOT is out at thirty times the KL for 2% more speed.
+
+**That KL measured the easy positions.** `sweep` scores only generated
+tokens, where the model is predicting its own confident output. On a
+document it did not write, i8mm's KL is forty times higher, and a question
+about 200 generated tokens says nothing about whether a sparse-attention
+selection that only starts choosing past 2,048 tokens starts choosing
+differently. `tests/kernel_kl.c` loads the container once per kernel,
+steps every copy through the same tokens with the trunk kernel switched
+between them, and scores each position as it goes: KL, argmax, top-10,
+the logits' relative L2, how many of each layer's ten routed experts
+agree, and each kernel's next-token perplexity on the real text — the one
+column that says whether a copy further from f32 is any worse. Against
+itself every column is exactly zero.
+
+The prompt was 5,918 tokens: `docs/QWEN.md`, `src/qwen_qsa.c`,
+`src/qwen_gdn.c` and a question about both, tokenized a file at a time;
+then 256 tokens generated from f32's greedy choices.
+
+| over the prompt | i8mm | SMLAL |
+|---|---:|---:|
+| perplexity (f32 3.712) | 3.698 (−0.40%) | 3.714 (+0.03%) |
+| KL | 9.2e-3 | 7.0e-3 |
+| argmax | 5,711/5,918 (96.5%) | 5,734/5,918 (96.9%) |
+| top-10 | 93.2% | 94.2% |
+| routed experts agreeing | 97.65% | 97.93% |
+| layer-positions with any expert different | 20.3% | 18.1% |
+| generated: KL, argmax | 1.5e-3, 251/256 | 1.2e-3, 251/256 |
+
+Nothing grows. By 512-position window i8mm's KL is 2.9e-2 over the first
+window, where the text is prose the model finds hardest, and falls to
+2–5e-3 across the source files; the window straddling 2,048 is 1.4e-2
+against 1.0e-2 before it, with perplexity 0.8% *lower*. Expert agreement is
+97.1–98.1% in every window, and perplexity per window moves between −2.3%
+and +0.8% with no trend. One expert in forty goes elsewhere and one argmax
+in thirty differs, and neither shows up in how well the model predicts the
+text.
+
+**Free-running, it is a coin that lands both ways.** Answering the
+5,918-token prompt, greedy for 400 tokens, f32 walked through QSA's
+selection correctly and i8mm stated the indexer's key width as 256 (it is
+128) and spent its tokens re-reading the table. Five short prompts at both
+kernels, greedy to 600 tokens, raw completion — a train catch-up (6:00 pm),
+reversing a linked list in C, why the sky is blue, ordering four people by
+age, a summary in exactly three bullets — gave the same correct answers on
+the first four. On the fifth it was f32 that deliberated until the token
+limit, one bullet started, and i8mm that finished in 479 tokens with three.
+Greedy decoding parts at the first near-tie and after that the two are
+writing different answers; one sample each way is what that looks like.
+
+**Speed is short-context speed.** At 200 decode tokens the default build
+measures 9.91 tok/s against 7.70 with `WASTE_TRUNK_KERNEL=0` in the same
+binary, 29%; the five prompts gained 26–28%. Decoding at a 6K context it
+was 5.19 against 4.67, 11% — the attention the context adds is not trunk
+matvec, and those two runs hit 88% and 93% of the cache on different text.
+
+So it is the Qwen default: a Qwen load selects i8mm when
+`WASTE_TRUNK_KERNEL` is not set, and the variable pins either kernel. The
+kernel is process-wide, so a process that loads Qwen and then another
+architecture keeps i8mm for both. The suite needs no change: the
+container-native oracle runs with `WASTE_Q8=0`, which dequantizes the
+trunk at load, and Qwen's chunked prefill is its decode step in a loop.
+K3 is the reason this was measured rather than assumed: SDOT measured KL
+0.289 there, teacher-forced, because its recurrence carried the error
+forward (the note above `WASTE_TRUNK_KERNEL` in `model.c`), and nothing
+here says the next model is Qwen.
+
+**Chunk size, a smaller and exact change.** A matvec's rows went to the
+pool at no fewer than 64 a chunk, and the pool rounds a chunk up to a
+multiple of that floor: on eight threads the 320-row HyperConnection down
+projection split into five chunks, the shared expert's 640 rows into five.
+Chunks are now about 16 KB of weights, a power of two of 2 to 64 rows, so
+i8mm's two-row tiles land on the same rows — tokens identical at both
+kernels. HyperConnection down went 17.1 → 19.4 GB/s at f32 and 29.5 → 31.6
+at i8mm, the shared expert 25.1 → 28.8. The first version also split the
+48-row projections and took `in_proj_a` from 7.5 to 2.7 GB/s — 63 KB is
+cheaper on the calling thread than dispatched — so anything under 256 KB
+stays there. Net: i8mm 9.59 → 9.82 and 9.79 tok/s, f32 inside its noise.
+It changes chunking on every model and was measured on this one.
+HyperConnection down is still 32 GB/s against `in_proj_qkv`'s 99, with a
+10,240-wide activation quantized serially before each call as the suspect,
+unmeasured.
+
+`sweep`'s route columns read 0% on Qwen: `qwen_moe_layer` does not write
+the capture it compares. `kernel_kl` reads routes from
+`waste_model_step`'s own argument instead.

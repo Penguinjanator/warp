@@ -43,7 +43,25 @@ typedef struct {
      * ever read). q and qs are NULL in that case. */
     int64_t file_off, file_scale_off;   /* not long: 32 bits on Windows */
     int    on_disk;
+    /* Row in waste_tmv_roles plus one, filled on the first profiled matvec
+     * so the profiler looks the name up once rather than every call. */
+    int    prof_slot;
 } waste_tensor;
+
+/* Trunk matvec by tensor role, under WASTE_PROFILE: a tensor's name with
+ * its layer number taken out, so all 36 of a model's in_proj_qkv are one
+ * row. The size buckets could not say which projection a millisecond was
+ * in — on Qwen, GDN's out_proj and QSA's o_proj are the same shape, and so
+ * are QSA's K/V projections and the router. */
+typedef struct {
+    char role[96];
+    int out, in, bits;          /* bits 32: an F32 tensor                    */
+    uint64_t calls, bytes;
+    double t;
+} waste_tmv_role;
+#define WASTE_TMV_ROLES 96
+extern waste_tmv_role waste_tmv_roles[WASTE_TMV_ROLES];
+extern int waste_tmv_nroles;
 
 typedef struct {
     int n_layers, hidden, n_experts, top_k, moe_inter, dense_inter;
