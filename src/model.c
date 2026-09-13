@@ -1273,7 +1273,7 @@ static int validate_qwen_tensors(waste_model *m)
             REQUIRE_VECTOR(tname("%smodel.layers.%d.ple.norm_query.weight", c->prefix, L), H);
             REQUIRE_VECTOR(tname("%smodel.layers.%d.ple.norm_conv.weight", c->prefix, L), H);
             REQUIRE_DATA(tname("%smodel.layers.%d.ple.conv1d.weight", c->prefix, L),
-                         (size_t)H * (c->ple_conv_k > 0 ? c->ple_conv_k : 4));
+                         (size_t)H * c->ple_conv_k);
             for (int h = 0; h < WASTE_QWEN_PLE_HEADS; h++) {
                 const int rows = c->ple_sz[h] > 0 ? (int)c->ple_sz[h] : 1;
                 const int width = (c->ple_embed && c->heads_per_ngram)
@@ -1426,6 +1426,13 @@ static int cfg_sane(const waste_config *c)
     if (c->kda_heads < 0 || c->kda_heads > (1 << 16)) return 0;
     if (c->kda_dim   < 0 || c->kda_dim   > (1 << 16)) return 0;
     if (c->conv_k    < 0 || c->conv_k    > 64) return 0;
+    /* A PLE conv kernel of 0 allocates a zero-length ring while the
+     * weight check and the step walk as if it were 4, so a container
+     * the loader should have refused reads past the allocation. Only
+     * a container that declares a PLE layer ever reaches the ring;
+     * the field stays 0 elsewhere and is meaningless there. */
+    if (c->ple_layer >= 0 && (c->ple_conv_k < 1 || c->ple_conv_k > 64))
+        return 0;
     if (c->kv_lora < 0 || c->kv_lora > (1 << 20) ||
         c->q_lora < 0 || c->q_lora > (1 << 20)) return 0;
     if (c->qk_nope < 0 || c->qk_nope > (1 << 20) ||
@@ -6045,7 +6052,7 @@ static void qwen_ple_inject(waste_model *m, int token)
     waste_qwen_rmsnorm(gnorm, gated, nc, H, hid, c->eps);
     const waste_tensor *cw = waste_find(m, tname("%smodel.layers.%d.ple.conv1d.weight",
                                                  c->prefix, L));
-    const int KS = c->ple_conv_k > 0 ? c->ple_conv_k : 4;
+    const int KS = c->ple_conv_k;
     float *conv_y = gnorm + H;
     if (cw && cw->data)
         qwen_dilated_conv_step(H, KS, ngram, cw->data, m->ple_ring, gnorm, conv_y);
