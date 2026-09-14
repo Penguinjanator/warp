@@ -3509,6 +3509,7 @@ typedef struct {
     const float *lut_gate, *lut_up;
     const int8_t *q_gate, *q_up;
     const float *qs_gate, *qs_up;
+    const int *jmap;                 /* task t is expert jmap[t]; NULL: j_off+t */
 } xpar_arg;
 
 static void moe_expert_range(int b, int e, void *p)
@@ -3519,7 +3520,7 @@ static void moe_expert_range(int b, int e, void *p)
     const int inter = a->inter, lat = a->lat;
 
     for (int t = b; t < e; t++) {
-        const int j = a->j_off + t;
+        const int j = a->jmap ? a->jmap[t] : a->j_off + t;
         const uint8_t *rec = a->recs[j];
         const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
         const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
@@ -4495,7 +4496,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
                 lut_done = 1;
             }
             xpar_arg pa = { m, c, recs, w, j0, inter, lat, lut_gate, lut_up,
-                            q_gate, q_up, qs_gate, qs_up };
+                            q_gate, q_up, qs_gate, qs_up, NULL };
             waste_parallel_for(j1 - j0, 1, moe_expert_range, &pa);
             PROF_END(P_EMM);
             waste_ecache_release(&m->cache);
@@ -6520,6 +6521,48 @@ static void qwen_qsa_layer(waste_model *m, int L, const float *in, float *out, i
                                          c->prefix, L)), attn, hid, qd);
 }
 
+/* One routed expert through the row-parallel kernels, into `acc`.
+ *
+ * The serial loop's body, taken out so the staged path below can run a
+ * layer's one or two missing experts the same way, on its own slices. Same
+ * kernels in the same order, so the two agree bit for bit. */
+static void qwen_expert_rows(waste_model *m, const uint8_t *rec, int inter,
+                             int hid, const float *lut_gate,
+                             const float *lut_up, float *ga, float *ub,
+                             float *acc, float *lut_down)
+{
+    const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
+    const uint16_t *corr = (const uint16_t *)(rec + h->chan_corr_off);
+    vq_apply(m, ga, rec + h->gate_off, corr, inter, hid, lut_gate, NULL, NULL);
+    vq_apply(m, ub, rec + h->up_off, corr + inter, inter, hid, lut_up, NULL, NULL);
+    for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
+    vq_matvec(m, acc, rec + h->down_off, corr + 2 * inter, ga, hid, inter,
+              h->codebook_id + 2 * m->stages, lut_down, NULL, NULL);
+}
+
+/* The shared expert and its gate, into `acc`; returns the gate. The add
+ * into the layer output is the caller's, and stays after the routed sum,
+ * so running this early changes when it is computed and not what is
+ * summed. */
+static float qwen_shared_expert(waste_model *m, int L, const float *in, float *acc)
+{
+    const waste_config *c = &m->cfg;
+    const int hid = c->hidden;
+    PROF_START(P_QSHX);
+    const int shared = c->shared_inter ? c->shared_inter : c->moe_inter;
+    ffn(m,
+        waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.gate_proj.weight", c->prefix, L)),
+        waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.up_proj.weight", c->prefix, L)),
+        waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.down_proj.weight", c->prefix, L)),
+        in, acc, shared, hid, 1.0f, 0);
+    float sg;
+    matvec_t(m, &sg, waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert_gate.weight",
+                                         c->prefix, L)), in, 1, hid);
+    sg = 1.0f / (1.0f + expf(-sg));
+    PROF_END(P_QSHX);
+    return sg;
+}
+
 static void qwen_moe_layer(waste_model *m, int L, const float *in, float *out, int *routed)
 {
     const waste_config *c = &m->cfg;
@@ -6554,30 +6597,101 @@ static void qwen_moe_layer(waste_model *m, int L, const float *in, float *out, i
     float *ga = m->ff, *ub = ga + inter, *acc = m->e_gate;
     const int lut_sz = (hid / m->vec_dim) * m->stages * m->cb_entries;
     float *lut_gate = m->lut, *lut_up = lut_gate + lut_sz, *lut_down = lut_up + lut_sz;
+    float sg = 0.0f;
+    int shared_done = 0;
 
-    /* Same expert-parallel path the Kimi/GLM router takes, and the same
-     * question decides it: one task per expert wins when the records are
-     * already resident, and loses when holding a batch barriers the
-     * read-ahead. Asked per layer and per token from the cache, not from
-     * the architecture — see moe_layer, which explains what it decides on.
-     * WASTE_XPAR=0/1 still forces it either way.
+    /* When the cache decides, it decides per expert and not per layer.
      *
-     * When it is the cache that said yes, every record is already there,
-     * so a batch has no barrier left to limit: all K go to the pool in one
-     * dispatch rather than three. At a 16 GiB cache that is 7.58 against
-     * 7.05 tok/s with the same bytes read, and 6.52 against 6.34 at 8 GiB
-     * (LEARNED §76). Forcing the path does not get the same thing: holding
-     * all ten before any arithmetic, whatever the cache holds, gained 5% at
-     * 16 GiB and lost 6% at 8, the I/O wait growing faster than the
-     * arithmetic shrank. A forced path, or an explicit WASTE_XPAR_BATCH,
-     * keeps the batch it was given. */
+     * §76 took the expert-parallel path only when all ten records were
+     * resident, and a layer missing one went to the row split for all ten:
+     * thirty dispatches of rows too short to fill the pool. At a 16 GiB
+     * cache that was 4,723 of 10,464 layers in a 200-token run, at 1.71 ms
+     * against 0.69 for a whole-resident layer, and half of them were missing
+     * exactly one record. So the residents go first, one expert per task —
+     * they need no read, so holding them is no barrier — and the reads the
+     * hint issued for the rest run underneath. The misses follow once they
+     * land, with the shared expert computed in the gap, since it needs no
+     * record either.
+     *
+     * A few misses take the row split, many take one task each: one expert
+     * on one thread is slower than its rows on eight, and the crossover
+     * measured at four (11.57 tok/s, against 11.16 with every miss a task
+     * and 11.33 with every miss rows). LEARNED §82.
+     *
+     * The order experts are computed in is not the order they are summed
+     * in — each writes its own slice and the sum below runs in route order —
+     * so this path, the fixed batches and the serial loop are bit-identical.
+     * A forced WASTE_XPAR, or an explicit WASTE_XPAR_BATCH, keeps §76's
+     * fixed batches; WASTE_XPAR=0 the serial loop. */
+    enum { QWEN_MISS_TASKS = 4 };
+    if (xpar_on < 0 && !xpar_batch_set && m->xga && K > 1 &&
+        K <= WASTE_PF_MAX && m->cache.n_slots >= 4 * K) {
+        const uint8_t *recs[WASTE_PF_MAX];
+        int order[WASTE_PF_MAX], later[WASTE_PF_MAX];
+        int nres = 0, nmis = 0, ok = 1, lut_done = 0;
+        for (int j = 0; j < K; j++) {
+            if (waste_ecache_resident_all(&m->cache, L, idx + j, 1)) order[nres++] = j;
+            else later[nmis++] = j;
+        }
+        memcpy(order + nres, later, (size_t)nmis * sizeof(int));
+        for (int stage = 0; stage < 2 && ok; stage++) {
+            const int *list = stage ? order + nres : order;
+            const int n = stage ? nmis : nres;
+            if (!n) continue;
+            if (stage) { sg = qwen_shared_expert(m, L, in, acc); shared_done = 1; }
+            PROF_START(P_EDEQ);
+            for (int t = 0; t < n && ok; t++) {
+                recs[list[t]] = waste_ecache_hold(&m->cache, L, idx[list[t]],
+                                                  bank_fetch, m);
+                if (!recs[list[t]]) ok = 0;
+            }
+            PROF_END(P_EDEQ);
+            if (!ok) break;
+            PROF_START(P_EMM);
+            if (!lut_done) {
+                const waste_expert_hdr *h0 = (const waste_expert_hdr *)recs[list[0]];
+                vq_build_lut(m, lut_gate, h0->codebook_id + 0 * m->stages,
+                             in, hid, m->stages, m->cb_entries, m->vec_dim,
+                             NULL, NULL);
+                vq_build_lut(m, lut_up, h0->codebook_id + 1 * m->stages,
+                             in, hid, m->stages, m->cb_entries, m->vec_dim,
+                             NULL, NULL);
+                lut_done = 1;
+            }
+            if (stage == 0 || n >= QWEN_MISS_TASKS) {
+                xpar_arg pa = { m, c, recs, w, 0, inter, hid,
+                                lut_gate, lut_up, NULL, NULL, NULL, NULL, list };
+                waste_parallel_for_each(n, moe_expert_range, &pa, g_pool.nthreads);
+            } else {
+                for (int t = 0; t < n; t++) {
+                    const int j = list[t];
+                    qwen_expert_rows(m, recs[j], inter, hid, lut_gate, lut_up,
+                                     m->xga + (size_t)j * inter,
+                                     m->xub + (size_t)j * inter,
+                                     m->xacc + (size_t)j * hid,
+                                     m->xlut + (size_t)j * m->xlut_sz);
+                }
+            }
+            PROF_END(P_EMM);
+            waste_ecache_release(&m->cache);
+        }
+        if (ok) goto qwen_moe_sum;
+        /* Something did not read: let go of what was held and fall through
+         * to the serial loop, which re-reads and reports the reason. It uses
+         * `acc` as its accumulator, so the shared expert is redone after. */
+        waste_ecache_release(&m->cache);
+        shared_done = 0;
+    }
+
+    /* Forced, or batched explicitly: §76's fixed batches, the barrier and
+     * all. WASTE_XPAR=0/1 forces the path either way. */
     const int xpar_here = xpar_on >= 0
         ? xpar_on
         : waste_ecache_resident_all(&m->cache, L, idx, K);
-    const int batch = xpar_on < 0 && !xpar_batch_set ? K : xpar_batch;
     if (xpar_here && m->xga && K > 1 && K <= WASTE_PF_MAX &&
         m->cache.n_slots >= 4 * K) {
         const uint8_t *recs[WASTE_PF_MAX];
+        const int batch = xpar_batch;
         int lut_done = 0, ok = 1;
         for (int j0 = 0; j0 < K; j0 += batch) {
             int j1 = j0 + batch;
@@ -6602,27 +6716,17 @@ static void qwen_moe_layer(waste_model *m, int L, const float *in, float *out, i
                 lut_done = 1;
             }
             /* Qwen's experts read the hidden state directly: there is no
-             * latent projection, so `lat` is the hidden size. */
+             * latent projection, so `lat` is the hidden size. One expert
+             * per range: a batch of ten on eight threads cut as rows would
+             * be five ranges of two, and three threads with nothing. */
             xpar_arg pa = { m, c, recs, w, j0, inter, hid,
-                            lut_gate, lut_up, NULL, NULL, NULL, NULL };
-            waste_parallel_for(j1 - j0, 1, moe_expert_range, &pa);
+                            lut_gate, lut_up, NULL, NULL, NULL, NULL, NULL };
+            waste_parallel_for_each(j1 - j0, moe_expert_range, &pa,
+                                    g_pool.nthreads);
             PROF_END(P_EMM);
             waste_ecache_release(&m->cache);
         }
-        if (ok) {
-            /* Summed in j order, so the total does not depend on the
-             * thread count or the batch size. */
-            PROF_START(P_EMM);
-            for (int j = 0; j < K; j++) {
-                const float *accj = m->xacc + (size_t)j * hid;
-                const float wj = w[j];
-                for (int i = 0; i < hid; i++) out[i] += wj * accj[i];
-            }
-            PROF_END(P_EMM);
-            goto qwen_moe_done;
-        }
-        /* Something did not read: let go of what was held and fall through
-         * to the serial loop, which re-reads and reports the reason. */
+        if (ok) goto qwen_moe_sum;
         waste_ecache_release(&m->cache);
     }
 
@@ -6632,43 +6736,45 @@ static void qwen_moe_layer(waste_model *m, int L, const float *in, float *out, i
         const uint8_t *rec = read_expert(m, L, idx[j]);
         PROF_END(P_EDEQ);
         if (!rec) break;
-        const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
-        const uint16_t *corr = (const uint16_t *)(rec + h->chan_corr_off);
         PROF_START(P_EMM);
         if (!lut_ready) {
+            const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
             vq_build_lut(m, lut_gate, h->codebook_id + 0 * m->stages,
                          in, hid, m->stages, m->cb_entries, m->vec_dim, NULL, NULL);
             vq_build_lut(m, lut_up, h->codebook_id + 1 * m->stages,
                          in, hid, m->stages, m->cb_entries, m->vec_dim, NULL, NULL);
             lut_ready = 1;
         }
-        vq_apply(m, ga, rec + h->gate_off, corr, inter, hid, lut_gate, NULL, NULL);
-        vq_apply(m, ub, rec + h->up_off, corr + inter, inter, hid, lut_up, NULL, NULL);
-        for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
-        vq_matvec(m, acc, rec + h->down_off, corr + 2 * inter, ga, hid, inter,
-                  h->codebook_id + 2 * m->stages, lut_down, NULL, NULL);
+        qwen_expert_rows(m, rec, inter, hid, lut_gate, lut_up, ga, ub, acc, lut_down);
         const float wj = w[j];
         for (int i = 0; i < hid; i++) out[i] += wj * acc[i];
         PROF_END(P_EMM);
     }
-qwen_moe_done: ;
-    PROF_START(P_QSHX);
-    const int shared = c->shared_inter ? c->shared_inter : inter;
-    ffn(m,
-        waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.gate_proj.weight", c->prefix, L)),
-        waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.up_proj.weight", c->prefix, L)),
-        waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.down_proj.weight", c->prefix, L)),
-        /* Not m->h: qwen_step passes it as `out`, and the routed sum is
-         * already in there waiting for HyperConnection to consume it. The
-         * expert accumulator is dead once the loop above has finished and
-         * is sized for hid floats, so the shared expert lands there. */
-        in, acc, shared, hid, 1.0f, 0);
-    float sg;
-    matvec_t(m, &sg, waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert_gate.weight",
-                                         c->prefix, L)), in, 1, hid);
-    sg = 1.0f / (1.0f + expf(-sg));
-    for (int i = 0; i < hid; i++) out[i] += sg * acc[i];
-    PROF_END(P_QSHX);
+    goto qwen_moe_shared;
+
+qwen_moe_sum:
+    /* Summed in route order, so the total does not depend on the thread
+     * count, the batch, or which experts were resident. */
+    {
+        PROF_START(P_EMM);
+        for (int j = 0; j < K; j++) {
+            const float *accj = m->xacc + (size_t)j * hid;
+            const float wj = w[j];
+            for (int i = 0; i < hid; i++) out[i] += wj * accj[i];
+        }
+        PROF_END(P_EMM);
+    }
+qwen_moe_shared:
+    /* Not m->h: qwen_step passes it as `out`, and the routed sum is already
+     * in there waiting for HyperConnection to consume it. The expert
+     * accumulator is dead once the routed experts are done and is sized for
+     * hid floats, so the shared expert lands there. */
+    if (!shared_done) sg = qwen_shared_expert(m, L, in, acc);
+    {
+        PROF_START(P_QSHX);
+        for (int i = 0; i < hid; i++) out[i] += sg * acc[i];
+        PROF_END(P_QSHX);
+    }
 }
 
 static const float *qwen_step(waste_model *m, int token, int pos, int *routed)

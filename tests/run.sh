@@ -1654,17 +1654,25 @@ else
     # so without one every arm below runs the row split and the comparison
     # is of a path against itself — which is how this check first passed.
     # One MB is 256 slots on the fixture, its whole bank, preloaded.
+    #
+    # Preloaded is also what keeps the default from ever meeting a miss:
+    # every layer finds its experts resident and only the first stage of
+    # qwen_moe_layer's staged path runs. The cold arm turns the preload off,
+    # so the first tokens hold residents and misses in two stages — five
+    # layers of the fixture take the second one, as the row split.
     QXIDS=3,7,11,5,3,7,11,5,3,7,11,5
     WASTE_CACHE_MB=1 ./test_forward "$QWENC" "$QXIDS" "$TMP/qwen_xdef.bin" 0 >/dev/null 2>&1
+    WASTE_CACHE_MB=1 WASTE_PRELOAD=0 ./test_forward "$QWENC" "$QXIDS" "$TMP/qwen_xcold.bin" 0 >/dev/null 2>&1
     WASTE_CACHE_MB=1 WASTE_XPAR=0 ./test_forward "$QWENC" "$QXIDS" "$TMP/qwen_xrows.bin" 0 >/dev/null 2>&1
     WASTE_CACHE_MB=1 WASTE_XPAR=1 WASTE_XPAR_BATCH=4 ./test_forward "$QWENC" "$QXIDS" "$TMP/qwen_x4.bin" 0 >/dev/null 2>&1
     WASTE_CACHE_MB=1 WASTE_XPAR=1 WASTE_XPAR_BATCH=64 ./test_forward "$QWENC" "$QXIDS" "$TMP/qwen_xall.bin" 0 >/dev/null 2>&1
     if [ ! -s "$TMP/qwen_xdef.bin" ]; then
         no "the Qwen expert-schedule comparison did not run"
     elif cmp -s "$TMP/qwen_xdef.bin" "$TMP/qwen_xrows.bin" &&
+         cmp -s "$TMP/qwen_xdef.bin" "$TMP/qwen_xcold.bin" &&
          cmp -s "$TMP/qwen_xdef.bin" "$TMP/qwen_x4.bin" &&
          cmp -s "$TMP/qwen_xdef.bin" "$TMP/qwen_xall.bin"; then
-        ok "Qwen's row split, a batch of four and one dispatch per layer give the default's logits"
+        ok "Qwen's row split, a batch of four, one dispatch per layer and a cold cache give the default's logits"
     else
         no "a Qwen expert schedule changes the logits"
     fi

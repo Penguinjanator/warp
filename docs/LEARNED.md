@@ -5983,3 +5983,95 @@ attention — on the pool now — is 8.3.
 
 The step at either length is now mostly MoE: 57 ms of it at 2,801 tokens,
 and its expert arithmetic the largest single part.
+
+## 82. A layer missing one expert ran all ten as rows (2026-09-14)
+
+§81 left MoE the largest part of a Qwen step. On §75's protocol (18-token
+prompt, 200 decode tokens, 16 GiB cache, eight threads) it was 55.7 ms of
+it, and 42.8 of those the routed experts' arithmetic. The profile hid where:
+its LUT apply row is timed only on the row split, so the expert-parallel
+layers showed up as a remainder of about 19 ms with no row of its own.
+
+**Counted per layer**, over that run with the prompt included:
+
+| path | layers | ms per layer |
+|---|---:|---:|
+| expert-parallel, all ten resident | 5,741 | 0.69 |
+| row split, anything missing | 4,723 | 1.71 |
+
+§76's rule sent a layer down the row split if any of its ten records was
+absent, and 2,343 of those 4,723 layers were missing exactly one. For one
+read, nine resident experts gave up the single dispatch and took thirty,
+over rows too short to fill the pool.
+
+**The thread split was a smaller thing than it looked.** A batch of ten on
+eight threads went to `waste_parallel_for`, which cuts n into equal ranges:
+five ranges of two, three threads with no expert. `waste_parallel_for_each`
+now gives each item its own range and lets every participant take the next
+one. On its own it measured within noise — 10.41 and 10.65 tok/s before,
+10.43 and 10.50 after, expert arithmetic 43.75 → 42.95 ms — because it
+only touches the layers that were already fast. It stays, since the staged
+path below runs through it.
+
+**The staged path.** When the cache decides, `qwen_moe_layer` asks it
+about each expert rather than the layer. The residents are held and run
+first, one task per expert: they need no read, so holding them is no
+barrier. The hint issued the reads for the rest before the first hold, so
+those run underneath. Then the misses are held and run: as rows when there
+are fewer than four, as tasks when there are more, because one expert on
+one thread is slower than its rows on eight. The shared expert, which needs
+no record either, is computed between the two stages. A forced `WASTE_XPAR`
+or an explicit `WASTE_XPAR_BATCH` keeps §76's fixed batches.
+
+Each expert writes its own slice, and the sum still runs in route order
+afterwards, so the order the experts are computed in does not reach the
+bits. First-position logits were byte-identical and every generated token
+the same in all ten real-container runs below. The suite's schedule check
+gains a cold-cache arm: the fixture preloads its whole bank, so the default
+arm never met a miss and only ever ran the first stage; with
+`WASTE_PRELOAD=0`, five of its layers take the second.
+
+The threshold of four, as single runs on an instrumented build before the
+shared expert moved: 11.57 tok/s at four, 11.16 with every miss a task,
+11.33 with every miss as rows.
+
+Against a build of §81's commit, unprofiled:
+
+| | before | after |
+|---|---:|---:|
+| 16 GiB, decode, two runs | 10.37, 10.28 | 11.30, 11.14 (+8.7%) |
+| 8 GiB, decode | 8.39 | 9.08 (+8.2%) |
+| 2,801-token context, decode | 9.41 | 10.03 (+6.6%) |
+| 2,801-token context, reading the prompt | 9.83 | 10.55 (+7.3%) |
+
+Hit rates and bytes read are unchanged at either cache size (90.2% and
+17.72 GB; 79.8% and 36.4 GB). Profiled, decode only, 16 GiB:
+
+| ms/step | before | after |
+|---|---:|---:|
+| MoE | 55.7 | 49.0 |
+| ├ expert arithmetic | 42.8 | 34.7 |
+| │ ├ LUT build | 5.6 | 3.0 |
+| │ └ LUT apply (row split only) | 18.6 | 2.6 |
+| ├ expert I/O | 7.1 | 8.2 |
+| ├ shared expert | 3.9 | 4.1 |
+| └ router | 1.6 | 1.7 |
+
+**Expert I/O rose, and that is the next thing.** On the row split a read
+landed under the arithmetic of the experts routed ahead of it; now the
+residents finish first and the misses are waited for. Timed on the
+instrumented build, over decode only: the second stage waited 9.4 ms a
+step and computed for 3.8. A record is 1.72 MB and a read took 0.88 ms,
+against about 0.6 ms of first-stage arithmetic. More readers did not buy
+it back: every read got slower and so did the arithmetic beside it.
+
+| readers / depth | tok/s | ms per read |
+|---|---:|---:|
+| 2 / 2 (the default) | 11.29 | 0.885 |
+| 4 / 4 | 10.91 | 1.239 |
+| 8 / 8 | 10.73 | 1.445 |
+| 4 / 10 | 10.94 | 1.228 |
+
+What would help is starting those reads earlier than the layer's own
+router. Kimi's `moe_layer` already does, through `predict_next_moe`
+(§34), and Qwen's does not.
