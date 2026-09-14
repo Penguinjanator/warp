@@ -6162,3 +6162,88 @@ bytes per token, and by that measure this one is a cost. A confidence
 cutoff — prefetch a guess only when its score clears the rest by a margin —
 might keep the useful reads and drop some of the wasted ones. It is not
 measured.
+
+## 84. The expert kernel was not waiting on memory, it was waiting on a thread with two (2026-09-14)
+
+After §83, 16 GiB and eight threads, the step was 85.6 ms and 34.7 of it
+the routed experts' arithmetic. Across thread counts, 64 decode tokens each:
+
+| ms/step | 1 thread | 2 | 4 | 8 | 12 | 1 → 8 |
+|---|---:|---:|---:|---:|---:|---:|
+| expert arithmetic | 152.5 | 87.9 | 52.0 | 34.7 | 32.4 | 4.40x |
+| lm_head | 48.2 | 24.3 | 12.4 | 6.4 | 7.3 | 7.55x |
+| GDN | 72.0 | 39.9 | 23.2 | 16.2 | 19.8 | 4.44x |
+| HyperConnection | 26.2 | 14.7 | 10.1 | 9.6 | 10.5 | 2.72x |
+| tok/s | 2.98 | 5.24 | 8.49 | 11.09 | 10.46 | |
+
+The trunk kernel runs 15 GB/s on one core at every call size. On eight its
+large calls reach 92–100 GB/s, a third of this machine's 273 GB/s, and its
+calls under 1 MB 25–28: those are dispatch, not arithmetic. Twelve threads
+lose, as §47 found on other models — the efficiency cores are stragglers.
+
+The expert kernel falls behind at two threads already (1.7x against lm_head's
+2.0x), which looked like memory: a gather is a load, an address and a load,
+and its tables sit in a cache the performance cores share. **It is not.**
+One engine thread, 32 decode tokens, with six other cores running each of
+five loads, two passes in opposite orders:
+
+| load | expert arithmetic | lm_head |
+|---|---|---|
+| none | 149.9, 154.1 | 46.6, 48.2 |
+| spin | 157.4, 158.9 | 49.3, 50.2 |
+| memcpy, 64 MB buffers | 157.4, 157.3 | 49.5, 49.5 |
+| address-dependent reads over 1 GB | 159.5, 159.8 | 49.4, 49.4 |
+| the same over 2 MB each | 157.6, 157.9 | 49.3, 49.3 |
+
+Everything lost 4–5% to any load at all, spin included — the cluster
+sharing power — and memory traffic added at most 1% on top. So the table
+was not quantized; `WASTE_VQ8`'s case rests on its kernel being faster, not
+on memory being the wall, and this entry did not test it.
+
+**What it was.** §82 gave every routed expert one task. Ten experts of
+equal size on eight threads is two threads with two experts and a barrier
+waiting for them: ten experts of work in two experts of wall time, 5x at
+best, and 4.4x measured. `experts_staged` cuts the work into equal pieces
+instead, in the three stages an expert depends on — every expert's gate and
+up rows 128 at a time, then each expert's activation and down table, then
+every expert's down rows 128 at a time. Three dispatches a layer, each
+piece writing only its own rows through the same `vq_rows` and
+`lutb_range` the per-expert task called, so the logits are unchanged. It
+runs both of §82's stages, and replaces the split between rows and tasks
+for the misses: every threshold of that split was slower.
+
+Against a build of §83's commit, unprofiled, logits byte-identical, every
+token the same and the bytes read unchanged in all eleven runs:
+
+| | before | after |
+|---|---|---|
+| 16 GiB, decode, three runs | 11.87, 11.41, 11.51 | 12.23, 11.95, 11.98 (+3.9%) |
+| 8 GiB, decode, two runs | 9.80, 9.75 | 10.19, 10.27 (+4.6%) |
+| 2,801-token context, decode | 10.03 | 10.56 (+5.3%) |
+| 2,801-token context, reading the prompt | 10.47 | 11.12 (+6.2%) |
+| expert arithmetic, profiled, ms/step | 34.3 | 26.8 |
+
+In one binary with a switch, an hour earlier, the same change measured
+11.19 and 11.14 against 12.17 and 11.92. The machine drifted by that much
+between the two sessions, which is why the table above is the one kept.
+
+Measured and not adopted, each within noise of the plain version at 16 GiB:
+
+| variant | tok/s |
+|---|---|
+| rows per piece 64 / 128 / 256 / 512 | 12.18, 11.83 / 12.14, 12.14 / 12.03, 12.34 / 11.94, 12.18 |
+| stage 2 in 16-vector pieces, the activation serial | 12.14, 11.99, 12.22 |
+| gate and up tables built in one dispatch | 11.86, 12.07, 12.12 |
+| both | 11.90, 12.09, 12.14 |
+| none of them | 12.25, 11.90, 12.02 |
+
+The suite cannot see the splitting: the synthetic Qwen fixture's matrices
+are 16 and 32 rows, under one piece. The eleven real-container runs above
+are what checks it.
+
+**The rest of this measurement, for the next entry.** The SSD holding the
+container is the internal one, 97% full: uncontended, one reader gets 3.1
+GB/s at 0.59 ms a 1.77 MB record, two get 4.4 GB/s at 0.84 ms, four get
+3.9 GB/s at 1.88 ms. Beside eight spinning threads two readers take 1.08 ms
+a record, beside eight memcpy threads 1.15 — the engine's 0.88 ms is this
+drive plus the arithmetic beside it. Two readers is the drive's best.

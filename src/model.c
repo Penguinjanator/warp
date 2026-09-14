@@ -3550,6 +3550,104 @@ static void moe_expert_range(int b, int e, void *p)
     }
 }
 
+/* ---- routed experts in row ranges, a stage at a time ---------------------
+ *
+ * One task per expert leaves the barrier waiting on whichever thread got two:
+ * ten equal experts on eight threads is two experts of wall time for ten of
+ * work, 5x at best, and Qwen's measured 4.4x on eight cores. It is not the
+ * memory — on one thread the kernel lost no more to six cores of random
+ * reads over 1 GB than to six cores spinning (LEARNED §84). So the work is
+ * cut into equal pieces instead, in the three stages an expert's arithmetic
+ * depends on:
+ *
+ *   1. every expert's gate and up rows, VQ_TILE * VQ_SUPER rows a task
+ *   2. every expert's activation and down table, one task each
+ *   3. every expert's down rows, in the same ranges
+ *
+ * Each piece writes only its own rows, through the kernels vq_apply_serial
+ * and vq_matvec_serial call, so the result is moe_expert_range's bit for
+ * bit. VQ3R with float tables only: that is what Qwen's experts use, and a
+ * VQ4P or WASTE_VQ8 layer keeps the per-expert tasks. */
+enum { XS_ROWS = VQ_TILE * VQ_SUPER };
+
+typedef struct {
+    waste_model *m;
+    const uint8_t **recs;
+    const int *list;                 /* piece t's expert is list[t / per]  */
+    int inter, hid, n_gu, n_dn;      /* row ranges per matrix              */
+    const float *lut_gate, *lut_up;
+} xstage_arg;
+
+static void xstage_gate_up(int b, int e, void *p)
+{
+    const xstage_arg *a = (const xstage_arg *)p;
+    waste_model *m = a->m;
+    const int inter = a->inter, per = 2 * a->n_gu;
+    for (int k = b; k < e; k++) {
+        const int j = a->list[k / per], mat = (k % per) / a->n_gu;
+        const int r0 = ((k % per) % a->n_gu) * XS_ROWS;
+        const int r1 = r0 + XS_ROWS < inter ? r0 + XS_ROWS : inter;
+        const uint8_t *rec = a->recs[j];
+        const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
+        const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
+        vq_arg va = { (mat ? m->xub : m->xga) + (size_t)j * inter,
+                      rec + (mat ? h->up_off : h->gate_off), sc + mat * inter,
+                      mat ? a->lut_up : a->lut_gate,
+                      a->hid / m->vec_dim, m->stages, m->cb_entries };
+        vq_rows(r0, r1, &va);
+    }
+}
+
+static void xstage_down_lut(int b, int e, void *p)
+{
+    const xstage_arg *a = (const xstage_arg *)p;
+    waste_model *m = a->m;
+    const int inter = a->inter;
+    for (int t = b; t < e; t++) {
+        const int j = a->list[t];
+        const waste_expert_hdr *h = (const waste_expert_hdr *)a->recs[j];
+        float *ga = m->xga + (size_t)j * inter;
+        waste_act_pair_range(&m->cfg, ga, m->xub + (size_t)j * inter, inter);
+        lutb_arg la = { m->xlut + (size_t)j * m->xlut_sz, m->codebooksT, ga,
+                        h->codebook_id + 2 * m->stages, m->stages,
+                        m->cb_entries, m->vec_dim };
+        waste_k.lutb_range(0, inter / m->vec_dim, &la);
+    }
+}
+
+static void xstage_down(int b, int e, void *p)
+{
+    const xstage_arg *a = (const xstage_arg *)p;
+    waste_model *m = a->m;
+    const int inter = a->inter, hid = a->hid;
+    for (int k = b; k < e; k++) {
+        const int j = a->list[k / a->n_dn];
+        const int r0 = (k % a->n_dn) * XS_ROWS;
+        const int r1 = r0 + XS_ROWS < hid ? r0 + XS_ROWS : hid;
+        const uint8_t *rec = a->recs[j];
+        const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
+        const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
+        vq_arg va = { m->xacc + (size_t)j * hid, rec + h->down_off, sc + 2 * inter,
+                      m->xlut + (size_t)j * m->xlut_sz,
+                      inter / m->vec_dim, m->stages, m->cb_entries };
+        vq_rows(r0, r1, &va);
+    }
+}
+
+/* n experts, named by list, into their xacc slices. */
+static void experts_staged(waste_model *m, const uint8_t **recs, const int *list,
+                           int n, int inter, int hid,
+                           const float *lut_gate, const float *lut_up)
+{
+    xstage_arg a = { m, recs, list, inter, hid,
+                     (inter + XS_ROWS - 1) / XS_ROWS, (hid + XS_ROWS - 1) / XS_ROWS,
+                     lut_gate, lut_up };
+    const int w = g_pool.nthreads;
+    waste_parallel_for_each(n * 2 * a.n_gu, xstage_gate_up, &a, w);
+    waste_parallel_for_each(n, xstage_down_lut, &a, w);
+    waste_parallel_for_each(n * a.n_dn, xstage_down, &a, w);
+}
+
 /* ---- layers ------------------------------------------------------------ */
 
 /* Log-space decay gate, in place over [H][D].
@@ -6524,9 +6622,8 @@ static void qwen_qsa_layer(waste_model *m, int L, const float *in, float *out, i
 
 /* One routed expert through the row-parallel kernels, into `acc`.
  *
- * The serial loop's body, taken out so the staged path below can run a
- * layer's one or two missing experts the same way, on its own slices. Same
- * kernels in the same order, so the two agree bit for bit. */
+ * The serial loop's body: the path WASTE_XPAR=0 forces, and the one a layer
+ * falls back to when a record does not read. */
 static void qwen_expert_rows(waste_model *m, const uint8_t *rec, int inter,
                              int hid, const float *lut_gate,
                              const float *lut_up, float *ga, float *ub,
@@ -6614,17 +6711,16 @@ static void qwen_moe_layer(waste_model *m, int L, const float *in, float *out, i
      * land, with the shared expert computed in the gap, since it needs no
      * record either.
      *
-     * A few misses take the row split, many take one task each: one expert
-     * on one thread is slower than its rows on eight, and the crossover
-     * measured at four (11.57 tok/s, against 11.16 with every miss a task
-     * and 11.33 with every miss rows). LEARNED §82.
+     * Both stages run through experts_staged, in equal row ranges rather
+     * than one task per expert, so neither a batch of ten nor a lone miss
+     * leaves threads idle. §82 had split the misses between rows and tasks
+     * at four; the row ranges beat both (LEARNED §84).
      *
      * The order experts are computed in is not the order they are summed
      * in — each writes its own slice and the sum below runs in route order —
      * so this path, the fixed batches and the serial loop are bit-identical.
      * A forced WASTE_XPAR, or an explicit WASTE_XPAR_BATCH, keeps §76's
      * fixed batches; WASTE_XPAR=0 the serial loop. */
-    enum { QWEN_MISS_TASKS = 4 };
     if (xpar_on < 0 && !xpar_batch_set && m->xga && K > 1 &&
         K <= WASTE_PF_MAX && m->cache.n_slots >= 4 * K) {
         const uint8_t *recs[WASTE_PF_MAX];
@@ -6659,19 +6755,12 @@ static void qwen_moe_layer(waste_model *m, int L, const float *in, float *out, i
                              NULL, NULL);
                 lut_done = 1;
             }
-            if (stage == 0 || n >= QWEN_MISS_TASKS) {
+            if (m->index_bits != 6 && !vq8_on) {
+                experts_staged(m, recs, list, n, inter, hid, lut_gate, lut_up);
+            } else {
                 xpar_arg pa = { m, c, recs, w, 0, inter, hid,
                                 lut_gate, lut_up, NULL, NULL, NULL, NULL, list };
                 waste_parallel_for_each(n, moe_expert_range, &pa, g_pool.nthreads);
-            } else {
-                for (int t = 0; t < n; t++) {
-                    const int j = list[t];
-                    qwen_expert_rows(m, recs[j], inter, hid, lut_gate, lut_up,
-                                     m->xga + (size_t)j * inter,
-                                     m->xub + (size_t)j * inter,
-                                     m->xacc + (size_t)j * hid,
-                                     m->xlut + (size_t)j * m->xlut_sz);
-                }
             }
             PROF_END(P_EMM);
             waste_ecache_release(&m->cache);
