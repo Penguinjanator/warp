@@ -81,7 +81,8 @@ enum { P_LUTB, P_KDA, P_MLA, P_ROUTE, P_EDEQ, P_EMM, P_HEAD, P_LUTA, P_MM,
        P_QSAR,    /* the RoPE cos/sin table the block scores rotate by   */
        P_QSAS,    /* block pooling, scoring and top-k                    */
        P_QSAG,    /* selected K/V, BF16 to F32                           */
-       P_QSAA };  /* attention over the selection                        */
+       P_QSAA,    /* attention over the selection                        */
+       P_QLAH };  /* router lookahead: the next layer's guess, inside P_ROUTE */
 static int prof_on = -1;
 static pthread_mutex_t prof_mu = PTHREAD_MUTEX_INITIALIZER;
 static double pnow(void)
@@ -6777,6 +6778,59 @@ qwen_moe_shared:
     }
 }
 
+/* Which experts layer L+1 is about to route to, asked as soon as layer L's
+ * MoE is back in the streams — so the reads it starts run under L+1's
+ * attention instead of after its router.
+ *
+ * Kimi's lookahead (§34) runs the next router on this layer's MoE input.
+ * On Qwen that input is one HyperConnection mix of four streams, and L+1's
+ * router will see a different mix of different streams. At the width used
+ * here it would have started 32% of L+1's cache misses early, for 0.43
+ * wasted reads a layer. L+1's own MLP mix, applied to the streams as they
+ * now are, starts 43% for 0.09 — and costs more than the reads it saves,
+ * 4.6% slower end to end. This is its cheap half: each stream normalized
+ * with L+1's MLP mix weights and averaged, the dynamic gate left out. 43%
+ * for 0.23, at the price of four norms and one router projection. LEARNED
+ * §83 has the other predictors and the widths.
+ *
+ * `m->x`, the block output and the router area are all dead here — the
+ * next layer's attention mix writes the first, its attention the second —
+ * so the guess needs no scratch of its own. Asking earlier, straight after
+ * layer L routes, would have needed scratch and measured the same expert
+ * I/O: what is still waited for is the misses no top-6 guesses. It only chooses what is read
+ * early; the real router still decides, so the logits cannot move. */
+static int qwen_predict_next_moe(waste_model *m, int L, int *out, int n)
+{
+    const waste_config *c = &m->cfg;
+    const int E = c->n_experts, hid = c->hidden, hc = c->hc_count;
+    if (n <= 0 || L + 1 >= c->n_layers) return 0;
+    if (n > E) n = E;
+    const waste_tensor *g = waste_find(m, tname("%smodel.layers.%d.mlp.gate.weight",
+                                                c->prefix, L + 1));
+    const waste_tensor *nw = waste_find(m, tname(
+        "%smodel.layers.%d.mlp_hyper_connection.hc_norm.weight", c->prefix, L + 1));
+    if (!g || !nw || !nw->data) return 0;
+    float *x = m->x, *nb = m->h, *sc = m->att + WASTE_ATT_ROUTER_OFF;
+    memset(x, 0, (size_t)hid * sizeof(float));
+    for (int b = 0; b < hc; b++) {
+        waste_qwen_rmsnorm(nb, m->hcx + (size_t)b * hid,
+                           nw->data + (size_t)b * hid, hid, hid, c->eps);
+        for (int i = 0; i < hid; i++) x[i] += nb[i];
+    }
+    matvec_t(m, sc, g, x, E, hid);
+    /* Top n by insertion: n is a handful and E is 512. */
+    int k = 0;
+    for (int e = 0; e < E; e++) {
+        const float v = sc[e];
+        if (!(v == v)) continue;
+        if (k == n && !(v > sc[out[n - 1]])) continue;
+        int q = k < n ? k++ : n - 1;
+        while (q > 0 && v > sc[out[q - 1]]) { out[q] = out[q - 1]; q--; }
+        out[q] = e;
+    }
+    return k;
+}
+
 static const float *qwen_step(waste_model *m, int token, int pos, int *routed)
 {
     dump_pos0 = pos;
@@ -6841,6 +6895,19 @@ static const float *qwen_step(waste_model *m, int token, int pos, int *routed)
             PROF_START(P_QHC);
             waste_qwen_hc_combine(m->hcx, block, inj, hc, hid, m->hcx);
             PROF_END(P_QHC);
+        }
+        /* The disk is about to go idle through the next layer's attention:
+         * start the reads its router is likely to ask for. Width 6 is
+         * WASTE_LOOKAHEAD's default for Kimi too, and it is where Qwen's
+         * curve peaked here — wider guesses read more than they save. */
+        if (lookahead_n && m->cache.io && m->cache.n_slots > 0) {
+            PROF_START(P_ROUTE);
+            PROF_START(P_QLAH);
+            int nxt[64];
+            const int nn = qwen_predict_next_moe(m, L, nxt, lookahead_n);
+            if (nn) waste_ecache_prefetch(&m->cache, L + 1, nxt, nn);
+            PROF_END(P_QLAH);
+            PROF_END(P_ROUTE);
         }
         /* Same role as the Kimi dump in waste_model_step: one residual
          * stream after every layer. Qwen's stream is the hc hyper-state. */

@@ -6075,3 +6075,90 @@ it back: every read got slower and so did the arithmetic beside it.
 What would help is starting those reads earlier than the layer's own
 router. Kimi's `moe_layer` already does, through `predict_next_moe`
 (§34), and Qwen's does not.
+
+## 83. Qwen's router lookahead: the cheap half of the next layer's mix (2026-09-14)
+
+§82 ended on expert I/O: 8.2 ms of a step spent waiting for the reads of
+experts no layer had asked for until its own router ran. Kimi starts them
+a layer early (§34, §35); Qwen did not. Its default `WASTE_LOOKAHEAD` of 6
+now applies to Qwen as well, with a predictor of its own.
+
+**Which input to give layer L+1's router**, measured before any of it read
+a byte: per layer transition over §75's 200 decode tokens at a 16 GiB
+cache, against L+1's real routing and the cache's residency at that
+moment. 0.71 of L+1's ten experts missed per transition.
+
+| predictor, top 6 | misses it would have started | wasted reads a layer |
+|---|---:|---:|
+| (a) layer L's MoE input — Kimi's | 32.1% | 0.43 |
+| (b) the same plus L's MoE output | 32.7% | 0.42 |
+| (c) L+1's MLP HyperConnection mix, on the streams after L | 43.0% | 0.09 |
+| (d) the streams normalized with (c)'s weights, averaged, no gate | 42.7% | 0.23 |
+| (e) the raw streams averaged | 38.0% | 0.45 |
+
+Kimi's predictor is weak here for a reason Kimi does not have: the MoE
+input is one mix of four streams, and the next router will see a different
+mix of different ones. (c) is nearly L+1's real MoE input, missing only
+L+1's attention, and wider it is better still — 75% of misses at top 10 for
+0.43 wasted. It is also a down projection over 10,240 values and an up
+projection back, per layer: 10.71–11.07 tok/s against 11.32–11.48 without
+the lookahead. (d) keeps its norms and drops the gate.
+
+A sixth, (f), predicted layer L from its own attention input, which is
+already computed and so costs only the router projection. It chose worse:
+93.8% hit rate and 21.05 GB read, against (d)'s 94.6% and 19.20 GB.
+
+**Width**, with (d), 16 GiB unless stated:
+
+| width | tok/s | hit rate | read |
+|---|---|---:|---:|
+| off | 11.34, 11.41 | 90.2% | 17.72 GB |
+| 3 | 11.46, 11.45 | 92.3% | 18.08 GB |
+| 4 | 11.09, 11.58 | 93.1% | 18.34 GB |
+| 6 | 11.00, 11.68 | 94.6% | 19.20 GB |
+| 8 | 11.11, 11.68 | 95.9% | 20.69 GB |
+| 10 | 11.23, 11.66 | 97.0% | 22.84 GB |
+| 12 | 11.32, 11.47 | 97.6% | 26.19 GB |
+| 16 | 11.03, 11.27 | 98.3% | 35.15 GB |
+| 8 GiB: off, 6, 10 | 9.09, 9.56, 9.07 | 79.8%, 88.3%, 92.7% | 36.4, 42.3, 55.3 GB |
+
+The first pass of this table dipped from width 4 to 8 and the second did
+not; this machine's run-to-run spread was ±3% all afternoon. Six is where
+the 8 GiB row peaks and the bytes have not yet started to climb.
+
+**Asked earlier, it waits the same.** Issuing (d)'s guess straight after
+layer L routes instead of after L's MoE gives the reads a whole MoE more to
+land in. Its hit rate was 94.3% against 94.6%, and expert I/O was 4.13 ms
+a step against 4.19 at 16 GiB, 16.47 against 16.27 at 8. What is still
+waited for is the misses no top-6 guess contains, not guesses that land
+late — so the guess stays where the buffers it needs are already dead.
+
+**Against a build of §82's commit**, unprofiled:
+
+| | before | after |
+|---|---|---|
+| 16 GiB, decode, three runs | 11.40, 11.01, 11.00 | 11.86, 11.01, 11.67 |
+| 8 GiB, decode, two runs | 9.01, 9.08 | 9.74, 9.86 (+8.2%) |
+| 2,801-token context, decode | 10.09 | 10.06 |
+| 2,801-token context, reading the prompt | 10.50 | 10.79 (+2.8%) |
+| read: 16 GiB / 8 GiB / 2,801-token run | 17.7 / 36.4 / 179 GB | 19.2 / 42.2 / 230 GB |
+
+First-position logits byte-identical and every token the same in all
+eleven runs; the suite's Qwen schedule check gains a cold arm with the
+lookahead off, and on the fixture the default's demand misses fall from
+7 to 3 with the same logits.
+
+Profiled, decode only, 16 GiB: expert I/O 8.25 → 4.58 ms a step, the
+lookahead itself 1.88 ms (a row of its own now, inside MoE), MoE 49.5 →
+46.5.
+
+**It costs bytes, and that is a choice rather than a finding.** The
+2,801-token run read 28% more, 29,000 more records at 1.72 MB — about the
+0.23 wasted reads a layer the table above predicted, over 2,833 steps, most
+of them spent reading the prompt. On this machine's internal SSD reads are
+not the budget and the lookahead was not slower in any configuration
+measured, so it is on by default for Qwen. This file judges K3's changes on
+bytes per token, and by that measure this one is a cost. A confidence
+cutoff — prefetch a guess only when its score clears the rest by a margin —
+might keep the useful reads and drop some of the wasted ones. It is not
+measured.
