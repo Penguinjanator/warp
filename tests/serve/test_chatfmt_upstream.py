@@ -19,6 +19,17 @@ passed, and one diff against the release did not.
   K2_DIR=/path/to/Kimi-K2-Instruct python3 -m unittest \\
       tests.serve.test_chatfmt_upstream -t .
 
+The template is looked up in this order:
+
+    1. $K2_DIR, if set — a Kimi-K2 release directory
+    2. tests/serve/k2_upstream/ — the vendored upstream template (the
+       default; see that directory's README.md for provenance)
+
+So the default path needs nothing on disk beyond this repo. It used to be
+a path on an external volume, which is a description of one machine rather
+than a default: everywhere else, CI included, it read as "no template" and
+skipped, and the only check of this grammar skipped with it.
+
 The directory needs one file — `chat_template.jinja`, or a
 `tokenizer_config.json` carrying a `chat_template` key. No weights: the
 template plus `examples/chat-kimi-linear.json` is the whole input, which
@@ -47,7 +58,8 @@ from serve.chatfmt import ChatFormat                          # noqa: E402
 from tests.serve.fake_engine import FakeEngine                # noqa: E402
 from tests.serve.test_chatfmt import KIMI_K2_MARKERS          # noqa: E402
 
-K2_DIR = os.environ.get("K2_DIR", "/Volumes/WasteDisk/kimi-k2")
+VENDORED_DIR = REPO / "tests" / "serve" / "k2_upstream"
+K2_DIR = os.environ.get("K2_DIR", str(VENDORED_DIR))
 LINEAR_CHAT = REPO / "examples" / "chat-kimi-linear.json"
 
 TOOLS = [{"type": "function", "function": {
