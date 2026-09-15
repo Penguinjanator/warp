@@ -5412,3 +5412,47 @@ nothing at all — silently, since the conversation still came out valid.
 is the other half. **A test that only compares a thing to itself is not a
 weak oracle, it is not an oracle**, and the three protocols this repo
 renders now each have one.
+
+## 74. A feasibility gate does not need the download (2026-09-15)
+
+DeepSeek-V4.1-Flash is 510 GB in 48 shards. The gate that had to run before
+any of it was fetched — does 3-bit VQ survive experts that are *already* fp4?
+— needed 24 experts. A safetensors file states every tensor's byte offset in
+its own header, and HuggingFace serves ranges, so 24 experts is **190 MB**
+and four minutes. `tools/hf_peek.py` is that generalized: header first, then
+one range request per tensor, then dequantize E2M1/E4M3 against the E8M0
+scale stream. It should be the first thing pointed at any new release.
+
+The answer was no change at all. 19.97% / 20.74% / 19.95% on `layers.0.w1`,
+`layers.0.w2` and `layers.20.w1`, against §23's already-recorded **20.3% for
+a K3 expert at 3 bits from MXFP4** and gate 3's 19.4% from bf16. Three
+sources — bf16, K3's MXFP4, this release's fp4 — and one number. Whatever
+3-bit residual VQ costs, it costs it against the tensor you hand it, and an
+upstream quantizer having been there first does not compound the way the
+gate assumed. [GATES.md](GATES.md) gate 8.
+
+What the gate did not expect to find is how little is left in these tensors
+to begin with. 94 M parameters of `layers.0.w1` hold **28 distinct values**,
+because the ue8m0 scale stream — nominally one exponent per 32 inputs per
+row — takes four or five values across the entire matrix, two of them
+covering 96.6% of the blocks. The published format is per-block and the
+trained content is very nearly one global grid.
+
+Priced as information: 2.861 bits for the magnitude, plus a sign that is
+44.1% positive on the 88.2% of weights that are nonzero, is **3.74
+bits/weight**. So a lossless container is 4.25 bits (the nibbles verbatim
+plus the scale stream) and an entropy-coded one could not beat 3.74 —
+against VQ3R's 3.00 at 20% error. That is a *narrower* window than any
+previous model in this family gave, and it is the first time the choice of
+3 bits has been a choice between "lossy and small" and "exact and 52%
+bigger" rather than against 16-bit weights. It still goes to 3 bits, on
+§20's exchange rate: 85 GB more bank costs more hit rate than 20% expert
+error costs accuracy — on K3, measured. Whether it costs the same here is
+open, and it is the one quantization question stage 5's oracle diff should
+be asked to answer rather than assumed.
+
+Method note, because it generalizes past this model: **the cheap part of a
+gate is usually the measurement and the expensive part is getting the
+bytes.** Two of the eight gates in this file spent their cost on a download
+or a conversion that the measurement itself did not need. Range requests
+against a published index is a way to not do that again.
