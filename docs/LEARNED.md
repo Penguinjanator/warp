@@ -5518,3 +5518,56 @@ the numbers instead of grepping its own output for the word "identical",
 which is what it did before and is why "22914/24021 identical" passed.
 That last part is §73 again, in the one file that had already written the
 warning down.
+
+## 76. The oracle was wrong, and only the shape of the error said so (2026-09-15)
+
+DeepSeek-V4.1's forward pass came up 0.7% off against `tools/ds41_ref.py`
+on the first run — same argmax, plausible logits, a number that could have
+been anything. `WASTE_DUMP_HIDDEN` against the oracle's `--hidden` put the
+first divergence at layer 2, the first layer that compresses its own KV,
+and that one was mine: the indexer derives its key from the compressor's
+*unrotated* latent, so it runs between the compressor and the rotation, and
+it had been handed the same scratch buffer. What got cached as the layer's
+compressed KV was the index key.
+
+The second was not mine, and it is the one worth writing down.
+
+With that fixed the diff moved to layer 3 at 0.0096% — which is small
+enough to read as accumulation and is not. Running the same diff at one,
+two, three and four tokens gave:
+
+| tokens | 1 | 2 | 3 | 4 |
+|---|---:|---:|---:|---:|
+| worst layer | 1e-7 | 1e-7 | **6.5%** | 0.039% |
+
+A bug that is exact at one, two and four tokens and 6% at three is not
+accumulation and is not a kernel. At ratio 2 the compressor publishes a
+latent on odd positions only, so position 2 is the first step where a
+compressing layer runs with *no* latent of its own — and upstream keeps
+what a source published in a module-level singleton, with a comment saying
+why: "layers run in order and every source writes before its consumers
+read, so one slot each is enough and nothing needs resetting between
+forwards." The oracle rebuilt that dictionary per step. On every step
+without a fresh latent it therefore lost the index keys, reported none, and
+the layer attended over its sliding window alone.
+
+**The engine was right and the oracle was wrong.** With the singleton
+persistent, every layer at every token count agrees to 1.9e-7.
+
+Three things this is evidence for:
+
+- **An oracle is a second implementation, not a specification.** §73 said a
+  test that only compares a thing to itself is not an oracle; this is the
+  other failure — two implementations, one of them wrong, and no way to
+  tell which from a single number. What told them apart was running the
+  diff at several sequence lengths and reading the *pattern*.
+- **Per-step state is where a decode-shaped engine and a batch-shaped
+  reference disagree.** The release's `model.py` prefills a whole chunk at
+  once, and in that form the compressor's "nothing to publish this step"
+  case barely exists. Transcribing it one token at a time is where it
+  becomes the common case.
+- **The test corpus has to reach the mechanism.** Four tokens against a
+  four-slot window never wraps the ring, never fills a compressed cache and
+  never gives the candidate filter two blocks to choose between. Twelve
+  does. §75 was the same lesson about a tokenizer corpus, three commits
+  earlier, and it did not transfer on its own.

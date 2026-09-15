@@ -61,8 +61,24 @@ memory, 510 GB as published). The plan and the arithmetic are in
   a per-head temperature whose absence a forward-pass diff would show only
   as drift.
 
-The forward pass is not implemented. A DeepSeek-V4.1 container loads and
-then says so; it does not fall through to `mla_layer`.
+- **The DeepSeek-V4.1 forward pass**, text only. CSA2 (a sliding window of
+  raw KV and up to `index_topk` compressed positions in one softmax, an
+  attention sink per head, the query's rotation removed from the output,
+  and an output projection that is low-rank *and* block-diagonal over
+  `o_groups`), single-pass mHC, Engram at two layers, and the
+  sqrt-softplus router. **0.000018% relative L2** against
+  `tools/ds41_ref.py`, which reads the same container — so that is
+  arithmetic and not quantization — and the same on the residual stream
+  after every layer. Chunked prefill is bit-identical to the sequential
+  path, as on GLM.
+- **`tools/ds41_ref.py`**, the oracle, and a `tests/run.sh` check that runs
+  it over twelve tokens. Twelve because the test container's window is four
+  slots: below five tokens the ring never wraps, no compressed cache fills,
+  and the candidate filter has nothing to choose between. LEARNED §76 is
+  about the two bugs that found — one in the engine, one in the oracle.
+
+Not implemented: the vision tower and DSpark. A container carrying either
+loads and ignores them.
 
 ### Fixed
 
