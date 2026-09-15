@@ -34,6 +34,35 @@ memory, 510 GB as published). The plan and the arithmetic are in
 - **`tools/tokdiff.py --wide N`** — a randomized corpus over the whole
   codepoint space plus multi-byte whitespace runs, and a `tests/run.sh`
   check that runs it.
+- **The DeepSeek-V4.1 container format and converter.** `waste_config`
+  gains CSA2 (`head_dim`, `o_groups`, `o_lora_rank`, `sliding_window`,
+  `compress_ratios`, `kv_source_layer_ids`, `index_source_layer_ids`,
+  `candidate_*`, `compress_rope_theta`), single-pass mHC, a third router
+  score function (`sqrtsoftplus`) with a second selection bias for image
+  spans, and Engram. `cfg_sane` bounds all of it, including the invariant
+  that a compressing layer's ratio matches the last KV source's — a
+  mismatch is not a shape error anywhere, it just divides the position by
+  the wrong number.
+- **Two rope schedules.** The window-only layers rotate at `rope_theta`
+  with YaRN off and the compressed ones at `compress_rope_theta` with it
+  on. This release states no `mscale`, so the shared `rope_init` would
+  refuse it — and writing the two keys in to get past that check would put
+  a 1.63x on the attention scale the model was not trained with.
+- **`tools/ds41_engram.py`** — the compressed token map, the bucket primes
+  and the hash multipliers, none of which is in the checkpoint. Checked two
+  ways against what the release states: the map came out 99,092 ids against
+  a stated 99,092, and the primes summed to 384,006,168 and 384,016,682
+  against the two stated row counts.
+- **`engram-L{n}.bin`**, streamed a chunk of rows at a time, because the
+  two tables are 98 GB each and 40% of the download. `--engram-bits` is 4
+  (110 GB) or 8 (209 GB); neither changes what a token reads.
+- **`make_test_container.py --ds41`** and `tests/test_convert_ds41.py`.
+  The container opens, and one missing `attn_sink` is refused by name —
+  a per-head temperature whose absence a forward-pass diff would show only
+  as drift.
+
+The forward pass is not implemented. A DeepSeek-V4.1 container loads and
+then says so; it does not fall through to `mla_layer`.
 
 ### Fixed
 
@@ -51,6 +80,10 @@ LEARNED §75.
   rather than assumed.
 - `tests/run.sh` tested the tokenizer with `grep -q identical`, and
   `"22914/24021 identical"` contains that word. It now reads the counts.
+- `mxfp4.ST` read an `int8` tensor with a `.scale` companion as if the
+  int8 were the values. That is DeepSeek-V4.1's spelling for packed fp4,
+  and no shape disagrees; it now refuses an int8 tensor with no scale
+  beside it rather than guess which of the two it is.
 
 ## 0.7.2 — 2026-08-28
 

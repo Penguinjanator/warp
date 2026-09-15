@@ -121,6 +121,55 @@ typedef struct {
      * tells them apart by name rather than by feature. */
     char  arch[64];
 
+    /* --- DeepSeek-V4.1-Flash (0/absent on every other container) -------- */
+    /* Set from `arch`. Everything below is read only when it is, and the
+     * engine's MLA/KDA paths are not reachable on such a container: CSA2 is
+     * a third attention, not a variant of either. */
+    int   ds41;
+    /* mHC, but each sublayer's mixing projection produces the `pre` the
+     * NEXT one collapses with, instead of the one it uses itself. Layer 0's
+     * attention starts from a one-hot, and the final collapse before the
+     * head is the last FFN's `pre` rather than hc_head's unweighted mean. */
+    int   hc_single_pass;
+    /* CSA2. One KV vector per token, `head_dim` wide, shared by every head;
+     * the output projection is low-rank AND block-diagonal over o_groups,
+     * so wo_a is [groups][o_lora][n_heads * head_dim / groups]. */
+    int   head_dim, o_groups, o_lora;
+    int   window;                    /* sliding-window KV slots, 128       */
+    /* Per layer: 0 = window only, r = this layer reads KV compressed r-to-1.
+     * A layer compresses its own only when kv_source says so; the rest read
+     * the most recent source's cache, which is what makes the whole model
+     * cost 890 bytes of KV per token. */
+    int8_t compress_ratio[WASTE_MAX_LAYERS];
+    int8_t kv_source[WASTE_MAX_LAYERS], index_source[WASTE_MAX_LAYERS];
+    /* Two-level indexing: cand_source keeps the best cand_topk_blocks blocks
+     * of cand_block compressed positions, and every later indexer scores
+     * only inside them. -1 = one level. */
+    int   cand_source, cand_topk_blocks, cand_block;
+    /* A compressed latent stands for compress_ratio tokens, so its positions
+     * are further apart and it rotates at its own theta -- with YaRN, where
+     * the window-only layers have none. att_mul stays 1 on both: this
+     * release applies no mscale to the attention scale. */
+    float compress_rope_theta;
+    float compress_inv_freq[WASTE_MAX_ROPE_HALF];
+    int   attn_sink;                 /* one learned fp32 scalar per head   */
+    /* Router score function. 0 = sigmoid (every Kimi and GLM container),
+     * 1 = softmax, 2 = sqrt(softplus(x)), which is unbounded above and is
+     * why norm_topk_prob divides by the sum with a fixed 1e-20. */
+#define WASTE_SCORE_SIGMOID 0
+#define WASTE_SCORE_SOFTMAX 1
+#define WASTE_SCORE_SQRTSOFTPLUS 2
+    int   score_func;
+    int   route_bias_vl;             /* a second selection bias, for image spans */
+    /* Engram: an n-gram hash lookup added into the residual stream at a few
+     * layers. The tables are 197 B parameters and stay on disk -- 24 rows
+     * per layer per token, one page each. */
+#define WASTE_MAX_ENGRAM 8
+    int     engram_n;
+    int8_t  engram_layer[WASTE_MAX_LAYERS];   /* 1 + its index, 0 = none   */
+    int     engram_ngram, engram_heads, engram_head_dim;
+    int64_t engram_rows[WASTE_MAX_ENGRAM];
+
     /* --- rotary -------------------------------------------------------- */
     /* The Kimi models set mla_use_nope and are the reason this was absent:
      * with NoPE the qk_rope dims pass through unrotated. Every DeepSeek-V3

@@ -1244,6 +1244,52 @@ static int validate_text_tensors(waste_model *m)
             }
             REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attn.o_norm.weight", c->prefix, L), D);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L), hid, C);
+        } else if (c->ds41) {
+            /* CSA2. One KV vector per token rather than per head, a query
+             * that is low-rank, and an output projection that is low-rank
+             * AND block-diagonal over o_groups -- so wo_a's rows are the
+             * groups' ranks and its columns are one group's heads, which is
+             * the shape an ordinary Linear would not have. */
+            const int hd = c->head_dim, qh = c->n_heads * hd;
+            const char *sa = "%smodel.layers.%d.self_attn.%s";
+            REQUIRE_MATRIX(tname(sa, c->prefix, L, "q_a_proj.weight"), c->q_lora, hid);
+            REQUIRE_VECTOR(tname(sa, c->prefix, L, "q_a_layernorm.weight"), c->q_lora);
+            REQUIRE_MATRIX(tname(sa, c->prefix, L, "q_b_proj.weight"), qh, c->q_lora);
+            REQUIRE_MATRIX(tname(sa, c->prefix, L, "kv_proj.weight"), hd, hid);
+            REQUIRE_VECTOR(tname(sa, c->prefix, L, "kv_layernorm.weight"), hd);
+            REQUIRE_MATRIX(tname(sa, c->prefix, L, "o_a_proj.weight"),
+                           c->o_groups * c->o_lora, qh / c->o_groups);
+            REQUIRE_MATRIX(tname(sa, c->prefix, L, "o_b_proj.weight"),
+                           hid, c->o_groups * c->o_lora);
+            /* One learned scalar per head, added to the softmax denominator
+             * and to nothing else. Omitting it is a per-head temperature on
+             * the whole output, and nothing about the result looks wrong. */
+            REQUIRE_DATA(tname(sa, c->prefix, L, "attn_sink"), (size_t)c->n_heads);
+
+            if (c->kv_source[L]) {
+                REQUIRE_MATRIX(tname(sa, c->prefix, L, "compress.kv_proj.weight"), hd, hid);
+                REQUIRE_VECTOR(tname(sa, c->prefix, L, "compress.norm.weight"), hd);
+                /* At ratio 1 there is nothing to pool, so the release ships
+                 * no gate -- four wkv and three wgate, which is the shape
+                 * that gives this branch away if it is wrong. */
+                if (c->compress_ratio[L] > 1)
+                    REQUIRE_MATRIX(tname(sa, c->prefix, L, "compress.gate_proj.weight"), hd, hid);
+            }
+            if (c->index_source[L]) {
+                REQUIRE_MATRIX(tname(sa, c->prefix, L, "indexer.q_b_proj.weight"),
+                               c->index_heads * c->index_dim, c->q_lora);
+                REQUIRE_MATRIX(tname(sa, c->prefix, L, "indexer.weights_proj.weight"),
+                               c->index_heads, hid);
+                /* The index keys come off the compressor's latent, so only
+                 * a layer that compresses its own KV can build them; the
+                 * other four indexers read the keys that layer published. */
+                if (c->kv_source[L]) {
+                    REQUIRE_MATRIX(tname(sa, c->prefix, L, "indexer.k_proj.weight"),
+                                   c->index_dim, hd);
+                    REQUIRE_VECTOR(tname(sa, c->prefix, L, "indexer.k_layernorm.weight"),
+                                   c->index_dim);
+                }
+            }
         } else {
             const int qd = c->qk_nope + c->qk_rope;
             if (c->q_lora) {
@@ -1272,7 +1318,7 @@ static int validate_text_tensors(waste_model *m)
                 REQUIRE_DATA(tname("%smodel.layers.%d.hc_%s_scale", c->prefix, L, site[i]), 3);
             }
         }
-        if (c->index_topk && !c->kda_layer[L]) {
+        if (c->index_topk && !c->kda_layer[L] && !c->ds41) {
             const char *ix = "%smodel.layers.%d.self_attn.indexer.%s";
             REQUIRE_MATRIX(tname(ix, c->prefix, L, "wq_b.weight"),
                            c->index_heads * c->index_dim, c->q_lora);
@@ -1286,6 +1332,21 @@ static int validate_text_tensors(waste_model *m)
                          (size_t)c->index_kpool * c->index_dim);
         }
 
+        if (c->engram_layer[L]) {
+            /* The table itself is not here: 197 B parameters stay on disk
+             * and are read a row at a time, so it is checked by
+             * engram_open against the row count the manifest states. What
+             * is resident is the projection that turns a lookup into a key
+             * per hc copy plus one shared value, and the two gate vectors. */
+            const char *eg = "%smodel.layers.%d.engram.%s";
+            const int cols = (c->engram_ngram - 1) * c->engram_heads *
+                             c->engram_head_dim;
+            REQUIRE_MATRIX(tname(eg, c->prefix, L, "wkv.weight"),
+                           hid * (c->hc_mult + 1), cols);
+            REQUIRE_MATRIX(tname(eg, c->prefix, L, "q_weight"), c->hc_mult, hid);
+            REQUIRE_MATRIX(tname(eg, c->prefix, L, "k_weight"), c->hc_mult, hid);
+        }
+
         if (c->attn_res_block) {
             REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attention_res_norm.weight", c->prefix, L), hid);
             REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attention_res_proj.weight", c->prefix, L), hid);
@@ -1297,6 +1358,12 @@ static int validate_text_tensors(waste_model *m)
             const int lat = c->latent_dim ? c->latent_dim : hid;
             const int shared = c->moe_inter * (c->n_shared ? c->n_shared : 1);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L), c->n_experts, hid);
+            /* The correction bias steers selection and does not scale the
+             * weights. DeepSeek-V4.1 carries a second one for tokens inside
+             * an image span, and picks between them per token. */
+            if (c->route_bias_vl)
+                REQUIRE_DATA(tname("%smodel.layers.%d.block_sparse_moe.gate.e_score_correction_bias_vl", c->prefix, L),
+                             (size_t)c->n_experts);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight", c->prefix, L), shared, hid);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.shared_experts.up_proj.weight", c->prefix, L), shared, hid);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight", c->prefix, L), hid, shared);
@@ -1322,6 +1389,78 @@ static int validate_text_tensors(waste_model *m)
 #undef REQUIRE_MATRIX
 #undef REQUIRE_VECTOR
 #undef REQUIRE_DATA
+
+/* Everything CSA2 and Engram need, bounded the way every other dimension
+ * here is. `ds41` is -1 when the reader found a list it could not use, so
+ * the refusal reaches this function rather than being decided there: one
+ * place says no, and it says no before anything is allocated.
+ *
+ * All-or-nothing on purpose. A container that states index_topk without an
+ * indexer's shapes, or engram layers without the tables' row counts, would
+ * run -- attending over nothing, or adding a lookup from a table it sizes
+ * wrong -- and report neither. */
+static int ds41_sane(const waste_config *c)
+{
+    if (c->ds41 == 0) return 1;
+    if (c->ds41 != 1) return 0;
+    if (c->head_dim < 1 || c->head_dim > (1 << 16)) return 0;
+    if (c->o_groups < 1 || c->o_groups > 1024) return 0;
+    if (c->o_lora < 1 || c->o_lora > (1 << 20)) return 0;
+    if (c->window < 1 || c->window > (1 << 20)) return 0;
+    if (c->n_heads < 1 || c->q_lora < 1) return 0;
+    /* wo_a is block-diagonal over o_groups, so the heads have to divide
+     * into them evenly or the block width is not an integer. */
+    if ((int64_t)c->n_heads * c->head_dim % c->o_groups) return 0;
+    if ((int64_t)c->n_heads * c->head_dim > INT_MAX) return 0;
+    if ((int64_t)c->o_groups * c->o_lora > INT_MAX) return 0;
+    if (c->qk_rope < 1 || c->qk_rope > c->head_dim) return 0;
+    if (c->hc_mult < 1) return 0;                /* mHC is not optional here */
+    if (c->index_topk < 1 || c->index_heads < 1 || c->index_dim < 1) return 0;
+    if (!(c->compress_rope_theta > 0.0f)) return 0;
+
+    /* Layers run in order and every source writes before its consumers
+     * read, so the whole scheme is one forward scan. `live` is the ratio of
+     * the most recent KV source, 0 before there has been one. */
+    int live = 0, index_live = 0;
+    for (int L = 0; L < c->n_layers; L++) {
+        const int r = c->compress_ratio[L];
+        if (r < 0) return 0;                     /* the reader's "not a ratio" */
+        if (c->kv_source[L]) {
+            if (!r) return 0;                    /* nothing to compress with */
+            live = r;
+        }
+        if (c->index_source[L]) {
+            if (!r) return 0;                    /* nothing to index */
+            index_live = 1;
+        }
+        if (!r) continue;
+        /* A compressing layer that is not itself a source reads the cache
+         * the last source wrote -- so there must be one, and it must have
+         * pooled at this layer's ratio. A mismatch is not a shape error
+         * anywhere: the reader would just divide the position by the wrong
+         * number and attend to the wrong tokens. */
+        if (live != r || !index_live) return 0;
+    }
+
+    if (c->cand_source >= c->n_layers) return 0;
+    if (c->cand_source >= 0) {
+        if (!c->index_source[c->cand_source]) return 0;
+        if (c->cand_block < 1 || c->cand_block > (1 << 16)) return 0;
+        if (c->cand_topk_blocks < 1) return 0;
+    }
+
+    if (c->engram_n < 0 || c->engram_n > WASTE_MAX_ENGRAM) return 0;
+    if (c->engram_n) {
+        if (c->engram_ngram < 2 || c->engram_ngram > 64) return 0;
+        if (c->engram_heads < 1 || c->engram_heads > 1024) return 0;
+        if (c->engram_head_dim < 1 || c->engram_head_dim > (1 << 16)) return 0;
+        for (int i = 0; i < c->engram_n; i++)
+            if (c->engram_rows[i] < 1 || c->engram_rows[i] > (int64_t)1 << 40)
+                return 0;
+    }
+    if (c->score_func < 0 || c->score_func > WASTE_SCORE_SQRTSOFTPLUS) return 0;
+    return 1;
+}
 
 /* A manifest is untrusted input, and these numbers size allocations and
  * bound loops that index fixed arrays. A config claiming 200 layers walks
@@ -1360,7 +1499,7 @@ static int cfg_sane(const waste_config *c)
         if (c->kda_heads < 1 || c->kda_dim < 1 || c->conv_k < 1) return 0;
         if ((int64_t)c->kda_heads * c->kda_dim > INT_MAX) return 0;
     }
-    if (n_kda < c->n_layers) {
+    if (n_kda < c->n_layers && !c->ds41) {
         const int64_t qd = (int64_t)c->qk_nope + c->qk_rope;
         if (c->kv_lora < 1 || qd < 1 || c->v_head < 1) return 0;
         if ((int64_t)c->n_heads * qd > INT_MAX ||
@@ -1368,6 +1507,7 @@ static int cfg_sane(const waste_config *c)
             (int64_t)c->n_heads * (c->qk_nope + c->v_head) > INT_MAX)
             return 0;
     }
+    if (!ds41_sane(c)) return 0;
     /* mHC multiplies the resident residual stream and every buffer sized
      * from it, so it is bounded like a dimension rather than a flag. */
     if (c->hc_mult < 0 || c->hc_mult > 16) return 0;
@@ -1417,9 +1557,86 @@ static int cfg_sane(const waste_config *c)
  * same failure this function was added to fix: not a degraded answer but an
  * unordered one, and one that looks like weight-shaped logits.
  */
-static void rope_init(waste_config *c, const js_doc *d, int cfg)
+/* inv_freq without any scaling. Split out because DeepSeek-V4.1 needs two
+ * tables: its window-only layers rotate at rope_theta with YaRN off, and
+ * its compressed ones at compress_rope_theta with YaRN on, because one
+ * latent stands for compress_ratio tokens and its positions are that much
+ * further apart. */
+static void rope_plain(float *inv, int half, int dim, double base)
+{
+    for (int j = 0; j < half; j++)
+        inv[j] = (float)(1.0 / pow(base, (double)(2 * j) / dim));
+}
+
+/* YaRN's ramp, in place, following DeepseekV3YarnRotaryEmbedding. The
+ * mscale halves are NOT here: they are the part that differs between
+ * releases, and the one caller that wants them applies them itself. */
+static void rope_yarn(float *inv, int half, int dim, double base,
+                      double factor, double orig, double bf, double bs)
 {
     const double PI = 3.14159265358979323846;
+    if (factor <= 1.0) return;
+    double low = floor(dim * log(orig / (bf * 2.0 * PI)) / (2.0 * log(base)));
+    double high = ceil(dim * log(orig / (bs * 2.0 * PI)) / (2.0 * log(base)));
+    if (low < 0.0) low = 0.0;
+    if (high > dim - 1) high = dim - 1;
+    if (low == high) high += 0.001;             /* upstream's singularity guard */
+    for (int j = 0; j < half; j++) {
+        double ramp = ((double)j - low) / (high - low);
+        ramp = ramp < 0.0 ? 0.0 : ramp > 1.0 ? 1.0 : ramp;
+        const double mask = 1.0 - ramp;         /* 1 = extrapolate, 0 = interpolate */
+        const double extra = inv[j];
+        inv[j] = (float)((extra / factor) * (1.0 - mask) + extra * mask);
+    }
+}
+
+/* DeepSeek-V4.1's two schedules.
+ *
+ * Kept apart from rope_init rather than folded into it, because the shared
+ * function refuses a config whose mscale and mscale_all_dim differ -- and
+ * this release states neither, which under HF's defaults (1 and 0) is
+ * exactly that refusal. It is not an omission to paper over: the reference
+ * applies no mscale at all, on cos/sin or on the attention scale, so
+ * att_mul stays 1 and writing the two keys in to get past the check would
+ * put a 1.63x on the scale that the model was not trained with. */
+static void rope_init_ds41(waste_config *c, const js_doc *d, int cfg)
+{
+    const int dim = c->qk_rope, half = dim / 2;
+    c->att_mul = 1.0f;
+    c->rope_err[0] = 0;
+    c->mla_nope = 0;
+    if (half <= 0 || half > WASTE_MAX_ROPE_HALF) {
+        snprintf(c->rope_err, sizeof c->rope_err,
+                 "qk_rope_head_dim %d needs rotation, this build holds %d",
+                 dim, 2 * WASTE_MAX_ROPE_HALF);
+        return;
+    }
+    rope_plain(c->rope_inv_freq, half, dim,
+               js_num(d, js_get(d, cfg, "rope_theta"), 10000.0));
+
+    const double cbase = c->compress_rope_theta > 0.0f ? c->compress_rope_theta
+                                                       : 10000.0;
+    rope_plain(c->compress_inv_freq, half, dim, cbase);
+    const int rs = js_get(d, cfg, "rope_scaling");
+    if (rs < 0 || js_size(d, rs) == 0) return;
+    char type[24];
+    int ty = js_get(d, rs, "type");
+    if (ty < 0) ty = js_get(d, rs, "rope_type");
+    js_str(d, ty, type, sizeof type);
+    if (strcmp(type, "yarn") != 0) {
+        snprintf(c->rope_err, sizeof c->rope_err,
+                 "rope_scaling type \"%s\" is not implemented, only yarn", type);
+        return;
+    }
+    rope_yarn(c->compress_inv_freq, half, dim, cbase,
+              js_num(d, js_get(d, rs, "factor"), 1.0),
+              js_num(d, js_get(d, rs, "original_max_position_embeddings"), 4096.0),
+              js_num(d, js_get(d, rs, "beta_fast"), 32.0),
+              js_num(d, js_get(d, rs, "beta_slow"), 1.0));
+}
+
+static void rope_init(waste_config *c, const js_doc *d, int cfg)
+{
     c->att_mul = 1.0f;
     c->rope_err[0] = 0;
     /* By value, not by presence: a container carrying "mla_use_nope": false
@@ -1447,8 +1664,7 @@ static void rope_init(waste_config *c, const js_doc *d, int cfg)
     }
 
     const double base = js_num(d, js_get(d, cfg, "rope_theta"), 10000.0);
-    for (int j = 0; j < half; j++)
-        c->rope_inv_freq[j] = (float)(1.0 / pow(base, (double)(2 * j) / dim));
+    rope_plain(c->rope_inv_freq, half, dim, base);
 
     /* A key that is absent, null or {} all mean no scaling, and js_size is 0
      * for each — the plain-RoPE table above is already the whole answer.
@@ -1487,24 +1703,87 @@ static void rope_init(waste_config *c, const js_doc *d, int cfg)
         return;
     }
 
-    const double orig = js_num(d, js_get(d, rs, "original_max_position_embeddings"), 4096.0);
-    const double bf = js_num(d, js_get(d, rs, "beta_fast"), 32.0);
-    const double bs = js_num(d, js_get(d, rs, "beta_slow"), 1.0);
-    double low = floor(dim * log(orig / (bf * 2.0 * PI)) / (2.0 * log(base)));
-    double high = ceil(dim * log(orig / (bs * 2.0 * PI)) / (2.0 * log(base)));
-    if (low < 0.0) low = 0.0;
-    if (high > dim - 1) high = dim - 1;
-    if (low == high) high += 0.001;             /* upstream's singularity guard */
-    for (int j = 0; j < half; j++) {
-        double ramp = ((double)j - low) / (high - low);
-        ramp = ramp < 0.0 ? 0.0 : ramp > 1.0 ? 1.0 : ramp;
-        const double mask = 1.0 - ramp;         /* 1 = extrapolate, 0 = interpolate */
-        const double extra = c->rope_inv_freq[j];
-        c->rope_inv_freq[j] = (float)((extra / factor) * (1.0 - mask) + extra * mask);
-    }
+    rope_yarn(c->rope_inv_freq, half, dim, base, factor,
+              js_num(d, js_get(d, rs, "original_max_position_embeddings"), 4096.0),
+              js_num(d, js_get(d, rs, "beta_fast"), 32.0),
+              js_num(d, js_get(d, rs, "beta_slow"), 1.0));
     if (m_dim != 0.0) {
         const double ms = 0.1 * m_dim * log(factor) + 1.0;
         c->att_mul = (float)(ms * ms);
+    }
+}
+
+/* Reads a list of layer indices into a per-layer flag array. The release
+ * states these 0-based (kv_source_layer_ids, index_source_layer_ids,
+ * engram_layer_ids) -- unlike Kimi's kda_layers, which is 1-based, and
+ * unlike GLM's, which is 0-based and was copied through as if it were not.
+ * That is the bug this function exists to not repeat: an off-by-one here
+ * puts the compressor on the wrong layer, finds every tensor, checks every
+ * shape and answers noise. */
+static int ds41_layer_flags(const js_doc *d, int list, int8_t *out, int n)
+{
+    for (int i = 0; i < js_size(d, list); i++) {
+        const int v = (int)js_int(d, js_at(d, list, i), -1);
+        if (v < 0 || v >= n) return -1;          /* refused, not clamped */
+        out[v] = 1;
+    }
+    return 0;
+}
+
+static void ds41_from_json(waste_config *c, const js_doc *d, int cfg)
+{
+    c->ds41 = strstr(c->arch, "DeepseekV41") != NULL ||
+              strstr(c->arch, "DeepSeekV41") != NULL;
+    if (!c->ds41) return;
+
+    c->hc_single_pass = 1;
+    c->head_dim = (int)js_int(d, js_get(d, cfg, "head_dim"), 0);
+    c->o_groups = (int)js_int(d, js_get(d, cfg, "o_groups"), 0);
+    c->o_lora   = (int)js_int(d, js_get(d, cfg, "o_lora_rank"), 0);
+    c->window   = (int)js_int(d, js_get(d, cfg, "sliding_window"), 0);
+    c->attn_sink = 1;
+    c->route_bias_vl = js_get(d, cfg, "routing_bias_vl") >= 0;
+    c->compress_rope_theta =
+        (float)js_num(d, js_get(d, cfg, "compress_rope_theta"), 0.0);
+    c->cand_source = (int)js_int(d, js_get(d, cfg, "candidate_source_layer_id"), -1);
+    c->cand_topk_blocks = (int)js_int(d, js_get(d, cfg, "candidate_topk_blocks"), 0);
+    c->cand_block = (int)js_int(d, js_get(d, cfg, "candidate_block_size"), 0);
+
+    memset(c->compress_ratio, 0, sizeof c->compress_ratio);
+    memset(c->kv_source, 0, sizeof c->kv_source);
+    memset(c->index_source, 0, sizeof c->index_source);
+    /* One entry per layer, and the release's list is longer than n_layers:
+     * it covers the MTP draft layers too, which this container does not
+     * carry. Read the prefix and bound the rest. */
+    const int cr = js_get(d, cfg, "compress_ratios");
+    for (int L = 0; L < c->n_layers && L < js_size(d, cr); L++) {
+        const int r = (int)js_int(d, js_at(d, cr, L), -1);
+        c->compress_ratio[L] = (r >= 0 && r <= 64) ? (int8_t)r : (int8_t)-1;
+    }
+    if (ds41_layer_flags(d, js_get(d, cfg, "kv_source_layer_ids"),
+                         c->kv_source, c->n_layers) < 0 ||
+        ds41_layer_flags(d, js_get(d, cfg, "index_source_layer_ids"),
+                         c->index_source, c->n_layers) < 0) {
+        c->ds41 = -1;                            /* cfg_sane refuses it */
+        return;
+    }
+
+    memset(c->engram_layer, 0, sizeof c->engram_layer);
+    c->engram_ngram    = (int)js_int(d, js_get(d, cfg, "engram_max_ngram_size"), 0);
+    c->engram_heads    = (int)js_int(d, js_get(d, cfg, "engram_n_heads"), 0);
+    c->engram_head_dim = (int)js_int(d, js_get(d, cfg, "engram_head_dim"), 0);
+    const int el = js_get(d, cfg, "engram_layer_ids");
+    const int en = js_get(d, cfg, "engram_num_embeddings");
+    c->engram_n = js_size(d, el);
+    if (c->engram_n > WASTE_MAX_ENGRAM || c->engram_n != js_size(d, en)) {
+        c->ds41 = -1;
+        return;
+    }
+    for (int i = 0; i < c->engram_n; i++) {
+        const int L = (int)js_int(d, js_at(d, el, i), -1);
+        if (L < 0 || L >= c->n_layers) { c->ds41 = -1; return; }
+        c->engram_layer[L] = (int8_t)(i + 1);
+        c->engram_rows[i] = js_int(d, js_at(d, en, i), 0);
     }
 }
 
@@ -1529,6 +1808,15 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     c->eps = (float)js_num(d, js_get(d, cfg, "rms_norm_eps"), 1e-5);
     c->routed_scale = (float)js_num(d, js_get(d, cfg, "routed_scaling_factor"), 1.0);
     c->renorm = js_get(d, cfg, "moe_renormalize") >= 0;
+    {
+        /* Absent = sigmoid, which is every Kimi and GLM container and what
+         * this engine did before there was a key. */
+        char sf[32];
+        js_str(d, js_get(d, cfg, "scoring_func"), sf, sizeof sf);
+        c->score_func = strcmp(sf, "softmax") == 0 ? WASTE_SCORE_SOFTMAX
+                      : strcmp(sf, "sqrtsoftplus") == 0 ? WASTE_SCORE_SQRTSOFTPLUS
+                      : WASTE_SCORE_SIGMOID;
+    }
 
     c->latent_dim = (int)js_int(d, js_get(d, cfg, "routed_expert_hidden_size"), 0);
     c->latent_norm = js_get(d, cfg, "latent_moe_use_norm") >= 0;
@@ -1552,7 +1840,11 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
         js_str(d, js_at(d, a, 0), c->arch, sizeof c->arch);
     }
 
-    rope_init(c, d, cfg);
+    /* Before the rope dispatch, which branches on c->ds41, and after the
+     * `arch` block above, which is where it comes from. */
+    ds41_from_json(c, d, cfg);
+    if (c->ds41 > 0) rope_init_ds41(c, d, cfg);
+    else             rope_init(c, d, cfg);
 
     /* GLM-5.3-Flash: mHC, the clamped SwiGLU and the DSA indexer. Absent on
      * every Kimi container, where all of these read back 0 and the ordinary
@@ -3539,6 +3831,24 @@ static void mla_head_range(int lo, int hi, void *ap)
     }
 }
 
+/* CSA2 — DeepSeek-V4.1's attention. Stage 5 of docs/DS41.md; the container
+ * format, the config and the tensor validation are in and the arithmetic is
+ * not. Refuse rather than fall through to mla_layer, which would look up
+ * tensors this container does not have and read a null pointer: a crash is
+ * not a better answer than a message, and a *wrong* answer would be worse
+ * than either. */
+static void csa2_layer(waste_model *m, int L, const float *in, float *out,
+                       int pos)
+{
+    (void)L; (void)in; (void)out; (void)pos;
+    if (!m->read_error) {
+        fprintf(stderr, "waste: this container is DeepSeek-V4.1 and the CSA2 "
+                        "forward pass is not implemented yet — see "
+                        "docs/DS41.md\n");
+        m->read_error = 1;
+    }
+}
+
 static void mla_layer(waste_model *m, int L, const float *in, float *out, int pos)
 {
     const waste_config *c = &m->cfg;
@@ -5274,7 +5584,9 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
 
         /* attention: per token, but on the batched norm buffer */
         for (int t = 0; t < n; t++) {
-            if (c->kda_layer[L]) kda_layer(m, L, m->cnorm + (size_t)t * hid,
+            if (c->ds41) csa2_layer(m, L, m->cnorm + (size_t)t * hid,
+                                    m->cresid + (size_t)t * hid, pos0 + t);
+            else if (c->kda_layer[L]) kda_layer(m, L, m->cnorm + (size_t)t * hid,
                                            m->cresid + (size_t)t * hid);
             else mla_layer(m, L, m->cnorm + (size_t)t * hid,
                            m->cresid + (size_t)t * hid, pos0 + t);
@@ -5407,7 +5719,8 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         if (hc_on) hc_collapse(m, L, "attn", m->x, hc_post, hc_comb, m->hccol);
         waste_rmsnorm(norm, hc_on ? m->hccol : m->x, waste_find(m, b)->data,
                       hid, c->eps);
-        if (c->kda_layer[L]) { PROF_START(P_KDA); kda_layer(m, L, norm, resid); PROF_END(P_KDA); }
+        if (c->ds41) { PROF_START(P_MLA); csa2_layer(m, L, norm, resid, pos); PROF_END(P_MLA); }
+        else if (c->kda_layer[L]) { PROF_START(P_KDA); kda_layer(m, L, norm, resid); PROF_END(P_KDA); }
         else { PROF_START(P_MLA); mla_layer(m, L, norm, resid, pos); PROF_END(P_MLA); }
 
         if (hc_on) {

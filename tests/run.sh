@@ -2110,6 +2110,60 @@ else
     printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5
 fi
 
+# DeepSeek-V4.1 shares almost nothing above the expert record with the rest
+# of this family, so the converter has to rename every tensor and lift half
+# its config off the wrapper. All of it is silent when wrong: an
+# unrecognised name is written under the checkpoint's own spelling and the
+# load then refuses a container that holds every weight — after hours.
+if [ -n "$PY_MISS" ]; then
+    sk "convert.py DeepSeek-V4.1 names and config" "$PY_MISS"
+elif out=$(python3 tests/test_convert_ds41.py 2>&1); then
+    ok "DeepSeek-V4.1's 40 tensor kinds, its prefixes and its lifted config"
+else
+    no "convert.py DeepSeek-V4.1 names and config"
+    printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5
+fi
+
+# And the container it produces has to open. A synthetic one at test scale
+# reaches the parts no other container does: CSA2's shapes, the two-level
+# indexer, the Engram tables and their hashing, a second routing bias. The
+# forward pass is stage 5 of docs/DS41.md and is not here yet, so what this
+# asserts is that the *load* accepts it — config bounds, tensor validation,
+# the engram index — and that it then says so rather than crashing.
+if [ -n "$PY_MISS" ]; then
+    sk "DeepSeek-V4.1 container loads" "$PY_MISS"
+else
+    ds41_dir="$TMP/ds41.waste"
+    rm -rf "$ds41_dir"
+    if ! python3 tools/make_test_container.py --ds41 "$ds41_dir" >/dev/null 2>&1; then
+        no "DeepSeek-V4.1 synthetic container builds"
+    elif info=$(./waste info "$ds41_dir" 2>&1) &&
+         printf '%s' "$info" | grep -q "DeepseekV41"; then
+        ok "a DeepSeek-V4.1 container opens: config, tensor shapes, engram index"
+        # Every shape validate_text_tensors demands is demanded: drop one
+        # tensor from the trunk index and the load must refuse. attn_sink is
+        # the one whose absence is invisible in a forward pass — it is a
+        # per-head temperature and the answer just drifts.
+        python3 - "$ds41_dir" <<'PYEOF'
+import json, sys
+p = sys.argv[1] + "/manifest.json"
+m = json.load(open(p))
+m["trunk"] = [t for t in m["trunk"]
+              if not t["name"].endswith("layers.0.self_attn.attn_sink")]
+json.dump(m, open(p, "w"), indent=1)
+PYEOF
+        if ./waste info "$ds41_dir" >/dev/null 2>&1; then
+            no "a container missing attn_sink is accepted"
+        else
+            ok "and one missing a tensor it needs is refused, by name"
+        fi
+    else
+        no "a DeepSeek-V4.1 container opens"
+        printf '%s\n' "$info" | head -3
+    fi
+    rm -rf "$ds41_dir"
+fi
+
 # The chat.json the converter installs has to be the one whose markup the
 # release's tokenizer carries. Installing the wrong one is silent: absent
 # markers encode as ordinary text, so the model reads its own turn structure
