@@ -1847,6 +1847,32 @@ def main():
     # does, and K3 normalizes to [-1, 1] with mean = std = 0.5, which is
     # not what CLIP does. Guess nothing that the release states.
     vc = cfg.get("_outer", {}).get("vision_config")
+    if vc and ds41:
+        # A third tower, and the engine has to be told which. It shares a
+        # block shape with the other two and nothing else: no learned
+        # position grid and no q/k norms, a 2D rotation that pairs each
+        # head's halves rather than its adjacent elements, one fused weight
+        # for gate and up, and a projector that is a 3x3 pixel-unshuffle
+        # into two dense layers where GLM has a Conv2d and a gated merger.
+        #
+        # `max_image_tokens` is a budget in LLM TOKENS, not in patches: an
+        # image costs n_h * (n_w + 1) + 2 of them, one newline per row and
+        # two delimiters, and that is what has to fit.
+        vj = {k: v for k, v in vc.items() if not k.startswith("_")}
+        vj["tower"] = "ds41"
+        vj["out_hidden_size"] = cfg["hidden_size"]
+        vj["media_placeholder_token_id"] = \
+            cfg.get("image_token_id") or cfg.get("_outer", {}).get("image_token_id")
+        # nn.RMSNorm's default, as in the release's vision.py — stated here
+        # so the oracle reads the same number the engine compiles in.
+        vj.setdefault("rms_norm_eps", 1e-6)
+        vj.setdefault("rope_theta", 10000.0)
+        atomic_json(os.path.join(args.out, "vision.json"), vj)
+        print(f"vision: {vj.get('num_hidden_layers', '?')}-layer DeepSeek "
+              f"tower, patch {vj.get('patch_size', '?')}, downsample "
+              f"{vj.get('downsample_ratio', '?')}, "
+              f"max {vj.get('max_image_tokens', '?')} LLM tokens")
+        vc = None
     if vc and glm:
         # Two towers, and the engine has to be told which. They agree on
         # almost nothing below the block level: GLM has no learned position

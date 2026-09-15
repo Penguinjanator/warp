@@ -161,6 +161,23 @@ GLM = {
 # 12-token prompt means the indexer actually discards something. At the
 # release's own 128 / 512 none of that happens under a hundred tokens and
 # the test would exercise dense attention under another name.
+# The tower at 1/32 scale. head_dim 16 so the 2D rotation has four
+# frequencies per axis to interleave, downsample 3 because that is the
+# release's and a 2 would make the pixel-unshuffle a different shape, and
+# two blocks so a residual has somewhere to accumulate.
+DS41_VISION = {
+    "model_type": "deepseek_v41_vision",
+    "num_hidden_layers": 2,
+    "hidden_size": 32,
+    "num_attention_heads": 2,
+    "intermediate_size": 48,
+    "patch_size": 14,
+    "downsample_ratio": 3,
+    "rope_theta": 10000.0,
+    "rms_norm_eps": 1e-6,
+    "max_image_tokens": 64,
+    "min_pixels": 0,
+}
 DS41_HEADS, DS41_HEAD_DIM = 4, 32
 DS41_OGROUPS, DS41_OLORA = 2, 16
 DS41_IDX_HEADS, DS41_IDX_DIM, DS41_IDX_TOPK = 2, 16, 4
@@ -586,7 +603,7 @@ def main():
 
     cfg = dict(CFG)
     if args.ds41:
-        if args.glm or args.rope or args.vision:
+        if args.glm or args.rope:
             ap.error("--ds41 is its own model, not a modifier on another")
         cfg.update(DS41)
         # CSA2 replaces MLA, so the MLA shapes are not merely unused here —
@@ -603,8 +620,9 @@ def main():
             cfg["index_topk"] = args.index_topk
     elif args.index_topk:
         ap.error("--index-topk needs --glm")
-    if args.vision and not args.glm:
-        ap.error("--vision is GLM's tower; K3's is not generated here")
+    if args.vision and not (args.glm or args.ds41):
+        ap.error("--vision is GLM's tower or DeepSeek-V4.1's; K3's is not "
+                 "generated here")
     if args.rope:
         # Dropping linear_attn_config is what makes every layer MLA, so the
         # rotation is exercised at depth rather than in the one full-attention
@@ -751,7 +769,34 @@ def main():
             t.quant(m + "shared_experts.gate_proj.weight", [sh, hid])
             t.quant(m + "shared_experts.up_proj.weight", [sh, hid])
             t.quant(m + "shared_experts.down_proj.weight", [hid, sh])
-    if args.vision:
+    if args.vision and args.ds41:
+        v = DS41_VISION
+        vd, vh_, vi = v["hidden_size"], v["num_attention_heads"], v["intermediate_size"]
+        npix = 3 * v["patch_size"] ** 2
+        t.f32("vision_tower.patch_embed.proj.weight", [vd, npix], prefixed=False)
+        t.f32("vision_tower.patch_embed.proj.bias", [vd], prefixed=False)
+        for b in range(v["num_hidden_layers"]):
+            a = f"vision_tower.blocks.{b}."
+            t.f32(a + "norm1.weight", [vd], prefixed=False)
+            t.f32(a + "norm2.weight", [vd], prefixed=False)
+            t.f32(a + "attn.wqkv.weight", [3 * vd, vd], prefixed=False)
+            t.f32(a + "attn.wqkv.bias", [3 * vd], prefixed=False)
+            t.f32(a + "attn.wo.weight", [vd, vd], prefixed=False)
+            t.f32(a + "attn.wo.bias", [vd], prefixed=False)
+            # one weight for gate and up, which is the shape a reader
+            # expecting two tensors would not find
+            t.f32(a + "mlp.w1.weight", [2 * vi, vd], prefixed=False)
+            t.f32(a + "mlp.w2.weight", [vd, vi], prefixed=False)
+        t.f32("vision_tower.norm.weight", [vd], prefixed=False)
+        r3 = v["downsample_ratio"]
+        t.f32("mm_projector.w1.weight", [hid, vd * r3 * r3], prefixed=False)
+        t.f32("mm_projector.w1.bias", [hid], prefixed=False)
+        t.f32("mm_projector.w2.weight", [hid, hid], prefixed=False)
+        t.f32("mm_projector.w2.bias", [hid], prefixed=False)
+        # the three learned span delimiters live in the TEXT trunk
+        for nmm in ("image_start", "image_end", "image_newline"):
+            t.f32("model." + nmm, [hid])
+    elif args.vision:
         # A GLM tower at test scale: the same 25 tensor kinds the release
         # has, at dimensions that make an encode take milliseconds. The
         # shapes are what the engine branches on — a bias where the release
@@ -871,7 +916,15 @@ def main():
               newline="\n") as f:
         json.dump(manifest, f, indent=1)
 
-    if args.vision:
+    if args.vision and args.ds41:
+        vj = dict(DS41_VISION)
+        vj["tower"] = "ds41"
+        vj["out_hidden_size"] = cfg["hidden_size"]
+        vj["media_placeholder_token_id"] = cfg["vocab_size"] - 1
+        with open(os.path.join(args.out, "vision.json"), "w",
+                  newline="\n") as f:
+            json.dump(vj, f, indent=1)
+    elif args.vision:
         vj = dict(VISION)
         vj["tower"] = "glm5-next"
         vj["media_placeholder_token_id"] = cfg["vocab_size"] - 1

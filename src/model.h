@@ -202,7 +202,8 @@ typedef struct {
  * 2D rope only, per-head q/k norms, biases everywhere, a clamped SwiGLU, a
  * two-slot temporal patch and a gated merger. vision.json names it, and a
  * file without the key is K3's — every container written before this one. */
-typedef enum { WASTE_TOWER_K3 = 0, WASTE_TOWER_GLM = 1 } waste_tower;
+typedef enum { WASTE_TOWER_K3 = 0, WASTE_TOWER_GLM = 1,
+               WASTE_TOWER_DS41 = 2 } waste_tower;
 
 typedef struct {
     int hidden, heads, qkv_hidden, inter, layers;
@@ -220,6 +221,8 @@ typedef struct {
     float swiglu_limit;
     int   img_start, img_end;    /* the ids an image block is wrapped in   */
     int   min_tokens;            /* the release's floor on an image's cost */
+    /* --- DeepSeek-V4.1's tower (0 elsewhere) ---------------------------- */
+    float rope_theta;            /* the 2D rotation's base, 10000           */
 } waste_vision_cfg;
 
 typedef struct {
@@ -514,6 +517,10 @@ int waste_vision_encode(waste_model *m, const float *pixels, int h, int w,
 /* GLM-5.3-Flash's tower. Same contract — patches in, one merged embedding
  * per merge block out — and a different network inside; see vision.c.
  * `pixels` is [h*w][3 * temporal * patch * patch] in block-major order. */
+/* DeepSeek-V4.1's: writes the whole image SPAN, delimiters included, so
+ * the engine's media queue stays one row per placeholder. */
+int waste_vision_encode_ds41(waste_model *m, const float *pixels, int gh,
+                             int gw, float *out);
 int waste_vision_encode_glm(waste_model *m, const float *pixels, int h, int w,
                             float *out);
 int waste_vision_available(const waste_model *m);
@@ -528,6 +535,14 @@ int waste_image_size(const char *path, int *w, int *h);
 /* GLM's preprocessing: a different grid rule and a different patch order,
  * both stated by the release. Returns [gh*gw][3 * temporal * patch^2] in
  * block-major order over merge blocks; the caller frees. */
+/* DeepSeek-V4.1's: the image is contained and grey-padded rather than
+ * stretched, and the grid is budgeted in LLM tokens rather than patches.
+ * waste_image_plan_ds41 is the geometry on its own, so an oracle can be
+ * asked the same question. */
+void   waste_image_plan_ds41(int sw, int sh, const waste_vision_cfg *v,
+                             int *bh, int *bw, int *nh, int *nw);
+float *waste_image_load_ds41(const char *path, const waste_vision_cfg *v,
+                             int *out_gh, int *out_gw);
 float *waste_image_load_glm(const char *path, const waste_vision_cfg *v,
                             int *out_h, int *out_w);
 float *waste_image_load(const char *path, int max_patches,

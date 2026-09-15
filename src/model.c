@@ -2247,10 +2247,42 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                      * every field twice. */
                     char tw[32];
                     js_str(&vd, js_get(&vd, 0, "tower"), tw, sizeof tw);
-                    v->tower = strcmp(tw, "glm5-next") == 0
-                             ? WASTE_TOWER_GLM : WASTE_TOWER_K3;
+                    v->tower = strcmp(tw, "glm5-next") == 0 ? WASTE_TOWER_GLM
+                             : strcmp(tw, "ds41") == 0 ? WASTE_TOWER_DS41
+                             : WASTE_TOWER_K3;
                 }
-                if (v->tower == WASTE_TOWER_GLM) {
+                if (v->tower == WASTE_TOWER_DS41) {
+                    /* The release's own key names, which are the ones the
+                     * converter copies through; `merge` is the aligner's
+                     * 3x3 pixel-unshuffle and `max_patches` is a budget in
+                     * LLM tokens rather than in patches. */
+                    v->hidden     = (int)js_int(&vd, js_get(&vd, 0, "hidden_size"), 1024);
+                    v->heads      = (int)js_int(&vd, js_get(&vd, 0, "num_attention_heads"), 16);
+                    v->qkv_hidden = v->hidden;
+                    v->inter      = (int)js_int(&vd, js_get(&vd, 0, "intermediate_size"), 2816);
+                    v->layers     = (int)js_int(&vd, js_get(&vd, 0, "num_hidden_layers"), 32);
+                    v->patch      = (int)js_int(&vd, js_get(&vd, 0, "patch_size"), 14);
+                    v->merge      = (int)js_int(&vd, js_get(&vd, 0, "downsample_ratio"), 3);
+                    v->temporal   = 1;
+                    v->out_hidden = (int)js_int(&vd, js_get(&vd, 0, "out_hidden_size"), 0);
+                    v->rope_theta = (float)js_num(&vd, js_get(&vd, 0, "rope_theta"), 10000.0);
+                    v->eps        = (float)js_num(&vd, js_get(&vd, 0, "rms_norm_eps"), 1e-6);
+                    v->max_patches = (int)js_int(&vd, js_get(&vd, 0, "max_image_tokens"), 1024);
+                    /* min_pixels, not min_tokens: this release states a
+                     * floor on the SOURCE area and not on the cost. */
+                    v->min_tokens = (int)js_int(&vd, js_get(&vd, 0, "min_pixels"), 0);
+                    v->media_token = (int)js_int(&vd, js_get(&vd, 0, "media_placeholder_token_id"), 0);
+                    v->text_hidden = v->out_hidden;
+                    /* No learned position grid at all — the rotation is the
+                     * only positional signal — but the bounds below are
+                     * shared, so give them something in range. */
+                    v->pos_h = v->pos_w = 1;
+                    v->proj_eps = v->eps;
+                    /* K3's block is the FALL-THROUGH of this chain, not
+                     * another branch of it: leaving without the goto lands
+                     * in it and quietly replaces every field above. */
+                    goto vision_pixels;
+                } else if (v->tower == WASTE_TOWER_GLM) {
                     v->hidden      = (int)js_int(&vd, js_get(&vd, 0, "hidden_size"), 1024);
                     v->heads       = (int)js_int(&vd, js_get(&vd, 0, "num_heads"), 16);
                     v->qkv_hidden  = v->hidden;      /* qkv is 3x hidden   */
@@ -2333,6 +2365,12 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                    v->pos_h > 0 && v->pos_h <= (1 << 16) &&
                    v->pos_w > 0 && v->pos_w <= (1 << 16) &&
                    v->text_hidden == c->hidden && v->patch == 14 &&
+                   (v->tower != WASTE_TOWER_DS41 ||
+                    (v->merge >= 1 && v->merge <= 8 &&
+                     v->out_hidden > 0 && v->out_hidden <= (1 << 20) &&
+                     v->hidden % v->heads == 0 &&
+                     ((v->hidden / v->heads) % 4) == 0 &&
+                     isfinite(v->rope_theta) && v->rope_theta > 0.0f)) &&
                    (v->tower != WASTE_TOWER_GLM ||
                     (v->merge >= 1 && v->merge <= 8 &&
                      v->temporal >= 1 && v->temporal <= 8 &&

@@ -94,8 +94,28 @@ memory, 510 GB as published). The plan and the arithmetic are in
   than sharing K3's four. All of them resolve or the format is refused: one
   that half-resolves is the failure the probe exists to prevent.
 
-Not implemented: the vision tower and DSpark. A container carrying either
-loads and ignores them.
+- **DeepSeek-V4.1's vision tower**, a third one. 32 blocks, no learned
+  position grid and no q/k norms, a fused `w1` for gate and up, and a
+  projector that is a 3x3 pixel-unshuffle into two dense layers.
+
+  Two things in it are not a variant of anything already here. The rotation
+  is **split-halves** — each head's dims halved and the first half rotated
+  against the second — where every other rotation in this engine pairs
+  adjacent elements. And the span is not the image: the LLM sees
+  `[start] ([image] * n_w [newline]) * n_h [end]`, so the tower emits the
+  three learned delimiters itself and the engine's media queue stays one
+  row per placeholder.
+
+  Preprocessing too: the image is contained and grey-padded rather than
+  stretched, and the grid is budgeted in LLM tokens rather than in patches.
+  `waste_image_plan_ds41` is that geometry on its own so an oracle can be
+  asked the same question.
+
+  6e-7 relative L2 against `tools/ds41_vision_ref.py` on five patch grids,
+  three of them not multiples of the downsample; the geometry agrees on
+  seven source sizes including both collapse cases.
+
+Not implemented: DSpark. A container carrying it loads and ignores it.
 
 ### Fixed
 

@@ -2247,6 +2247,69 @@ PYEOF
     rm -rf "$ds41_dir"
 fi
 
+# DeepSeek-V4.1's tower. A third one, and it shares a block shape with the
+# other two and nothing else: no learned position grid and no q/k norms, a
+# 2D rotation that pairs each head's HALVES where every other rotation here
+# pairs adjacent elements, one fused weight for gate and up, and a projector
+# that is a 3x3 pixel-unshuffle into two dense layers.
+#
+# Five grids, not one. Three of them are not multiples of the downsample, so
+# the unfold's zero padding on the right and bottom actually runs; on a
+# 6x6 grid it never does and the diff is green over it.
+if [ -n "$PY_MISS" ]; then
+    sk "DeepSeek-V4.1's vision tower" "$PY_MISS"
+elif ! command -v uv >/dev/null 2>&1; then
+    sk "DeepSeek-V4.1's vision tower" "uv not installed"
+else
+    vd="$TMP/ds41vis.waste"
+    rm -rf "$vd"
+    python3 tools/make_test_container.py --ds41 --vision "$vd" >/dev/null 2>&1
+    bad=0
+    for g in 3x3 4x5 6x6 7x4 2x9; do
+        gh=${g%x*}; gw=${g#*x}
+        python3 - "$gh" "$gw" "$TMP/ds41px.bin" <<'PYEOF'
+import random, struct, sys
+gh, gw, out = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+random.seed(gh * 7 + gw)
+n = gh * gw * 3 * 14 * 14
+open(out, "wb").write(struct.pack(f"<{n}f",
+                                  *[random.uniform(-1, 1) for _ in range(n)]))
+PYEOF
+        ./test_vision_ds41 tower "$vd" "$gh" "$gw" "$TMP/ds41px.bin" \
+            "$TMP/ds41tow.bin" >/dev/null 2>&1 || { bad=$((bad+1)); continue; }
+        run_uv run --quiet --with torch --no-project python \
+            tools/ds41_vision_ref.py --container "$vd" \
+            --pixels "$TMP/ds41px.bin" --grid "$g" \
+            --engine "$TMP/ds41tow.bin" >/dev/null 2>&1 || bad=$((bad+1))
+    done
+    if [ "$bad" = 0 ]; then
+        ok "32-block 2D-rope tower and the 3x3 pixel-unshuffle match the oracle"
+    else
+        no "DeepSeek-V4.1's tower differs from the oracle on $bad of 5 grids"
+    fi
+
+    # And the geometry, which decides how much of the context an image
+    # costs. A pure function on both sides, so it is asked the same
+    # question rather than inferred from a decoded file — including the two
+    # collapse cases, where a very tall image keeps two tokens of head-room
+    # and a very wide one three.
+    bad=0
+    for wh in 100x100 800x600 4000x300 300x4000 1x1 1920x1080 7000x7000; do
+        w=${wh%x*}; h=${wh#*x}
+        a=$(./test_vision_ds41 plan "$vd" "$w" "$h" 2>/dev/null)
+        b=$(run_uv run --quiet --with torch --no-project python \
+            tools/ds41_vision_ref.py --container "$vd" --plan "$wh" 2>/dev/null \
+            | grep box)
+        [ -n "$a" ] && [ "$a" = "$b" ] || bad=$((bad+1))
+    done
+    if [ "$bad" = 0 ]; then
+        ok "an image's pixel box and token span agree with the release's"
+    else
+        no "DeepSeek-V4.1 image geometry differs on $bad of 7 sizes"
+    fi
+    rm -rf "$vd"
+fi
+
 # The chat.json the converter installs has to be the one whose markup the
 # release's tokenizer carries. Installing the wrong one is silent: absent
 # markers encode as ordinary text, so the model reads its own turn structure
