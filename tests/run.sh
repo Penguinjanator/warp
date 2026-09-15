@@ -2007,17 +2007,54 @@ else
     sk "prompt text cannot forge control tokens" "needs a container with specials.json"
 fi
 
+# `grep -q identical` used to be the whole test here, and "22914/24021
+# identical" contains that word. It passed for as long as the character
+# classes in tokenizer.c were wrong, which was every release. Read the
+# numbers.
+tokdiff_all_identical() {
+    local line
+    line=$(printf '%s' "$1" | tail -1)
+    case "$line" in
+        *identical*) ;;
+        *) return 1 ;;
+    esac
+    local n d
+    n=${line%%/*}
+    d=${line#*/}
+    d=${d%% *}
+    [ -n "$n" ] && [ "$n" = "$d" ]
+}
+
 if [ "$SYNTHETIC" = 1 ]; then
     sk "tokenizer diff" "synthetic container carries no tokenizer"
+    sk "tokenizer diff over the whole codepoint space" "no tokenizer"
 elif [ -d "$MODEL" ] && command -v uv >/dev/null 2>&1 && [ -d "$SRC" ]; then
-    if run_uv run --quiet --with tiktoken --no-project python tools/tokdiff.py \
-           "$MODEL" "$SRC" 2>/dev/null | tail -1 | grep -q "identical"; then
-        ok "C tokenizer matches Python tiktoken"
+    out=$(run_uv run --quiet --with tiktoken --with tokenizers --no-project \
+          python tools/tokdiff.py "$MODEL" "$SRC" 2>/dev/null)
+    if tokdiff_all_identical "$out"; then
+        ok "C tokenizer matches the release's ($(printf '%s' "$out" | tail -1))"
     else
-        no "tokenizer differs from tiktoken"
+        no "tokenizer differs: $(printf '%s' "$out" | tail -1)"
+    fi
+    # The curated list is twenty-one strings and scored 21/21 through a bug
+    # that moved a thousand strings in four thousand. This is the corpus that
+    # found it: every codepoint, thinned, plus multi-byte whitespace runs.
+    # A handful of disagreements survive on codepoints assigned after the
+    # Unicode revision src/unicode_classes.h was generated from, so this
+    # reports the count rather than demanding equality.
+    out=$(run_uv run --quiet --with tiktoken --with tokenizers --no-project \
+          python tools/tokdiff.py --wide 20000 "$MODEL" "$SRC" 2>/dev/null)
+    line=$(printf '%s' "$out" | tail -1)
+    n=${line%%/*}; d=${line#*/}; d=${d%% *}
+    if [ -n "$n" ] && [ -n "$d" ] && [ "$d" -gt 0 ] 2>/dev/null &&
+       [ "$((100 * n / d))" -ge 99 ]; then
+        ok "C tokenizer over the whole codepoint space ($line)"
+    else
+        no "wide tokenizer diff: ${line:-no output}"
     fi
 else
     sk "tokenizer diff" "needs uv, a container and source weights"
+    sk "tokenizer diff over the whole codepoint space" "needs uv, a container and source weights"
 fi
 
 # ------------------------------------------------------------ converter ----

@@ -5456,3 +5456,65 @@ gate is usually the measurement and the expensive part is getting the
 bytes.** Two of the eight gates in this file spent their cost on a download
 or a conversion that the measurement itself did not need. Range requests
 against a published index is a way to not do that again.
+
+## 75. Twenty-one strings is not a tokenizer corpus, and it never was (2026-09-15)
+
+`tools/tokdiff.py` opens with a comment saying "twelve short ASCII strings
+is not a tokenizer corpus". It then lists twenty-one strings and, until
+today, tested against those. Adding DeepSeek-V4.1's pre-tokenizer made the
+inadequacy measurable, because unlike cl100k's its pattern has five
+character classes and no catch-all.
+
+`src/tokenizer.c` codes the patterns directly rather than carrying a regex
+engine, so `\p{L}`, `\p{N}` and `\s` were hand-written ranges — the blocks
+the two Kimi releases and GLM had been tried on. In cl100k that was
+survivable by accident: a letter the table did not know fell into
+`[^\s\p{L}\p{N}]+`, which is a catch-all, so it still produced *a* piece.
+In DeepSeek's pattern the same character becomes `\p{S}`, joins the
+punctuation run beside it, and shifts every id after it.
+
+`tokdiff.py --wide 20000` — every codepoint thinned by a stride, plus a
+block of multi-byte whitespace runs — on the two releases that were
+**already supported and passing**:
+
+| | curated 21 | wide 24021 before | after |
+|---|---|---:|---:|
+| Kimi-Linear | 21/21 both times | 22937 | 24017 |
+| GLM-5.3-Flash | 21/21 both times | 22914 | 24020 |
+
+Four and a half percent of strings encoded differently from the release,
+under a green board, for the whole life of those two containers. The
+remaining handful are codepoints assigned after the Unicode revision
+`src/unicode_classes.h` was generated from — regenerating on a CPython with
+Unicode 16.0 instead of 15.0 was worth three strings on one and two on the
+other.
+
+Two distinct defects came out of it, and neither is DeepSeek-specific:
+
+- **`\s+(?!\S)` backed off one byte.** It has to keep all but the last
+  *character* of a whitespace run when text follows, and `is_space()`
+  admits U+00A0. A no-break space before a word was cut down the middle
+  into two replacement bytes. Worth 1080 of 4000 strings in the whitespace
+  corner of the corpus on its own.
+- **`\p{N}` and `\s` were ASCII.** Both patterns in the file mean the
+  Unicode classes — the tiktoken one is compiled by Python's `regex` and
+  the `tokenizers` one by Oniguruma, and both were *probed* rather than
+  assumed, because the two plausible answers differ on U+3000 and agree on
+  U+00A0. `"²³x"` is `"²³"` + `"x"`.
+
+And one that is: DeepSeek's three Splits run in sequence, so pass 3 never
+sees across a number or a CJK run. `\s+(?!\S)` therefore succeeds at a
+segment boundary — `"  ०"` is one whitespace piece, not two — and a `\p{P}`
+run must stop at U+30FB, the katakana middle dot, which is punctuation
+*and* inside pass 2's range. Both were found by the wide corpus and neither
+would have been found by reading the pattern.
+
+The lesson is not "write more test strings". It is that a hand-written
+Unicode class **cannot fail loudly**: there is no character it rejects that
+produces an error, only one that produces a different split. The table is
+generated now, from `unicodedata`, by `tools/gen_unicode.py` — 30 KB of
+rodata against a whole category of silent wrongness — and the check reads
+the numbers instead of grepping its own output for the word "identical",
+which is what it did before and is why "22914/24021 identical" passed.
+That last part is §73 again, in the one file that had already written the
+warning down.

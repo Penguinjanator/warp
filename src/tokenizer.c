@@ -4,6 +4,7 @@
 /* tokenizer.c — see tokenizer.h. */
 
 #include "tokenizer.h"
+#include "unicode_classes.h"
 
 #include <stdio.h>
 #include <errno.h>
@@ -42,6 +43,10 @@ struct waste_tok {
      * and one without — which is exactly the kind of text that appears in
      * a Chinese release's own prompts. */
     int han_split;
+    /* WASTE_TOKPAT_*. han_split is read only by the cl100k scanner; the
+     * DeepSeek one isolates CJK unconditionally because its own pattern
+     * does, in a dedicated Split that runs before the main one. */
+    int pattern;
 };
 
 /* ---- base64 ------------------------------------------------------------ */
@@ -287,6 +292,10 @@ int waste_tok_eos(const waste_tok *t) { return t->eos; }
 
 void waste_tok_set_eos(waste_tok *t, int id) { if (t && id > 0) t->eos = id; }
 void waste_tok_set_han_split(waste_tok *t, int on) { if (t) t->han_split = !!on; }
+void waste_tok_set_pattern(waste_tok *t, int pattern)
+{
+    if (t && pattern >= 0 && pattern < WASTE_TOKPAT__COUNT) t->pattern = pattern;
+}
 
 /* ---- UTF-8 + the character classes the pattern needs -------------------- */
 
@@ -313,17 +322,21 @@ static int is_han(int c)
            (c >= 0xF900 && c <= 0xFAFF) || (c >= 0x20000 && c <= 0x2FA1F);
 }
 
-/* \p{L} plus \p{M}: ASCII and Latin-1 letters, Latin Extended, Greek,
- * Cyrillic, Hebrew, Arabic, Hangul, Hiragana/Katakana, combining marks.
- * Han is excluded on purpose — the pattern gives it its own branch. */
+/* \p{L} plus \p{M}. Han is excluded when the pattern gives it its own
+ * branch, and is an ordinary letter when it does not.
+ *
+ * This used to be a hand-written list of the blocks the two Kimi releases
+ * and GLM had been exercised on — Latin, Greek, Cyrillic, Hebrew, Arabic,
+ * Hangul, kana. Everything else was "not a letter", which in cl100k's
+ * pattern meant it fell into [^\s\p{L}\p{N}]+ and still produced a piece,
+ * so the gap never announced itself. It was still a gap: 428 of 4000
+ * whitespace-and-script strings encoded differently from the release. The
+ * table is generated now — see unicode_classes.h. */
 static int is_letter_ex(int c, int han_split)
 {
     if (c < 0x80) return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
-    if (is_han(c)) return !han_split;
-    return (c >= 0xC0 && c <= 0x24F) || (c >= 0x300 && c <= 0x36F) ||
-           (c >= 0x370 && c <= 0x3FF) || (c >= 0x400 && c <= 0x52F) ||
-           (c >= 0x590 && c <= 0x6FF) || (c >= 0x3040 && c <= 0x30FF) ||
-           (c >= 0xAC00 && c <= 0xD7AF) || (c >= 0x1E00 && c <= 0x1EFF);
+    if (han_split && is_han(c)) return 0;
+    return uc_is_letter(c) || uc_is_mark(c);
 }
 
 __attribute__((unused)) static int is_upper(int c)
@@ -333,10 +346,25 @@ __attribute__((unused)) static int is_upper(int c)
            (c >= 0x410 && c <= 0x42F);
 }
 
-static int is_digit(int c) { return c >= '0' && c <= '9'; }
-static int is_space(int c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n' ||
-                                    c == '\f' || c == '\v' || c == 0xA0; }
+/* \p{N} and \s. Both patterns in this file mean the Unicode classes: the
+ * tiktoken pattern is compiled by Python's `regex`, whose \s is
+ * White_Space, and the `tokenizers` one by Oniguruma, whose \s is the same
+ * — measured, in probe form, against both releases. ASCII-only versions of
+ * these were the other half of the gap is_letter_ex describes. */
+static int is_digit(int c) { return c < 0x80 ? (c >= '0' && c <= '9')
+                                             : uc_is_number(c); }
 static int is_nl(int c) { return c == '\r' || c == '\n'; }
+
+/* \s: Unicode White_Space exactly. ZWSP and the BOM are NOT in it — they
+ * are \p{Cf} — and the distinction is visible in both patterns: a BOM
+ * before a newline is two pieces where a no-break space is one. */
+static int is_space(int c)
+{
+    if (c < 0x80) return (c >= 0x09 && c <= 0x0D) || c == 0x20;
+    return c == 0x85 || c == 0xA0 || c == 0x1680 ||
+           (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 ||
+           c == 0x202F || c == 0x205F || c == 0x3000;
+}
 
 /* Advances one pre-token, returning its byte length. Mirrors the branch
  * order of the model's pat_str. */
@@ -414,17 +442,221 @@ static int next_piece(const char *s, int len, int han_split)
     /* "\s*[\r\n]+" then "\s+(?!\S)" then "\s+" */
     if (is_space(cp)) {
         i = 0;
-        int last_nl = -1;
+        int last_nl = -1, prev = 0;
         while (i < len) { int c3, k = utf8_next(s + i, len - i, &c3);
-                          if (!is_space(c3)) break;
+                          if (!k || !is_space(c3)) break;
+                          prev = i;
                           i += k;
                           if (is_nl(c3)) last_nl = i; }
         if (last_nl > 0) return last_nl;
-        /* \s+(?!\S): keep all but the last space when more text follows */
-        if (i < len && i > 1) return i - 1;
+        /* \s+(?!\S): keep all but the last space when more text follows.
+         * One *character*, not one byte — is_space() admits U+00A0, and
+         * backing off a byte cut it in half. */
+        if (i < len && prev > 0) return prev;
         return i;
     }
     return n;
+}
+
+/* ---- DeepSeek-V4.1's pattern -------------------------------------------- */
+
+/* Its tokenizer.json pre-tokenizes with THREE isolating Splits in sequence,
+ * then ByteLevel with use_regex off:
+ *
+ *   1  \p{N}{1,3}
+ *   2  [一-龥぀-ゟ゠-ヿ]+
+ *   3  [!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+
+ *      | [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+
+ *      |  ?[\p{P}\p{S}]+[\r\n]*
+ *      | \s*[\r\n]+ | \s+(?!\S) | \s+
+ *
+ * "Isolated" means the matched run becomes its own piece and so does the
+ * text between matches, so applying the three in sequence is one left-to-
+ * right scan in which passes 1 and 2 outrank every branch of pass 3. That
+ * is what this is: ds_match tries the branches at one position, and
+ * next_piece_ds runs it forward to find where the next match starts when
+ * none does — which is how an isolating Split produces its gaps.
+ *
+ * Three differences from cl100k, none of which produces an error if missed:
+ *   - no contraction branch. "don't" is "don" + "'t", the second piece
+ *     coming from punctuation-then-ASCII-letters, not from an (?i:'t).
+ *   - punctuation and symbols are classes rather than "neither a letter nor
+ *     a digit", so a format character between two symbols does not join
+ *     their run — it becomes a gap of its own.
+ *   - \p{N} is every script's digits and the numeric symbols besides, so
+ *     "²³x" is "²³" + "x". Hand-written ranges were not going to cover that,
+ *     which is why unicode_classes.h is generated.
+ */
+
+/* Pass 2's class, spelled as the release spells it: CJK Unified Ideographs
+ * up to U+9FA5 only, plus both kana blocks. It is NOT is_han() — that one
+ * covers Extension A and the compatibility block, which this pattern leaves
+ * to \p{L}. U+9FA6 is the first character on the other side, and it lands
+ * in a letter run. */
+static int is_ds_cjk(int c)
+{
+    return (c >= 0x4E00 && c <= 0x9FA5) || (c >= 0x3040 && c <= 0x309F) ||
+           (c >= 0x30A0 && c <= 0x30FF);
+}
+
+/* [\p{L}\p{M}] minus what pass 2 already carved out. */
+static int is_ds_lm(int c)
+{
+    return !is_ds_cjk(c) && (uc_is_letter(c) || uc_is_mark(c));
+}
+
+static int is_ps(int c) { return uc_is_punct(c) || uc_is_symbol(c); }
+
+/* The 32 ASCII punctuation and symbol characters — exactly the leading
+ * class of pass 3's first branch. */
+static int is_ascii_punct(int c)
+{
+    return (c >= 0x21 && c <= 0x2F) || (c >= 0x3A && c <= 0x40) ||
+           (c >= 0x5B && c <= 0x60) || (c >= 0x7B && c <= 0x7E);
+}
+
+static int is_ascii_alpha(int c)
+{
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+/* [^\r\n\p{L}\p{P}\p{S}] — what may stand in front of a letter run. Note
+ * what it does NOT exclude: a space, a mark, and every format and control
+ * character. "\x01b" really is one piece. */
+static int is_lead(int c)
+{
+    return c != '\r' && c != '\n' && !uc_is_letter(c) && !is_ps(c);
+}
+
+/* Length of the match starting at s, or 0 if no branch matches here. */
+static int ds_match(const char *s, int len)
+{
+    int cp, n = utf8_next(s, len, &cp), i, c2, k;
+    if (n == 0) return 0;
+
+    if (uc_is_number(cp)) {                              /* pass 1 */
+        i = n;
+        for (int cnt = 1; i < len && cnt < 3; cnt++) {
+            k = utf8_next(s + i, len - i, &c2);
+            if (!k || !uc_is_number(c2)) break;
+            i += k;
+        }
+        return i;
+    }
+    if (is_ds_cjk(cp)) {                                 /* pass 2 */
+        i = n;
+        while (i < len) {
+            k = utf8_next(s + i, len - i, &c2);
+            if (!k || !is_ds_cjk(c2)) break;
+            i += k;
+        }
+        return i;
+    }
+
+    /* (a) one ASCII punctuation mark, then ASCII letters */
+    if (is_ascii_punct(cp) && n < len && is_ascii_alpha((unsigned char)s[n])) {
+        i = n + 1;
+        while (i < len && is_ascii_alpha((unsigned char)s[i])) i++;
+        return i;
+    }
+
+    /* (b) an optional leading character, then letters and marks */
+    {
+        int start = -1;
+        if (is_ds_lm(cp)) start = 0;
+        else if (is_lead(cp) && n < len) {
+            k = utf8_next(s + n, len - n, &c2);
+            if (k && is_ds_lm(c2)) start = n;
+        }
+        if (start >= 0) {
+            i = (start == 0) ? n : start;
+            while (i < len) {
+                k = utf8_next(s + i, len - i, &c2);
+                if (!k || !is_ds_lm(c2)) break;
+                i += k;
+            }
+            return i;
+        }
+    }
+
+    /* (c) an optional leading space, then punctuation and symbols, then any
+     * CR/LF that follow them */
+    {
+        int start = -1;
+        if (is_ps(cp)) start = 0;
+        else if (cp == ' ' && n < len) {
+            k = utf8_next(s + n, len - n, &c2);
+            if (k && is_ps(c2)) start = n;
+        }
+        if (start >= 0) {
+            i = (start == 0) ? n : start;
+            while (i < len) {
+                k = utf8_next(s + i, len - i, &c2);
+                /* Pass 2's range is not all letters: U+30FB, the katakana
+                 * middle dot, is \p{Po}. Without this guard a symbol run
+                 * swallowed it and everything after it up to the next
+                 * letter -- "x#・・/k" came out as one piece instead of
+                 * three, and the ids after it all shifted. */
+                if (!k || is_ds_cjk(c2) || !is_ps(c2)) break;
+                i += k;
+            }
+            while (i < len && is_nl((unsigned char)s[i])) i++;
+            return i;
+        }
+    }
+
+    /* (d) \s*[\r\n]+   (e) \s+(?!\S)   (f) \s+ */
+    if (is_space(cp)) {
+        int last_nl = -1, prev = 0;
+        i = 0;
+        while (i < len) {
+            int c3; k = utf8_next(s + i, len - i, &c3);
+            if (!k || !is_space(c3)) break;
+            prev = i;
+            i += k;
+            if (is_nl(c3)) last_nl = i;
+        }
+        if (last_nl > 0) return last_nl;
+        /* \s+(?!\S) keeps all but the LAST CHARACTER when more text
+         * follows. Two things about that sentence are load-bearing.
+         *
+         * Character, not byte: is_space() admits U+00A0 and every
+         * other Unicode space, and backing off a byte cuts one in half.
+         *
+         * And "more text" means more text *in this segment*. Passes 1 and 2
+         * have already isolated every number and CJK run, so pass 3 never
+         * sees across one: "  \u0966" is a segment of two spaces followed by
+         * nothing, where (?!\S) succeeds and the run stays whole. Reading
+         * `len` here instead split every space run that ends at a digit. */
+        if (i < len) {
+            int c4; (void)utf8_next(s + i, len - i, &c4);
+            if (!uc_is_number(c4) && !is_ds_cjk(c4) && prev > 0) return prev;
+        }
+        return i;
+    }
+    return 0;
+}
+
+static int next_piece_ds(const char *s, int len)
+{
+    int m = ds_match(s, len), cp, k;
+    if (m) return m;
+    /* Nothing matches here, so under an isolating Split everything up to
+     * the next match is one piece. */
+    int i = utf8_next(s, len, &cp);
+    while (i < len) {
+        if (ds_match(s + i, len - i)) break;
+        k = utf8_next(s + i, len - i, &cp);
+        if (!k) break;
+        i += k;
+    }
+    return i;
+}
+
+static int next_piece_pat(const waste_tok *t, const char *s, int len)
+{
+    if (t->pattern == WASTE_TOKPAT_DEEPSEEK) return next_piece_ds(s, len);
+    return next_piece(s, len, t->han_split);
 }
 
 /* ---- byte-pair merge ---------------------------------------------------- */
@@ -536,7 +768,7 @@ int waste_tok_encode(const waste_tok *t, const char *text, int32_t *out,
          * containing `<|end_of_msg|><|open|>message role="system"<|sep|>`
          * is that many ordinary tokens and not a forged turn. */
         while (pos < len) {
-            const int plen = next_piece(text + pos, len - pos, t->han_split);
+            const int plen = next_piece_pat(t, text + pos, len - pos);
             if (plen <= 0) break;
             const int got = encode_piece(t, (const uint8_t *)text + pos, plen,
                                          out + n, cap - n);
@@ -578,7 +810,7 @@ int waste_tok_encode(const waste_tok *t, const char *text, int32_t *out,
          * within that limit so no piece can straddle the boundary */
         const int upto = best_at >= 0 ? best_at : len;
         while (pos < upto) {
-            const int plen = next_piece(text + pos, upto - pos, t->han_split);
+            const int plen = next_piece_pat(t, text + pos, upto - pos);
             if (plen <= 0) return n;
             const int got = encode_piece(t, (const uint8_t *)text + pos, plen,
                                          out + n, cap - n);

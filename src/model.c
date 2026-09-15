@@ -1377,6 +1377,10 @@ static int cfg_sane(const waste_config *c)
         if ((int64_t)c->hc_mult * c->hidden > INT_MAX) return 0;
     }
     if (!(c->swiglu_limit >= 0.0f)) return 0;              /* also NaN */
+    /* A pattern this build does not have is refused rather than defaulted
+     * to cl100k: the wrong splitter encodes every prompt into a different
+     * token stream and reports nothing. */
+    if (c->tok_pattern < 0 || c->tok_pattern >= WASTE_TOKPAT__COUNT) return 0;
     /* The indexer is all-or-nothing: a container that states a topk without
      * the shapes to score with would silently attend over nothing. */
     if (c->index_kpool < 1 || c->index_kpool > 64) return 0;
@@ -1563,6 +1567,7 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     c->index_dim   = (int)js_int(d, js_get(d, cfg, "index_head_dim"), 0);
     c->index_tail  = js_get(d, cfg, "index_kpool_always_select_tail") >= 0;
     c->tok_han_split = js_bool(d, js_get(d, cfg, "tokenizer_han_split"), 1);
+    c->tok_pattern   = (int)js_int(d, js_get(d, cfg, "tokenizer_pattern"), 0);
 
     int lac = js_get(d, cfg, "linear_attn_config");
     c->full_rank_gate = js_get(d, lac, "use_full_rank_gate") >= 0;

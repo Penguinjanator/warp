@@ -8,6 +8,50 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
+## Unreleased
+
+Work towards **DeepSeek-V4.1-Flash** (552 B backbone + 197 B of n-gram
+memory, 510 GB as published). The plan and the arithmetic are in
+[docs/DS41.md](docs/DS41.md), the feasibility gate is gate 8 in
+[docs/GATES.md](docs/GATES.md), and the model does not load yet.
+
+### Added
+
+- **`tools/hf_peek.py`** — read individual tensors out of a HuggingFace
+  safetensors repo over HTTP range requests, dequantizing E2M1/E4M3 against
+  an E8M0 scale stream. Gate 8 needed 24 experts out of 48 shards and cost
+  **190 MB of 510 GB**. `tools/quant_lab.py` grew `--npy` to take the
+  result. LEARNED §74.
+- **The DeepSeek-V4.1 pre-tokenizer** in `src/tokenizer.c`, selected by
+  `tokenizer_pattern` in the manifest and `waste_tok_set_pattern`. Three
+  isolating Splits in sequence rather than one pattern, punctuation and
+  symbols as classes of their own, and no contraction branch.
+  `tools/hf_tokenizer.py` recognizes it and refuses anything else, as
+  before.
+- **`tools/gen_unicode.py` and `src/unicode_classes.h`** — `\p{L}`,
+  `\p{M}`, `\p{N}`, `\p{P}`, `\p{S}` as generated range tables instead of
+  hand-written blocks. 30 KB of rodata, binary searched.
+- **`tools/tokdiff.py --wide N`** — a randomized corpus over the whole
+  codepoint space plus multi-byte whitespace runs, and a `tests/run.sh`
+  check that runs it.
+
+### Fixed
+
+**Two tokenizer defects that affect every existing container**, found by
+the wide corpus and invisible to the twenty-one curated strings, which
+scored 21/21 before and after. On 24021 strings, Kimi-Linear went from
+22937 identical to 24017 and GLM-5.3-Flash from 22914 to 24020 — so
+**about 4.5% of strings used to encode differently from the release**.
+LEARNED §75.
+
+- `\s+(?!\S)` backed off one **byte** where it must back off one
+  character, cutting a U+00A0 before a word into two replacement bytes.
+- `\p{N}` and `\s` were ASCII-only. Both patterns mean the Unicode
+  classes; which characters are in `\s` was probed against both releases
+  rather than assumed.
+- `tests/run.sh` tested the tokenizer with `grep -q identical`, and
+  `"22914/24021 identical"` contains that word. It now reads the counts.
+
 ## 0.7.2 — 2026-08-28
 
 Six pull requests and two issues, and one theme running through all of

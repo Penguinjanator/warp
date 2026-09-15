@@ -18,6 +18,7 @@
 #include <stdio.h>
 
 #include "ecache.h"
+#include "tokenizer.h"
 
 /* Public image requests are decoded before resize.  Keep the source-image
  * allocation finite so the memory planner can include its true worst case. */
@@ -106,6 +107,10 @@ typedef struct {
      * branch. 1 on both Kimi models and the default; GLM's pattern has no
      * such branch and its containers say so. */
     int   tok_han_split;
+    /* WASTE_TOKPAT_*: which pre-tokenization pattern the release splits
+     * with. 0 = cl100k, which is every container written before
+     * DeepSeek-V4.1 and the only one tok_han_split means anything for. */
+    int   tok_pattern;
     /* generation_config.json's eos_token_id, mirrored into the container
      * config. The tokenizer used to derive this positionally as
      * base_vocab + 2, which is right on both Kimi models by luck of the
