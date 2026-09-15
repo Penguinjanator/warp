@@ -6320,3 +6320,119 @@ the profile splits a batch's time among its tensors by bytes.
 CPU, twelve here, and §84 measured twelve 6% slower than eight on Qwen:
 the efficiency cores are stragglers. A default that counted performance
 cores would be worth measuring on every model before it is one.
+
+## 86. The pool parks 300 times a token, and closing gaps is worth 2% (2026-09-16)
+
+§84 left seven milliseconds of the expert stages above their eight-thread
+ideal and HyperConnection's non-matvec work at 4.3 ms. Timed inside, with
+clock reads around each piece, 200 decode tokens at 16 GiB:
+
+| HyperConnection, per mix | us | ms/step |
+|---|---:|---:|
+| RMSNorm, four streams on the pool | 21.6 | 2.09 |
+| down projection, its quantization included | 40.2 | 3.90 |
+| up projection | 28.0 | 2.72 |
+| sigmoid over 10,240, on the pool | 10.1 | 0.98 |
+| weighted sum over streams | 4.4 | 0.42 |
+| inject projection | 5.0 | 0.49 |
+| combine | 3.6 | 0.35 |
+
+| expert stages, per call | us | ms/step |
+|---|---:|---:|
+| holds — the misses' reads | 103.6 | 6.66 |
+| gate and up tables | 40.0 | 2.57 |
+| stage 1, gate and up rows | 214.8 | 13.79 |
+| stage 2, activation and down table | 38.7 | 2.48 |
+| stage 3, down rows | 127.5 | 8.19 |
+
+A norm over 10,240 floats is about 10 us of arithmetic; it took 21.6. With
+`WASTE_SPIN=200000` in the same instrumented build it took 8.1, the down
+projection 21.0, the sigmoid 4.8 and the expert tables 19.4. What the pieces
+cost is mostly waking a parked pool.
+
+**How often.** A probe on `waste__pool_run` timed the calling thread's
+serial stretch before every dispatch, keyed by the function dispatched.
+Per token, the dispatches that followed a stretch longer than a worker's
+8 us spin:
+
+| next dispatch | per token | after a gap | serial ms |
+|---|---:|---:|---:|
+| GDN, QSA and router batches (§85) | 96 | 96 | 1.47 |
+| HyperConnection norm | 97 | 65 | 1.53 |
+| GDN recurrence | 36 | 36 | 1.66 |
+| i8mm matvecs | 339 | 55 | 1.41 |
+| activation quantization | 48 | 46 | 0.62 |
+| VQ tables | 96 | 28 | 0.54 |
+| stage 1 (after the misses' reads) | 64 | 14 | 5.98 |
+
+About 330 wakes a token, and 7.7 ms of serial time outside the expert
+reads. `waste_find` was a suspect — a linear `strcmp` over every tensor —
+and is not: one lookup averaged 0.1 us.
+
+**A wake is the scheduler, not the primitive.** Seven workers at the fast
+group's quality of service, parked, woken together after 2 ms idle, 500
+times, until the first and the last acknowledged:
+
+| primitive | first, median | last, median | last, p90 | last, p99 |
+|---|---:|---:|---:|---:|
+| condvar broadcast under a mutex | 18.6 us | 37.2 | 67.6 | 184 |
+| `os_sync_wake_by_address_all` | 18.6 | 37.5 | 66.2 | 178 |
+
+No cheaper wake to swap in, and a barrier waits for the last one.
+
+**Spinning through them is §78's trade again.** Unprofiled, same build,
+user+system CPU for the whole run:
+
+| `WASTE_SPIN` | tok/s | CPU s |
+|---:|---|---:|
+| 20,000 | 12.89, 12.63 | 100.6, 103.6 |
+| 50,000 | 13.26, 13.32 | 108.7, 107.5 |
+| 100,000 | 13.33, 13.61 | 113.4, 110.0 |
+| 200,000 | 13.50, 13.68 | 114.9, 112.3 |
+
++6.5% for +12% CPU. The instrumented build said +10%: clock reads lengthen
+the gaps being measured, as §78 found of the profiler.
+
+**Closing gaps instead**, each the same function over the same elements in
+the same order, so the logits do not move:
+
+- *HyperConnection's norm task* now also does the combine that finishes the
+  previous block, when the mix is the MLP's, and quantizes the stream's
+  weight groups for the down projection, which reads the planes through
+  `matvec_t_prequant`. `prequant_ok` says when a tensor can: i8mm, four
+  bits, and the caller's piece a whole number of groups.
+- *Its gate* is one job of pieces: the sigmoid and the sum over streams, a
+  256-wide hidden range at a time, and the inject projection's four rows,
+  each the `dotf` `matvec` would have taken. A quantized inject falls back
+  to `matvec_t`.
+- *GDN's short conv* runs a range of channels per task, 46 us of SiLU a
+  layer that had been serial in front of the recurrence.
+- *GDN's gated RMSNorm* and out_proj's quantization moved into the
+  recurrence's per-head tasks.
+
+HyperConnection is three dispatches where it was six. In the instrumented
+build the down projection went 42.4 → 27.3 us and the sum and sigmoid 16.0
+→ 11.4; the recurrence's serial gap 1.70 → 0.20 ms a token and the parked
+quantizations 47 → 11. Folding the inject and the combine in cut the
+batches' parked count 96 → 82, which is how we know most of their gap is
+not those two.
+
+Three runs a side could not see any of it — the arms landed within 0.2
+tok/s of each other in both directions. Against a build of §85's commit,
+six alternated pairs:
+
+| | tok/s | mean | CPU s |
+|---|---|---:|---:|
+| before | 13.04, 13.24, 13.03, 12.96, 13.09, 13.15 | 13.09 | 101.3 |
+| after | 13.73, 13.26, 13.17, 13.32, 13.29, 13.32 | 13.35 | 100.8 |
+
++2.0%, faster in all six pairs, at the same CPU. The 2,801-token context
+did not move (prompt 12.13 → 12.22, decode 11.27 → 11.23, one run each).
+Logits byte-identical and every token the same in every run, and also
+against the same commit with `WASTE_TRUNK_KERNEL=0` and `=1`, where
+nothing can take prequantized planes and every fallback runs. Profiled:
+HyperConnection 10.1 → 9.3 ms a step, GDN 14.7 → 13.8.
+
+Two percent here was not obviously worth the code. It went in because the
+gaps are a property of this machine's wake latency and eight cores, and a
+machine with more cores or a slower scheduler pays more for each one.

@@ -1087,6 +1087,47 @@ static void matvec_t_batch(waste_model *m, const float *x, int in,
     for (int i = 0; i < n; i++) matvec_t(m, it[i].y, it[i].t, x, it[i].out, in);
 }
 
+/* The same kernel over planes the caller has already filled.
+ *
+ * i8mm quantizes each weight group of the input on its own, so a caller
+ * that computes the input a piece at a time — a HyperConnection stream, a
+ * GDN value head — can quantize each piece's groups in the task that wrote
+ * it, instead of leaving a serial stretch and a second dispatch in front of
+ * the projection. `prequant_ok` says whether `t` reads planes laid out that
+ * way: i8mm, four bits, a group the kernel takes, and `span` — the size of
+ * the caller's pieces — a whole number of groups. */
+static int prequant_ok(const waste_tensor *t, int span)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    return t && t->q && trunk_kern == TK_I8MM && !trunk_check && t->bits == 4 &&
+           t->group > 0 && (t->group & 31) == 0 && span % t->group == 0;
+#else
+    (void)t; (void)span;
+    return 0;
+#endif
+}
+
+static void matvec_t_prequant(waste_model *m, float *y, const waste_tensor *t,
+                              int out, int in)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    const double t0 = prof_on ? pnow() : 0;
+    const int g = t->group;
+    mvq4_arg a = { y, (const uint8_t *)t->q, t->qs, m->xq, m->xs,
+                   in, (in + g - 1) / g, g, sdot4_sg, g / sdot4_sg, t->rowbytes };
+    waste_parallel_for_work(out, mv_chunk(out, t->rowbytes), waste_mvq4_rows_i8mm, &a,
+                            (size_t)out * t->rowbytes);
+    if (prof_on) {
+        const double dt = pnow() - t0;
+        pthread_mutex_lock(&prof_mu);
+        tmv_account(t, out, in, dt, 0.0);
+        pthread_mutex_unlock(&prof_mu);
+    }
+#else
+    (void)m; (void)y; (void)t; (void)out; (void)in;
+#endif
+}
+
 /* Dequantize one row of a trunk tensor into dst[cols].
  *
  * matvec_t fuses this with the dot product, which is right when every row
@@ -6271,27 +6312,91 @@ static void qwen_rope_cs(const waste_config *c, int pos, float *cos, float *sin)
     }
 }
 
-typedef struct { float *o; const float *x, *w; int group; float eps; } hcn_arg;
+/* One stream of a HyperConnection mix's front half: the combine that
+ * finishes the previous block when there is one, the RMSNorm, and — when
+ * the down projection can take them — the i8mm planes of the stream's
+ * groups. Each is the same function over the same elements as the serial
+ * loop it replaced, one stream at a time. */
+typedef struct {
+    float *o, *x;
+    const float *w;
+    int group;
+    float eps;
+    const float *block, *inj;        /* combine into x first, unless NULL  */
+    int qg, n;                       /* quantize o in groups of qg, if > 0 */
+    int8_t *q;
+    float *sc;
+} hcn_arg;
 
 static void hc_norm_range(int b, int e, void *p)
 {
     const hcn_arg *a = (const hcn_arg *)p;
     for (int s = b; s < e; s++) {
         const size_t off = (size_t)s * (size_t)a->group;
+        if (a->block)
+            waste_qwen_hc_combine(a->x + off, a->block, a->inj + s, 1, a->group,
+                                  a->x + off);
         waste_qwen_rmsnorm(a->o + off, a->x + off, a->w + off,
                            a->group, a->group, a->eps);
+#if defined(__ARM_NEON) || defined(__aarch64__)
+        if (a->qg) {
+            const int per = a->group / a->qg;
+            for (int k = s * per; k < (s + 1) * per; k++)
+                quant_act4_mm_group(a->o, a->n, a->qg, k, a->q, a->sc);
+        }
+#endif
     }
 }
 
-typedef struct { float *v; } sig_arg;
+/* The back half, as pieces of one job: the sigmoid of every stream's gate
+ * and the weighted sum over streams, a hidden range at a time, and the
+ * inject projection's rows. The sigmoid is a scalar expf per element and
+ * the sum runs over streams in order for each element, as the serial loop
+ * did; an inject row is the dotf matvec() would have taken. */
+enum { HC_SPAN = 256 };
+typedef struct {
+    float *gate, *mixed, *yi;
+    const float *normed, *W;         /* W: float inject rows, or NULL      */
+    int hc, hid, n_mix;
+} hcg_arg;
 
-static void sigmoid_range(int b, int e, void *p)
+static void hc_gate_mix_piece(int b, int e, void *p)
 {
-    float *v = ((const sig_arg *)p)->v;
-    for (int i = b; i < e; i++) v[i] = 1.0f / (1.0f + expf(-v[i]));
+    const hcg_arg *a = (const hcg_arg *)p;
+    const int hc = a->hc, hid = a->hid;
+    for (int k = b; k < e; k++) {
+        if (k < a->n_mix) {
+            const int d0 = k * HC_SPAN, d1 = d0 + HC_SPAN < hid ? d0 + HC_SPAN : hid;
+            for (int st = 0; st < hc; st++) {
+                float *v = a->gate + (size_t)st * hid;
+                for (int d = d0; d < d1; d++) v[d] = 1.0f / (1.0f + expf(-v[d]));
+            }
+            for (int d = d0; d < d1; d++) {
+                float s = 0.0f;
+                for (int st = 0; st < hc; st++)
+                    s += a->gate[st * hid + d] * a->normed[st * hid + d];
+                a->mixed[d] = s / (float)hc;
+            }
+        } else {
+            const int o = k - a->n_mix, H = hc * hid;
+            a->yi[o] = dotf(a->W + (size_t)o * H, a->normed, H);
+        }
+    }
 }
 
-static void qwen_hc_mix_t(waste_model *m, const float *hyper,
+/* `cblock`, when given, is the block the streams have not taken in yet:
+ * the combine with the previous mix's `cinj` weights happens here, stream by
+ * stream in the same tasks as the norm, rather than as a serial pass in front
+ * of it. `cinj` may be `inj_w` itself — it is copied before anything writes.
+ *
+ * The mix used to be six dispatches and four serial stretches, and each
+ * stretch long enough for the pool to park before the next dispatch: the
+ * combine (3.5 us), the down projection's quantization, the sum over streams
+ * (4.4 us) and the inject projection (5 us). It is now three dispatches, the
+ * norm and the gate each carrying the work that sat between them and the
+ * matvecs (LEARNED §86). */
+static void qwen_hc_mix_t(waste_model *m, float *hyper,
+                          const float *cblock, const float *cinj,
                           const waste_tensor *nw, const waste_tensor *down,
                           const waste_tensor *up, const waste_tensor *inject,
                           int use_inj, float *mixed, float *inj_w)
@@ -6299,7 +6404,10 @@ static void qwen_hc_mix_t(waste_model *m, const float *hyper,
     const waste_config *c = &m->cfg;
     const int hc = c->hc_count, hid = c->hidden, rank = c->hc_lowrank;
     const int H = hc * hid;
+    float inj_prev[16];
+    if (cblock) memcpy(inj_prev, cinj, (size_t)hc * sizeof(float));
     if (!nw || !nw->data || !down || !up) {
+        if (cblock) waste_qwen_hc_combine(hyper, cblock, inj_prev, hc, hid, hyper);
         memset(mixed, 0, (size_t)hid * sizeof(float));
         if (inj_w) memset(inj_w, 0, (size_t)hc * sizeof(float));
         return;
@@ -6307,33 +6415,37 @@ static void qwen_hc_mix_t(waste_model *m, const float *hyper,
     float *normed = m->tmp;
     float *lo = normed + H;
     float *gate = lo + rank;
-    /* The norm before the down projection and the sigmoid after the up are
-     * each about 10 us of a mix that is otherwise matvec, and a pool worker
-     * parks after 8 us without a job (WASTE_SPIN's 20,000 iterations). On
-     * the calling thread they left both matvecs that follow them — the down
-     * projection, and the next block's first projection — to start by
-     * waking the pool. On it, they keep it awake. Each stream is normalized
-     * and each element squashed by the same function in the same order, so
-     * the results are the serial loops' bit for bit. */
+    const int pq = prequant_ok(down, hid);
     {
-        hcn_arg na = { normed, hyper, nw->data, hid, c->eps };
+        hcn_arg na = { normed, hyper, nw->data, hid, c->eps,
+                       cblock, inj_prev, pq ? down->group : 0, H, m->xq, m->xs };
         waste_parallel_for_fast(hc, 1, hc_norm_range, &na);
     }
-    matvec_t(m, lo, down, normed, rank, H);
+    if (pq) matvec_t_prequant(m, lo, down, rank, H);
+    else matvec_t(m, lo, down, normed, rank, H);
     for (int i = 0; i < rank; i++) lo[i] = silu(lo[i] / (float)hc);
     matvec_t(m, gate, up, lo, H, rank);
+
+    const int want_inj = use_inj && inject && inj_w && hc <= 16;
+    const int inj_rows = want_inj && !inject->q && inject->data;
+    float tmpi[16];
     {
-        sig_arg sa = { gate };
-        waste_parallel_for_fast(H, 256, sigmoid_range, &sa);
+        const int n_mix = (hid + HC_SPAN - 1) / HC_SPAN;
+        hcg_arg ga = { gate, mixed, tmpi, normed, inj_rows ? inject->data : NULL,
+                       hc, hid, n_mix };
+        const double t0 = prof_on && inj_rows ? pnow() : 0;
+        waste_parallel_for_each(n_mix + (inj_rows ? hc : 0), hc_gate_mix_piece, &ga,
+                                waste_pool_fast());
+        if (prof_on && inj_rows) {
+            /* The inject rows share a job with the mix; the matvec table
+             * gets their share of it by piece count, which is an estimate. */
+            pthread_mutex_lock(&prof_mu);
+            tmv_account(inject, hc, H, (pnow() - t0) * hc / (n_mix + hc), 0.0);
+            pthread_mutex_unlock(&prof_mu);
+        }
     }
-    for (int d = 0; d < hid; d++) {
-        float s = 0.0f;
-        for (int b = 0; b < hc; b++) s += gate[b * hid + d] * normed[b * hid + d];
-        mixed[d] = s / (float)hc;
-    }
-    if (use_inj && inject && inj_w) {
-        float tmpi[16];
-        matvec_t(m, tmpi, inject, normed, hc, H);
+    if (want_inj) {
+        if (!inj_rows) matvec_t(m, tmpi, inject, normed, hc, H);
         for (int b = 0; b < hc; b++)
             inj_w[b] = 2.0f / (1.0f + expf(-tmpi[b] / (float)hc));
     }
@@ -6447,6 +6559,54 @@ static void gdn_heads_range(int b, int e, void *p)
                               a->g_log, a->beta, a->S, a->o, u);
 }
 
+/* GDN's short conv, a range of channels at a time. Each channel reads its
+ * own ring and input and writes its own output, through the same kernel the
+ * whole-layer call used. On the calling thread it was 46 us a layer of
+ * SiLU — the pool asleep by the time the recurrence reached it. */
+typedef struct { int KS; const float *w; float *ring; const float *x; float *y; } gconv_arg;
+
+static void gdn_conv_range(int b, int e, void *p)
+{
+    const gconv_arg *a = (const gconv_arg *)p;
+    const int R = a->KS - 1;
+    waste_k.short_conv_step(e - b, a->KS, a->w + (size_t)b * a->KS, NULL,
+                            a->ring + (size_t)b * R, a->x + b, a->y + b);
+}
+
+/* A value head from the recurrence to the output projection's input: its
+ * state update, its gated RMSNorm, and — when out_proj can take them — the
+ * i8mm planes of its groups. The norm used to be a serial loop over the heads
+ * after the recurrence's dispatch, and out_proj's quantization a dispatch
+ * after that, which found the pool parked 47 times a token. */
+typedef struct {
+    gdn_arg r;
+    const float *z, *nw;
+    float eps;
+    float *normed;
+    int qg, n;                       /* quantize normed in groups, if > 0  */
+    int8_t *q;
+    float *sc;
+} gdnf_arg;
+
+static void gdn_heads_out_range(int b, int e, void *p)
+{
+    const gdnf_arg *a = (const gdnf_arg *)p;
+    const int Dv = a->r.Dv;
+    float u[GDN_SCRATCH];
+    waste_qwen_gdn_step_heads(b, e, a->r.Hk, a->r.Hv, a->r.Dk, Dv, a->r.q, a->r.k,
+                              a->r.v, a->r.g_log, a->r.beta, a->r.S, a->r.o, u);
+    for (int h = b; h < e; h++)
+        waste_k.rmsnorm_gated(Dv, a->r.o + (size_t)h * Dv, a->z + (size_t)h * Dv,
+                              a->nw, a->eps, a->normed + (size_t)h * Dv);
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    if (a->qg) {
+        const int per = Dv / a->qg;
+        for (int k = b * per; k < e * per; k++)
+            quant_act4_mm_group(a->normed, a->n, a->qg, k, a->q, a->sc);
+    }
+#endif
+}
+
 static void qwen_gdn_layer(waste_model *m, int L, const float *in, float *out)
 {
     const waste_config *c = &m->cfg;
@@ -6478,10 +6638,12 @@ static void qwen_gdn_layer(waste_model *m, int L, const float *in, float *out)
     }
     const waste_tensor *cw = waste_find(m, tname("%smodel.layers.%d.linear_attn.conv1d.weight",
                                                  c->prefix, L));
-    if (cw && cw->data)
-        waste_k.short_conv_step(qkv, c->conv_k, cw->data, NULL, m->conv[L], mixed, conv_y);
-    else
+    if (cw && cw->data) {
+        gconv_arg ca = { c->conv_k, cw->data, m->conv[L], mixed, conv_y };
+        waste_parallel_for_fast(qkv, 512, gdn_conv_range, &ca);
+    } else {
         memcpy(conv_y, mixed, (size_t)qkv * sizeof(float));
+    }
     for (int h = 0; h < Hv; h++) b[h] = 1.0f / (1.0f + expf(-b[h]));
     const waste_tensor *tA = waste_find(m, tname("%smodel.layers.%d.linear_attn.A_log",
                                                  c->prefix, L));
@@ -6500,6 +6662,23 @@ static void qwen_gdn_layer(waste_model *m, int L, const float *in, float *out)
      * heads share nothing but the QK rows they read (see qwen_gdn.h), and
      * each runs the same code in the same order, so the state and output are
      * the serial loop's bit for bit. */
+    const waste_tensor *tnw = waste_find(m, tname("%smodel.layers.%d.linear_attn.norm.weight",
+                                                  c->prefix, L));
+    const waste_tensor *top = waste_find(m, tname("%smodel.layers.%d.linear_attn.out_proj.weight",
+                                                  c->prefix, L));
+    if (Dv <= GDN_SCRATCH && tnw && tnw->data) {
+        /* `normed` is `mixed`: in_proj_qkv's output, which nothing reads
+         * after the conv, so the heads can write it while they run. */
+        const int pq = prequant_ok(top, Dv);
+        gdnf_arg fa = { { Hk, Hv, Dk, Dv, q, k, v, m->gdn_g, b, m->S[L], core },
+                        z, tnw->data, c->eps, mixed,
+                        pq ? top->group : 0, Hv * Dv, m->xq, m->xs };
+        waste_parallel_for_fast(Hv, 1, gdn_heads_out_range, &fa);
+        PROF_END(P_KDAK);
+        if (pq) matvec_t_prequant(m, out, top, hid, Hv * Dv);
+        else matvec_t(m, out, top, mixed, hid, Hv * Dv);
+        return;
+    }
     if (Dv <= GDN_SCRATCH) {
         gdn_arg ga = { Hk, Hv, Dk, Dv, q, k, v, m->gdn_g, b, m->S[L], core };
         waste_parallel_for_fast(Hv, 1, gdn_heads_range, &ga);
@@ -6507,15 +6686,12 @@ static void qwen_gdn_layer(waste_model *m, int L, const float *in, float *out)
         waste_qwen_gdn_step(Hk, Hv, Dk, Dv, q, k, v, m->gdn_g, b, m->S[L], core, m->att);
     }
     PROF_END(P_KDAK);
-    const waste_tensor *tnw = waste_find(m, tname("%smodel.layers.%d.linear_attn.norm.weight",
-                                                  c->prefix, L));
     if (!tnw || !tnw->data) return;
     float *normed = mixed;
     for (int h = 0; h < Hv; h++)
         waste_k.rmsnorm_gated(Dv, core + (size_t)h * Dv, z + (size_t)h * Dv,
                               tnw->data, c->eps, normed + (size_t)h * Dv);
-    matvec_t(m, out, waste_find(m, tname("%smodel.layers.%d.linear_attn.out_proj.weight",
-                                         c->prefix, L)), normed, hid, Hv * Dv);
+    matvec_t(m, out, top, normed, hid, Hv * Dv);
 }
 
 typedef struct {
@@ -7084,7 +7260,7 @@ static const float *qwen_step(waste_model *m, int token, int pos, int *routed)
          * needs a scope of its own. */
         {
             PROF_START(P_QHC);
-            qwen_hc_mix_t(m, m->hcx,
+            qwen_hc_mix_t(m, m->hcx, NULL, NULL,
                 waste_find(m, tname("%smodel.layers.%d.attn_hyper_connection.hc_norm.weight", c->prefix, L)),
                 waste_find(m, tname("%smodel.layers.%d.attn_hyper_connection.input_mix_weight_down.weight", c->prefix, L)),
                 waste_find(m, tname("%smodel.layers.%d.attn_hyper_connection.input_mix_weight_up.weight", c->prefix, L)),
@@ -7103,8 +7279,8 @@ static const float *qwen_step(waste_model *m, int token, int pos, int *routed)
         }
         {
             PROF_START(P_QHC);
-            waste_qwen_hc_combine(m->hcx, block, inj, hc, hid, m->hcx);
-            qwen_hc_mix_t(m, m->hcx,
+            /* The attention block goes into the streams inside the mix. */
+            qwen_hc_mix_t(m, m->hcx, block, inj,
                 waste_find(m, tname("%smodel.layers.%d.mlp_hyper_connection.hc_norm.weight", c->prefix, L)),
                 waste_find(m, tname("%smodel.layers.%d.mlp_hyper_connection.input_mix_weight_down.weight", c->prefix, L)),
                 waste_find(m, tname("%smodel.layers.%d.mlp_hyper_connection.input_mix_weight_up.weight", c->prefix, L)),
@@ -7147,7 +7323,7 @@ static const float *qwen_step(waste_model *m, int token, int pos, int *routed)
         }
     }
     PROF_START(P_QHC);
-    qwen_hc_mix_t(m, m->hcx,
+    qwen_hc_mix_t(m, m->hcx, NULL, NULL,
         waste_find(m, tname("%smodel.hyper_connection_mixer.hc_norm.weight", c->prefix)),
         waste_find(m, tname("%smodel.hyper_connection_mixer.input_mix_weight_down.weight", c->prefix)),
         waste_find(m, tname("%smodel.hyper_connection_mixer.input_mix_weight_up.weight", c->prefix)),
