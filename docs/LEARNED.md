@@ -5571,3 +5571,54 @@ Three things this is evidence for:
   never gives the candidate filter two blocks to choose between. Twelve
   does. §75 was the same lesson about a tokenizer corpus, three commits
   earlier, and it did not transfer on its own.
+
+## 77. A speculative batch of five reads 3.45 tokens' worth (2026-09-15)
+
+Speculative decoding verifies K draft tokens in one backbone pass, and on a
+GPU that is nearly free — the pass is compute-bound and the K tokens ride
+along in the same matmuls. Here the pass *is* the expert reads, so the
+question is not the acceptance rate on its own. It is the acceptance rate
+against how much the union of K routes grows.
+
+`tools/spec_window.py` over a real `WASTE_DUMP_ROUTE` trace, on the three
+containers this machine has:
+
+| K | Kimi-Linear 48 B, top-8, 26 L | GLM-5.3-Flash 313 B, top-8, 42 L | K3 2.78 T, top-16, 92 L |
+|---|---:|---:|---:|
+| 2 | 85.6% | 85.4% | 84.4% |
+| 3 | 78.1% | 78.1% | 76.2% |
+| 4 | 73.0% | 72.8% | 70.7% |
+| **5** | **68.9%** | **69.0%** | **66.7%** |
+| 8 | 60.8% | 60.9% | 58.5% |
+
+Two orders of magnitude of scale, two different top-k, and the curve agrees
+to a tenth of a point at every K. That is the finding: **the union growth of
+consecutive routes is a property of top-k routing at this sparsity, not of
+any one model.** A number that stable is worth acting on before the model it
+is about has finished downloading.
+
+At K = 5 a batch touches 3.45 times what one token does, so 3.45 of the five
+drafts have to survive for it to read no more per accepted token than plain
+decoding. Σ p^i = 3.45 puts the per-position acceptance that needs at 0.88.
+At three accepted it reads 15% *more*; the best case, all five, saves 31%.
+
+Two things this is the other half of. Gate 0 measured 43.5% next-token
+expert reuse on OLMoE and called it "moderate, not the strong locality the
+literature assumed" — this is the same quantity read forwards, as what a
+batch costs rather than as what a cache saves, and it now has three
+first-party models under it. And §44: `WASTE_XPAR` is worth 1.18x on
+Kimi-Linear and a regression on K3 because "the batch that gives it
+parallelism is the same batch that barriers the read-ahead". Batching is not
+free on this engine at any level, and the reason is the same one twice.
+
+K3's top-16 does slightly better than the two top-8 models — more experts
+per token means more of them shared — which is worth knowing in the other
+direction: a *sparser* router makes speculation worse, and
+DeepSeek-V4.1's top-6 of 384 is sparser than all three.
+
+The gate is deferred rather than refuted (GATES.md gate 9). What DSpark's
+acceptance actually is on this model is not published, the release's own
+inference code says the speculative loop "is out of scope for this repo",
+and it is the one number left. What is settled is everything else: the
+threshold it has to clear, and that a batched CSA2/mHC forward path is the
+price of finding out.

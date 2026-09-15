@@ -23,6 +23,7 @@ those are the ones to quote.
 | 6 | is per-expert bit allocation a real lever? | ❌ run 2026-07-29 — refuted, nothing to allocate |
 | 7 | is the budget resolver's quantum still a working set? | ❌ run 2026-08-23 — refuted, the quantum stands |
 | 8 | DeepSeek-V4.1-Flash: does 3-bit VQ survive an fp4 source? | ✅ run 2026-09-15 — 19.95%, indistinguishable from K3 |
+| 9 | is speculative decoding worth its bytes on a streaming MoE? | ⏸ run 2026-09-15 — break-even is 3.45 of 5, and the deciding number needs the model |
 
 ## Gate 0 — does the trace→simulate methodology work, and what does real
 ## batch-1 routing look like? ✅ PASSED (with a sobering data point)
@@ -469,3 +470,70 @@ published model is usually the download, and a safetensors header states
 every tensor's byte range. Eight experts is 190 MB. `tools/hf_peek.py` is
 that, generalized, and it should be the first thing pointed at the next
 release rather than `huggingface-cli download`.
+
+## Gate 9 — is speculative decoding worth its bytes here?
+## ⏸ RUN 2026-09-15 — break-even is 3.45 of 5 drafts, on three models
+
+*Protects:* DSpark. Three drafter blocks, a Markov head, a confidence head,
+a scheduler, 5.1 GB more bank, and — the expensive part — a BATCHED forward
+path for CSA2 and mHC, which this engine does not have and which is exactly
+where single-pass mHC's shifted dependency and the compressor's per-step
+state make batching awkward.
+
+*The premise speculation rests on, and where it does not hold.* Verifying K
+draft tokens in one backbone pass is nearly free on a GPU: the pass is
+compute-bound and the K tokens ride along in the same matmuls. Here the pass
+IS the expert reads. A K3 decode token pulls 17 GB off disk; verifying five
+of them pulls the union of five routes, and a top-k router gives consecutive
+tokens only a fraction of their experts in common.
+
+*Test:* `tools/spec_window.py` over a real `WASTE_DUMP_ROUTE` trace — for
+each K, the distinct (layer, expert) records a window of K consecutive
+decode tokens touches, against K times what one touches. Run on three
+containers already on disk, 48 generated tokens each (20 on K3).
+
+| K | Kimi-Linear 48 B, top-8, 26 L | GLM-5.3-Flash 313 B, top-8, 42 L | K3 2.78 T, top-16, 92 L |
+|---|---:|---:|---:|
+| 2 | 85.6% | 85.4% | 84.4% |
+| 3 | 78.1% | 78.1% | 76.2% |
+| 4 | 73.0% | 72.8% | 70.7% |
+| **5** | **68.9%** | **69.0%** | **66.7%** |
+| 8 | 60.8% | 60.9% | 58.5% |
+
+Three models, two orders of magnitude of scale, two different top-k, and the
+curve agrees to a tenth of a point at every K. **It is a property of top-k
+routing at this sparsity and not of any one model**, which is what makes it
+worth acting on before DeepSeek-V4.1's own trace exists.
+
+*What it means.* At DSpark's block size of five, a batch touches 3.45x what
+one token does. So **3.45 of the 5 drafts must be accepted for the batch to
+read no more per accepted token than plain decoding**; at 3 accepted it
+reads 15% more, and the best case — all five — saves 31%. Solving
+Σ p^i = 3.45 puts the per-position acceptance it needs at about **0.88**.
+
+K3's top-16 does slightly better than the two top-8 models, as more experts
+per token means more of them shared. DeepSeek-V4.1 routes top-6 of 384,
+sparser than all three, so its break-even is the same or worse.
+
+*Verdict: deferred, not refuted, and the deciding number is not ours.* What
+DSpark's acceptance actually is on this model is not published and cannot be
+measured until the container exists — it is the one number that decides
+this, and everything else about the gate is settled. Stage 6 first.
+
+*Kill criterion:* measured acceptance under 3.45 of 5 on a real prompt set.
+*Revival criterion:* over 4 of 5, which is a 14% saving in bytes and would
+justify the batched path.
+
+One thing the counting does not capture, and it favours speculation: a
+rejected draft's experts stay in the cache, so the next batch may find them
+warm. The other direction is not captured either — the drafter's own MoE,
+128 experts top-3 over three blocks, adds about 4% of a batch's reads. Both
+are small against a factor of 3.45.
+
+*Method note.* The release's own `inference/model.py` implements DSpark's
+forward pass and says plainly that "the speculative-decoding loop itself is
+out of scope for this repo". Building it here would have meant inventing the
+accept/reject policy from the tech report and then measuring it. The tech
+report also says the scheduler picks the verification length from "profiled
+engine throughput curves" — on this engine that curve is the table above,
+and it says the length should be short.

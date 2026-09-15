@@ -115,7 +115,17 @@ memory, 510 GB as published). The plan and the arithmetic are in
   three of them not multiples of the downsample; the geometry agrees on
   seven source sizes including both collapse cases.
 
-Not implemented: DSpark. A container carrying it loads and ignores it.
+- **`tools/spec_window.py`** — what a speculative batch of K tokens costs
+  an engine whose budget is bytes read per token, from a real
+  `WASTE_DUMP_ROUTE` trace. Gate 9 ran it on three containers: a window of
+  five consecutive decode tokens touches **3.45x** the expert records one
+  token does, on Kimi-Linear, GLM-5.3-Flash and K3 alike — two orders of
+  magnitude of scale and two different top-k, agreeing to a tenth of a
+  point at every K. So DSpark needs 3.45 of its 5 drafts accepted to break
+  even on bytes. LEARNED §77.
+
+Not implemented: DSpark, deferred by gate 9. A container's MTP weights are
+dropped at conversion.
 
 ### Fixed
 
