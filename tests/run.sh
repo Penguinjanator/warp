@@ -1046,15 +1046,29 @@ PY
         hot_why=$(python3 - "$MODEL" <<'PYHOT'
 import json, os, subprocess, sys
 WASTE = os.path.join(os.curdir, "waste" + (".exe" if os.name == "nt" else ""))
-r = subprocess.run([WASTE, "plan", sys.argv[1], "--json"],
+r = subprocess.run([WASTE, "plan", sys.argv[1], "--json", "--budget", "5G"],
                    capture_output=True, text=True)
 try:
-    floor = json.loads(r.stdout)["floor_bytes"]
+    p = json.loads(r.stdout)
 except Exception:
     sys.exit(0)
-if floor > 5 * (1 << 30):
-    print(f"this container's floor is {floor / (1 << 30):.2f} GB and the "
+G = 1 << 30
+floor, ws = p["floor_bytes"], p["working_set_bytes"]
+cache = p.get("expert_cache_bytes", -1)
+if floor > 5 * G:
+    print(f"this container's floor is {floor / G:.2f} GB and the "
           f"check opens at 5G, which the engine refuses")
+elif 0 <= cache < ws:
+    # Opening is not the same as having room to learn anything. A cache
+    # below one token's working set has a hit rate of zero, not a low one
+    # (docs/ENGINE.md section 3): every record the hotlist preloads is
+    # evicted before the token that wanted it comes round again.
+    # DeepSeek-V4.1 is the first container here that fits under 5G and
+    # still cannot hold one — floor 4.86 GB, so 310 MB of cache against a
+    # 3.19 GB working set — and it answered 284 misses -> 286, which is
+    # the engine behaving as designed and this check calling it a defect.
+    print(f"a 5G budget leaves {cache / G:.2f} GB of expert cache and one "
+          f"token needs {ws / G:.2f} GB, so no hotlist can hit")
 PYHOT
 )
     fi

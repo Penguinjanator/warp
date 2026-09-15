@@ -1172,6 +1172,17 @@ static int cmd_bench(int argc, char **argv)
         return 0;
     }
     printf("  %.2f tok/s (%.0f ms/token)\n", tps, 1000.0 / (tps > 0 ? tps : 1));
+    /* A model that ends its turn early leaves this measuring the prefill.
+     * DeepSeek-V4.1 emits EOS immediately on the bare continuation prompt
+     * below — 1 token of the 120 asked for — and the figure came out
+     * "0.19 tok/s" with nothing to say it was one decode step behind an
+     * 18-token prefill. The rate is still true; what it is a rate OF is
+     * the part that was missing. */
+    if (s.tokens_generated < (uint64_t)o.max_tokens)
+        printf("  note      %llu of the %u tokens asked for — generation stopped\n"
+               "            early, so this is mostly prefill and is not a decode\n"
+               "            rate. Use a prompt this model will keep answering.\n",
+               (unsigned long long)s.tokens_generated, o.max_tokens);
     if (!s.direct_io)
         printf("  note      page cache not bypassed on this filesystem — the hit\n"
                "            rate below is partly the kernel's, not the engine's\n");

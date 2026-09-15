@@ -32,6 +32,14 @@ KINDS = (("gate", "w1"), ("up", "w3"), ("down", "w2"))
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mxfp4 import ST                                              # noqa: E402
+# The naming of a checkpoint's experts is convert.py's fact, and it had a
+# second copy here: an inline probe for DeepSeek-V3's `mlp/gate_proj` with
+# Mixtral's `block_sparse_moe/w1` as the fallback. DeepSeek-V4.1 is neither
+# — `layers.0.ffn.experts.0.w1.weight`, no `model.` in front of it — so the
+# round-trip on the one container whose converter is newest was the one
+# that could not run, and it failed as a KeyError with stderr swallowed by
+# tests/run.sh. Import the table instead of restating it.
+from convert import moe_layout, source_prefixes                   # noqa: E402
 
 
 def load_codebooks(path):
@@ -102,7 +110,11 @@ def main():
           f"layers {list(man['layers'])}")
 
     sr = ST(args.src)
-    prefix = man.get("tensor_prefix", "")
+    # Where the CHECKPOINT puts `layers.N`, which is not the container's
+    # tensor_prefix with "model." glued on: GLM nests the two components the
+    # other way round and DeepSeek-V4.1 has neither.
+    _pfx, src_pfx, _cfg = source_prefixes(
+        json.load(open(os.path.join(args.src, "config.json"))))
     ok = True
     for lstr, meta in man["layers"].items():
         L = int(lstr)
@@ -110,27 +122,18 @@ def main():
         assert len(bank) == meta["bytes"]
         shapes = []
 
-        deepseek_probe = (
-            f"{prefix}model.layers.{L}.mlp.experts.0.gate_proj.weight"
-        )
-        use_deepseek_names = sr.have(deepseek_probe)
+        layout, moe_segment, src_kinds = moe_layout(sr, src_pfx, L)
+        if layout is None:
+            print(f"  L{L}: no MoE experts under any known naming at "
+                  f"{src_pfx}layers.{L}.*.experts.0 — is --src the right "
+                  f"checkpoint?")
+            return 1
 
-        if use_deepseek_names:
-            src_kinds = (
-                ("gate", "gate_proj"),
-                ("up", "up_proj"),
-                ("down", "down_proj"),
-            )
-            moe_segment = "mlp"
-        else:
-            src_kinds = KINDS
-            moe_segment = "block_sparse_moe"
+        def ename(e, tag):
+            return f"{src_pfx}layers.{L}.{moe_segment}.experts.{e}.{tag}.weight"
 
         for _kind, tag in src_kinds:
-            t = sr.tensor(
-                f"{prefix}model.layers.{L}.{moe_segment}.experts.0.{tag}.weight"
-            )
-            shapes.append(tuple(t.shape))
+            shapes.append(tuple(sr.tensor(ename(0, tag)).shape))
 
         off, checked = 0, 0
         while off < len(bank) and checked < args.experts:
@@ -139,9 +142,7 @@ def main():
                                            man["expert_quant"].get("index_block", 0))
             assert off % ALIGN == 0, f"record {eid} not 4 KiB aligned"
             for i, (kind, tag) in enumerate(src_kinds):
-                W = sr.tensor(
-                    f"{prefix}model.layers.{L}.{moe_segment}.experts.{eid}.{tag}.weight"
-                )
+                W = sr.tensor(ename(eid, tag))
                 err = (W - rec[kind]).norm() / W.norm()
                 flag = "ok " if err < 0.30 else "BAD"
                 if err >= 0.30:

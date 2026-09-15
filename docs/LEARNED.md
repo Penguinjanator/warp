@@ -5674,3 +5674,53 @@ the same corrupted string read from the same file. A rendering artifact at
 the end of a correct generation looks like a cosmetic bug in the printer.
 It was the tokenizer's security boundary, seen from the other side.
 
+## 79. Three checks that were wrong about a correct engine (2026-09-15)
+
+The DeepSeek-V4.1 container converted, matched its oracle to 0.0025% and
+answered "The capital of France is" with " Paris." — and the suite said 4
+failures. Every one of them was the check, not the engine.
+
+- **`tests/run.sh` tested the tokenizer with `grep -q identical`**, and the
+  string `"22914/24021 identical"` contains that word. §75.
+- **`verify_container.py` kept a second copy of how a checkpoint names its
+  experts**, an inline probe for `mlp/gate_proj` falling back to
+  `block_sparse_moe/w1`, while `convert.py` had the same fact in
+  `MOE_LAYOUTS`. DeepSeek-V4.1 is neither, so the checker raised a
+  `KeyError` — into a `2>/dev/null` — and run.sh reported it as the
+  *container* failing to round-trip.
+- **The learned-hotlist check guarded on the wrong quantity.** It asked
+  whether the container's floor fits under its 5G budget. This one's does,
+  at 4.86 GB, which leaves 0.29 GB of expert cache against a 2.97 GB
+  working set — a tenth of one token, where §3 of ENGINE.md says the hit
+  rate is zero and not low. It answered 284 misses → 286 on one run and
+  fewer on the next: a verdict decided by noise.
+
+Plus §78, the escaped `specials.json`, which was a real defect — so the
+board read 4 failures over 1 bug.
+
+**A suite is only exercised by a model it has not seen.** These three sat
+under green boards across four releases because Kimi-Linear, GLM and K3
+all satisfy their unstated assumptions: ASCII control tokens, one of two
+expert namings, a working set small enough that 5G is a real cache. None
+of those is a property anything checked; each was a coincidence three
+models shared. The fourth model was the test.
+
+The practical consequence is about *reading* a red board rather than
+writing one. The first instinct on 4 failures against a new architecture
+is that the new architecture is broken, and here that instinct was wrong
+four times out of four — but only because the engine had an independent
+oracle to be right against. Without `ds41_ref.py` saying 0.0025%, there is
+no way to tell a checker bug from an engine bug except by looking, and
+looking is expensive enough that the default assumption usually wins.
+
+Two small rules fall out, both cheap:
+
+**Never swallow a checker's stderr.** `2>/dev/null` on the round-trip
+turned "the checker crashed" into "the container is wrong", which is the
+one substitution that costs the most to undo. `run.sh` now shows it.
+
+**A check with an unstated prerequisite should state it and SKIP.** The
+hotlist check knew how to say "this container's floor is too high"; it
+just did not know that opening is not the same as having room to learn
+anything. Both guards read the same JSON from `waste plan`. The second one
+cost one line.
