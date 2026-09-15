@@ -80,6 +80,15 @@ LEARNED §75.
   rather than assumed.
 - `tests/run.sh` tested the tokenizer with `grep -q identical`, and
   `"22914/24021 identical"` contains that word. It now reads the counts.
+- **`tools/fetch_weights.sh` reported a vanished destination as a finished
+  download.** A USB enclosure dropped off the bus 184 GB into a 475 GB
+  pull; `$STATE` went with it, `wc -l` produced nothing, `[ "" -lt 48 ]` is
+  an error that `test` reports as false, and the run printed
+  `ALL SHARDS COMPLETE` with rc=0 over a directory that no longer existed.
+  The next thing that would have happened is `convert.py` writing a
+  container out of 39% of a model. It now asks whether the destination is
+  still there before believing anything counted from it, and refuses a
+  count that is not a number. Same shape as #35 one level up.
 - `mxfp4.ST` read an `int8` tensor with a `.scale` companion as if the
   int8 were the values. That is DeepSeek-V4.1's spelling for packed fp4,
   and no shape disagrees; it now refuses an int8 tensor with no scale

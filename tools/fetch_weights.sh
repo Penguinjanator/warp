@@ -433,7 +433,39 @@ grep -vxF -f "$STATE" "$DEST/.shards" 2>/dev/null \
     | xargs -P "$JOBS" -n1 "$DEST/.worker.sh"
 rc=$?
 
-done_now=$(wc -l < "$STATE" | tr -d ' ')
+# How many shards are actually on disk, or a refusal.
+#
+# The destination can go away under a long run. A USB enclosure that drops
+# off the bus takes $STATE with it; `wc -l` then produces nothing, and
+# `[ "" -lt 48 ]` is an error that `test` reports as false — so the run fell
+# through every check after it and printed ALL SHARDS COMPLETE with rc=0
+# over a directory that no longer existed. Measured on 2026-09-15, 184 GB
+# into a 475 GB pull, and the next thing that would have happened is
+# convert.py writing a container out of 39% of a model.
+#
+# So: ask whether the destination is still there before believing anything
+# counted from it, and refuse a count that is not a number. #35 was this
+# same shape one level up — completion reported on evidence nobody read.
+count_done() {
+    if [ ! -d "$DEST" ] || ! : > "$DEST/.writable" 2>/dev/null; then
+        log "FAILED: $DEST is gone or not writable. The download is NOT"
+        log "        complete; reconnect the device and re-run — nothing"
+        log "        already on disk is refetched."
+        return 1
+    fi
+    rm -f "$DEST/.writable"
+    local n
+    n=$(wc -l < "$STATE" 2>/dev/null | tr -d ' ')
+    case "$n" in
+        ''|*[!0-9]*)
+            log "FAILED: cannot read $STATE, so how much is on disk is"
+            log "        unknown. That is incomplete, not complete."
+            return 1 ;;
+    esac
+    printf '%s\n' "$n"
+}
+
+done_now=$(count_done) || exit 1
 log "pass finished (rc=$rc): $done_now / $TOTAL shards complete, $(free_gb) GB free"
 if [ "$done_now" -lt "$TOTAL" ]; then
     log "re-run to continue; nothing already downloaded is refetched"

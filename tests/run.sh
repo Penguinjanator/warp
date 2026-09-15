@@ -401,6 +401,41 @@ else
     kill $RSRV 2>/dev/null; wait $RSRV 2>/dev/null
 fi
 
+# Completion, reported on evidence. A USB enclosure dropping off the bus
+# mid-run took $STATE with it; `wc -l` produced nothing, `[ "" -lt 48 ]` is
+# an error that `test` reports as false, and the run printed ALL SHARDS
+# COMPLETE with rc=0 over a directory that no longer existed. 184 GB of 475.
+# Same shape as #35 one level up, and the same remedy: read the number.
+count_done_says() {                    # $1 = DEST, $2 = STATE contents or ""
+    { echo "DEST=$1; STATE=\$DEST/.st"
+      echo 'log() { printf "%s\n" "$*" >&2; }'
+      sed -n '/^count_done() {$/,/^}$/p' tools/fetch_weights.sh
+      echo 'count_done'
+    } > "$FT/gencd.sh"
+    bash "$FT/gencd.sh" 2>/dev/null
+}
+
+# Nothing but bash and sed, so this one runs everywhere the suite does.
+{
+    CD="$FT/cd"
+    rm -rf "$CD"; mkdir -p "$CD"
+    printf 'a\nb\nc\n' > "$CD/.st"
+    got=$(count_done_says "$CD"); rc_ok=$?
+    # gone entirely, which is what an unplugged disk looks like
+    missing=$(count_done_says "$FT/definitely-not-here"); rc_gone=$?
+    # there, but with no state file to count
+    rm -f "$CD/.st"
+    nostate=$(count_done_says "$CD"); rc_nostate=$?
+    if [ "$rc_ok" = 0 ] && [ "$got" = 3 ] &&
+       [ "$rc_gone" != 0 ] && [ -z "$missing" ] &&
+       [ "$rc_nostate" != 0 ] && [ -z "$nostate" ]; then
+        ok "a download whose destination vanished is incomplete, not complete"
+    else
+        no "count_done: ok=$rc_ok/$got gone=$rc_gone/$missing nostate=$rc_nostate/$nostate"
+    fi
+    rm -rf "$CD"
+}
+
 # get_small, the other half of the script, and the half that had no checks.
 # Its contract is that a file the repo's own listing names and the server
 # does not deliver is a failure and not a 404 (#35): one attempt with the
