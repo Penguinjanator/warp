@@ -77,6 +77,23 @@ memory, 510 GB as published). The plan and the arithmetic are in
   and the candidate filter has nothing to choose between. LEARNED §76 is
   about the two bugs that found — one in the engine, one in the oracle.
 
+- **`serve/dsml.py`** — DeepSeek-V4.1's prompt format and its reply reader,
+  wired into the server ahead of the `chat.json` fallback and behind XTML.
+  A numeric reasoning effort (1–100, with low/high/max mapping onto
+  50/75/100), `<think>` channels, `<｜DSML｜ calls>` tool markup,
+  mid-conversation system turns, `<tool_result>` blocks in place of a
+  `tool` role, and the six internal task tokens.
+
+  Diffed against `encoding/encoding.py`, the release's five checked-in
+  golden outputs included, by `tests/serve/test_dsml_upstream.py` when
+  `DS41_DIR` names a release. `tests/serve/test_dsml.py` holds what a
+  string diff cannot see: **which segments are markup**. `｜DSML｜` is the
+  control token and the tag name is not, so `<｜DSML｜ calls>` is three
+  segments and a tool result containing that literal cannot open a block.
+- **`Engine.marker_ids_for`**, so a format can state its own markers rather
+  than sharing K3's four. All of them resolve or the format is refused: one
+  that half-resolves is the failure the probe exists to prevent.
+
 Not implemented: the vision tower and DSpark. A container carrying either
 loads and ignores them.
 

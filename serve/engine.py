@@ -574,28 +574,38 @@ class Engine:
                 continue
             raise EngineError("detokenize", st)
 
-    def marker_ids(self) -> dict[int, str]:
-        """Control-token id -> marker, for RegionParser.feed_token.
+    def marker_ids_for(self, texts, *, what: str = "this chat format"
+                       ) -> dict[int, str]:
+        """Control-token id -> marker, for a reply parser's feed_token.
 
         Each marker must encode to exactly one token in markup mode. One
         that does not is not in the container's specials, which means the
         chat format and the tokenizer disagree — a prompt built from it
         would be markup the model reads as prose. Better to say so here
         than to serve wrong answers.
+
+        All of them or none: a format that half-resolves is the failure
+        this probe exists to prevent.
         """
-        if self._markers is not None:
-            return self._markers
         markers: dict[int, str] = {}
-        for text in (OPEN_TOKEN, CLOSE_TOKEN, SEP_TOKEN, END_OF_MSG_TOKEN):
+        for text in texts:
             ids = self.tokenize(text, markup=True)
             if len(ids) != 1:
                 raise EngineError(
                     f"{text} is not a single token in this container "
                     f"(got {len(ids)}): its specials.json does not carry "
-                    f"K3's XTML markers", WASTE_E_UNSUPPORTED)
+                    f"{what}'s markers", WASTE_E_UNSUPPORTED)
             markers[ids[0]] = text
-        self._markers = markers
         return markers
+
+    def marker_ids(self) -> dict[int, str]:
+        """K3's four XTML markers, cached."""
+        if self._markers is not None:
+            return self._markers
+        self._markers = self.marker_ids_for(
+            (OPEN_TOKEN, CLOSE_TOKEN, SEP_TOKEN, END_OF_MSG_TOKEN),
+            what="K3's XTML")
+        return self._markers
 
     # ---- images ---------------------------------------------------------
 

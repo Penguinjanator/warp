@@ -112,6 +112,22 @@ class FakeEngine:
                 f"markers", WASTE_E_UNSUPPORTED)
         return dict(self.markers)
 
+    def marker_ids_for(self, texts, *, what: str = "this chat format"
+                       ) -> dict[int, str]:
+        """The real engine asks the tokenizer; this one asks its own marker
+        table. A container is a DSML container here only if the test set one
+        up, which is what `dsml_markers` in this file does."""
+        by_text = self._by_text
+        out: dict[int, str] = {}
+        for text in texts:
+            if text not in by_text:
+                raise EngineError(
+                    f"{text} is not a single token in this container "
+                    f"(got 5): its specials.json does not carry {what}'s "
+                    f"markers", WASTE_E_UNSUPPORTED)
+            out[by_text[text]] = text
+        return out
+
     def model_info(self) -> dict:
         return {"n_layers": 4, "n_experts": 8, "top_k": 2, "hidden": 128,
                 "ctx_max": self.ctx_max, "params_total": 1000,

@@ -418,7 +418,16 @@ for try in \$(seq 1 \$max_retry); do
                       || say "pull \$f (try \$try)"
     # -C - resumes; --speed-limit kills a connection that has stalled rather
     # than waiting out a TCP timeout that may never come.
-    hcurl -fL -C - --retry 3 --retry-delay 5 --speed-limit 1024 --speed-time 120 \\
+    #
+    # --http1.1 is not a preference. Over a long single transfer this CDN
+    # returns CURLE_HTTP2_STREAM (rc=92) often enough to matter: measured
+    # on the DeepSeek-V4.1 pull, one 7.4 GB shard took five resumes and an
+    # hour where its neighbours took twenty minutes each. The retry logic
+    # survives it and the throughput does not, and a multi-hundred-GB
+    # download is exactly where that compounds. HTTP/1.1 costs a little
+    # multiplexing this script never uses — one file per connection.
+    hcurl -fL --http1.1 -C - --retry 3 --retry-delay 5 \\
+          --speed-limit 1024 --speed-time 120 \\
           -o "\$dest/\$f" "\$raw/\$f" 2>/dev/null
     rc=\$?
     [ \$rc -eq 0 ] && continue          # the next pass verifies the size

@@ -27,7 +27,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from . import chatfmt, glmtools, kimitools, xtml
+from . import chatfmt, dsml, glmtools, kimitools, xtml
 from .engine import Engine
 from .regions import RegionParser
 
@@ -150,7 +150,8 @@ def validate_messages(messages: Any) -> list[dict]:
 _EFFORT_OFF = {"none", "minimal", "off"}
 
 
-def resolve_thinking(body: dict, default_thinking: bool) -> tuple[bool, Optional[str]]:
+def resolve_thinking(body: dict, default_thinking: bool,
+                     fmt: Any = None) -> tuple[bool, Any]:
     """(thinking, thinking_effort) from the request.
 
     Returns the think channel on or off, and how hard to push it. An
@@ -173,12 +174,39 @@ def resolve_thinking(body: dict, default_thinking: bool) -> tuple[bool, Optional
     if effort is None:
         return (default_thinking if thinking is None else thinking), None
 
+    # DeepSeek-V4.1 takes a NUMBER, 1 to 100, and maps low/high/max onto
+    # 50/75/100. K3 takes the three names and nothing else. An integer sent
+    # to K3 is refused rather than rounded onto a name, for the reason this
+    # whole function exists: a server that quietly substitutes reports a
+    # different amount of reasoning than it did.
+    if fmt is dsml and isinstance(effort, int) and not isinstance(effort, bool):
+        if not 1 <= effort <= 100:
+            raise APIError(
+                f"reasoning_effort={effort} is outside [1, 100]",
+                param="reasoning_effort")
+        if thinking is False:
+            raise APIError("'thinking' is false but 'reasoning_effort' asks "
+                           "for reasoning — pick one", param="reasoning_effort")
+        return True, effort
     if not isinstance(effort, str):
-        raise APIError("'reasoning_effort' must be a string",
-                       param="reasoning_effort")
+        raise APIError(
+            "'reasoning_effort' must be a string"
+            + (" or an integer in [1, 100]" if fmt is dsml else ""),
+            param="reasoning_effort")
     low = effort.lower()
     if low in _EFFORT_OFF:
         return False, None
+    if fmt is dsml:
+        if low not in dsml.EFFORT_NAMES:
+            raise APIError(
+                f"reasoning_effort={effort!r} is not supported by this "
+                f"model. DeepSeek-V4.1 accepts an integer in [1, 100], "
+                f"{sorted(dsml.EFFORT_NAMES)}, or {sorted(_EFFORT_OFF)} to "
+                f"answer without reasoning.", param="reasoning_effort")
+        if thinking is False:
+            raise APIError("'thinking' is false but 'reasoning_effort' asks "
+                           "for reasoning — pick one", param="reasoning_effort")
+        return True, low
     if low not in xtml._VALID_THINKING_EFFORTS:
         raise APIError(
             f"reasoning_effort={effort!r} is not supported by this model. "
@@ -306,7 +334,7 @@ def build_prompt(engine: Engine, body: dict, *, default_thinking: bool,
     drop the rest of the embeddings on the floor.
     """
     messages = validate_messages(_require(body, "messages"))
-    thinking, effort = resolve_thinking(body, default_thinking)
+    thinking, effort = resolve_thinking(body, default_thinking, fmt=fmt)
 
     tools = body.get("tools")
     if tools is not None and not isinstance(tools, list):
@@ -386,6 +414,8 @@ def build_prompt(engine: Engine, body: dict, *, default_thinking: bool,
     except kimitools.KimiToolError as e:
         raise APIError(str(e), param=e.param or "messages")
     except glmtools.GlmToolError as e:
+        raise APIError(str(e), param=e.param or "messages")
+    except dsml.DSMLError as e:
         raise APIError(str(e), param=e.param or "messages")
 
     tokens = engine.tokenize_segments(segments)

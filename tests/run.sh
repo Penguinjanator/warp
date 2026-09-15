@@ -2315,6 +2315,27 @@ else
     sk "XTML vs encoding_k3.py" "no release at $K3_SRC (set K3_DIR)"
 fi
 
+# And for DeepSeek-V4.1's. serve/dsml.py is a port of encoding/encoding.py,
+# and a port is a second implementation of something whose only
+# specification is the first one — so it is diffed against that file, plus
+# the release's own five checked-in golden outputs. Those cover a
+# mid-conversation system turn, an internal task token and a two-image
+# vision turn, none of which this repo would have thought to write down.
+DS41_SRC="${DS41_DIR:-/Volumes/WasteDisk/ds41}"
+if [ ! -f "$DS41_SRC/encoding/encoding.py" ]; then
+    sk "DSML vs encoding.py" "no release at $DS41_SRC (set DS41_DIR)"
+elif [ -n "$PY_MISS" ]; then
+    sk "DSML vs encoding.py" "$PY_MISS"
+elif out=$(DS41_DIR="$DS41_SRC" python3 -m unittest discover -s tests/serve \
+           -t . -p "test_dsml_upstream.py" 2>&1) &&
+     printf '%s' "$out" | tail -3 | grep -q "^OK"; then
+    n=$(printf '%s' "$out" | grep -oE "Ran [0-9]+ tests" | grep -oE "[0-9]+")
+    ok "DSML prompts and replies match the release's encoding.py ($n checks)"
+else
+    no "DSML differs from encoding.py"
+    printf '%s\n' "$out" | grep -E "FAIL|Error|AssertionError" | head -3
+fi
+
 # The same question for the other format serve/ renders. Kimi-Linear's
 # tokenizer carries Kimi K2's five tool-call tokens and its release ships
 # no chat_template at all, so the vocabulary is stated and the grammar is
