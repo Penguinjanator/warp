@@ -8,12 +8,31 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
-## Unreleased
+## 0.8.0 — 2026-09-15
 
-Work towards **DeepSeek-V4.1-Flash** (552 B backbone + 197 B of n-gram
-memory, 510 GB as published). The plan and the arithmetic are in
-[docs/DS41.md](docs/DS41.md), the feasibility gate is gate 8 in
-[docs/GATES.md](docs/GATES.md), and the model does not load yet.
+**DeepSeek-V4.1-Flash runs.** 552 B backbone plus 197 B of n-gram memory,
+510 GB as published, converted to a 299 GiB container and decoding at
+**3.77 tok/s over 64 tokens** on a 64 GB laptop — faster than
+GLM-5.3-Flash on a bank twice the size, and above the 1.5–2.5 that
+[docs/DS41.md](docs/DS41.md) projected before the download started. Against
+a PyTorch oracle reading the same container: 0.0025% relative L2, top-5
+identical.
+
+It is a fourth architecture rather than a variant of the three already
+here — CSA2, Engram, single-pass mHC, a third router score function, a
+third pre-tokenizer and a third prompt format — and bringing it up found
+defects in all of them. The one that matters outside this release is the
+JSON reader: `specials.json` had been read without decoding JSON escapes
+since 0.6.0, which no ASCII-marked container could notice.
+
+The other theme is a continuation of 0.7.2's. That release was about tests
+that compare a thing to itself; this one is about tests that are wrong
+about a thing that is right. The suite reported four failures against a
+correct engine, three of which were the check — see LEARNED §79 — and each
+had been green since 0.6.0 because three models happened to share an
+assumption nothing had written down.
+
+No ABI move: `src/waste.h` changes only its version macros.
 
 ### Added
 
@@ -126,6 +145,22 @@ memory, 510 GB as published). The plan and the arithmetic are in
   three of them not multiples of the downsample; the geometry agrees on
   seven source sizes including both collapse cases.
 
+- **`tools/pipeline.sh` takes a `MODEL`**, so the unattended
+  download → probe → round-trip → convert → run → oracle path is no longer
+  K3's alone. `MODEL=ds41` and `MODEL=glm` join it; everything that differs
+  between the three — the repo, the default paths, the free space demanded,
+  which oracle can read the container and what it needs installed — is one
+  table at the top, and an unknown name is refused rather than defaulted.
+  `SRC`, `OUT` and `MIN_FREE_GB` still win if set, so a profile is a
+  default and not a constraint. Verified end to end on DeepSeek-V4.1: all
+  six stages, `rel 2.409e-05`, argmax match, top-10 identical.
+
+  Running it that way found a bug older than the change: the free-space
+  check compared the container's full size against *free* space alone, so
+  a resumed run on a finished 299 GiB container was refused for wanting
+  310 GiB on a volume with 197 left. It counts what the container already
+  occupies now, which is what "room for the finished container" means and
+  what every resumable stage below it assumed.
 - **`tools/spec_window.py`** — what a speculative batch of K tokens costs
   an engine whose budget is bytes read per token, from a real
   `WASTE_DUMP_ROUTE` trace. Gate 9 ran it on three containers: a window of
@@ -189,9 +224,9 @@ LEARNED §75.
   `waste_tokenize`, which is the security boundary in §"Prompt safety"
   collapsed to nothing, DSML could not be served, and the CLI printed
   `<\uff5cend\u2581of\u2581sentence\uff5c>` where the model had emitted EOS.
-  The four releases before this one had ASCII-only markup — `<|open|>`,
+  Every container before this one had ASCII-only markup — `<|open|>`,
   `<|endoftext|>` — which is why a `memcpy` where a decoder belonged
-  shipped four times.
+  shipped in 0.6.0 and survived every release since.
 
   Both readers now share one `js_unescape`, surrogate pairs included, and
   the converters write UTF-8 (`ensure_ascii=False`) so the file says what
