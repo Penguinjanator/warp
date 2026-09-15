@@ -124,7 +124,21 @@ fi
 mkdir -p "$DEST" || exit 1
 touch "$STATE"
 
-log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG"; }
+# The message goes to the terminal first and to the log file second. It was
+# one `tee` and the two shared a fate: $LOG lives on $DEST, and when a USB
+# enclosure drops off the bus mid-run every log() prints "tee: ... No such
+# file or directory" and swallows what it was told to say. The run that
+# found this refused correctly and said nothing about why -- so the failure
+# looked like the silence it was there to break.
+log() {
+    printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+    # 2>/dev/null BEFORE the append, not after. Redirections are applied
+    # left to right, so with the append first the shell reports "No such
+    # file or directory" on a stderr that has not been silenced yet -- which
+    # is the same message, from a different mouth.
+    printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" 2>/dev/null >> "$LOG"
+    return 0
+}
 
 # --- small files ----------------------------------------------------------
 # The index is needed by every mode, because it is what says which shards
@@ -447,10 +461,13 @@ rc=$?
 # counted from it, and refuse a count that is not a number. #35 was this
 # same shape one level up — completion reported on evidence nobody read.
 count_done() {
+    # Its answer goes to stdout, so everything it says goes to stderr —
+    # otherwise the caller's $(count_done) would capture the diagnostics as
+    # if they were the count.
     if [ ! -d "$DEST" ] || ! : > "$DEST/.writable" 2>/dev/null; then
-        log "FAILED: $DEST is gone or not writable. The download is NOT"
-        log "        complete; reconnect the device and re-run — nothing"
-        log "        already on disk is refetched."
+        log "FAILED: $DEST is gone or not writable. The download is NOT" >&2
+        log "        complete; reconnect the device and re-run — nothing" >&2
+        log "        already on disk is refetched." >&2
         return 1
     fi
     rm -f "$DEST/.writable"
@@ -458,8 +475,8 @@ count_done() {
     n=$(wc -l < "$STATE" 2>/dev/null | tr -d ' ')
     case "$n" in
         ''|*[!0-9]*)
-            log "FAILED: cannot read $STATE, so how much is on disk is"
-            log "        unknown. That is incomplete, not complete."
+            log "FAILED: cannot read $STATE, so how much is on disk is" >&2
+            log "        unknown. That is incomplete, not complete." >&2
             return 1 ;;
     esac
     printf '%s\n' "$n"

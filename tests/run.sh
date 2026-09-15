@@ -406,13 +406,20 @@ fi
 # an error that `test` reports as false, and the run printed ALL SHARDS
 # COMPLETE with rc=0 over a directory that no longer existed. 184 GB of 475.
 # Same shape as #35 one level up, and the same remedy: read the number.
-count_done_says() {                    # $1 = DEST, $2 = STATE contents or ""
-    { echo "DEST=$1; STATE=\$DEST/.st"
-      echo 'log() { printf "%s\n" "$*" >&2; }'
+count_done_says() {                    # $1 = DEST; stdout = count, stderr = why
+    # The REAL log(), not a stub. It used to be one `tee` into $DEST/log, so
+    # when $DEST went away every message was replaced by "tee: No such file
+    # or directory" — the refusal fired and said nothing about why, which is
+    # the silence it exists to break.
+    { echo "DEST=$1; STATE=\$DEST/.st; LOG=\$DEST/download.log"
+      sed -n '/^log() {$/,/^}$/p' tools/fetch_weights.sh
       sed -n '/^count_done() {$/,/^}$/p' tools/fetch_weights.sh
       echo 'count_done'
     } > "$FT/gencd.sh"
     bash "$FT/gencd.sh" 2>/dev/null
+}
+count_done_why() {                     # the same, keeping only the messages
+    bash "$FT/gencd.sh" 2>&1 >/dev/null
 }
 
 # Nothing but bash and sed, so this one runs everywhere the suite does.
@@ -426,12 +433,17 @@ count_done_says() {                    # $1 = DEST, $2 = STATE contents or ""
     # there, but with no state file to count
     rm -f "$CD/.st"
     nostate=$(count_done_says "$CD"); rc_nostate=$?
+    # and it has to SAY so: the message must survive $DEST being the thing
+    # that is gone, because that is where the log file lives.
+    count_done_says "$FT/definitely-not-here" >/dev/null 2>&1
+    why=$(count_done_why | tr -d '\n')
     if [ "$rc_ok" = 0 ] && [ "$got" = 3 ] &&
        [ "$rc_gone" != 0 ] && [ -z "$missing" ] &&
-       [ "$rc_nostate" != 0 ] && [ -z "$nostate" ]; then
-        ok "a download whose destination vanished is incomplete, not complete"
+       [ "$rc_nostate" != 0 ] && [ -z "$nostate" ] &&
+       printf '%s' "$why" | grep -q "FAILED"; then
+        ok "a download whose destination vanished is incomplete, and says so"
     else
-        no "count_done: ok=$rc_ok/$got gone=$rc_gone/$missing nostate=$rc_nostate/$nostate"
+        no "count_done: ok=$rc_ok/$got gone=$rc_gone nostate=$rc_nostate why=[$why]"
     fi
     rm -rf "$CD"
 }
