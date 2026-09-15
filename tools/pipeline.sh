@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 SQLite Cloud, Inc.
-# pipeline.sh — download -> convert -> verify -> first K3 run, unattended.
+# pipeline.sh — download -> convert -> verify -> first run, unattended.
 #
 # Every stage is resumable and refuses to start on a failed predecessor, so
 # this can be killed and restarted at any point. It writes a running report
@@ -9,9 +9,15 @@
 # $RUN defaults to $OUT.runs — beside the container, not inside it, so
 # the container holds only what the engine loads.
 #
-#   tools/pipeline.sh
+#   MODEL=ds41 tools/pipeline.sh          # DeepSeek-V4.1-Flash, end to end
+#   MODEL=glm  tools/pipeline.sh          # GLM-5.3-Flash
+#   tools/pipeline.sh                     # K3, the default
 #   SRC=... OUT=... JOBS=3 tools/pipeline.sh
 #   RECLAIM=on tools/pipeline.sh          # delete staging as it is consumed
+#
+# MODEL picks the repo, the default paths, the free space demanded and the
+# oracle; everything else is the same six stages. SRC, OUT and MIN_FREE_GB
+# still win if set, so a profile is a default and not a constraint.
 #
 # Stages
 #   1 download   loops tools/fetch_weights.sh until all shards verify
@@ -21,9 +27,10 @@
 #   5 run        the C engine generates from a prompt
 #   6 oracle     PyTorch reference on the same prompt, logits diffed
 #
-# Stage 6 is the one that matters: it is the first end-to-end check that
-# K3's latent MoE, Attention Residuals, SiTU and full-rank gate are wired
-# up correctly, not merely implemented correctly in isolation.
+# Stage 6 is the one that matters: it is the first end-to-end check that the
+# architecture is wired up correctly, not merely implemented correctly in
+# isolation — K3's latent MoE, Attention Residuals, SiTU and full-rank gate;
+# DeepSeek-V4.1's CSA2, single-pass mHC and Engram.
 #
 # Why the round-trip sits at 3 rather than after the whole conversion: it
 # is the only check that reads the source weights, and RECLAIM=on deletes
@@ -63,16 +70,51 @@ fi
 export PY
 cd "$(dirname "$0")/.."
 
-SRC="${SRC:-/Volumes/WasteDisk/k3}"
-OUT="${OUT:-$HOME/models/k3.waste}"
+# Which model. Everything that differs between them lives in this one
+# table: the repo to fetch, where the staging and the container go by
+# default, how much room the container needs, and which oracle can read it.
+# Nothing below the table names a model, so adding one is adding a case.
+#
+# MIN_FREE_GB is the CONTAINER, in GiB, on the target volume — not the
+# download, which lands on $SRC and may be another disk entirely.
+MODEL="${MODEL:-k3}"
+case "$MODEL" in
+k3)
+    REPO="${REPO:-moonshotai/Kimi-K3}"
+    : "${SRC:=/Volumes/WasteDisk/k3}"; : "${OUT:=$HOME/models/k3.waste}"
+    : "${MIN_FREE_GB:=1100}"
+    ORACLE=kimi_ref.py; ORACLE_IDS=--prompt-ids; ORACLE_EXTRA=--tokens=0
+    UV_WITH="--with torch --with fla-core --with einops"
+    ;;
+ds41)
+    REPO="${REPO:-deepseek-ai/DeepSeek-V4.1-Flash}"
+    : "${SRC:=/Volumes/WasteDisk/ds41}"; : "${OUT:=$HOME/models/ds41.waste}"
+    : "${MIN_FREE_GB:=310}"
+    # ds41_ref.py spells the same argument --ids, and needs neither
+    # fla-core nor einops: there is no KDA recurrence in this one.
+    ORACLE=ds41_ref.py; ORACLE_IDS=--ids; ORACLE_EXTRA=--top=1
+    UV_WITH="--with torch"
+    ;;
+glm)
+    REPO="${REPO:-zai-org/GLM-5.3-Flash}"
+    : "${SRC:=/Volumes/WasteDisk/glm53}"; : "${OUT:=$HOME/models/glm53.waste}"
+    : "${MIN_FREE_GB:=120}"
+    ORACLE=kimi_ref.py; ORACLE_IDS=--prompt-ids; ORACLE_EXTRA=--tokens=0
+    UV_WITH="--with torch --with fla-core --with einops"
+    ;;
+*)
+    echo "MODEL=$MODEL is not one of: k3, ds41, glm" >&2; exit 2 ;;
+esac
+
 JOBS="${JOBS:-3}"
 RECLAIM="${RECLAIM:-off}"            # off | dry | on — see the note above
-MIN_FREE_GB="${MIN_FREE_GB:-1100}"   # K3's container; a smaller model wants less
 PROMPT="${PROMPT:-The capital of France is}"
 NTOK="${NTOK:-24}"
+BUDGET="${BUDGET:-46G}"
+CONVERT_ARGS="${CONVERT_ARGS:-}"     # e.g. --engram-bits 8 on DeepSeek-V4.1
 RUN="${RUN_DIR:-$OUT.runs}"          # reports and logs, never inside $OUT
 LOG="$RUN/pipeline.log"
-UV="uv run --quiet --with torch --with fla-core --with einops --no-project python"
+UV="uv run --quiet $UV_WITH --no-project python"
 
 mkdir -p "$OUT" "$RUN"
 say() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG"; }
@@ -80,6 +122,7 @@ die() { say "FAILED at $*"; echo "$*" > "$RUN/.failed"; exit 1; }
 
 rm -f "$RUN/.failed"
 say "=== pipeline start ==="
+say "model $MODEL ($REPO)"
 say "src $SRC -> out $OUT, $JOBS conversion processes"
 
 # ---- 1. download ---------------------------------------------------------
@@ -93,15 +136,23 @@ tries=0
 while [ "$(have)" -lt "$NEED" ]; do
     tries=$((tries + 1))
     [ "$tries" -gt 200 ] && die "download (gave up after $tries passes)"
-    ./tools/fetch_weights.sh --dest "$SRC" >/dev/null 2>&1
+    ./tools/fetch_weights.sh --repo "$REPO" --dest "$SRC" >/dev/null 2>&1
     say "  pass $tries: $(have)/$NEED"
 done
 say "stage 1 done: all $NEED shards verified"
 
 # ---- 2. probe: one layer, while the checkpoint is still whole ------------
-FREE=$(( $(df -kP "$(dirname "$OUT")" | awk 'NR==2 {print $4}') / 1048576 ))
-say "stage 2: probe — ${FREE} GB free on the target volume"
-[ "$FREE" -lt "$MIN_FREE_GB" ] && die "convert (need ${MIN_FREE_GB} GB, ${FREE} GB free)"
+# Room for the FINISHED container, which is free space plus whatever this
+# container already occupies — not free space alone. A resumed run is the
+# normal case here (every stage is resumable, and a 299 GiB container on a
+# volume with 197 GiB left is a completed one, not a doomed one), and
+# comparing bare free space against the full size refuses exactly the runs
+# that have already done the work.
+HAVE_KB=$(du -sk "$OUT" 2>/dev/null | awk '{print $1}')
+FREE=$(( ( $(df -kP "$(dirname "$OUT")" | awk 'NR==2 {print $4}') \
+           + ${HAVE_KB:-0} ) / 1048576 ))
+say "stage 2: probe — ${FREE} GB for the container (free, plus $(( ${HAVE_KB:-0} / 1048576 )) GB already written)"
+[ "$FREE" -lt "$MIN_FREE_GB" ] && die "convert (need ${MIN_FREE_GB} GB, ${FREE} GB available)"
 
 # The first MoE layer. K3 nests the text model, and the dense prefix has no
 # experts to round-trip, so neither is a detail this can guess at.
@@ -127,7 +178,7 @@ if probe_done; then
 else
     T0=$(date +%s)
     $UV tools/convert.py --src "$SRC" --out "$OUT" --jobs 1 --layers "$PROBE" \
-        >>"$LOG" 2>&1 || die "probe"
+        $CONVERT_ARGS >>"$LOG" 2>&1 || die "probe"
     say "stage 2 done in $(( ($(date +%s) - T0) / 60 )) min: layer $PROBE + trunk"
 fi
 
@@ -155,7 +206,7 @@ ERR=$(grep -oE "rel err +[0-9.]+%" "$RUN/verify.txt" | head -1)
 say "stage 4: convert (reclaim=$RECLAIM)"
 T0=$(date +%s)
 $UV tools/convert.py --src "$SRC" --out "$OUT" --jobs "$JOBS" --skip-trunk \
-    --reclaim "$RECLAIM" >>"$LOG" 2>&1 || die "convert"
+    --reclaim "$RECLAIM" $CONVERT_ARGS >>"$LOG" 2>&1 || die "convert"
 say "stage 4 done in $(( ($(date +%s) - T0) / 60 )) min, $(du -sh "$OUT" | cut -f1)"
 RECLAIMED=$(grep -E "^reclaim: .* (reclaimed|reclaimable) from " "$LOG" \
     | tail -1 | sed 's/^reclaim: //')
@@ -164,18 +215,18 @@ RECLAIMED=$(grep -E "^reclaim: .* (reclaimed|reclaimable) from " "$LOG" \
 # ---- 5. the engine actually runs -----------------------------------------
 say "stage 5: engine"
 make -s >>"$LOG" 2>&1 || die "build"
-./waste run "$OUT" "$PROMPT" -n "$NTOK" --budget 46G > "$RUN/generated.txt" 2>&1 \
+./waste run "$OUT" "$PROMPT" -n "$NTOK" --budget "$BUDGET" > "$RUN/generated.txt" 2>&1 \
     || die "engine run (see $RUN/generated.txt)"
 say "stage 5 done: $(head -c 200 "$RUN/generated.txt")"
 
 # ---- 6. against the oracle ----------------------------------------------
-say "stage 6: PyTorch oracle (slow — 93 layers in Python)"
+say "stage 6: PyTorch oracle ($ORACLE, slow — the whole model in Python)"
 IDS=$(./test_tokenizer "$OUT" "$PROMPT" | head -1 | cut -d' ' -f2- | tr ' ' ',')
 [ -n "$IDS" ] || die "tokenize"
 say "  prompt ids: $IDS"
 
 ./test_forward "$OUT" "$IDS" "$RUN/logits_c.bin" 0 >>"$LOG" 2>&1 || die "engine logits"
-$UV tools/kimi_ref.py --container "$OUT" --tokens 0 --prompt-ids "$IDS" \
+$UV "tools/$ORACLE" --container "$OUT" "$ORACLE_IDS" "$IDS" "$ORACLE_EXTRA" \
     --dump "$RUN/logits_ref.bin" >>"$LOG" 2>&1 || die "oracle"
 
 "$PY" - "$RUN/logits_c.bin" "$RUN/logits_ref.bin" > "$RUN/diff.txt" <<'PY'
@@ -199,7 +250,7 @@ grep -q "^ORACLE OK" "$RUN/diff.txt" || die "oracle diff (see $RUN/diff.txt)"
 
 # ---- report --------------------------------------------------------------
 {
-    echo "# K3 pipeline report"
+    echo "# $MODEL pipeline report"
     echo
     echo "Finished $(date '+%Y-%m-%d %H:%M')."
     echo

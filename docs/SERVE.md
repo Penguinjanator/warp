@@ -129,7 +129,13 @@ startup the server asks for the richer format first and falls back:
 1. **XTML**, if the container's tokenizer carries `<|open|>`, `<|sep|>`,
    `<|close|>` and `<|end_of_msg|>` as single tokens. Channels, tools,
    images — everything below in this document.
-2. **The container's own `chat.json`**, otherwise. The same strings
+2. **DSML** (`serve/dsml.py`), if it carries DeepSeek-V4.1's markers
+   instead. It comes before the declarative fallback for the reason XTML
+   comes before both: it is a whole protocol — turns, thinking, tools,
+   images — where `chat.json` is a plain conversation. The probe is every
+   marker or none, so a container that is not this release falls through
+   rather than half-resolving.
+3. **The container's own `chat.json`**, otherwise. The same strings
    `waste chat` reads, so a container is addressed identically over HTTP
    and on the command line, and a hand-edited `chat.json` is honoured by
    both. Kimi-Linear and GLM-5.3-Flash are served this way.
@@ -140,6 +146,21 @@ chat     from ~/models/kimi-linear.waste/chat.json — plain conversation, no re
 chat     from ~/models/glm53.waste/chat.json — plain conversation, a reasoning channel,
          images, glm tools
 ```
+
+DSML differs from the other two in three ways worth knowing before writing
+a client. Its reasoning effort is **numeric, 1 to 100** — `low`, `high` and
+`max` map onto 50, 75 and 100 — where every other format has a channel that
+is on or off; see [reasoning_effort](#reasoning_effort). Its generation
+prompt always opens a channel, `<think>` or `</think>`, so thinking cannot
+be left unchosen and defaults on, as the release does. And its tool markup
+is tokenized carefully: `｜DSML｜` is the only control token in a tag, so
+`<｜DSML｜ calls>` is **three segments** and a tool result that contains
+that literal cannot open a block. `tests/serve/test_dsml.py` pins which
+segments are markup, which a string diff cannot see;
+`tests/serve/test_dsml_upstream.py` diffs the rendering against the
+release's own `encoding/encoding.py`, its five checked-in golden outputs
+included, whenever `DS41_DIR` names a release — the discipline
+`test_xtml.TestAgainstUpstream` applies to K3.
 
 The three capabilities are read from the container, never assumed: the
 channel and the images from `chat.json`, the tools from whether the
@@ -268,6 +289,11 @@ port reproduces the refusal rather than the documentation, and the server
 returns a 400 that says so instead of quietly substituting `high`.
 
 `none`, `minimal` and `off` turn the think channel off entirely.
+
+**DSML takes a number instead**: any integer from 1 to 100, with `low`,
+`high` and `max` mapping onto 50, 75 and 100 so the same client works
+against both. Anything outside that range, and `medium`, are 400s naming
+what is accepted. The off switches work there too.
 
 **The default is thinking on**, which is what the model was trained for.
 The technical report measures reasoning at up to 73% of the tokens in a

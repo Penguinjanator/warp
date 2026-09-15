@@ -250,8 +250,8 @@ static inline int js_hex4(const char *p, const char *end)
  * DeepSeek-V4.1's control tokens reached the engine as the seven literal
  * characters "\uff5c" and every one of them tokenized as prose. Every
  * container before it had ASCII-only markup — <|open|>, <|endoftext|> —
- * which is why a JSON reader that did not decode JSON went four releases
- * without being noticed.
+ * which is why a JSON reader that did not decode JSON shipped in 0.6.0 and
+ * went unnoticed through every release since.
  *
  * Returns the byte length written. Exposed because specials.json is read
  * by a scanner of its own in tokenizer.c, and one of the two decoding and

@@ -5638,8 +5638,9 @@ bytes between the quotes. The marker in memory was the eighteen literal
 characters `<\uff5cUser\uff5c>`, and nothing a user could type would ever
 equal it.
 
-The bug is four releases old. K3, Kimi-Linear, GLM and the synthetic
-container all spell their control tokens `<|open|>`, `<|endoftext|>`,
+The bug shipped in 0.6.0 and survived every release since. The four
+containers that existed — K3, Kimi-Linear, GLM and the synthetic one — all
+spell their control tokens `<|open|>`, `<|endoftext|>`,
 `<|tool_call_begin|>` — ASCII, where an escaping writer and a
 non-decoding reader agree. DeepSeek-V4.1 is the first release here whose
 markup is full-width bars and `▁`, and it found it on contact.
@@ -5699,8 +5700,8 @@ Plus §78, the escaped `specials.json`, which was a real defect — so the
 board read 4 failures over 1 bug.
 
 **A suite is only exercised by a model it has not seen.** These three sat
-under green boards across four releases because Kimi-Linear, GLM and K3
-all satisfy their unstated assumptions: ASCII control tokens, one of two
+under green boards since 0.6.0 because Kimi-Linear, GLM and K3 all
+satisfy their unstated assumptions: ASCII control tokens, one of two
 expert namings, a working set small enough that 5G is a real cache. None
 of those is a property anything checked; each was a coincidence three
 models shared. The fourth model was the test.
