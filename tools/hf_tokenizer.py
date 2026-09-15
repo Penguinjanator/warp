@@ -227,7 +227,10 @@ def main():
     if specials:
         with io.open(os.path.join(args.out, "specials.json"), "w",
                      encoding="utf-8", newline="\n") as f:
-            json.dump(specials, f, indent=1)
+            # ensure_ascii=False for the reason convert.py's atomic_json
+            # gives: a control token that is not ASCII should be in the file
+            # as itself, not as \uXXXX.
+            json.dump(specials, f, indent=1, ensure_ascii=False)
     notes = []
     if not han:
         notes.append("tokenizer_han_split must be false")

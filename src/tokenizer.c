@@ -4,6 +4,7 @@
 /* tokenizer.c — see tokenizer.h. */
 
 #include "tokenizer.h"
+#include "json.h"
 #include "unicode_classes.h"
 
 #include <stdio.h>
@@ -164,12 +165,19 @@ static void load_specials(waste_tok *t, const char *dir)
                 if (!g) break;
                 t->special = g;
             }
+            /* Unescaped, not copied. A release whose control tokens are
+             * not ASCII — DeepSeek-V4.1's are full-width bars — has them
+             * written as \uXXXX by Python's json.dump, and a raw copy
+             * turns each one into the six literal characters of the escape,
+             * so the marker is prose and the markup entry point — the whole
+             * point of which is that content cannot forge it — finds
+             * nothing to match. */
             char *txt = (char *)malloc((size_t)len + 1);
             if (!txt) break;
-            memcpy(txt, q, (size_t)len);
-            txt[len] = 0;
+            const size_t tlen = js_unescape(q, e, txt, (size_t)len + 1);
+            if (tlen == 0) { free(txt); p = e; continue; }
             t->special[t->n_special].text = txt;
-            t->special[t->n_special].len = len;
+            t->special[t->n_special].len = (int)tlen;
             t->special[t->n_special].id = id;
             t->n_special++;
         }

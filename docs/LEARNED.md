@@ -5622,3 +5622,55 @@ inference code says the speculative loop "is out of scope for this repo",
 and it is the one number left. What is settled is everything else: the
 threshold it has to clear, and that a batched CSA2/mHC forward path is the
 price of finding out.
+
+## 78. Four releases of a JSON reader that did not decode JSON (2026-09-15)
+
+DeepSeek-V4.1 loaded, ran, matched its oracle to 0.0025% on the real
+container — and could not tokenize `<｜User｜>`. Markup mode returned
+exactly what plain mode did: `5 30 28217 6756 28217 32`, six tokens of
+prose. `<think>` resolved. Everything else did not.
+
+What separates those two is that `<think>` is ASCII. `specials.json` is
+written by `json.dump`, whose `ensure_ascii` defaults to True, so the file
+holds `"<\uff5cUser\uff5c>"` — and the two readers of it, `js_str` in
+`src/json.h` and `load_specials` in `src/tokenizer.c`, both copied the
+bytes between the quotes. The marker in memory was the eighteen literal
+characters `<\uff5cUser\uff5c>`, and nothing a user could type would ever
+equal it.
+
+The bug is four releases old. K3, Kimi-Linear, GLM and the synthetic
+container all spell their control tokens `<|open|>`, `<|endoftext|>`,
+`<|tool_call_begin|>` — ASCII, where an escaping writer and a
+non-decoding reader agree. DeepSeek-V4.1 is the first release here whose
+markup is full-width bars and `▁`, and it found it on contact.
+
+Three things are worth keeping from it.
+
+**A parser is only tested by input it did not write.** Both ends of this
+were ours: `convert.py` escaped, `tokenizer.c` copied, and the round trip
+through our own writer was the only round trip anyone had ever run. It is
+the same failure as §73 — a protocol checked only against itself — one
+layer down, in a file format rather than a wire format. The fix is
+therefore *both* directions and neither alone: the converters now write
+UTF-8, and the reader decodes, because a container from someone else's
+tool may still escape and must still load. `tests/run.sh` builds a
+deliberately escaped container to hold that side down; against the
+previous binary it comes back as 11 tokens instead of 1.
+
+**The failure was silent in the one place it must not be.** The split
+between `waste_tokenize_markup` and `waste_tokenize` is the security
+boundary in CLAUDE.md: content must not be able to write conversation
+structure. With no marker resolving, markup mode *became* plain mode —
+the boundary held, vacuously, by failing closed in the safe direction.
+That is luck, not design, and it is why the run.sh injection check reads
+`markup != plain` and not just `no control ids in plain`. Reading only the
+second half, this release would have passed.
+
+**The visible symptom was somewhere else entirely.** What a person
+actually saw first was the CLI printing
+`<｜end▁of▁sentence｜>` at the end of "The capital of
+France is Paris." — the detokenizer rendering a special's text, which is
+the same corrupted string read from the same file. A rendering artifact at
+the end of a correct generation looks like a cosmetic bug in the printer.
+It was the tokenizer's security boundary, seen from the other side.
+

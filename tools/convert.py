@@ -74,9 +74,19 @@ def atomic_json(path, value):
     # one converted anywhere else. Python's text mode translates, the engine
     # parses either, and nothing fails loudly — what breaks is every gate
     # that hashes a container to prove its provenance. #36 gap 2.
+    #
+    # ensure_ascii=False because the default is True and that is how
+    # DeepSeek-V4.1's control tokens — <｜User｜>, ｜DSML｜ — reached a
+    # container spelled "<\\uff5cUser\\uff5c>". Every release before it had
+    # ASCII-only markup, so four of them shipped over a reader that did not
+    # decode JSON escapes (fixed in json.h/tokenizer.c: a container written
+    # by some other tool may still escape, and must still load). Writing the
+    # bytes the file claims to hold costs nothing and makes it greppable.
+    # Containers already converted are unaffected either way; only ones with
+    # non-ASCII specials change bytes, and only DS41 has any.
     tmp = path + ".tmp"
     with io.open(tmp, "w", encoding="utf-8", newline="\n") as out:
-        json.dump(value, out, indent=1)
+        json.dump(value, out, indent=1, ensure_ascii=False)
         out.flush()
         os.fsync(out.fileno())
     os.replace(tmp, path)

@@ -2054,6 +2054,61 @@ else
     sk "prompt text cannot forge control tokens" "needs a container with specials.json"
 fi
 
+# The same file, written the way Python writes it. json.dump escapes
+# non-ASCII by default, so DeepSeek-V4.1's full-width-bar control tokens
+# arrived in a container as "<\\uff5cUser\\uff5c>" — and load_specials
+# copied the bytes between the quotes without decoding them, so no marker
+# matched and markup mode tokenized every one of them as prose. The four
+# releases before it had ASCII-only control tokens, which is how a JSON
+# reader that did not decode JSON went unnoticed that long.
+#
+# The converter writes UTF-8 now, but a container built by some other tool
+# may still escape, so the reader must decode. This needs no real weights
+# and no non-ASCII vocabulary: what is under test is the decoder, so it
+# builds a small container with a tokenizer, rewrites one special to a
+# marker with 2-, 3- and 4-byte characters in it (the last as a surrogate
+# pair), escapes the whole file, and asks for that one id back.
+if python3 tools/make_test_container.py --tokenizer "$TMP/esc.waste" \
+        >/dev/null 2>&1 &&
+   python3 - "$TMP/esc.waste" "$TMP/esc.txt" "$TMP/esc.id" <<'ESCPY'
+import json, os, sys
+dst, txtf, idf = sys.argv[1:4]
+p = os.path.join(dst, "specials.json")
+sp = json.load(open(p))
+sp[0]["text"] = "<\u00e9\u2581\U0001d11e>"    # 2, 3 and 4 bytes of UTF-8
+
+def esc(s):
+    out = []
+    for ch in s:
+        cp = ord(ch)
+        if cp < 0x10000:
+            out.append("\\u%04x" % cp)
+        else:                                # one character or none: a pair
+            cp -= 0x10000                    # that decodes to two is wrong
+            out.append("\\u%04x\\u%04x"
+                       % (0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF)))
+    return "".join(out)
+
+body = ",\n".join('{"id": %d, "text": "%s"}' % (e["id"], esc(e["text"]))
+                  for e in sp)
+with open(p, "w") as f:
+    f.write("[\n" + body + "\n]\n")
+open(txtf, "w").write(sp[0]["text"])
+open(idf, "w").write(str(sp[0]["id"]))
+ESCPY
+then
+    want=$(cat "$TMP/esc.id")
+    got=$(./test_tokenizer "$TMP/esc.waste" "$(cat "$TMP/esc.txt")" \
+              2>/dev/null | head -1)
+    if [ "$got" = "1 $want" ]; then
+        ok "a \\uXXXX-escaped specials.json resolves to the same ids"
+    else
+        no "escaped specials.json: wanted \"1 $want\", got \"$got\""
+    fi
+else
+    sk "escaped specials.json resolves" "${PY_MISS:-could not build a tokenizer container}"
+fi
+
 # `grep -q identical` used to be the whole test here, and "22914/24021
 # identical" contains that word. It passed for as long as the character
 # classes in tokenizer.c were wrong, which was every release. Read the
