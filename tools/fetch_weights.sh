@@ -331,6 +331,7 @@ PY
 if [ "$CHECK_ONLY" = 1 ]; then
     log "--check: verifying sizes on disk against the remote"
     bad=0
+    fixed=0
     while read -r f; do
         [ -f "$DEST/$f" ] || continue
         want=$(hcurl -sIL --max-time 60 "$RAW/$f" \
@@ -339,9 +340,18 @@ if [ "$CHECK_ONLY" = 1 ]; then
         if [ "$want" != "$got" ]; then
             log "  INCOMPLETE $f ($got / ${want:-?})"
             bad=$((bad + 1))
+        elif ! grep -qxF "$f" "$STATE" 2>/dev/null; then
+            # It matches the remote and the state file does not say so.
+            # The remote is the stronger evidence of the two, and this is
+            # the only place that has asked it — so record it, rather than
+            # leave convert.py reading a ledger that disagrees with the
+            # bytes on disk and refusing a checkpoint that is complete.
+            echo "$f" >> "$STATE"
+            fixed=$((fixed + 1))
         fi
     done < "$DEST/.shards"
-    log "--check done: $bad incomplete"
+    log "--check done: $bad incomplete$([ "$fixed" -gt 0 ] && \
+        printf ', %s verified against the remote and recorded' "$fixed")"
     rm -f "$DEST/.shards"
     exit $(( bad > 0 ))
 fi
@@ -446,6 +456,20 @@ for try in \$(seq 1 \$max_retry); do
     say "fail \$f rc=\$rc, retry in \${wait}s"
     sleep \$wait
 done
+# The size check happens at the TOP of the loop, so a transfer that
+# completed on the last attempt is never verified and never recorded. Seen
+# for real: two 7.4 GB shards finished, took an rc=18 on the retry after
+# that, and were reported GIVE UP while sitting on disk byte-exact — and
+# .download-state then disagreed with the remote for the rest of the run.
+# Ask once more before saying no.
+want=\$(hcurl -sIL --max-time 90 "\$raw/\$f" \\
+       | awk -F': ' '/^[Cc]ontent-[Ll]ength/{print \$2}' | tr -d '\r' | tail -1)
+got=\$(fsize "\$dest/\$f")
+if [ -n "\$want" ] && [ "\$got" = "\$want" ]; then
+    echo "\$f" >> "\$state"
+    say "ok   \$f (\$((got/1048576)) MB, on the last attempt)"
+    exit 0
+fi
 say "GIVE UP \$f after \$max_retry tries"
 exit 1
 WORKER

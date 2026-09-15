@@ -1465,17 +1465,20 @@ def main():
         # is wrong: everything the ENGINE looks up has to be in the
         # checkpoint, at the shape the config implies. A load refuses on the
         # first missing name, and by then the conversion has run.
-        try:
-            import ds41_preflight                              # noqa: F401
-        except ImportError:
-            pass
-        else:
-            rc = os.system(f"{sys.executable} "
-                           f"{os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ds41_preflight.py')} "
-                           f"{args.src}")
-            if rc:
-                print("preflight failed; not converting", file=sys.stderr)
-                return 1
+        import ds41_preflight
+        eg_missing, eg_wrong, eg_exp, eg_n = ds41_preflight.check(args.src)
+        if eg_missing or eg_wrong or eg_exp:
+            print(f"preflight: of {eg_n} tensors the engine will demand, "
+                  f"{len(eg_missing)} are missing and {len(eg_wrong)} have "
+                  f"the wrong shape; {eg_exp} routed-expert tensors are "
+                  f"absent. Not converting.", file=sys.stderr)
+            for nm in eg_missing[:8]:
+                print(f"  missing {nm}", file=sys.stderr)
+            for nm, got, dims in eg_wrong[:8]:
+                print(f"  {nm}: index {got}, engine wants {dims}",
+                      file=sys.stderr)
+            return 1
+        print(f"preflight: {eg_n} named tensors, 0 missing, 0 mismatched")
         drop_trunk = ds41_drop_trunk(n_layers)
         # The second routing bias is stated by being there, so say so in the
         # manifest rather than making the engine probe for a tensor.
