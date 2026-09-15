@@ -5443,6 +5443,12 @@ typedef struct {
      * words, and both have to be compared: a file written by one and read
      * by the other is the right length in neither direction. */
     int32_t  hc_mult, index_dim;
+    /* CSA2's shape. A state file is refused when these disagree, the way
+     * the MLA ones already are: a window restored at the wrong width or a
+     * latent cache at the wrong ratio is not a short read, it is a session
+     * that resumes attending to the wrong tokens. 0 on every other
+     * container, which is what makes the check backward-compatible. */
+    int32_t  head_dim, window, engram_n;
 } waste_state_hdr;
 
 static void state_fill(const waste_model *m, waste_state_hdr *h, int pos)
@@ -5456,6 +5462,9 @@ static void state_fill(const waste_model *m, waste_state_hdr *h, int pos)
     h->n_heads = c->n_heads; h->qk_nope = c->qk_nope; h->qk_rope = c->qk_rope;
     h->v_head = c->v_head; h->attn_res_block = c->attn_res_block;
     h->hc_mult = c->hc_mult; h->index_dim = c->index_topk ? c->index_dim : 0;
+    h->head_dim = c->ds41 ? c->head_dim : 0;
+    h->window   = c->ds41 ? c->window : 0;
+    h->engram_n = c->ds41 ? c->engram_n : 0;
     h->pos = pos; h->n_blockres = m->n_blockres;
 }
 
@@ -5650,7 +5659,25 @@ int waste_model_state_save(const waste_model *m, const char *path, int pos)
 
     const int H = c->kda_heads, D = c->kda_dim, C = H * D;
     for (int L = 0; L < c->n_layers && !rc; L++) {
-        if (c->kda_layer[L]) {
+        if (c->ds41) {
+            /* The window is a ring and `pos` in the header says where its
+             * head is, so it goes whole. Only the four source layers have
+             * anything else: their compressed latents, the index keys
+             * derived from them, and the tail of the group still filling
+             * up — which is the piece a session cannot recompute, because
+             * the tokens that would fill it have already gone by. */
+            const size_t wn = (size_t)c->window * c->head_dim;
+            if (fwrite(m->winkv[L], sizeof(float), wn, f) != wn) { rc = -1; break; }
+            if (!c->kv_source[L]) continue;
+            const int32_t nl = m->n_lat[L];
+            if (fwrite(&nl, sizeof nl, 1, f) != 1) { rc = -1; break; }
+            const size_t cn = (size_t)nl * c->head_dim;
+            const size_t in = (size_t)nl * c->index_dim;
+            const size_t pn = (size_t)c->compress_ratio[L] * 2 * c->head_dim;
+            if (cn && fwrite(m->ckvc[L], sizeof(float), cn, f) != cn) rc = -1;
+            else if (in && fwrite(m->ikey[L], sizeof(float), in, f) != in) rc = -1;
+            else if (fwrite(m->cpool[L], sizeof(float), pn, f) != pn) rc = -1;
+        } else if (c->kda_layer[L]) {
             if (fwrite(m->S[L], sizeof(float), (size_t)H * D * D, f) != (size_t)H * D * D) rc = -1;
             const size_t cn = (size_t)3 * C * (c->conv_k - 1);
             if (!rc && fwrite(m->conv[L], sizeof(float), cn, f) != cn) rc = -1;
@@ -5671,6 +5698,15 @@ int waste_model_state_save(const waste_model *m, const char *path, int pos)
                 else if (fwrite(m->idxbuf[L], sizeof(float), bn, f) != bn) rc = -1;
             }
         }
+    }
+    /* The n-gram history. Not derivable from the prompt a caller still
+     * holds: the ids in it are COMPRESSED, and the map that compresses
+     * them is the container's. A session restored without it hashes the
+     * first few tokens against padding and reads another token's memory. */
+    if (!rc && c->ds41 && c->engram_n && m->eg_hist) {
+        const size_t n = (size_t)(pos > 0 ? pos : 0) + 1;
+        if (n <= (size_t)m->kv_cap &&
+            fwrite(m->eg_hist, sizeof(int32_t), n, f) != n) rc = -1;
     }
     if (!rc && c->attn_res_block && m->n_blockres > 0) {
         const size_t n = (size_t)m->n_blockres * c->hidden;
@@ -5705,7 +5741,9 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
         h.conv_k != want.conv_k || h.n_heads != want.n_heads ||
         h.qk_nope != want.qk_nope || h.qk_rope != want.qk_rope ||
         h.v_head != want.v_head || h.attn_res_block != want.attn_res_block ||
-        h.hc_mult != want.hc_mult || h.index_dim != want.index_dim) {
+        h.hc_mult != want.hc_mult || h.index_dim != want.index_dim ||
+        h.head_dim != want.head_dim || h.window != want.window ||
+        h.engram_n != want.engram_n) {
         fclose(f);
         return -2;                       /* state does not belong to this model */
     }
@@ -5729,7 +5767,30 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
     const uint64_t fsize = (uint64_t)fsize_i;
     for (int L = 0; L < c->n_layers; L++) {
         uint64_t bytes = 0;
-        if (c->kda_layer[L]) {
+        if (c->ds41) {
+            /* The window is fixed; only a source layer carries a count,
+             * and that count is derivable from the position — so it is
+             * checked against the position rather than merely bounded,
+             * the same way the MLA branch checks nkv against h.pos. */
+            bytes = (uint64_t)c->window * c->head_dim * 4;
+            if (c->kv_source[L]) {
+                int32_t nl = 0;
+                const uint64_t at = off + bytes;
+                if (at > fsize || fsize - at < sizeof nl ||
+                    waste_pread(fileno(f), &nl, sizeof nl, (int64_t)at) != sizeof nl) {
+                    fclose(f); return -2;
+                }
+                /* h.pos is the NEXT position, as the MLA branch's
+                 * `nkv != h.pos` already assumes: after processing
+                 * position h.pos - 1 a ratio-r source has published
+                 * h.pos / r latents. */
+                const int r = c->compress_ratio[L] ? c->compress_ratio[L] : 1;
+                if (nl < 0 || nl != h.pos / r) { fclose(f); return -2; }
+                bytes += sizeof nl +
+                         ((uint64_t)nl * (c->head_dim + c->index_dim) +
+                          (uint64_t)c->compress_ratio[L] * 2 * c->head_dim) * 4;
+            }
+        } else if (c->kda_layer[L]) {
             bytes = ((uint64_t)H * D * D + (uint64_t)3 * C * (c->conv_k - 1)) * 4;
         } else {
             int32_t nkv = 0;
@@ -5760,7 +5821,12 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
         off += bytes;
     }
     {
-        const uint64_t tail = (uint64_t)h.n_blockres * c->hidden * 4 +
+        /* The n-gram history is one compressed id per position seen. */
+        const uint64_t eg = (c->ds41 && c->engram_n && m->eg_hist &&
+                             (uint64_t)h.pos + 1 <= (uint64_t)m->kv_cap)
+                          ? ((uint64_t)h.pos + 1) * sizeof(int32_t) : 0;
+        const uint64_t tail = eg +
+                              (uint64_t)h.n_blockres * c->hidden * 4 +
                               (uint64_t)(c->hc_mult ? c->hc_mult : 1) *
                               c->hidden * 4;
         if (off > fsize || tail > fsize - off || off + tail != fsize) {
@@ -5771,7 +5837,22 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
 
     int rc = 0;
     for (int L = 0; L < c->n_layers && !rc; L++) {
-        if (c->kda_layer[L]) {
+        if (c->ds41) {
+            const size_t wn = (size_t)c->window * c->head_dim;
+            if (fread(m->winkv[L], sizeof(float), wn, f) != wn) { rc = -1; break; }
+            if (!c->kv_source[L]) continue;
+            int32_t nl = 0;
+            if (fread(&nl, sizeof nl, 1, f) != 1) { rc = -1; break; }
+            const int r = c->compress_ratio[L] ? c->compress_ratio[L] : 1;
+            if (nl < 0 || nl > m->kv_cap / r + 1) { rc = -1; break; }
+            const size_t cn = (size_t)nl * c->head_dim;
+            const size_t in = (size_t)nl * c->index_dim;
+            const size_t pn = (size_t)c->compress_ratio[L] * 2 * c->head_dim;
+            if (cn && fread(m->ckvc[L], sizeof(float), cn, f) != cn) rc = -1;
+            else if (in && fread(m->ikey[L], sizeof(float), in, f) != in) rc = -1;
+            else if (fread(m->cpool[L], sizeof(float), pn, f) != pn) rc = -1;
+            m->n_lat[L] = nl;
+        } else if (c->kda_layer[L]) {
             if (fread(m->S[L], sizeof(float), (size_t)H * D * D, f) != (size_t)H * D * D) rc = -1;
             const size_t cn = (size_t)3 * C * (c->conv_k - 1);
             if (!rc && fread(m->conv[L], sizeof(float), cn, f) != cn) rc = -1;
@@ -5793,6 +5874,11 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
                 m->n_pool[L] = np;
             }
         }
+    }
+    if (!rc && c->ds41 && c->engram_n && m->eg_hist) {
+        const size_t n = (size_t)(h.pos > 0 ? h.pos : 0) + 1;
+        if (n <= (size_t)m->kv_cap &&
+            fread(m->eg_hist, sizeof(int32_t), n, f) != n) rc = -1;
     }
     m->n_blockres = h.n_blockres;
     if (!rc && c->attn_res_block && h.n_blockres > 0) {
