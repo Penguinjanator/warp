@@ -6247,3 +6247,76 @@ GB/s at 0.59 ms a 1.77 MB record, two get 4.4 GB/s at 0.84 ms, four get
 3.9 GB/s at 1.88 ms. Beside eight spinning threads two readers take 1.08 ms
 a record, beside eight memcpy threads 1.15 — the engine's 0.88 ms is this
 drive plus the arithmetic beside it. Two readers is the drive's best.
+
+## 85. A bigger cache is a long-context fix, and one quantization per vector (2026-09-15)
+
+Two of the three places §84 left to look.
+
+**The cache.** 16 GiB has been every Qwen measurement's protocol since §76,
+not a recommendation. On the same build, one process per run, peak RSS from
+`/usr/bin/time -l`, swap unused before and after:
+
+| expert cache | 200 tokens, tok/s | read | peak RSS |
+|---|---|---:|---:|
+| 16 GiB | 11.91, 11.47 | 19.20 GB | 20.0 GB |
+| 20 GiB | 12.60, 11.58 | 18.34 GB | 22.5 GB |
+| 24 GiB | 12.06, 11.33 | 18.34 GB | 22.6 GB |
+| 28 GiB | 11.76, 11.94 | 18.34 GB | 22.6 GB |
+
+| expert cache | 2,801-token prompt | decode | hit rate | read | peak RSS |
+|---|---:|---:|---:|---:|---:|
+| 16 GiB | 11.20 tok/s | 10.70 | 95.3% | 229.6 GB | 20.1 GB |
+| 24 GiB | 11.88 | 11.19 | 98.5% | 72.2 GB | 28.7 GB |
+
+A 200-token session evicts nothing from 20 GiB up, and what it still misses
+is first use: nothing a cache can hold. The second pass of that table ran
+beside two compiles and says nothing about speed. A long prompt is
+different — 69% fewer bytes and about 5% on both phases, single runs.
+
+None of it needs a change. `waste run` with no `--budget` already takes
+35.18 of this machine's 48 GB, 32.31 of it expert cache.
+
+**One quantization per vector.** The trunk's calls under 1 MB ran at 25.9
+GB/s against the same kernel's 15 GB/s on one core (§84): per call, an
+activation quantization and a dispatch of their own. Qwen reads one vector
+three and four times over. GDN projects its input through `in_proj_qkv`,
+`_z`, `_a` and `_b`; QSA through q, k, v and the indexer; the MoE through
+the router and the shared expert's gate, up and gate scalar.
+
+`matvec_t_batch` quantizes the vector once — i8mm's planes are a function
+of the vector and the group size alone — and cuts every tensor's rows at
+the multiples `mv_chunk` would have, so i8mm's two-row tiles stay where
+they were, then hands every piece to one dispatch. Each row is the same
+kernel call on the same bytes, so the logits do not move; anything the
+shared planes do not fit goes through `matvec_t` as before. GDN's conv
+reads only the first projection and now follows all four. The shared
+expert keeps its gate and up outputs in `m->ff` until it runs; the serial
+loop is the one path that writes there, and it has the shared expert
+redo them.
+
+Against a build of §84's commit, unprofiled:
+
+| | before | after |
+|---|---|---|
+| 16 GiB, decode, three runs | 12.02, 12.03, 12.00 | 13.07, 12.28, 12.41 (+4.7%) |
+| 2,801-token context, decode | 10.56 | 10.88 (+3.0%) |
+| 2,801-token context, reading the prompt | 11.14 | 11.69 (+4.9%) |
+
+Logits byte-identical and every token the same in all eight runs. Profiled,
+decode only, 16 GiB:
+
+| | before | after |
+|---|---:|---:|
+| trunk calls under 1 MB | 25.9 GB/s | 38.9 GB/s |
+| QSA k, v, indexer projections | 26–31 GB/s | 97 GB/s |
+| GDN, ms/step | 16.6 | 15.1 |
+| QSA, ms/step | 5.5 | 4.9 |
+| router and shared expert, ms/step | 5.6 | 4.1 |
+
+The router row now carries the shared expert's gate and up projections;
+the profile splits a batch's time among its tensors by bytes.
+
+**For the CLI, not measured on it.** `--threads 0` is one thread per logical
+CPU, twelve here, and §84 measured twelve 6% slower than eight on Qwen:
+the efficiency cores are stragglers. A default that counted performance
+cores would be worth measuring on every model before it is one.

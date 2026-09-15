@@ -864,17 +864,12 @@ static void tmv_role_name(const char *name, char *dst, size_t cap)
     if (n > 7 && !strcmp(dst + n - 7, ".weight")) dst[n - 7] = 0;
 }
 
-static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
-                     const float *x, int out, int in)
+/* One call's worth of profile: the P_TMV total, its size bucket, and the
+ * tensor's role row. Caller holds prof_mu. */
+static void tmv_account(const waste_tensor *t, int out, int in, double dt, double dtq)
 {
-    if (!prof_on) { matvec_t_inner(m, y, t, x, out, in); return; }
-    tmv_quant_dt = 0;
-    const double t0 = pnow();
-    matvec_t_inner(m, y, t, x, out, in);
-    const double dt = pnow() - t0;
     const uint64_t nb = t ? (uint64_t)out * t->rowbytes : 0;
     const int bk = nb < (1u<<20) ? 0 : nb < (8u<<20) ? 1 : nb < (32u<<20) ? 2 : 3;
-    pthread_mutex_lock(&prof_mu);
     waste_prof[P_TMV] += dt; waste_prof_n[P_TMV]++;
     waste_tmv_bytes += nb;
     waste_tmv_t[bk] += dt; waste_tmv_b[bk] += nb; waste_tmv_c[bk]++;
@@ -902,9 +897,21 @@ static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
             r->calls++;
             r->bytes += t->q ? nb : (uint64_t)out * (uint64_t)in * sizeof(float);
             r->t += dt;
-            r->tq += tmv_quant_dt;
+            r->tq += dtq;
         }
     }
+}
+
+static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
+                     const float *x, int out, int in)
+{
+    if (!prof_on) { matvec_t_inner(m, y, t, x, out, in); return; }
+    tmv_quant_dt = 0;
+    const double t0 = pnow();
+    matvec_t_inner(m, y, t, x, out, in);
+    const double dt = pnow() - t0;
+    pthread_mutex_lock(&prof_mu);
+    tmv_account(t, out, in, dt, tmv_quant_dt);
     pthread_mutex_unlock(&prof_mu);
 }
 
@@ -990,6 +997,94 @@ static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
         run_rows(out, mc, waste_k.mvq_rows_f32, &a,
                  (size_t)out * t->rowbytes);
     }
+}
+
+/* Several projections of the same vector, as one.
+ *
+ * i8mm's activation planes are a function of the vector and the group size
+ * alone, so projections that read the same input can share them: quantized
+ * once, and every tensor's rows cut at the multiples mv_chunk would have cut
+ * them at — even boundaries, so i8mm's two-row tiles fall where they did —
+ * and handed to the pool as one job. Each row is the same kernel call on the
+ * same bytes as matvec_t's, so the outputs are its bit for bit. Qwen reads
+ * the same vector three and four times over: GDN's four input projections,
+ * QSA's four, the router beside the shared expert's gate and up — and each
+ * of those was a quantization and a dispatch of its own, half of them too
+ * small to wake the pool for (LEARNED §85).
+ *
+ * Anything the shared planes do not fit — another kernel, another group, a
+ * float tensor, the trunk check — goes through matvec_t as before. */
+typedef struct { float *y; const waste_tensor *t; int out; } mvb_item;
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+enum { MVB_MAX = 8 };
+typedef struct {
+    mvq4_arg a[MVB_MAX];
+    int base[MVB_MAX + 1], mc[MVB_MAX], out[MVB_MAX], n;
+} mvb_arg;
+
+static void mvb_pieces(int b, int e, void *p)
+{
+    const mvb_arg *a = (const mvb_arg *)p;
+    int i = 0;
+    for (int k = b; k < e; k++) {
+        while (k >= a->base[i + 1]) i++;
+        const int r0 = (k - a->base[i]) * a->mc[i];
+        const int r1 = r0 + a->mc[i] < a->out[i] ? r0 + a->mc[i] : a->out[i];
+        waste_mvq4_rows_i8mm(r0, r1, (void *)&a->a[i]);
+    }
+}
+#endif
+
+static void matvec_t_batch(waste_model *m, const float *x, int in,
+                           const mvb_item *it, int n)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    const int shared = trunk_kern == TK_I8MM && !trunk_check && n > 1 &&
+                       n <= MVB_MAX && it[0].t && it[0].t->q;
+    const int g = shared ? it[0].t->group : 0;
+    mvb_arg a;
+    a.n = 0;
+    a.base[0] = 0;
+    int left[MVB_MAX], nleft = 0;
+    size_t bytes = 0;
+    for (int i = 0; i < n; i++) {
+        const waste_tensor *t = it[i].t;
+        if (shared && t && t->q && t->bits == 4 && t->group == g && (g & 31) == 0) {
+            const int k = a.n++;
+            a.a[k] = (mvq4_arg){ it[i].y, (const uint8_t *)t->q, t->qs, m->xq, m->xs,
+                                 in, (in + g - 1) / g, g, sdot4_sg, g / sdot4_sg,
+                                 t->rowbytes };
+            a.mc[k] = mv_chunk(it[i].out, t->rowbytes);
+            a.out[k] = it[i].out;
+            a.base[k + 1] = a.base[k] + (it[i].out + a.mc[k] - 1) / a.mc[k];
+            bytes += (size_t)it[i].out * t->rowbytes;
+        } else {
+            left[nleft++] = i;
+        }
+    }
+    if (a.n >= 2) {
+        const double t0 = prof_on ? pnow() : 0;
+        quant_act4_mm(x, in, g, m->xq, m->xs);
+        const double tq = prof_on ? pnow() - t0 : 0;
+        waste_parallel_for_work(a.base[a.n], 1, mvb_pieces, &a, bytes);
+        if (prof_on) {
+            const double dt = pnow() - t0;
+            pthread_mutex_lock(&prof_mu);
+            for (int i = 0; i < n; i++) {
+                const waste_tensor *t = it[i].t;
+                if (!(t && t->q && t->bits == 4 && t->group == g && (g & 31) == 0)) continue;
+                const double share = bytes ? (double)it[i].out * t->rowbytes / bytes : 0;
+                tmv_account(t, it[i].out, in, dt * share, tq * share);
+            }
+            pthread_mutex_unlock(&prof_mu);
+        }
+        for (int j = 0; j < nleft; j++)
+            matvec_t(m, it[left[j]].y, it[left[j]].t, x, it[left[j]].out, in);
+        return;
+    }
+#endif
+    for (int i = 0; i < n; i++) matvec_t(m, it[i].y, it[i].t, x, it[i].out, in);
 }
 
 /* Dequantize one row of a trunk tensor into dst[cols].
@@ -6366,20 +6461,27 @@ static void qwen_gdn_layer(waste_model *m, int L, const float *in, float *out)
     float *a = z + Hv * Dv;
     float *b = a + Hv;
     float *core = b + Hv;
-    matvec_t(m, mixed, waste_find(m, tname("%smodel.layers.%d.linear_attn.in_proj_qkv.weight",
-                                           c->prefix, L)), in, qkv, hid);
+    {
+        /* Four projections of one vector, as one job. The conv reads only
+         * the first, so it follows all four. */
+        const mvb_item proj[4] = {
+            { mixed, waste_find(m, tname("%smodel.layers.%d.linear_attn.in_proj_qkv.weight",
+                                         c->prefix, L)), qkv },
+            { z, waste_find(m, tname("%smodel.layers.%d.linear_attn.in_proj_z.weight",
+                                     c->prefix, L)), Hv * Dv },
+            { a, waste_find(m, tname("%smodel.layers.%d.linear_attn.in_proj_a.weight",
+                                     c->prefix, L)), Hv },
+            { b, waste_find(m, tname("%smodel.layers.%d.linear_attn.in_proj_b.weight",
+                                     c->prefix, L)), Hv },
+        };
+        matvec_t_batch(m, in, hid, proj, 4);
+    }
     const waste_tensor *cw = waste_find(m, tname("%smodel.layers.%d.linear_attn.conv1d.weight",
                                                  c->prefix, L));
     if (cw && cw->data)
         waste_k.short_conv_step(qkv, c->conv_k, cw->data, NULL, m->conv[L], mixed, conv_y);
     else
         memcpy(conv_y, mixed, (size_t)qkv * sizeof(float));
-    matvec_t(m, z, waste_find(m, tname("%smodel.layers.%d.linear_attn.in_proj_z.weight",
-                                       c->prefix, L)), in, Hv * Dv, hid);
-    matvec_t(m, a, waste_find(m, tname("%smodel.layers.%d.linear_attn.in_proj_a.weight",
-                                       c->prefix, L)), in, Hv, hid);
-    matvec_t(m, b, waste_find(m, tname("%smodel.layers.%d.linear_attn.in_proj_b.weight",
-                                       c->prefix, L)), in, Hv, hid);
     for (int h = 0; h < Hv; h++) b[h] = 1.0f / (1.0f + expf(-b[h]));
     const waste_tensor *tA = waste_find(m, tname("%smodel.layers.%d.linear_attn.A_log",
                                                  c->prefix, L));
@@ -6488,15 +6590,19 @@ static void qwen_qsa_layer(waste_model *m, int L, const float *in, float *out, i
     float *k = qgate + qd * 2;
     float *v = k + kvd;
     float *idx = v + kvd;
-    matvec_t(m, qgate, waste_find(m, tname("%smodel.layers.%d.self_attn.q_proj.weight",
-                                           c->prefix, L)), in, qd * 2, hid);
-    matvec_t(m, k, waste_find(m, tname("%smodel.layers.%d.self_attn.k_proj.weight",
-                                       c->prefix, L)), in, kvd, hid);
-    matvec_t(m, v, waste_find(m, tname("%smodel.layers.%d.self_attn.v_proj.weight",
-                                       c->prefix, L)), in, kvd, hid);
-    matvec_t(m, idx, waste_find(m, tname(
-        "%smodel.layers.%d.self_attn.indexer.index_qk_proj.weight",
-        c->prefix, L)), in, idxd, hid);
+    {
+        const mvb_item proj[4] = {
+            { qgate, waste_find(m, tname("%smodel.layers.%d.self_attn.q_proj.weight",
+                                         c->prefix, L)), qd * 2 },
+            { k, waste_find(m, tname("%smodel.layers.%d.self_attn.k_proj.weight",
+                                     c->prefix, L)), kvd },
+            { v, waste_find(m, tname("%smodel.layers.%d.self_attn.v_proj.weight",
+                                     c->prefix, L)), kvd },
+            { idx, waste_find(m, tname("%smodel.layers.%d.self_attn.indexer.index_qk_proj.weight",
+                                       c->prefix, L)), idxd },
+        };
+        matvec_t_batch(m, in, hid, proj, 4);
+    }
     float *q = m->qsa_q, *gate = m->qsa_gate;
     for (int h = 0; h < Hq; h++) {
         memcpy(q + (size_t)h * D, qgate + (size_t)h * 2 * D, (size_t)D * sizeof(float));
@@ -6641,22 +6747,33 @@ static void qwen_expert_rows(waste_model *m, const uint8_t *rec, int inter,
 /* The shared expert and its gate, into `acc`; returns the gate. The add
  * into the layer output is the caller's, and stays after the routed sum,
  * so running this early changes when it is computed and not what is
- * summed. */
-static float qwen_shared_expert(waste_model *m, int L, const float *in, float *acc)
+ * summed.
+ *
+ * `pre` says the router's job already projected `in` through the gate and
+ * up matrices into m->ff and the gate scalar into `sg_raw` (see
+ * qwen_moe_layer); what is left is the activation, the down projection and
+ * the sigmoid. Without it, all of it is done here, as ffn does it. */
+static float qwen_shared_expert(waste_model *m, int L, const float *in, float *acc,
+                                int pre, float sg_raw)
 {
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
     PROF_START(P_QSHX);
     const int shared = c->shared_inter ? c->shared_inter : c->moe_inter;
-    ffn(m,
-        waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.gate_proj.weight", c->prefix, L)),
-        waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.up_proj.weight", c->prefix, L)),
-        waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.down_proj.weight", c->prefix, L)),
-        in, acc, shared, hid, 1.0f, 0);
-    float sg;
-    matvec_t(m, &sg, waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert_gate.weight",
-                                         c->prefix, L)), in, 1, hid);
-    sg = 1.0f / (1.0f + expf(-sg));
+    if (pre) {
+        waste_act_pair_range(c, m->ff, m->ff + shared, shared);
+        matvec_t(m, acc, waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.down_proj.weight",
+                                             c->prefix, L)), m->ff, hid, shared);
+    } else {
+        ffn(m,
+            waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.gate_proj.weight", c->prefix, L)),
+            waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.up_proj.weight", c->prefix, L)),
+            waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.down_proj.weight", c->prefix, L)),
+            in, acc, shared, hid, 1.0f, 0);
+        matvec_t(m, &sg_raw, waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert_gate.weight",
+                                                 c->prefix, L)), in, 1, hid);
+    }
+    const float sg = 1.0f / (1.0f + expf(-sg_raw));
     PROF_END(P_QSHX);
     return sg;
 }
@@ -6668,9 +6785,26 @@ static void qwen_moe_layer(waste_model *m, int L, const float *in, float *out, i
     float *sc = m->att + WASTE_ATT_ROUTER_OFF;
     int idx[64];
     float w[64];
+    const int shared_in = c->shared_inter ? c->shared_inter : inter;
+    float sg_raw = 0.0f;
+    int shared_pre = 1;
     PROF_START(P_QRTR);
-    matvec_t(m, sc, waste_find(m, tname("%smodel.layers.%d.mlp.gate.weight",
-                                        c->prefix, L)), in, E, hid);
+    {
+        /* The router and the shared expert's gate, up and gate scalar all
+         * read `in`: one job. The shared expert keeps its outputs in m->ff
+         * until it runs, which nothing on the routed paths below touches
+         * except the serial loop — and that clears shared_pre. */
+        const mvb_item proj[4] = {
+            { sc, waste_find(m, tname("%smodel.layers.%d.mlp.gate.weight", c->prefix, L)), E },
+            { m->ff, waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.gate_proj.weight",
+                                         c->prefix, L)), shared_in },
+            { m->ff + shared_in, waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.up_proj.weight",
+                                                     c->prefix, L)), shared_in },
+            { &sg_raw, waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert_gate.weight",
+                                           c->prefix, L)), 1 },
+        };
+        matvec_t_batch(m, in, hid, proj, 4);
+    }
     const int route_rc = waste_qwen_moe_route(sc, E, K, c->renorm, idx, w,
                                               m->moe_prob, m->moe_used);
     PROF_END(P_QRTR);
@@ -6735,7 +6869,7 @@ static void qwen_moe_layer(waste_model *m, int L, const float *in, float *out, i
             const int *list = stage ? order + nres : order;
             const int n = stage ? nmis : nres;
             if (!n) continue;
-            if (stage) { sg = qwen_shared_expert(m, L, in, acc); shared_done = 1; }
+            if (stage) { sg = qwen_shared_expert(m, L, in, acc, shared_pre, sg_raw); shared_done = 1; }
             PROF_START(P_EDEQ);
             for (int t = 0; t < n && ok; t++) {
                 recs[list[t]] = waste_ecache_hold(&m->cache, L, idx[list[t]],
@@ -6820,6 +6954,9 @@ static void qwen_moe_layer(waste_model *m, int L, const float *in, float *out, i
         waste_ecache_release(&m->cache);
     }
 
+    /* ga and ub are m->ff: the shared expert's projections are about to be
+     * overwritten, and it redoes them after. */
+    shared_pre = 0;
     int lut_ready = 0;
     for (int j = 0; j < K; j++) {
         PROF_START(P_EDEQ);
@@ -6859,7 +6996,7 @@ qwen_moe_shared:
      * in there waiting for HyperConnection to consume it. The expert
      * accumulator is dead once the routed experts are done and is sized for
      * hid floats, so the shared expert lands there. */
-    if (!shared_done) sg = qwen_shared_expert(m, L, in, acc);
+    if (!shared_done) sg = qwen_shared_expert(m, L, in, acc, shared_pre, sg_raw);
     {
         PROF_START(P_QSHX);
         for (int i = 0; i < hid; i++) out[i] += sg * acc[i];
