@@ -37,6 +37,7 @@ internal SSD:
 | Model | Container | Minimum RAM | 64 tokens | 200 tokens |
 |---|---:|---:|---:|---:|
 | Kimi K3 2.78T | 982 GB | 29.19 GB | 0.45–0.62 tok/s | — |
+| DeepSeek-V4.1-Flash 552B | 299 GB | 4.86 GB | 3.77 tok/s | 3.71 tok/s |
 | GLM-5.3-Flash 313B | 112 GB | 5.14 GB | 3.32 tok/s | **3.86 tok/s** |
 | Kimi-Linear 48B | 19 GB | 1.32 GB | 14.29 tok/s | **17.22 tok/s** |
 
@@ -44,6 +45,13 @@ The longer run is faster because the expert cache is still filling during
 the first few dozen tokens; both columns are what the same command prints,
 not a steady state extrapolated from it. K3 has no 200-token column here
 because one run of it takes ten minutes and reads 4.6 TB.
+
+DeepSeek-V4.1 is the exception to the first sentence: 3.77 over 64 and 3.71
+over 200, flat rather than climbing, because its cache is already at 93% by
+the 64th token and there is nothing left for the longer run to win.
+[docs/DS41.md](docs/DS41.md) has the cache-size curve behind that — the
+knee is at 9.6 GB and the automatic budget's 41.74 GB is slightly past the
+top, buying hit rate that no longer buys time.
 
 For K3, 64 GB is the practical minimum. A 32 GB machine can open the model but will page heavily. The default memory budget on the test machine is 46.39 GB, including a 17.56 GB expert cache.
 

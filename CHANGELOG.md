@@ -90,6 +90,17 @@ memory, 510 GB as published). The plan and the arithmetic are in
   string diff cannot see: **which segments are markup**. `｜DSML｜` is the
   control token and the tag name is not, so `<｜DSML｜ calls>` is three
   segments and a tool result containing that literal cannot open a block.
+- **Session state for DeepSeek-V4.1** — `waste_state_save`/`_load`, which
+  segfaulted on this container because the shared path wrote a latent
+  cache it does not have. CSA2 saves the window ring whole and, for the
+  four KV source layers, the compressed latents, the index keys and the
+  partly-filled pooling group; Engram saves its n-gram history, whose ids
+  are *compressed* by a map only the container has, so a caller holding
+  the original prompt cannot reconstruct it. `head_dim`, `sliding_window`
+  and the Engram row count join the header fields a mismatched state file
+  is refused on — restoring a window at the wrong width is a session that
+  resumes attending to the wrong tokens, not a short read — and the size
+  is checked before the first byte is read.
 - **`Engine.marker_ids_for`**, so a format can state its own markers rather
   than sharing K3's four. All of them resolve or the format is refused: one
   that half-resolves is the failure the probe exists to prevent.
@@ -124,6 +135,22 @@ memory, 510 GB as published). The plan and the arithmetic are in
   point at every K. So DSpark needs 3.45 of its 5 drafts accepted to break
   even on bytes. LEARNED §77.
 
+- **Measured throughput**, replacing the projection docs/DS41.md carried
+  (which is kept as written beside it). **3.77 tok/s over 64 tokens and
+  3.71 over 200**, against 1.5–2.5 projected — faster than GLM-5.3-Flash
+  on a bank twice the size, because the working set is GLM's to within 1%.
+  It is the first container here that is *not* faster over the longer run:
+  the cache is at 93% by the 64th token and there is nothing left to fill.
+  docs/DS41.md has the cache-size curve, which is flat from 9.6 GB and
+  declines slightly after, and the phase profile at both ends of it —
+  expert I/O is 58.7% of a step at the 152 MB floor and 10.2% at 17 GB, so
+  this engine is disk-bound starved and compute-bound fed.
+- **`waste bench` now says when it measured a prefill.** It divides by the
+  tokens actually generated, and a model that ends its turn on the bare
+  continuation prompt it uses leaves that at 1: DeepSeek-V4.1 reported
+  "0.19 tok/s" for one decode step behind an 18-token prefill, with
+  nothing to say so. The rate was true; what it was a rate of was missing.
+
 Not implemented: DSpark, deferred by gate 9. A container's MTP weights are
 dropped at conversion.
 
@@ -152,6 +179,43 @@ LEARNED §75.
   container out of 39% of a model. It now asks whether the destination is
   still there before believing anything counted from it, and refuses a
   count that is not a number. Same shape as #35 one level up.
+- **A JSON reader that did not decode JSON.** `specials.json` is written
+  by `json.dump`, which escapes non-ASCII by default, so
+  DeepSeek-V4.1's control tokens reached the container as
+  `"<\uff5cUser\uff5c>"` — and both readers, `js_str` in `src/json.h` and
+  `load_specials` in `src/tokenizer.c`, copied the bytes between the
+  quotes. Every marker the release has is non-ASCII, so **none of them
+  resolved**: `waste_tokenize_markup` returned the same ids as
+  `waste_tokenize`, which is the security boundary in §"Prompt safety"
+  collapsed to nothing, DSML could not be served, and the CLI printed
+  `<\uff5cend\u2581of\u2581sentence\uff5c>` where the model had emitted EOS.
+  The four releases before this one had ASCII-only markup — `<|open|>`,
+  `<|endoftext|>` — which is why a `memcpy` where a decoder belonged
+  shipped four times.
+
+  Both readers now share one `js_unescape`, surrogate pairs included, and
+  the converters write UTF-8 (`ensure_ascii=False`) so the file says what
+  it holds. A container written either way loads: the escaped one on disk
+  is what the regression check in `tests/run.sh` builds, since a reader
+  that only works against our own writer is the same bug waiting.
+- **`tools/verify_container.py` kept a second copy of how a checkpoint
+  names its experts** — an inline probe for DeepSeek-V3's
+  `mlp/gate_proj` with Mixtral's `block_sparse_moe/w1` as the fallback,
+  while `convert.py` had the same fact in `MOE_LAYOUTS`. DeepSeek-V4.1 is
+  neither (`layers.0.ffn.experts.0.w1.weight`, and no `model.` in front of
+  it), so the round-trip on the newest converter was the one that could
+  not run: a `KeyError` with its stderr swallowed by `tests/run.sh`. It
+  imports `moe_layout` and `source_prefixes` now. On the 299 GiB
+  container it passes across all 40 layers at **19.5–20.4% per-expert
+  error**, which is gate 8's projected 19.95–20.74% confirmed on the
+  weights rather than on 190 MB of range requests.
+- **The learned-hotlist check now skips where no hotlist can hit.** It
+  guarded only on the container's floor fitting under its 5G budget.
+  DeepSeek-V4.1's floor is 4.86 GB, so it opens — and leaves 310 MB of
+  expert cache against a 3.19 GB working set, under a tenth of one token,
+  where docs/ENGINE.md section 3 says the hit rate is zero and not low.
+  The check answered 284 misses -> 286 on one run and fewer on the next,
+  which is a verdict decided by noise. A missing prerequisite is a SKIP.
 - `mxfp4.ST` read an `int8` tensor with a `.scale` companion as if the
   int8 were the values. That is DeepSeek-V4.1's spelling for packed fp4,
   and no shape disagrees; it now refuses an int8 tensor with no scale
