@@ -1461,6 +1461,21 @@ def main():
                   + "\n  ".join(stray[:12])
                   + ("\n  ..." if len(stray) > 12 else ""), file=sys.stderr)
             return 1
+        # And the other direction, which is the one that costs hours when it
+        # is wrong: everything the ENGINE looks up has to be in the
+        # checkpoint, at the shape the config implies. A load refuses on the
+        # first missing name, and by then the conversion has run.
+        try:
+            import ds41_preflight                              # noqa: F401
+        except ImportError:
+            pass
+        else:
+            rc = os.system(f"{sys.executable} "
+                           f"{os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ds41_preflight.py')} "
+                           f"{args.src}")
+            if rc:
+                print("preflight failed; not converting", file=sys.stderr)
+                return 1
         drop_trunk = ds41_drop_trunk(n_layers)
         # The second routing bias is stated by being there, so say so in the
         # manifest rather than making the engine probe for a tensor.
