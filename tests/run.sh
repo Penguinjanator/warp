@@ -2204,6 +2204,42 @@ PYEOF
         else
             ok "and one missing a tensor it needs is refused, by name"
         fi
+        # And the arithmetic, against an oracle reading the SAME container —
+        # so this measures the forward pass and not the quantization. Twelve
+        # tokens rather than four because the window is four slots wide: the
+        # ring has to wrap, the compressed caches have to fill, and layer 4's
+        # candidate filter has to have blocks to choose between. At four
+        # tokens none of that happens and the diff is green over three
+        # mechanisms that never ran.
+        rm -rf "$ds41_dir"
+        python3 tools/make_test_container.py --ds41 "$ds41_dir" >/dev/null 2>&1
+        DIDS=3,7,11,5,19,23,2,41,8,64,17,90
+        if ! command -v uv >/dev/null 2>&1; then
+            sk "DeepSeek-V4.1 vs a PyTorch oracle" "uv not installed"
+        elif run_uv run --quiet --with torch --no-project python tools/ds41_ref.py \
+                 --container "$ds41_dir" --ids "$DIDS" --top 1 \
+                 --dump "$TMP/ds41.ref" >/dev/null 2>&1 &&
+             ./test_forward "$ds41_dir" "$DIDS" "$TMP/ds41.eng" 0 >/dev/null 2>&1; then
+            rel=$(python3 - "$TMP/ds41.ref" "$TMP/ds41.eng" <<'PYEOF'
+import math, struct, sys
+a = open(sys.argv[1], "rb").read()
+b = open(sys.argv[2], "rb").read()
+n = min(len(a), len(b)) // 4
+x = struct.unpack(f"<{n}f", a[:n * 4])
+y = struct.unpack(f"<{n}f", b[:n * 4])
+num = math.sqrt(sum((p - q) ** 2 for p, q in zip(x, y)))
+den = math.sqrt(sum(p * p for p in x)) or 1.0
+print(f"{100.0 * num / den:.6f}")
+PYEOF
+)
+            if [ -n "$rel" ] && python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 0.01 else 1)" "$rel"; then
+                ok "CSA2, single-pass mHC, Engram and the sqrt-softplus router match an oracle (${rel}% rel L2)"
+            else
+                no "DeepSeek-V4.1 differs from the oracle: ${rel:-no output}% rel L2"
+            fi
+        else
+            no "DeepSeek-V4.1 oracle or engine did not run"
+        fi
     else
         no "a DeepSeek-V4.1 container opens"
         printf '%s\n' "$info" | head -3

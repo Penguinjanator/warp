@@ -288,6 +288,52 @@ typedef struct {
                                       * MLA query is still living in       */
     float *idxscore;                 /* one score per candidate pool         */
     int   *idxrank;                  /* its top-k scratch                    */
+    /* --- CSA2 state (DeepSeek-V4.1) ------------------------------------
+     *
+     * Every layer keeps a sliding window of raw KV as a ring of `window`
+     * slots — 128 x 512 floats, constant in context. Only the four
+     * kv_source layers keep the compressed caches; the thirty-six others
+     * read whatever the last source published, which is where the model's
+     * 890 bytes of KV per token come from.
+     *
+     * f32 here against the release's fp4/fp8. That is 8x its number and
+     * still small: 890 B/token becomes ~7 KB, so a 128 K context costs
+     * under a gigabyte, against the 27 GB of latents K3 would want. */
+    float *winkv[WASTE_MAX_LAYERS];   /* [window][head_dim], a ring       */
+    float *ckvc[WASTE_MAX_LAYERS];    /* [kv_cap/ratio][head_dim]         */
+    float *ikey[WASTE_MAX_LAYERS];    /* [kv_cap/ratio][index_dim]        */
+    /* The tail of a group still filling up: `ratio` (kv, gate score) pairs,
+     * carried across decode steps because a latent is only published when
+     * its group completes. */
+    float *cpool[WASTE_MAX_LAYERS];   /* [ratio][2 * head_dim]            */
+    int    n_lat[WASTE_MAX_LAYERS];   /* latents published by this source */
+    /* What a source published, for the layers between it and the next. One
+     * slot each: layers run in order and every source writes before its
+     * consumers read, so nothing needs resetting between steps. */
+    const float *cur_ckv, *cur_ikey;
+    int    cur_nlat, cur_ratio;
+    int   *csel;                      /* compressed positions this step keeps */
+    int    csel_n;
+    float *cscore;                    /* a score per compressed position,
+                                       * then the per-block maxima          */
+    uint8_t *cand;                    /* candidate-block mask               */
+    const float **csa_kv;             /* what one step attends over          */
+    float *csa_q, *csa_o, *csa_lat, *csa_score;
+    /* --- Engram ---------------------------------------------------------
+     * The tables are on disk in their own files; what is here is the
+     * hashing that addresses them and one row's worth of scratch. */
+    int      eg_fd[WASTE_MAX_ENGRAM];
+    int64_t  eg_rows[WASTE_MAX_ENGRAM];
+    int      eg_rowbytes[WASTE_MAX_ENGRAM], eg_bits[WASTE_MAX_ENGRAM];
+    int      eg_group[WASTE_MAX_ENGRAM];
+    int64_t *eg_prime[WASTE_MAX_ENGRAM], *eg_off[WASTE_MAX_ENGRAM];
+    int64_t *eg_mult[WASTE_MAX_ENGRAM];
+    int32_t *eg_map;                  /* token id -> compressed id         */
+    int      eg_map_n, eg_pad;
+    int32_t *eg_hist;                 /* [kv_cap] compressed ids, -1 = dead */
+    uint8_t *eg_raw;                  /* one table row, as stored          */
+    float   *eg_row, *eg_kv, *eg_key; /* dequantized row, wkv output, keys */
+
     /* mHC scratch: the flattened stream vector the mapping reads, and the
      * collapsed single stream the sublayer runs on. */
     float *hcflat, *hccol, *hcmix;
