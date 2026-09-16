@@ -428,3 +428,42 @@ jobs:
           grep -q "^OK" /tmp/oracle.log
           ran=$(grep -oE "^Ran [0-9]+ tests?" /tmp/oracle.log | grep -oE "[0-9]+")
           [ "$ran" = 3 ] || { echo "expected 3 oracle checks, ran $ran"; exit 1; }
+
+  # The same rule for the other tool protocol serve/ renders, and the one
+  # the comment above used to have to exempt: "the same ground-truth rule
+  # the K2 template check in tests/run.sh applies, except this one may not
+  # skip". Now neither may.
+  #
+  # It matters here for a reason GLM's does not have. Kimi-Linear's
+  # tokenizer carries Kimi K2's five tool-call tokens and its own release
+  # ships no chat_template at all, so the vocabulary is stated and the
+  # grammar is not — the grammar is K2's, and only K2 publishes it. Skip
+  # this and the rendering is checked against a parser that reads back what
+  # the renderer wrote, which agrees with itself whatever the format is;
+  # that is how the turn a tool result opens came to say `system` where the
+  # template says the tool's own name.
+  #
+  # The template is vendored at tests/serve/k2_upstream/ (provenance,
+  # pinned revision, file hash and licence in its README.md), so no model
+  # download, no weights and no machine-local ~/models: the
+  # tokenizer/engine boundary is FakeEngine. Until 0.8.0 this defaulted to
+  # a path on an external volume, which is why it had never run here.
+  k2_upstream_oracle:
+    name: K2 tool protocol vs upstream template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the pinned test dependencies
+        run: pip install -r requirements-test.txt
+      - name: The seven oracle checks, no skips allowed
+        env:
+          CI_K2_ORACLE_STRICT: '1'
+          K2_DIR: tests/serve/k2_upstream
+        run: |
+          python3 -m unittest tests.serve.test_chatfmt_upstream -v 2>&1 | tee /tmp/k2_oracle.log
+          grep -q "^OK" /tmp/k2_oracle.log
+          ran=$(grep -oE "^Ran [0-9]+ tests?" /tmp/k2_oracle.log | grep -oE "[0-9]+")
+          [ "$ran" = 7 ] || { echo "expected 7 oracle checks, ran $ran"; exit 1; }

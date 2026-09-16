@@ -30,6 +30,12 @@ a path on an external volume, which is a description of one machine rather
 than a default: everywhere else, CI included, it read as "no template" and
 skipped, and the only check of this grammar skipped with it.
 
+Without it the suite skips, loudly; with CI_K2_ORACLE_STRICT=1 the
+designated CI oracle job runs it instead, and a missing template, missing
+jinja2 or unresolved markers is a failure rather than a skip — that job
+must never be green because it did nothing, so it also asserts that all
+seven checks ran.
+
 The directory needs one file — `chat_template.jinja`, or a
 `tokenizer_config.json` carrying a `chat_template` key. No weights: the
 template plus `examples/chat-kimi-linear.json` is the whole input, which
@@ -60,6 +66,10 @@ from tests.serve.test_chatfmt import KIMI_K2_MARKERS          # noqa: E402
 
 VENDORED_DIR = REPO / "tests" / "serve" / "k2_upstream"
 K2_DIR = os.environ.get("K2_DIR", str(VENDORED_DIR))
+
+# The designated CI oracle job sets this: skips become failures, so a green
+# run means the seven checks below actually executed.
+STRICT = os.environ.get("CI_K2_ORACLE_STRICT") == "1"
 LINEAR_CHAT = REPO / "examples" / "chat-kimi-linear.json"
 
 TOOLS = [{"type": "function", "function": {
@@ -101,19 +111,29 @@ def render_upstream(template, messages, tools):
         messages=messages, tools=tools, add_generation_prompt=True)
 
 
+def _skip_or_fail(reason):
+    """Skip in local development, fail in the strict CI oracle job."""
+    if STRICT:
+        raise AssertionError(f"CI_K2_ORACLE_STRICT: {reason}")
+    raise unittest.SkipTest(reason)
+
+
 class TestAgainstK2Template(unittest.TestCase):
     """chat.json rendering against Kimi K2's published chat_template."""
+
+    n_ran = 0
 
     @classmethod
     def setUpClass(cls):
         try:
             import jinja2                                     # noqa: F401
         except ImportError:
-            raise unittest.SkipTest(
-                "jinja2 not installed; the template cannot be rendered")
+            _skip_or_fail(
+                "jinja2 not installed; the template cannot be rendered "
+                "(pip install -r requirements-test.txt)")
         cls.template = load_template()
         if not cls.template:
-            raise unittest.SkipTest(
+            _skip_or_fail(
                 f"no chat_template at {K2_DIR} (set K2_DIR to a Kimi-K2 "
                 f"release directory; only chat_template.jinja is needed)")
         # ChatFormat.load reads <model_path>/chat.json, so the format under
@@ -125,13 +145,23 @@ class TestAgainstK2Template(unittest.TestCase):
                          markers=dict(KIMI_K2_MARKERS))
         cls.fmt = ChatFormat.load(eng)
         if not cls.fmt.tool_markers:
-            raise unittest.SkipTest(
+            _skip_or_fail(
                 "the five tool markers did not resolve; there is nothing "
                 "to compare against the template")
 
     @classmethod
     def tearDownClass(cls):
         shutil.rmtree(getattr(cls, "_tmp", ""), ignore_errors=True)
+        # Strict is a promise about what ran, not merely what passed: if a
+        # registration mistake left a check out of the class, a green job
+        # would quietly cover one fewer oracle.
+        if STRICT:
+            assert cls.n_ran == 7, (
+                f"strict oracle ran {cls.n_ran} of 7 checks; the rest "
+                "never executed")
+
+    def tearDown(self):
+        TestAgainstK2Template.n_ran += 1
 
     def rendered(self, messages, tools=None):
         segs = self.fmt.build_chat_segments(messages, tools=tools,

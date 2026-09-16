@@ -25,6 +25,17 @@ changed. Each entry names the section to read for the numbers behind it.
   `glm_upstream/` already was; `K2_DIR` still points a real release over
   it. The suite goes to 85 passed, 0 failed, 2 skipped with nothing set.
 
+### Added
+
+- **A strict CI job for the K2 tool protocol**, the one GLM has had and
+  which `ci.yml` used to have to exempt K2 from in so many words: "the same
+  ground-truth rule the K2 template check in tests/run.sh applies, except
+  this one may not skip". Now neither may. `CI_K2_ORACLE_STRICT=1` turns
+  every skip path — missing template, missing jinja2, unresolved markers —
+  into a failure, and the job asserts all **seven** checks ran, so it
+  cannot be green by having done nothing. Vendoring the template is what
+  made it possible: no download, no weights, no machine-local `~/models`.
+
 ## 0.8.0 — 2026-09-15
 
 **DeepSeek-V4.1-Flash runs.** 552 B backbone plus 197 B of n-gram memory,
