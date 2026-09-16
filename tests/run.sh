@@ -1783,6 +1783,17 @@ PYQ
         no "QSA's block pick orders the selection differently from the argmax"
     fi
 
+    # And the attention itself, scoring four selected tokens at a time and
+    # summing the values through NEON. What has to match is not only the
+    # order of the sums but the rounding of every product: the loop it
+    # replaced rounds each product on its own, and a fused multiply-add
+    # rounds once. Both ways of getting that wrong shifted the logits.
+    if ./test_qsa_attn >/dev/null 2>&1; then
+        ok "QSA's attention is bit-identical to the loops it replaced"
+    else
+        no "QSA's attention differs from the loops it replaced"
+    fi
+
     # The container-native oracle: the same container read by a PyTorch
     # implementation of the same forward pass. Routes must match exactly
     # and the argmax must match; the residual is gated at what this fixture

@@ -8,6 +8,10 @@
 #include <math.h>
 #include <string.h>
 
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 void waste_qwen_mrope_interleave(const float *freqs_t, const float *freqs_h,
                                  const float *freqs_w, const int *section,
                                  int half, float *out)
@@ -175,6 +179,18 @@ void waste_qwen_qsa_attn(const float *q, int Hq, int D,
                               out, scratch);
 }
 
+/* Four selected tokens' scores at a time, and the value sum over lanes.
+ *
+ * Both halves of this are a dot product 256 wide, and the first was costing
+ * what a dependent chain of fused multiply-adds costs: one element per
+ * ~4 cycles, whatever the machine could otherwise issue. Four tokens have
+ * four independent chains, and each still sums its own dimensions in the
+ * order it did — the same trick, and the same reason, as the VQ gather's
+ * four rows (LEARNED §41). The value accumulation is the other way round:
+ * every output dimension sums the selected tokens in order, so the lanes
+ * run along `d` and each element's sequence is untouched. Both are bit
+ * for bit what the scalar loops produced; §87 has the check.
+ */
 void waste_qwen_qsa_attn_heads(int h0, int h1, const float *q, int Hq, int D,
                                const float *k, const float *v, int Hkv, int T,
                                const int *sel, int n_sel, float scale,
@@ -189,7 +205,45 @@ void waste_qwen_qsa_attn_heads(int h0, int h1, const float *q, int Hq, int D,
         const int hv = h / (n_rep > 0 ? n_rep : 1);
         const float *qh = q + (size_t)h * D;
         float m = -1e30f;
-        for (int i = 0; i < n_sel; i++) {
+        int i = 0;
+        /* Four at a time only when there are enough to pay for it: a short
+         * context selects a handful, and there the plain loop below is
+         * what measured faster. */
+        const int n4 = n_sel >= 32 ? n_sel : 0;
+        for (; i + 4 <= n4; i += 4) {
+            const int t0 = sel[i], t1 = sel[i + 1], t2 = sel[i + 2], t3 = sel[i + 3];
+            if (t0 < 0 || t0 >= T || t1 < 0 || t1 >= T ||
+                t2 < 0 || t2 >= T || t3 < 0 || t3 >= T) break;
+            const float *k0 = k + ((size_t)t0 * Hkv + hv) * D;
+            const float *k1 = k + ((size_t)t1 * Hkv + hv) * D;
+            const float *k2 = k + ((size_t)t2 * Hkv + hv) * D;
+            const float *k3 = k + ((size_t)t3 * Hkv + hv) * D;
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+            /* The product and the sum are separate statements on purpose.
+             * The loop this replaces compiles to four products a time in
+             * one vector and a scalar chain of adds — the products are
+             * independent, the order of the adds is not — so each product
+             * is rounded on its own. Written as `s += q * k` the compiler
+             * may contract the pair into one fused multiply-add, which
+             * rounds once instead of twice and is a different number.
+             * Across a 2,048-token selection that difference moves a
+             * logit. */
+            for (int d = 0; d < D; d++) {
+                const float qd = qh[d];
+                const float p0 = qd * k0[d], p1 = qd * k1[d];
+                const float p2 = qd * k2[d], p3 = qd * k3[d];
+                s0 = s0 + p0; s1 = s1 + p1;
+                s2 = s2 + p2; s3 = s3 + p3;
+            }
+            s0 *= scale; s1 *= scale; s2 *= scale; s3 *= scale;
+            scores[i] = s0; scores[i + 1] = s1;
+            scores[i + 2] = s2; scores[i + 3] = s3;
+            if (s0 > m) m = s0;
+            if (s1 > m) m = s1;
+            if (s2 > m) m = s2;
+            if (s3 > m) m = s3;
+        }
+        for (; i < n_sel; i++) {
             const int t = sel[i];
             if (t < 0 || t >= T) { scores[i] = -1e30f; continue; }
             const float *kh = k + ((size_t)t * Hkv + hv) * D;
@@ -206,12 +260,22 @@ void waste_qwen_qsa_attn_heads(int h0, int h1, const float *q, int Hq, int D,
         }
         if (z < 1e-20f) z = 1e-20f;
         float *oh = out + (size_t)h * D;
-        for (int i = 0; i < n_sel; i++) {
-            const int t = sel[i];
+        for (int j = 0; j < n_sel; j++) {
+            const int t = sel[j];
             if (t < 0 || t >= T) continue;
-            const float w = scores[i] / z;
+            const float w = scores[j] / z;
             const float *vh = v + ((size_t)t * Hkv + hv) * D;
-            for (int d = 0; d < D; d++) oh[d] += w * vh[d];
+            int d = 0;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+            const float32x4_t wv = vdupq_n_f32(w);
+            for (; d + 16 <= D; d += 16) {
+                vst1q_f32(oh + d,      vfmaq_f32(vld1q_f32(oh + d),      wv, vld1q_f32(vh + d)));
+                vst1q_f32(oh + d + 4,  vfmaq_f32(vld1q_f32(oh + d + 4),  wv, vld1q_f32(vh + d + 4)));
+                vst1q_f32(oh + d + 8,  vfmaq_f32(vld1q_f32(oh + d + 8),  wv, vld1q_f32(vh + d + 8)));
+                vst1q_f32(oh + d + 12, vfmaq_f32(vld1q_f32(oh + d + 12), wv, vld1q_f32(vh + d + 12)));
+            }
+#endif
+            for (; d < D; d++) oh[d] += w * vh[d];
         }
     }
 }

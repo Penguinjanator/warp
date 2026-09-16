@@ -6436,3 +6436,60 @@ HyperConnection 10.1 → 9.3 ms a step, GDN 14.7 → 13.8.
 Two percent here was not obviously worth the code. It went in because the
 gaps are a property of this machine's wake latency and eight cores, and a
 machine with more cores or a slower scheduler pays more for each one.
+
+## 87. QSA's attention, four scores at a time — and the product that must not fuse (2026-09-16)
+
+At a 2,801-token context QSA's attention was 8.3 ms of a 87 ms step, on
+the pool since §80 and scalar inside: per selected token a 256-wide dot
+against the query, then a 256-wide accumulation of that token's values.
+
+The dot was not short of arithmetic, it was short of independence — each
+element's multiply-add waits for the one before it, ~4 cycles deep,
+whatever else the core could issue. So four selected tokens are scored in
+one pass now, each with its own accumulator summing its own dimensions in
+its own order: §41's trick on the VQ gather, for the same reason. The
+value accumulation is the other way round — every output dimension sums
+the tokens in order — so its lanes run along the dimension, four vectors
+at a time. Both leave every element's sequence where it was.
+
+Against a build of §86's commit, 16 GiB, three pairs:
+
+| | before | after |
+|---|---|---|
+| 2,801-token context, decode | 11.35, 11.35, 11.47 | 11.68, 11.81, 11.72 (+3.0%) |
+| 2,801-token context, reading the prompt | 11.89, 12.13, 12.15 | 12.32, 12.51, 12.35 (+2.6%) |
+| attention, ms/step | 8.34 | 5.36 |
+| QSA, ms/step | 14.59 | 11.78 |
+
+A short context selects a handful of tokens and measured 0.5% slower in
+three pairs of three, so the four-at-a-time pass is taken from 32
+selections up; below that the plain loop runs and the short prompt is back
+to level.
+
+**What nearly shipped instead.** The first two versions were not
+bit-identical, and neither was wrong about the order of anything. The loop
+they replaced compiles — at -O2, no fast-math — to four *products* in one
+vector and a scalar chain of adds: the products are independent, the sum
+order is not, so clang vectorizes the multiplies and leaves the additions
+alone. Each product is therefore rounded on its own. Write the same
+arithmetic as `s += q * k` in four accumulators and clang's SLP pass packs
+them into a vector too, but emits a multiply and an add where the original
+contracted to one fused multiply-add; write it as `fmaf` and every product
+fuses. Both round differently from the original — by one ulp, on a dot of
+256 terms, over 2,048 tokens and 24 heads. The logits moved in the last
+bits and the text diverged a few hundred tokens in.
+
+The fix is to say exactly what the original does: a product, then a sum,
+as two statements, which C's contraction rules leave alone. `-fno-vectorize
+-fno-slp-vectorize` also fixes it, and is not a fix — it is a build flag
+this file cannot rely on.
+
+**A bit-identical kernel needs a bit-identical test.** `tests/run.sh` ran
+the whole suite green through both wrong versions: its Qwen checks compare
+paths of *one* build against each other, and both paths had the same
+kernel. `tests/test_qsa_attn.c` holds the old loops verbatim and compares
+them with the new ones over 40 random cases with out-of-range selections
+mixed in, in one translation unit, where a compiler that transforms one
+and not the other is exactly what is being looked for. It is the same
+shape as §81's `test_qsa_pick`, and it was written after the fact rather
+than before, which is the part to do differently next time.

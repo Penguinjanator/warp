@@ -260,7 +260,8 @@ waste$(EXE): cli/main.o libwaste.a
 # `test` builds and `clean` forgets defeats the check meant to notice it.
 TESTNAMES := test_kda test_container test_forward test_tokenizer test_k3parts \
              test_qwenparts test_state test_vision test_vision_glm test_image \
-             test_memory test_cpus test_lock sweep kernel_kl test_qsa_pick
+             test_memory test_cpus test_lock sweep kernel_kl test_qsa_pick \
+             test_qsa_attn
 TESTBINS  := $(addsuffix $(EXE),$(TESTNAMES))
 
 test: $(TESTBINS)
@@ -289,6 +290,9 @@ kernel_kl$(EXE): tests/kernel_kl.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 test_qsa_pick$(EXE): tests/test_qsa_pick.o libwaste.a
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test_qsa_attn$(EXE): tests/test_qsa_attn.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 test_tokenizer$(EXE): tests/test_tokenizer.o libwaste.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
