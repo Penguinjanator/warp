@@ -6493,3 +6493,315 @@ mixed in, in one translation unit, where a compiler that transforms one
 and not the other is exactly what is being looked for. It is the same
 shape as §81's `test_qsa_pick`, and it was written after the fact rather
 than before, which is the part to do differently next time.
+## 88. A feasibility gate does not need the download (2026-09-15)
+
+DeepSeek-V4.1-Flash is 510 GB in 48 shards. The gate that had to run before
+any of it was fetched — does 3-bit VQ survive experts that are *already* fp4?
+— needed 24 experts. A safetensors file states every tensor's byte offset in
+its own header, and HuggingFace serves ranges, so 24 experts is **190 MB**
+and four minutes. `tools/hf_peek.py` is that generalized: header first, then
+one range request per tensor, then dequantize E2M1/E4M3 against the E8M0
+scale stream. It should be the first thing pointed at any new release.
+
+The answer was no change at all. 19.97% / 20.74% / 19.95% on `layers.0.w1`,
+`layers.0.w2` and `layers.20.w1`, against §23's already-recorded **20.3% for
+a K3 expert at 3 bits from MXFP4** and gate 3's 19.4% from bf16. Three
+sources — bf16, K3's MXFP4, this release's fp4 — and one number. Whatever
+3-bit residual VQ costs, it costs it against the tensor you hand it, and an
+upstream quantizer having been there first does not compound the way the
+gate assumed. [GATES.md](GATES.md) gate 8.
+
+What the gate did not expect to find is how little is left in these tensors
+to begin with. 94 M parameters of `layers.0.w1` hold **28 distinct values**,
+because the ue8m0 scale stream — nominally one exponent per 32 inputs per
+row — takes four or five values across the entire matrix, two of them
+covering 96.6% of the blocks. The published format is per-block and the
+trained content is very nearly one global grid.
+
+Priced as information: 2.861 bits for the magnitude, plus a sign that is
+44.1% positive on the 88.2% of weights that are nonzero, is **3.74
+bits/weight**. So a lossless container is 4.25 bits (the nibbles verbatim
+plus the scale stream) and an entropy-coded one could not beat 3.74 —
+against VQ3R's 3.00 at 20% error. That is a *narrower* window than any
+previous model in this family gave, and it is the first time the choice of
+3 bits has been a choice between "lossy and small" and "exact and 52%
+bigger" rather than against 16-bit weights. It still goes to 3 bits, on
+§20's exchange rate: 85 GB more bank costs more hit rate than 20% expert
+error costs accuracy — on K3, measured. Whether it costs the same here is
+open, and it is the one quantization question stage 5's oracle diff should
+be asked to answer rather than assumed.
+
+Method note, because it generalizes past this model: **the cheap part of a
+gate is usually the measurement and the expensive part is getting the
+bytes.** Two of the eight gates in this file spent their cost on a download
+or a conversion that the measurement itself did not need. Range requests
+against a published index is a way to not do that again.
+
+## 89. Twenty-one strings is not a tokenizer corpus, and it never was (2026-09-15)
+
+`tools/tokdiff.py` opens with a comment saying "twelve short ASCII strings
+is not a tokenizer corpus". It then lists twenty-one strings and, until
+today, tested against those. Adding DeepSeek-V4.1's pre-tokenizer made the
+inadequacy measurable, because unlike cl100k's its pattern has five
+character classes and no catch-all.
+
+`src/tokenizer.c` codes the patterns directly rather than carrying a regex
+engine, so `\p{L}`, `\p{N}` and `\s` were hand-written ranges — the blocks
+the two Kimi releases and GLM had been tried on. In cl100k that was
+survivable by accident: a letter the table did not know fell into
+`[^\s\p{L}\p{N}]+`, which is a catch-all, so it still produced *a* piece.
+In DeepSeek's pattern the same character becomes `\p{S}`, joins the
+punctuation run beside it, and shifts every id after it.
+
+`tokdiff.py --wide 20000` — every codepoint thinned by a stride, plus a
+block of multi-byte whitespace runs — on the two releases that were
+**already supported and passing**:
+
+| | curated 21 | wide 24021 before | after |
+|---|---|---:|---:|
+| Kimi-Linear | 21/21 both times | 22937 | 24017 |
+| GLM-5.3-Flash | 21/21 both times | 22914 | 24020 |
+
+Four and a half percent of strings encoded differently from the release,
+under a green board, for the whole life of those two containers. The
+remaining handful are codepoints assigned after the Unicode revision
+`src/unicode_classes.h` was generated from — regenerating on a CPython with
+Unicode 16.0 instead of 15.0 was worth three strings on one and two on the
+other.
+
+Two distinct defects came out of it, and neither is DeepSeek-specific:
+
+- **`\s+(?!\S)` backed off one byte.** It has to keep all but the last
+  *character* of a whitespace run when text follows, and `is_space()`
+  admits U+00A0. A no-break space before a word was cut down the middle
+  into two replacement bytes. Worth 1080 of 4000 strings in the whitespace
+  corner of the corpus on its own.
+- **`\p{N}` and `\s` were ASCII.** Both patterns in the file mean the
+  Unicode classes — the tiktoken one is compiled by Python's `regex` and
+  the `tokenizers` one by Oniguruma, and both were *probed* rather than
+  assumed, because the two plausible answers differ on U+3000 and agree on
+  U+00A0. `"²³x"` is `"²³"` + `"x"`.
+
+And one that is: DeepSeek's three Splits run in sequence, so pass 3 never
+sees across a number or a CJK run. `\s+(?!\S)` therefore succeeds at a
+segment boundary — `"  ०"` is one whitespace piece, not two — and a `\p{P}`
+run must stop at U+30FB, the katakana middle dot, which is punctuation
+*and* inside pass 2's range. Both were found by the wide corpus and neither
+would have been found by reading the pattern.
+
+The lesson is not "write more test strings". It is that a hand-written
+Unicode class **cannot fail loudly**: there is no character it rejects that
+produces an error, only one that produces a different split. The table is
+generated now, from `unicodedata`, by `tools/gen_unicode.py` — 30 KB of
+rodata against a whole category of silent wrongness — and the check reads
+the numbers instead of grepping its own output for the word "identical",
+which is what it did before and is why "22914/24021 identical" passed.
+That last part is §73 again, in the one file that had already written the
+warning down.
+
+## 90. The oracle was wrong, and only the shape of the error said so (2026-09-15)
+
+DeepSeek-V4.1's forward pass came up 0.7% off against `tools/ds41_ref.py`
+on the first run — same argmax, plausible logits, a number that could have
+been anything. `WASTE_DUMP_HIDDEN` against the oracle's `--hidden` put the
+first divergence at layer 2, the first layer that compresses its own KV,
+and that one was mine: the indexer derives its key from the compressor's
+*unrotated* latent, so it runs between the compressor and the rotation, and
+it had been handed the same scratch buffer. What got cached as the layer's
+compressed KV was the index key.
+
+The second was not mine, and it is the one worth writing down.
+
+With that fixed the diff moved to layer 3 at 0.0096% — which is small
+enough to read as accumulation and is not. Running the same diff at one,
+two, three and four tokens gave:
+
+| tokens | 1 | 2 | 3 | 4 |
+|---|---:|---:|---:|---:|
+| worst layer | 1e-7 | 1e-7 | **6.5%** | 0.039% |
+
+A bug that is exact at one, two and four tokens and 6% at three is not
+accumulation and is not a kernel. At ratio 2 the compressor publishes a
+latent on odd positions only, so position 2 is the first step where a
+compressing layer runs with *no* latent of its own — and upstream keeps
+what a source published in a module-level singleton, with a comment saying
+why: "layers run in order and every source writes before its consumers
+read, so one slot each is enough and nothing needs resetting between
+forwards." The oracle rebuilt that dictionary per step. On every step
+without a fresh latent it therefore lost the index keys, reported none, and
+the layer attended over its sliding window alone.
+
+**The engine was right and the oracle was wrong.** With the singleton
+persistent, every layer at every token count agrees to 1.9e-7.
+
+Three things this is evidence for:
+
+- **An oracle is a second implementation, not a specification.** §73 said a
+  test that only compares a thing to itself is not an oracle; this is the
+  other failure — two implementations, one of them wrong, and no way to
+  tell which from a single number. What told them apart was running the
+  diff at several sequence lengths and reading the *pattern*.
+- **Per-step state is where a decode-shaped engine and a batch-shaped
+  reference disagree.** The release's `model.py` prefills a whole chunk at
+  once, and in that form the compressor's "nothing to publish this step"
+  case barely exists. Transcribing it one token at a time is where it
+  becomes the common case.
+- **The test corpus has to reach the mechanism.** Four tokens against a
+  four-slot window never wraps the ring, never fills a compressed cache and
+  never gives the candidate filter two blocks to choose between. Twelve
+  does. §89 was the same lesson about a tokenizer corpus, three commits
+  earlier, and it did not transfer on its own.
+
+## 91. A speculative batch of five reads 3.45 tokens' worth (2026-09-15)
+
+Speculative decoding verifies K draft tokens in one backbone pass, and on a
+GPU that is nearly free — the pass is compute-bound and the K tokens ride
+along in the same matmuls. Here the pass *is* the expert reads, so the
+question is not the acceptance rate on its own. It is the acceptance rate
+against how much the union of K routes grows.
+
+`tools/spec_window.py` over a real `WASTE_DUMP_ROUTE` trace, on the three
+containers this machine has:
+
+| K | Kimi-Linear 48 B, top-8, 26 L | GLM-5.3-Flash 313 B, top-8, 42 L | K3 2.78 T, top-16, 92 L |
+|---|---:|---:|---:|
+| 2 | 85.6% | 85.4% | 84.4% |
+| 3 | 78.1% | 78.1% | 76.2% |
+| 4 | 73.0% | 72.8% | 70.7% |
+| **5** | **68.9%** | **69.0%** | **66.7%** |
+| 8 | 60.8% | 60.9% | 58.5% |
+
+Two orders of magnitude of scale, two different top-k, and the curve agrees
+to a tenth of a point at every K. That is the finding: **the union growth of
+consecutive routes is a property of top-k routing at this sparsity, not of
+any one model.** A number that stable is worth acting on before the model it
+is about has finished downloading.
+
+At K = 5 a batch touches 3.45 times what one token does, so 3.45 of the five
+drafts have to survive for it to read no more per accepted token than plain
+decoding. Σ p^i = 3.45 puts the per-position acceptance that needs at 0.88.
+At three accepted it reads 15% *more*; the best case, all five, saves 31%.
+
+Two things this is the other half of. Gate 0 measured 43.5% next-token
+expert reuse on OLMoE and called it "moderate, not the strong locality the
+literature assumed" — this is the same quantity read forwards, as what a
+batch costs rather than as what a cache saves, and it now has three
+first-party models under it. And §44: `WASTE_XPAR` is worth 1.18x on
+Kimi-Linear and a regression on K3 because "the batch that gives it
+parallelism is the same batch that barriers the read-ahead". Batching is not
+free on this engine at any level, and the reason is the same one twice.
+
+K3's top-16 does slightly better than the two top-8 models — more experts
+per token means more of them shared — which is worth knowing in the other
+direction: a *sparser* router makes speculation worse, and
+DeepSeek-V4.1's top-6 of 384 is sparser than all three.
+
+The gate is deferred rather than refuted (GATES.md gate 9). What DSpark's
+acceptance actually is on this model is not published, the release's own
+inference code says the speculative loop "is out of scope for this repo",
+and it is the one number left. What is settled is everything else: the
+threshold it has to clear, and that a batched CSA2/mHC forward path is the
+price of finding out.
+
+## 92. Four releases of a JSON reader that did not decode JSON (2026-09-15)
+
+DeepSeek-V4.1 loaded, ran, matched its oracle to 0.0025% on the real
+container — and could not tokenize `<｜User｜>`. Markup mode returned
+exactly what plain mode did: `5 30 28217 6756 28217 32`, six tokens of
+prose. `<think>` resolved. Everything else did not.
+
+What separates those two is that `<think>` is ASCII. `specials.json` is
+written by `json.dump`, whose `ensure_ascii` defaults to True, so the file
+holds `"<\uff5cUser\uff5c>"` — and the two readers of it, `js_str` in
+`src/json.h` and `load_specials` in `src/tokenizer.c`, both copied the
+bytes between the quotes. The marker in memory was the eighteen literal
+characters `<\uff5cUser\uff5c>`, and nothing a user could type would ever
+equal it.
+
+The bug shipped in 0.6.0 and survived every release since. The four
+containers that existed — K3, Kimi-Linear, GLM and the synthetic one — all
+spell their control tokens `<|open|>`, `<|endoftext|>`,
+`<|tool_call_begin|>` — ASCII, where an escaping writer and a
+non-decoding reader agree. DeepSeek-V4.1 is the first release here whose
+markup is full-width bars and `▁`, and it found it on contact.
+
+Three things are worth keeping from it.
+
+**A parser is only tested by input it did not write.** Both ends of this
+were ours: `convert.py` escaped, `tokenizer.c` copied, and the round trip
+through our own writer was the only round trip anyone had ever run. It is
+the same failure as §73 — a protocol checked only against itself — one
+layer down, in a file format rather than a wire format. The fix is
+therefore *both* directions and neither alone: the converters now write
+UTF-8, and the reader decodes, because a container from someone else's
+tool may still escape and must still load. `tests/run.sh` builds a
+deliberately escaped container to hold that side down; against the
+previous binary it comes back as 11 tokens instead of 1.
+
+**The failure was silent in the one place it must not be.** The split
+between `waste_tokenize_markup` and `waste_tokenize` is the security
+boundary in CLAUDE.md: content must not be able to write conversation
+structure. With no marker resolving, markup mode *became* plain mode —
+the boundary held, vacuously, by failing closed in the safe direction.
+That is luck, not design, and it is why the run.sh injection check reads
+`markup != plain` and not just `no control ids in plain`. Reading only the
+second half, this release would have passed.
+
+**The visible symptom was somewhere else entirely.** What a person
+actually saw first was the CLI printing
+`<｜end▁of▁sentence｜>` at the end of "The capital of
+France is Paris." — the detokenizer rendering a special's text, which is
+the same corrupted string read from the same file. A rendering artifact at
+the end of a correct generation looks like a cosmetic bug in the printer.
+It was the tokenizer's security boundary, seen from the other side.
+
+## 93. Three checks that were wrong about a correct engine (2026-09-15)
+
+The DeepSeek-V4.1 container converted, matched its oracle to 0.0025% and
+answered "The capital of France is" with " Paris." — and the suite said 4
+failures. Every one of them was the check, not the engine.
+
+- **`tests/run.sh` tested the tokenizer with `grep -q identical`**, and the
+  string `"22914/24021 identical"` contains that word. §89.
+- **`verify_container.py` kept a second copy of how a checkpoint names its
+  experts**, an inline probe for `mlp/gate_proj` falling back to
+  `block_sparse_moe/w1`, while `convert.py` had the same fact in
+  `MOE_LAYOUTS`. DeepSeek-V4.1 is neither, so the checker raised a
+  `KeyError` — into a `2>/dev/null` — and run.sh reported it as the
+  *container* failing to round-trip.
+- **The learned-hotlist check guarded on the wrong quantity.** It asked
+  whether the container's floor fits under its 5G budget. This one's does,
+  at 4.86 GB, which leaves 0.29 GB of expert cache against a 2.97 GB
+  working set — a tenth of one token, where §3 of ENGINE.md says the hit
+  rate is zero and not low. It answered 284 misses → 286 on one run and
+  fewer on the next: a verdict decided by noise.
+
+Plus §92, the escaped `specials.json`, which was a real defect — so the
+board read 4 failures over 1 bug.
+
+**A suite is only exercised by a model it has not seen.** These three sat
+under green boards since 0.6.0 because Kimi-Linear, GLM and K3 all
+satisfy their unstated assumptions: ASCII control tokens, one of two
+expert namings, a working set small enough that 5G is a real cache. None
+of those is a property anything checked; each was a coincidence three
+models shared. The fourth model was the test.
+
+The practical consequence is about *reading* a red board rather than
+writing one. The first instinct on 4 failures against a new architecture
+is that the new architecture is broken, and here that instinct was wrong
+four times out of four — but only because the engine had an independent
+oracle to be right against. Without `ds41_ref.py` saying 0.0025%, there is
+no way to tell a checker bug from an engine bug except by looking, and
+looking is expensive enough that the default assumption usually wins.
+
+Two small rules fall out, both cheap:
+
+**Never swallow a checker's stderr.** `2>/dev/null` on the round-trip
+turned "the checker crashed" into "the container is wrong", which is the
+one substitution that costs the most to undo. `run.sh` now shows it.
+
+**A check with an unstated prerequisite should state it and SKIP.** The
+hotlist check knew how to say "this container's floor is too high"; it
+just did not know that opening is not the same as having room to learn
+anything. Both guards read the same JSON from `waste plan`. The second one
+cost one line.

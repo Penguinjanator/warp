@@ -397,3 +397,34 @@ jobs:
       # the .exe-suffixed checkers, and every Python block that shells out.
       - name: Suite
         run: bash tests/run.sh
+
+  # A required, CPU-only check that the tool protocol serve/glmtools.py
+  # renders is the one GLM's own chat_template.jinja defines — the same
+  # ground-truth rule the K2 template check in tests/run.sh applies, except
+  # this one may not skip. The template is vendored at
+  # tests/serve/glm_upstream/ (provenance in its README.md), so no model
+  # download, no weights, and no machine-local ~/models are involved: the
+  # tokenizer/engine boundary is FakeEngine. CI_GLM_ORACLE_STRICT=1 turns
+  # every skip path in test_glm_upstream.py into a failure and asserts all
+  # three oracle checks ran, so this job cannot be green because it did
+  # nothing. It says nothing about end-to-end model compatibility — the
+  # comparison is renderer vs template, nothing more.
+  glm_upstream_oracle:
+    name: GLM tool protocol vs upstream template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the pinned test dependencies
+        run: pip install -r requirements-test.txt
+      - name: The three oracle checks, no skips allowed
+        env:
+          CI_GLM_ORACLE_STRICT: '1'
+          GLM_DIR: tests/serve/glm_upstream
+        run: |
+          python3 -m unittest tests.serve.test_glm_upstream -v 2>&1 | tee /tmp/oracle.log
+          grep -q "^OK" /tmp/oracle.log
+          ran=$(grep -oE "^Ran [0-9]+ tests?" /tmp/oracle.log | grep -oE "[0-9]+")
+          [ "$ran" = 3 ] || { echo "expected 3 oracle checks, ran $ran"; exit 1; }

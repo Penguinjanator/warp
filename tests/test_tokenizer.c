@@ -34,6 +34,10 @@ int main(int argc, char **argv)
      * `\p{N}{1,3}`. See waste_tok_set_digit_run. */
     const char *drun = getenv("WASTE_TOK_DIGITS");
     if (drun) waste_tok_set_digit_run(t, atoi(drun));
+    /* Same reason, for the release that needs a different pattern rather
+     * than the same one without its Han branch. */
+    const char *pat = getenv("WASTE_TOK_PATTERN");
+    if (pat && *pat) waste_tok_set_pattern(t, atoi(pat));
     for (int a = 2; a < argc; a++) {
         int32_t ids[4096];
         const int n = waste_tok_encode(t, argv[a], ids, 4096, markup);

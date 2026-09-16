@@ -395,6 +395,23 @@ class TestGeneration(EngineTestCase):
         with self.assertRaises(E.EngineError):
             self.engine.generate([], lambda *a: True)
 
+    def test_token_limit_reports_incomplete_generation(self):
+        self.engine.generate(self.engine.tokenize("hello"), lambda *a: True,
+                             temperature=0.0, max_tokens=1)
+        self.assertIn("max_tokens (1)", self.engine._detail())
+
+    def test_cli_reports_token_limit_on_stderr(self):
+        cli = ROOT / ("waste.exe" if os.name == "nt" else "waste")
+        if not cli.exists():
+            self.skipTest("CLI not built")
+        result = subprocess.run(
+            [str(cli), "run", str(self.model), "hello", "--raw", "-n", "1"],
+            capture_output=True, text=True, errors="replace", timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("max_tokens (1)", result.stderr)
+        self.assertIn("larger -n", result.stderr)
+        self.assertNotIn("max_tokens", result.stdout)
+
     def test_stop_token_ends_generation(self):
         """Feed the first token it would produce back as a stop token."""
         first = []
@@ -406,9 +423,10 @@ class TestGeneration(EngineTestCase):
         seen = []
         self.engine.generate(self.engine.tokenize("hello"),
                              lambda t, p, i: seen.append(t) or True,
-                             temperature=0.0, max_tokens=32,
+                             temperature=0.0, max_tokens=1,
                              stop_tokens=[first[0]])
-        self.assertLess(len(seen), 32,
+        self.assertEqual(self.engine._detail(), "")
+        self.assertEqual(len(seen), 1,
                         "generation ran past its stop token")
 
     def test_pieces_reassemble_into_the_detokenized_text(self):

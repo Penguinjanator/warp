@@ -79,9 +79,19 @@ def atomic_json(path, value):
     # one converted anywhere else. Python's text mode translates, the engine
     # parses either, and nothing fails loudly — what breaks is every gate
     # that hashes a container to prove its provenance. #36 gap 2.
+    #
+    # ensure_ascii=False because the default is True and that is how
+    # DeepSeek-V4.1's control tokens — <｜User｜>, ｜DSML｜ — reached a
+    # container spelled "<\\uff5cUser\\uff5c>". Every release before it had
+    # ASCII-only markup, so four of them shipped over a reader that did not
+    # decode JSON escapes (fixed in json.h/tokenizer.c: a container written
+    # by some other tool may still escape, and must still load). Writing the
+    # bytes the file claims to hold costs nothing and makes it greppable.
+    # Containers already converted are unaffected either way; only ones with
+    # non-ASCII specials change bytes, and only DS41 has any.
     tmp = path + ".tmp"
     with io.open(tmp, "w", encoding="utf-8", newline="\n") as out:
-        json.dump(value, out, indent=1)
+        json.dump(value, out, indent=1, ensure_ascii=False)
         out.flush()
         os.fsync(out.fileno())
     os.replace(tmp, path)
@@ -96,6 +106,7 @@ def atomic_text(path, value):
     os.replace(tmp, path)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mxfp4                                                    # noqa: E402
 from mxfp4 import ST, unblock_scale                             # noqa: E402
 
 # --- native VQ encoder (optional; ~15x the torch path) --------------------
@@ -151,6 +162,8 @@ MOE_LAYOUTS = (
     # name        moe segment          gate/up/down source tags
     ("mixtral",   "block_sparse_moe",  ("w1", "w3", "w2")),
     ("deepseek",  "mlp",               ("gate_proj", "up_proj", "down_proj")),
+    # DeepSeek-V4.1 keeps Mixtral's w1/w3/w2 and moves the segment.
+    ("ds41",      "ffn",               ("w1", "w3", "w2")),
 )
 KIND_ORDER = ("gate", "up", "down")
 KINDS = tuple(zip(KIND_ORDER, MOE_LAYOUTS[0][2]))   # default: Mixtral naming
@@ -392,6 +405,151 @@ def glm_normalise(out):
     return out
 
 
+def is_ds41(cfg):
+    """DeepSeek-V4.1-Flash, by the name it gives itself.
+
+    Almost nothing below the MoE is shared with the rest of this family:
+    CSA2 instead of MLA or KDA, mHC scheduled a sublayer ahead of itself,
+    and an n-gram memory at two layers. What it does share is the shape the
+    container is built around — one record per expert, gate/up/down
+    adjacent — and that is the part that decides whether this engine can
+    stream it. See docs/DS41.md."""
+    hf = ((cfg.get("_outer", {}).get("architectures")
+           or cfg.get("architectures") or [""]))[0]
+    return "DeepseekV41" in hf or str(cfg.get("model_type", "")).startswith(
+        "deepseek_v41")
+
+
+# Source name -> the name the engine looks the tensor up by. Everything here
+# is a fixed string on the C side, so a tensor written under its own name is
+# a tensor nothing will ever ask for: the load refuses a container that in
+# fact holds every weight. Same reason as glm_rename.
+#
+# The attention half has no counterpart in the family at all, so these names
+# are ours; they are the ones src/model.c's validate_text_tensors demands,
+# and the two lists have to be read together.
+DS41_ATTN = {
+    "wq_a.weight":                  "q_a_proj.weight",
+    "q_norm.weight":                "q_a_layernorm.weight",
+    "wq_b.weight":                  "q_b_proj.weight",
+    "wkv.weight":                   "kv_proj.weight",
+    "kv_norm.weight":               "kv_layernorm.weight",
+    "wo_a.weight":                  "o_a_proj.weight",
+    "wo_b.weight":                  "o_b_proj.weight",
+    "attn_sink":                    "attn_sink",
+    "compressor.wkv.weight":        "compress.kv_proj.weight",
+    "compressor.wgate.weight":      "compress.gate_proj.weight",
+    "compressor.norm.weight":       "compress.norm.weight",
+    "indexer.wq_b.weight":          "indexer.q_b_proj.weight",
+    "indexer.wk.weight":            "indexer.k_proj.weight",
+    "indexer.k_norm.weight":        "indexer.k_layernorm.weight",
+    "indexer.weights_proj.weight":  "indexer.weights_proj.weight",
+}
+DS41_FFN = {
+    "gate.weight":            "gate.weight",
+    "gate.bias":              "gate.e_score_correction_bias",
+    "gate.bias_vl":           "gate.e_score_correction_bias_vl",
+    "shared_experts.w1.weight": "shared_experts.gate_proj.weight",
+    "shared_experts.w3.weight": "shared_experts.up_proj.weight",
+    "shared_experts.w2.weight": "shared_experts.down_proj.weight",
+}
+# Passed through under their own tail. The mHC mixing parameters are
+# already spelled the way src/model.c looks them up; the Engram table is
+# named so it is recognised and then skipped -- build_trunk writes it with
+# write_engram, a row at a time, into its own file.
+DS41_LAYER = {
+    "hc_attn_fn", "hc_attn_base", "hc_attn_scale",
+    "hc_ffn_fn", "hc_ffn_base", "hc_ffn_scale",
+    "engram.wkv.weight", "engram.q_weight", "engram.k_weight",
+    "engram.embed.weight",
+}
+DS41_TOP = {
+    "embed.weight":   "model.embed_tokens.weight",
+    "norm.weight":    "model.norm.weight",
+    "head.weight":    "lm_head.weight",
+    "image_start":    "model.image_start",
+    "image_end":      "model.image_end",
+    "image_newline":  "model.image_newline",
+}
+
+
+def ds41_rename(name):
+    """One name, renamed. Anything unrecognised comes back unchanged and is
+    then caught by ds41_check_names, which is the half that matters: a typo
+    here writes a tensor under a name nothing reads, and the container is
+    only wrong at load."""
+    if name in DS41_TOP:
+        return DS41_TOP[name]
+    if name.startswith("vision."):
+        return "vision_tower." + name[len("vision."):]
+    if name.startswith("aligner."):
+        return "mm_projector." + name[len("aligner."):]
+    m = re.match(r"layers\.(\d+)\.(.*)", name)
+    if not m:
+        return name
+    L, tail = m.group(1), m.group(2)
+    base = f"model.layers.{L}."
+    if tail == "attn_norm.weight":
+        return base + "input_layernorm.weight"
+    if tail == "ffn_norm.weight":
+        return base + "post_attention_layernorm.weight"
+    if tail in DS41_LAYER:
+        return base + tail
+    if tail.startswith("attn.") and tail[5:] in DS41_ATTN:
+        return base + "self_attn." + DS41_ATTN[tail[5:]]
+    if tail.startswith("ffn.") and tail[4:] in DS41_FFN:
+        return base + "block_sparse_moe." + DS41_FFN[tail[4:]]
+    # Deliberately NOT a catch-all on the `attn.`/`ffn.` prefixes. Renaming
+    # an unrecognised tail produces a name that looks like the others and
+    # that nothing looks up, which is precisely the failure ds41_check_names
+    # is there to catch -- and it cannot catch what has already been given a
+    # plausible new name.
+    return name
+
+
+def ds41_drop_trunk(n_layers):
+    """The DSpark draft head. Three more layers at index n_layers.., with
+    128 routed experts each — 15 GB of bank at VQ3R for a speculative
+    decoder this engine does not have a loop for. Dropped rather than
+    carried: a tensor nothing reads is resident RAM taken from the expert
+    cache, which is the whole budget.
+
+    The vision tower is NOT dropped. It is 485 M parameters, it is left on
+    disk unless a caller asks for it, and without it a later `--reclaim`
+    would mean downloading 510 GB again to add images."""
+    def drop(name):
+        m = re.match(r"mtp\.(\d+)\.", name)
+        return bool(m) or name.startswith("mtp.")
+    return drop
+
+
+def ds41_check_names(names, rename):
+    """Every source name either renames to something the engine knows or is
+    deliberately dropped. Run before a byte is written.
+
+    K3's conversion learned this the expensive way in the other direction —
+    a name the engine could not find cost an hour and a refused container.
+    Here the failure is quieter still: `ds41_rename` returns its input
+    unchanged for anything it does not recognise, so a release that renames
+    one tensor would convert cleanly and refuse at load."""
+    bad = [n for n in names
+           if rename(n) == n and not n.startswith(("mtp.", "model.", "lm_head"))]
+    return sorted(bad)
+
+
+def ds41_normalise(out):
+    """The DeepSeek-V4.1 half of normalise_cfg, in place."""
+    # bos/eos/pad are stated on the wrapper, not on the text config, and the
+    # engine reads its config from the text half. Without this the tokenizer
+    # keeps its positional guess at the eos id — which is right on both Kimi
+    # models by luck of the reserved-block layout and is a guess here.
+    outer = out.get("_outer", {})
+    for k in ("eos_token_id", "bos_token_id", "pad_token_id"):
+        if k not in out and outer.get(k) is not None:
+            out[k] = outer[k]
+    return out
+
+
 def source_prefixes(cfg):
     """(container tensor_prefix, checkpoint layer prefix, inner config).
 
@@ -412,10 +570,15 @@ def source_prefixes(cfg):
     Returns the inner config too, since the same test decides whether there
     is a wrapper to unwrap at all."""
     prefix, src_pfx = "", "model."
-    if "text_config" in cfg:            # K3, GLM and Qwen nest the text model
+    if "text_config" in cfg:       # K3, GLM, Qwen and DS41 nest the text model
         outer = {k: v for k, v in cfg.items() if k != "text_config"}
         cfg = {**cfg["text_config"], "_outer": outer}
-        if is_glm(cfg) or is_qwen(cfg):
+        if is_ds41(cfg):
+            # No wrapper in the tensor names at all: `layers.0.attn.wq_a`,
+            # `embed.weight`, `head.weight`. Nothing to strip and nothing to
+            # publish -- the whole mapping is ds41_rename.
+            src_pfx = ""
+        elif is_glm(cfg) or is_qwen(cfg):
             src_pfx = "model.language_model."
         else:
             prefix, src_pfx = "language_model.", "language_model.model."
@@ -482,6 +645,8 @@ def normalise_cfg(cfg):
             out[canon] = True
     if is_glm(cfg):
         glm_normalise(out)
+    if is_ds41(cfg):
+        ds41_normalise(out)
     return out
 
 
@@ -810,6 +975,64 @@ def write_expert_record(f, layer, eid, cb_base, payloads, scales, shapes,
     f.write(body)
     f.write(b"\0" * pad)
     return blocks
+
+
+def write_engram(st, out_dir, src_name, layer, group=32, bits=4,
+                 chunk_rows=1 << 20):
+    """Stream one Engram hash table into engram-L{layer}.bin.
+
+    Not a trunk tensor and not an expert bank, because it is neither. 384 M
+    rows of 256 values is 98 GB as published and cannot be held; and one
+    token reads 24 rows of it per Engram layer, 144 bytes each, so the
+    access pattern is the embedding table's rather than a bank's. Written as
+    row records — payload then scales, contiguous — so a lookup is ONE
+    pread of one page instead of two of two.
+
+    Returns the manifest entry, or None when the source shard is not there.
+    """
+    if not st.have(src_name):
+        return None
+    rows, dim = st.shape(src_name)
+    if dim % group:
+        raise ValueError(f"{src_name}: dim {dim} is not a multiple of {group}")
+    ng = dim // group
+    row_bytes = dim * bits // 8 + ng * 2
+    path = os.path.join(out_dir, f"engram-L{layer}.bin")
+    tmp = path + ".tmp"
+    scale_name = st.companion(src_name)
+    t0, done = time.time(), 0
+    with open(tmp, "wb") as f:
+        for r0 in range(0, rows, chunk_rows):
+            r1 = min(rows, r0 + chunk_rows)
+            w = st.row_slice(src_name, r0, r1).float()
+            if scale_name is not None:
+                sc = st.row_slice(scale_name, r0, r1)
+                if st.shape(scale_name)[1] * group != dim:
+                    raise ValueError(
+                        f"{scale_name}: {st.shape(scale_name)} does not tile "
+                        f"{(rows, dim)} at group {group}")
+                w = (w.view(r1 - r0, -1, group) *
+                     mxfp4.e8m0_scale(sc).unsqueeze(-1)).view(r1 - r0, dim)
+            q, s, _ = (quantize_q4g(w, group) if bits == 4
+                       else quantize_q8g(w, group))
+            # Interleave back into row records. q is flat bytes in row order
+            # and s is one fp16 per group, so both reshape by row.
+            qb = q.view(r1 - r0, dim * bits // 8)
+            sb = s.view(r1 - r0, ng).view(torch.uint8).view(r1 - r0, ng * 2)
+            f.write(raw_bytes(torch.cat([qb, sb], dim=1).contiguous()))
+            done += r1 - r0
+            el = time.time() - t0
+            print(f"  engram L{layer}: {done}/{rows} rows "
+                  f"({100.0 * done / rows:5.1f}%, {human(f.tell())}, "
+                  f"{done / max(el, 1e-6) / 1e6:.1f} Mrow/s)",
+                  end="\r", flush=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    print(f"  engram L{layer}: {rows} rows x {row_bytes} B = "
+          f"{human(os.path.getsize(path))}" + " " * 24)
+    return {"rows": rows, "dim": dim, "group": group, "bits": bits,
+            "row_bytes": row_bytes, "bytes": os.path.getsize(path)}
 
 
 def bank_is_sound(path, layer, n_exp):
@@ -1235,6 +1458,20 @@ def build_trunk(args, sr, st, existing, manifest_path, drop=None, rename=None,
                 if ".experts." in name or name.endswith(
                         (".weight_packed", ".weight_scale", ".weight_scale_inv")):
                     continue
+                # DeepSeek-V4.1 spells the companion `<x>.scale` beside
+                # `<x>.weight` rather than as a suffix on the weight's own
+                # name, so the suffix test above cannot see it and the
+                # scales would be converted as if they were weights. Tested
+                # against the index rather than by suffix, because GLM ships
+                # a real learned parameter called `hc_attn_scale` and the
+                # last thing that guessed here dropped all ninety of them.
+                if name.endswith(".scale") and (
+                        name[: -len(".scale")] + ".weight") in st.wm:
+                    continue
+                # The Engram tables are 98 GB each and are written by
+                # write_engram, a row at a time, into their own file.
+                if name.endswith(".engram.embed.weight"):
+                    continue
                 if drop and drop(name):
                     continue
                 if not st.have(name):
@@ -1397,6 +1634,58 @@ def build_ple(args, st, names, tindex):
     return tindex
 
 
+def build_engram_meta(src, cfg, out_dir):
+    """engram.json and engram-tokmap.bin: which row a token's n-gram hashes
+    to. Derived from the tokenizer and a fixed RNG rather than shipped, so
+    the container has to carry the derivation — see tools/ds41_engram.py,
+    which also checks it two ways against what the release states."""
+    if not (cfg.get("engram_layer_ids") or []):
+        return
+    try:
+        import ds41_engram
+    except ImportError as e:                                  # pragma: no cover
+        raise SystemExit(f"tools/ds41_engram.py: {e}")
+    doc = ds41_engram.build(src, cfg, out_dir)
+    print(f"engram: {len(doc['layers'])} layer(s), "
+          f"{doc['compressed_vocab_size']} compressed ids, "
+          f"pad -> {doc['pad_id']}")
+
+
+def build_engram(st, out_dir, cfg, bits):
+    """The Engram tables, one file each, or {} when there are none.
+
+    Runs with the trunk pass and not after it: both read tensors that are
+    not experts, so --reclaim treats their shards as the trunk's debt and
+    deletes them the moment the trunk pass ends. Splitting the two would
+    delete 203 GB of table between writing the trunk and reading it.
+
+    Resumable by size, like a bank: 384 M rows is not something to redo
+    because the run after it failed.
+    """
+    out = {}
+    for L in cfg.get("engram_layer_ids") or []:
+        src = f"layers.{L}.engram.embed.weight"
+        if src not in st.wm:
+            continue
+        rows, dim = st.shape(src)
+        row_bytes = dim * bits // 8 + (dim // 32) * 2
+        path = os.path.join(out_dir, f"engram-L{L}.bin")
+        want = rows * row_bytes
+        entry = {"rows": rows, "dim": dim, "group": 32, "bits": bits,
+                 "row_bytes": row_bytes, "bytes": want}
+        if os.path.exists(path) and os.path.getsize(path) == want:
+            print(f"  engram L{L}: {human(want)} already written, keeping it")
+            out[str(L)] = entry
+            continue
+        written = write_engram(st, out_dir, src, L, bits=bits)
+        if written is None:
+            print(f"  engram L{L}: shard not downloaded yet, skipping",
+                  file=sys.stderr)
+            continue
+        out[str(L)] = written
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True,
@@ -1424,6 +1713,11 @@ def main():
     ap.add_argument("--trunk-bits", type=int, default=4, choices=(3, 4, 8),
                     help="bit width for the bulk of the trunk; it is the RAM "
                          "floor, so this is the main lever on cache size")
+    ap.add_argument("--engram-bits", type=int, default=4, choices=(4, 8),
+                    help="DeepSeek-V4.1's n-gram tables: 4 bits is 110 GB of "
+                         "container, 8 is 209. Neither changes what a token "
+                         "reads -- 24 rows per Engram layer, one page each -- "
+                         "so this is disk against precision and nothing else")
     ap.add_argument("--trunk8", action="store_true",
                     help="keep the whole trunk at 8 bits (needs the RAM)")
     ap.add_argument("--skip-trunk", action="store_true",
@@ -1554,11 +1848,52 @@ def main():
     n_exp = cfg.get("num_experts") or cfg.get("n_routed_experts")
     print(f"prefix {prefix!r}  layers {n_layers}  experts {n_exp}")
 
-    # ---- what this converter refuses to guess at, on GLM -----------------
+    # ---- what this converter refuses to guess at -------------------------
     glm = is_glm(cfg)
+    ds41 = is_ds41(cfg)
     drop_trunk = None
     rename = None
     reshape = None
+    if ds41:
+        # Every source name must map onto something the engine looks up, and
+        # this is the only moment that is cheap to check. ds41_rename
+        # returns its input unchanged for anything it does not recognise, so
+        # a release that renamed one tensor would convert in full and refuse
+        # at load — after hours.
+        stray = ds41_check_names([n for n in st.wm
+                                  if ".experts." not in n
+                                  and not n.endswith(".scale")], ds41_rename)
+        if stray:
+            print(f"{len(stray)} tensor(s) in this checkpoint have no name "
+                  f"the engine looks up, and writing them under their own "
+                  f"names would produce a container that refuses to load:\n  "
+                  + "\n  ".join(stray[:12])
+                  + ("\n  ..." if len(stray) > 12 else ""), file=sys.stderr)
+            return 1
+        # And the other direction, which is the one that costs hours when it
+        # is wrong: everything the ENGINE looks up has to be in the
+        # checkpoint, at the shape the config implies. A load refuses on the
+        # first missing name, and by then the conversion has run.
+        import ds41_preflight
+        eg_missing, eg_wrong, eg_exp, eg_n = ds41_preflight.check(args.src)
+        if eg_missing or eg_wrong or eg_exp:
+            print(f"preflight: of {eg_n} tensors the engine will demand, "
+                  f"{len(eg_missing)} are missing and {len(eg_wrong)} have "
+                  f"the wrong shape; {eg_exp} routed-expert tensors are "
+                  f"absent. Not converting.", file=sys.stderr)
+            for nm in eg_missing[:8]:
+                print(f"  missing {nm}", file=sys.stderr)
+            for nm, got, dims in eg_wrong[:8]:
+                print(f"  {nm}: index {got}, engine wants {dims}",
+                      file=sys.stderr)
+            return 1
+        print(f"preflight: {eg_n} named tensors, 0 missing, 0 mismatched")
+        drop_trunk = ds41_drop_trunk(n_layers)
+        # The second routing bias is stated by being there, so say so in the
+        # manifest rather than making the engine probe for a tensor.
+        if any(n.endswith(".ffn.gate.bias_vl") for n in st.wm):
+            cfg["routing_bias_vl"] = True
+        rename = ds41_rename
     if glm:
         # Cross-layer top-k sharing: a "shared" indexer layer reuses the
         # previous full layer's selection instead of running an indexer of
@@ -1695,7 +2030,7 @@ def main():
                      args.entries, args.index_bits, str(dev), args.cb_sample,
                      base, cached_ok))
 
-    tindex = None
+    tindex, engram = None, {}
     if debt is not None:
         reclaim(debt, args.reclaim, ShardDebt.SKIP, "excluded tensors")
         # The trunk pass consumes every tensor that is not an expert, so
@@ -1707,6 +2042,10 @@ def main():
                              drop_trunk, rename, reshape)
         if tindex is None:
             return 1
+        if ds41:
+            engram = build_engram(st, args.out, cfg, args.engram_bits)
+            build_engram_meta(args.src, cfg, args.out)
+            build_engram_meta(args.src, cfg, args.out)
         reclaim(debt, args.reclaim, ShardDebt.TRUNK, "trunk")
 
         # A resumed conversion is holding the shards of every layer an
@@ -1831,7 +2170,8 @@ def main():
     # one src/tokenizer.c implements. See tools/hf_tokenizer.py.
     if not copied_tok and os.path.exists(os.path.join(args.src, "tokenizer.json")):
         import hf_tokenizer
-        text, han_split, tok_specials, digit_run = hf_tokenizer.convert(args.src)
+        text, han_split, tok_specials, digit_run, tok_pattern = \
+            hf_tokenizer.convert(args.src)
         atomic_text(os.path.join(args.out, "tokenizer.model"), text)
         # The engine defaults to the Kimi pattern, so only the other case is
         # written — and it is written, not inferred at load: the difference
@@ -1842,9 +2182,14 @@ def main():
             cfg["tokenizer_han_split"] = False
         if digit_run != 3:
             cfg["tokenizer_digit_run"] = digit_run
-        print(f"tokenizer: re-encoded tokenizer.json"
-              f"{'' if han_split else ' (no Han branch in its pattern)'}"
-              f"{'' if digit_run == 3 else f', {digit_run} digit per piece'}")
+        if tok_pattern != hf_tokenizer.TOKPAT_CL100K:
+            cfg["tokenizer_pattern"] = tok_pattern
+        note = ("" if han_split else " (no Han branch in its pattern)")
+        if tok_pattern != hf_tokenizer.TOKPAT_CL100K:
+            note = f" (pattern {tok_pattern}, not cl100k)"
+        if digit_run != 3:
+            note += f" ({digit_run} digit per piece)"
+        print(f"tokenizer: re-encoded tokenizer.json{note}")
 
     # ---- special tokens --------------------------------------------------
     # tiktoken's rank file holds only ordinary merges; the markup tokens live
@@ -1915,7 +2260,8 @@ def main():
              or cfg.get("architectures") or [""]))[0]
     _arch0 = ("kimi-k3" if "KimiK3" in _hf0 else
               "kimi-linear" if "KimiLinear" in _hf0 else
-              "glm5-next" if "Glm5Next" in _hf0 else "")
+              "glm5-next" if "Glm5Next" in _hf0 else
+              "deepseek-v41" if "DeepseekV41" in _hf0 else "")
     _dst = os.path.join(args.out, "chat.json")
     _name = _tmpl_for.get(_arch0)
     if _name and not os.path.exists(_dst):
@@ -1979,6 +2325,32 @@ def main():
     if vc and qwen:
         # The Qwen tower is not carried (see qwen_drop_trunk), so a
         # vision.json would describe weights this container does not hold.
+        vc = None
+    if vc and ds41:
+        # A third tower, and the engine has to be told which. It shares a
+        # block shape with the other two and nothing else: no learned
+        # position grid and no q/k norms, a 2D rotation that pairs each
+        # head's halves rather than its adjacent elements, one fused weight
+        # for gate and up, and a projector that is a 3x3 pixel-unshuffle
+        # into two dense layers where GLM has a Conv2d and a gated merger.
+        #
+        # `max_image_tokens` is a budget in LLM TOKENS, not in patches: an
+        # image costs n_h * (n_w + 1) + 2 of them, one newline per row and
+        # two delimiters, and that is what has to fit.
+        vj = {k: v for k, v in vc.items() if not k.startswith("_")}
+        vj["tower"] = "ds41"
+        vj["out_hidden_size"] = cfg["hidden_size"]
+        vj["media_placeholder_token_id"] = \
+            cfg.get("image_token_id") or cfg.get("_outer", {}).get("image_token_id")
+        # nn.RMSNorm's default, as in the release's vision.py — stated here
+        # so the oracle reads the same number the engine compiles in.
+        vj.setdefault("rms_norm_eps", 1e-6)
+        vj.setdefault("rope_theta", 10000.0)
+        atomic_json(os.path.join(args.out, "vision.json"), vj)
+        print(f"vision: {vj.get('num_hidden_layers', '?')}-layer DeepSeek "
+              f"tower, patch {vj.get('patch_size', '?')}, downsample "
+              f"{vj.get('downsample_ratio', '?')}, "
+              f"max {vj.get('max_image_tokens', '?')} LLM tokens")
         vc = None
     if vc and glm:
         # Two towers, and the engine has to be told which. They agree on
@@ -2069,6 +2441,8 @@ def main():
             tindex = build_ple(args, st, list(sr.names()), tindex)
         if debt is not None:
             reclaim_ple_if_complete(debt, args.reclaim, tindex)
+    if ds41 and not engram:
+        engram = build_engram(st, args.out, cfg, args.engram_bits)
     trunk_path = os.path.join(args.out, "trunk.bin")
     trunk_tmp = trunk_path + ".tmp"
 
@@ -2084,6 +2458,7 @@ def main():
             "kimi-linear" if "KimiLinear" in _hf else
             "glm5-next" if "Glm5Next" in _hf else
             QWEN_TEXT_TYPE if qwen else
+            "deepseek-v41" if "DeepseekV41" in _hf else
             _hf or cfg.get("model_type", "unknown"))
 
     man_cfg = normalise_cfg(cfg)
@@ -2114,6 +2489,11 @@ def main():
         "layers": manifest_layers,
         "trunk": tindex,
     }
+    # One entry per Engram layer, naming the file the engine preads rows
+    # from. Absent on every other container, and absent here when the
+    # release has no Engram, which is what the engine tests.
+    if engram:
+        manifest["engram"] = engram
     # A manifest that lists fewer expert layers than the one it replaces
     # publishes a container the engine will refuse to open, and the banks it
     # drops are still on disk taking up room. Never intended; say so.

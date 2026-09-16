@@ -136,6 +136,13 @@ class TestLoad(Base):
         vocabulary. Serving it would answer plausibly and wrongly."""
         self.refuses(CHATML, contains="<|im_start|>")
 
+    def test_stop_marker_absent_from_role_strings_is_validated(self):
+        raw = json.loads(SHIPPED.read_text())
+        raw["stop"] = "<|separate_stop|>"
+        fmt = self.load(raw, markers={**LINEAR_MARKERS, 99: "<|separate_stop|>"})
+        self.assertEqual(fmt.stop_id, 99)
+        self.refuses(raw, contains="<|separate_stop|>")
+
     def test_a_missing_file_says_so(self):
         self.refuses(None, contains="no chat.json")
 
@@ -259,6 +266,7 @@ class TestRender(Base):
                      response_format={"type": "json_object"})
 
     def test_a_tool_result_turn(self):
+        self.fmt = self.load(SHIPPED, markers=KIMI_K2_MARKERS)
         segs = self.render([
             {"role": "tool", "content": "42", "tool_call_id": "a"}
         ])
@@ -272,6 +280,7 @@ class TestRender(Base):
 
     def test_a_named_tool_result_turn(self):
         """The name the client sends is the name the turn opens with."""
+        self.fmt = self.load(SHIPPED, markers=KIMI_K2_MARKERS)
         segs = self.render([
             {"role": "tool", "content": "42", "tool_call_id": "a",
              "name": "get_weather"}
@@ -283,6 +292,7 @@ class TestRender(Base):
         self.assertIn("## Return of a\n42", rendered)
 
     def test_an_assistant_turn_carrying_tool_calls(self):
+        self.fmt = self.load(SHIPPED, markers=KIMI_K2_MARKERS)
         segs = self.render([
             {
                 "role": "assistant",
@@ -693,3 +703,37 @@ class TestKimiK2ToolParser(unittest.TestCase):
         )
 
         self.assertIn(0, delta.tool_calls)
+
+    def test_kimi_tool_call_without_arguments_marker(self):
+        p = self.parser()
+
+        self.feed(p, [
+            (1002, "<|tool_calls_section_begin|>"),
+            (1004, "<|tool_call_begin|>"),
+            (2001, "functions.get_time:0"),
+            (1006, "<|tool_call_end|>"),
+            (1003, "<|tool_calls_section_end|>"),
+            (1001, "<|im_end|>"),
+        ])
+
+        self.assertEqual(len(p.tool_calls), 1)
+        call = p.tool_calls[0]
+        self.assertEqual(call.name, "get_time")
+        self.assertEqual(call.index, 0)
+        self.assertEqual(call.json_block, "")
+
+    def test_kimi_tool_call_stream_ended_in_header(self):
+        p = self.parser()
+
+        self.feed(p, [
+            (1002, "<|tool_calls_section_begin|>"),
+            (1004, "<|tool_call_begin|>"),
+            (2001, "functions.get_time:0"),
+        ])
+        p.finish()
+
+        self.assertEqual(len(p.tool_calls), 1)
+        call = p.tool_calls[0]
+        self.assertEqual(call.name, "get_time")
+        self.assertEqual(call.index, 0)
+        self.assertEqual(call.json_block, "")

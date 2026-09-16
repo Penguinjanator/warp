@@ -21,6 +21,10 @@ error, and output-space relative error on Gaussian activations (a proxy —
 true calibration needs real activations, which needs a CUDA box).
 
   uv run --with torch python tools/quant_lab.py --model /Volumes/WasteDisk/kimi-linear
+
+`--npy` takes a [E, out, in] f32 stack instead of a checkpoint, which is how
+gate 8 fed it eight DeepSeek-V4.1-Flash experts pulled over HTTP range
+requests (`tools/hf_peek.py`) rather than downloading a 7.4 GB shard.
 """
 
 import argparse
@@ -182,6 +186,7 @@ def errors(W, R, n_act=256, seed=0):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="/Volumes/WasteDisk/kimi-linear")
+    ap.add_argument("--npy", help="[E, out, in] f32 stack, instead of --model")
     ap.add_argument("--layer", type=int, default=1)
     ap.add_argument("--mat", default="w1", choices=("w1", "w2", "w3"))
     ap.add_argument("--experts", type=int, default=32)
@@ -193,14 +198,25 @@ def main():
 
     global VQ_SAMPLE
     VQ_SAMPLE = args.kmeans_sample
-    W = load_experts(args.model, args.layer, args.mat, args.experts)
-    E, M, N = W.shape
-    print(f"layer {args.layer} {args.mat}: {E} experts, {M}x{N} each "
-          f"({E*M*N/1e6:.1f} M params)\n")
+    if args.npy:
+        import numpy as np
+        W = torch.from_numpy(np.load(args.npy)).float()
+        E, M, N = W.shape
+        # A source that is itself quantized has a countable alphabet, and its
+        # size is the single most informative thing about what is left to
+        # lose — see gate 8, where 94 M parameters held 28 distinct values.
+        print(f"{args.npy}: {E} experts, {M}x{N} each ({E*M*N/1e6:.1f} M params), "
+              f"{len(torch.unique(W))} distinct values\n")
+    else:
+        W = load_experts(args.model, args.layer, args.mat, args.experts)
+        E, M, N = W.shape
+        print(f"layer {args.layer} {args.mat}: {E} experts, {M}x{N} each "
+              f"({E*M*N/1e6:.1f} M params)\n")
 
     schemes = [
         ("rtn4-row",  lambda w: rtn_group(w, 4, 0)),
         ("rtn4-g128", lambda w: rtn_group(w, 4, 128)),
+        ("rtn4-g32",  lambda w: rtn_group(w, 4, 32)),
         ("rtn3-g64",  lambda w: rtn_group(w, 3, 64)),
         ("rtn2-g64",  lambda w: rtn_group(w, 2, 64)),
         ("vq2",       lambda w: vq_residual(w, 2)),

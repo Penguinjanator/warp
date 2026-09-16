@@ -22,6 +22,8 @@ those are the ones to quote.
 | 4 | engine correctness | ✅ all three steps passed 2026-07-27 |
 | 6 | is per-expert bit allocation a real lever? | ❌ run 2026-07-29 — refuted, nothing to allocate |
 | 7 | is the budget resolver's quantum still a working set? | ❌ run 2026-08-23 — refuted, the quantum stands |
+| 8 | DeepSeek-V4.1-Flash: does 3-bit VQ survive an fp4 source? | ✅ run 2026-09-15 — 19.95%, indistinguishable from K3 |
+| 9 | is speculative decoding worth its bytes on a streaming MoE? | ⏸ run 2026-09-15 — break-even is 3.45 of 5, and the deciding number needs the model |
 
 ## Gate 0 — does the trace→simulate methodology work, and what does real
 ## batch-1 routing look like? ✅ PASSED (with a sobering data point)
@@ -403,3 +405,135 @@ physical RAM, not a cache size, and the largest arm here reached only ~66% of
 RAM where the 64 GB machine was still healthy at ~72%. `cache=70000` would be
 the arm that actually tests it. Not run, and worth running either way — §63
 says what each outcome would mean.
+
+## Gate 8 — does 3-bit VQ survive DeepSeek-V4.1-Flash's fp4 experts?
+## ✅ RUN 2026-09-15 — yes, at 19.95%, and the download is approved
+
+*Protects:* a 510 GB download and a ~320 GB conversion, plus the C work
+behind CSA2, single-pass mHC and Engram.
+
+*The arithmetic first,* in [DS41.md](DS41.md): shapes read out of the
+checkpoint's own safetensors headers over HTTP range requests, so nothing in
+it is inferred from the config. It says the model is a **better** fit for
+this engine than K3 — a 3.19 GB per-token working set, within 1% of
+GLM-5.3-Flash's, on a 204 GB bank; 4.9 GB of resident trunk; 890 bytes of KV
+per token. Projected 1.5–2.5 tok/s.
+
+*What the arithmetic could not answer:* gate 3 measured 3-bit VQ against
+**bf16** experts. This release ships its routed experts already quantized —
+fp4 e2m1, two per byte, one ue8m0 scale per 32 inputs per row — so a WASTE
+container re-quantizes an already-lossy tensor, and two lossy steps compound.
+
+*Test:* `tools/hf_peek.py` reads individual tensors out of the repo over HTTP
+range requests. Eight experts of `layers.0.w1`, eight of `layers.0.w2` and
+eight of `layers.20.w1` — 283 M parameters, **190 MB fetched out of 510 GB**,
+under four minutes — dequantized to f32 and handed to
+`tools/quant_lab.py --npy`.
+
+| | rtn4-g128 | rtn4-g32 | vq2 | **vq3** | vq4 |
+|---|---:|---:|---:|---:|---:|
+| bits/weight | 4.12 | 4.50 | 2.00 | **3.00** | 4.00 |
+| L0 `w1` | 12.24% | 10.27% | 33.69% | **19.97%** | 11.96% |
+| L0 `w2` | 12.17% | 10.23% | 34.77% | **20.74%** | 12.42% |
+| L20 `w1` | 12.12% | 10.21% | 33.66% | **19.95%** | 11.93% |
+
+Output error on Gaussian activations tracks weight error within 0.2 points
+everywhere, so nothing in the structure of these tensors defeats the proxy.
+
+*Verdict: passed, and it is not even a new result.* §23 of
+[LEARNED.md](LEARNED.md) already recorded that "a K3 expert costs 20.3% at 3
+bits from MXFP4"; K3 ships fp4 too. This model lands at 19.95–20.74% on its
+own weights. The fp4 source costs nothing extra — 3-bit VQ is 3-bit VQ, and
+the gate's worry was unfounded in a way that is now measured rather than
+argued. **The container is written at VQ3R, 204 GB, and the download is
+approved.**
+
+Three things the gate produced that it was not asked for:
+
+- **The alphabet is tiny.** 94 M parameters of `layers.0.w1` hold **28
+  distinct values**, because the ue8m0 scales take only four or five values
+  across a whole matrix — 96.6% of the blocks in that tensor share two
+  exponents. The weights are fp4 in name and very nearly a single global
+  grid in fact.
+- **Which puts their entropy at 3.74 bits/weight** — 2.86 for the magnitude
+  plus a near-balanced sign on the 88.2% that are nonzero. VQ3R stores 3.00
+  and loses 20%; a *lossless* container exists at 4.25 bits (289 GB) and a
+  4.53 GB/token working set. Not chosen: §20's exchange rate says the extra
+  85 GB of bank buys less than the hit rate it costs. Worth revisiting only
+  if the oracle diff at stage 5 says 20% is too much here, which is not what
+  it said on K3.
+- **rtn4-g32 is the cheapest thing that beats vq3** and it is 50% larger.
+  There is no scheme between them, same as everywhere else in this family.
+
+*Method note worth keeping.* The expensive part of a feasibility gate on a
+published model is usually the download, and a safetensors header states
+every tensor's byte range. Eight experts is 190 MB. `tools/hf_peek.py` is
+that, generalized, and it should be the first thing pointed at the next
+release rather than `huggingface-cli download`.
+
+## Gate 9 — is speculative decoding worth its bytes here?
+## ⏸ RUN 2026-09-15 — break-even is 3.45 of 5 drafts, on three models
+
+*Protects:* DSpark. Three drafter blocks, a Markov head, a confidence head,
+a scheduler, 5.1 GB more bank, and — the expensive part — a BATCHED forward
+path for CSA2 and mHC, which this engine does not have and which is exactly
+where single-pass mHC's shifted dependency and the compressor's per-step
+state make batching awkward.
+
+*The premise speculation rests on, and where it does not hold.* Verifying K
+draft tokens in one backbone pass is nearly free on a GPU: the pass is
+compute-bound and the K tokens ride along in the same matmuls. Here the pass
+IS the expert reads. A K3 decode token pulls 17 GB off disk; verifying five
+of them pulls the union of five routes, and a top-k router gives consecutive
+tokens only a fraction of their experts in common.
+
+*Test:* `tools/spec_window.py` over a real `WASTE_DUMP_ROUTE` trace — for
+each K, the distinct (layer, expert) records a window of K consecutive
+decode tokens touches, against K times what one touches. Run on three
+containers already on disk, 48 generated tokens each (20 on K3).
+
+| K | Kimi-Linear 48 B, top-8, 26 L | GLM-5.3-Flash 313 B, top-8, 42 L | K3 2.78 T, top-16, 92 L |
+|---|---:|---:|---:|
+| 2 | 85.6% | 85.4% | 84.4% |
+| 3 | 78.1% | 78.1% | 76.2% |
+| 4 | 73.0% | 72.8% | 70.7% |
+| **5** | **68.9%** | **69.0%** | **66.7%** |
+| 8 | 60.8% | 60.9% | 58.5% |
+
+Three models, two orders of magnitude of scale, two different top-k, and the
+curve agrees to a tenth of a point at every K. **It is a property of top-k
+routing at this sparsity and not of any one model**, which is what makes it
+worth acting on before DeepSeek-V4.1's own trace exists.
+
+*What it means.* At DSpark's block size of five, a batch touches 3.45x what
+one token does. So **3.45 of the 5 drafts must be accepted for the batch to
+read no more per accepted token than plain decoding**; at 3 accepted it
+reads 15% more, and the best case — all five — saves 31%. Solving
+Σ p^i = 3.45 puts the per-position acceptance it needs at about **0.88**.
+
+K3's top-16 does slightly better than the two top-8 models, as more experts
+per token means more of them shared. DeepSeek-V4.1 routes top-6 of 384,
+sparser than all three, so its break-even is the same or worse.
+
+*Verdict: deferred, not refuted, and the deciding number is not ours.* What
+DSpark's acceptance actually is on this model is not published and cannot be
+measured until the container exists — it is the one number that decides
+this, and everything else about the gate is settled. Stage 6 first.
+
+*Kill criterion:* measured acceptance under 3.45 of 5 on a real prompt set.
+*Revival criterion:* over 4 of 5, which is a 14% saving in bytes and would
+justify the batched path.
+
+One thing the counting does not capture, and it favours speculation: a
+rejected draft's experts stay in the cache, so the next batch may find them
+warm. The other direction is not captured either — the drafter's own MoE,
+128 experts top-3 over three blocks, adds about 4% of a batch's reads. Both
+are small against a factor of 3.45.
+
+*Method note.* The release's own `inference/model.py` implements DSpark's
+forward pass and says plainly that "the speculative-decoding loop itself is
+out of scope for this repo". Building it here would have meant inventing the
+accept/reject policy from the tech report and then measuring it. The tech
+report also says the scheduler picks the verification length from "profiled
+engine throughput curves" — on this engine that curve is the table above,
+and it says the length should be short.

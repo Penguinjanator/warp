@@ -18,6 +18,7 @@
 #include <stdio.h>
 
 #include "ecache.h"
+#include "tokenizer.h"
 
 /* Public image requests are decoded before resize.  Keep the source-image
  * allocation finite so the memory planner can include its true worst case. */
@@ -126,6 +127,10 @@ typedef struct {
      * such branch and its containers say so. */
     int   tok_han_split;
     int   tok_digit_run;    /* digits per pre-token: 3 (default) or 1     */
+    /* WASTE_TOKPAT_*: which pre-tokenization pattern the release splits
+     * with. 0 = cl100k, which is every container written before
+     * DeepSeek-V4.1 and the only one tok_han_split means anything for. */
+    int   tok_pattern;
     /* generation_config.json's eos_token_id, mirrored into the container
      * config. The tokenizer used to derive this positionally as
      * base_vocab + 2, which is right on both Kimi models by luck of the
@@ -135,6 +140,55 @@ typedef struct {
      * themselves model_type "kimi_linear", so this is the only field that
      * tells them apart by name rather than by feature. */
     char  arch[64];
+
+    /* --- DeepSeek-V4.1-Flash (0/absent on every other container) -------- */
+    /* Set from `arch`. Everything below is read only when it is, and the
+     * engine's MLA/KDA paths are not reachable on such a container: CSA2 is
+     * a third attention, not a variant of either. */
+    int   ds41;
+    /* mHC, but each sublayer's mixing projection produces the `pre` the
+     * NEXT one collapses with, instead of the one it uses itself. Layer 0's
+     * attention starts from a one-hot, and the final collapse before the
+     * head is the last FFN's `pre` rather than hc_head's unweighted mean. */
+    int   hc_single_pass;
+    /* CSA2. One KV vector per token, `head_dim` wide, shared by every head;
+     * the output projection is low-rank AND block-diagonal over o_groups,
+     * so wo_a is [groups][o_lora][n_heads * head_dim / groups]. */
+    int   head_dim, o_groups, o_lora;
+    int   window;                    /* sliding-window KV slots, 128       */
+    /* Per layer: 0 = window only, r = this layer reads KV compressed r-to-1.
+     * A layer compresses its own only when kv_source says so; the rest read
+     * the most recent source's cache, which is what makes the whole model
+     * cost 890 bytes of KV per token. */
+    int8_t compress_ratio[WASTE_MAX_LAYERS];
+    int8_t kv_source[WASTE_MAX_LAYERS], index_source[WASTE_MAX_LAYERS];
+    /* Two-level indexing: cand_source keeps the best cand_topk_blocks blocks
+     * of cand_block compressed positions, and every later indexer scores
+     * only inside them. -1 = one level. */
+    int   cand_source, cand_topk_blocks, cand_block;
+    /* A compressed latent stands for compress_ratio tokens, so its positions
+     * are further apart and it rotates at its own theta -- with YaRN, where
+     * the window-only layers have none. att_mul stays 1 on both: this
+     * release applies no mscale to the attention scale. */
+    float compress_rope_theta;
+    float compress_inv_freq[WASTE_MAX_ROPE_HALF];
+    int   attn_sink;                 /* one learned fp32 scalar per head   */
+    /* Router score function. 0 = sigmoid (every Kimi and GLM container),
+     * 1 = softmax, 2 = sqrt(softplus(x)), which is unbounded above and is
+     * why norm_topk_prob divides by the sum with a fixed 1e-20. */
+#define WASTE_SCORE_SIGMOID 0
+#define WASTE_SCORE_SOFTMAX 1
+#define WASTE_SCORE_SQRTSOFTPLUS 2
+    int   score_func;
+    int   route_bias_vl;             /* a second selection bias, for image spans */
+    /* Engram: an n-gram hash lookup added into the residual stream at a few
+     * layers. The tables are 197 B parameters and stay on disk -- 24 rows
+     * per layer per token, one page each. */
+#define WASTE_MAX_ENGRAM 8
+    int     engram_n;
+    int8_t  engram_layer[WASTE_MAX_LAYERS];   /* 1 + its index, 0 = none   */
+    int     engram_ngram, engram_heads, engram_head_dim;
+    int64_t engram_rows[WASTE_MAX_ENGRAM];
 
     /* --- rotary -------------------------------------------------------- */
     /* The Kimi models set mla_use_nope and are the reason this was absent:
@@ -187,7 +241,8 @@ typedef struct {
  * 2D rope only, per-head q/k norms, biases everywhere, a clamped SwiGLU, a
  * two-slot temporal patch and a gated merger. vision.json names it, and a
  * file without the key is K3's — every container written before this one. */
-typedef enum { WASTE_TOWER_K3 = 0, WASTE_TOWER_GLM = 1 } waste_tower;
+typedef enum { WASTE_TOWER_K3 = 0, WASTE_TOWER_GLM = 1,
+               WASTE_TOWER_DS41 = 2 } waste_tower;
 
 typedef struct {
     int hidden, heads, qkv_hidden, inter, layers;
@@ -205,6 +260,8 @@ typedef struct {
     float swiglu_limit;
     int   img_start, img_end;    /* the ids an image block is wrapped in   */
     int   min_tokens;            /* the release's floor on an image's cost */
+    /* --- DeepSeek-V4.1's tower (0 elsewhere) ---------------------------- */
+    float rope_theta;            /* the 2D rotation's base, 10000           */
 } waste_vision_cfg;
 
 typedef struct {
@@ -273,6 +330,52 @@ typedef struct {
                                       * MLA query is still living in       */
     float *idxscore;                 /* one score per candidate pool         */
     int   *idxrank;                  /* its top-k scratch                    */
+    /* --- CSA2 state (DeepSeek-V4.1) ------------------------------------
+     *
+     * Every layer keeps a sliding window of raw KV as a ring of `window`
+     * slots — 128 x 512 floats, constant in context. Only the four
+     * kv_source layers keep the compressed caches; the thirty-six others
+     * read whatever the last source published, which is where the model's
+     * 890 bytes of KV per token come from.
+     *
+     * f32 here against the release's fp4/fp8. That is 8x its number and
+     * still small: 890 B/token becomes ~7 KB, so a 128 K context costs
+     * under a gigabyte, against the 27 GB of latents K3 would want. */
+    float *winkv[WASTE_MAX_LAYERS];   /* [window][head_dim], a ring       */
+    float *ckvc[WASTE_MAX_LAYERS];    /* [kv_cap/ratio][head_dim]         */
+    float *ikey[WASTE_MAX_LAYERS];    /* [kv_cap/ratio][index_dim]        */
+    /* The tail of a group still filling up: `ratio` (kv, gate score) pairs,
+     * carried across decode steps because a latent is only published when
+     * its group completes. */
+    float *cpool[WASTE_MAX_LAYERS];   /* [ratio][2 * head_dim]            */
+    int    n_lat[WASTE_MAX_LAYERS];   /* latents published by this source */
+    /* What a source published, for the layers between it and the next. One
+     * slot each: layers run in order and every source writes before its
+     * consumers read, so nothing needs resetting between steps. */
+    const float *cur_ckv, *cur_ikey;
+    int    cur_nlat, cur_ratio;
+    int   *csel;                      /* compressed positions this step keeps */
+    int    csel_n;
+    float *cscore;                    /* a score per compressed position,
+                                       * then the per-block maxima          */
+    uint8_t *cand;                    /* candidate-block mask               */
+    const float **csa_kv;             /* what one step attends over          */
+    float *csa_q, *csa_o, *csa_lat, *csa_score;
+    /* --- Engram ---------------------------------------------------------
+     * The tables are on disk in their own files; what is here is the
+     * hashing that addresses them and one row's worth of scratch. */
+    int      eg_fd[WASTE_MAX_ENGRAM];
+    int64_t  eg_rows[WASTE_MAX_ENGRAM];
+    int      eg_rowbytes[WASTE_MAX_ENGRAM], eg_bits[WASTE_MAX_ENGRAM];
+    int      eg_group[WASTE_MAX_ENGRAM];
+    int64_t *eg_prime[WASTE_MAX_ENGRAM], *eg_off[WASTE_MAX_ENGRAM];
+    int64_t *eg_mult[WASTE_MAX_ENGRAM];
+    int32_t *eg_map;                  /* token id -> compressed id         */
+    int      eg_map_n, eg_pad;
+    int32_t *eg_hist;                 /* [kv_cap] compressed ids, -1 = dead */
+    uint8_t *eg_raw;                  /* one table row, as stored          */
+    float   *eg_row, *eg_kv, *eg_key; /* dequantized row, wkv output, keys */
+
     /* mHC scratch: the flattened stream vector the mapping reads, and the
      * collapsed single stream the sublayer runs on. */
     float *hcflat, *hccol, *hcmix;
@@ -475,6 +578,10 @@ int waste_vision_encode(waste_model *m, const float *pixels, int h, int w,
 /* GLM-5.3-Flash's tower. Same contract — patches in, one merged embedding
  * per merge block out — and a different network inside; see vision.c.
  * `pixels` is [h*w][3 * temporal * patch * patch] in block-major order. */
+/* DeepSeek-V4.1's: writes the whole image SPAN, delimiters included, so
+ * the engine's media queue stays one row per placeholder. */
+int waste_vision_encode_ds41(waste_model *m, const float *pixels, int gh,
+                             int gw, float *out);
 int waste_vision_encode_glm(waste_model *m, const float *pixels, int h, int w,
                             float *out);
 int waste_vision_available(const waste_model *m);
@@ -489,6 +596,14 @@ int waste_image_size(const char *path, int *w, int *h);
 /* GLM's preprocessing: a different grid rule and a different patch order,
  * both stated by the release. Returns [gh*gw][3 * temporal * patch^2] in
  * block-major order over merge blocks; the caller frees. */
+/* DeepSeek-V4.1's: the image is contained and grey-padded rather than
+ * stretched, and the grid is budgeted in LLM tokens rather than patches.
+ * waste_image_plan_ds41 is the geometry on its own, so an oracle can be
+ * asked the same question. */
+void   waste_image_plan_ds41(int sw, int sh, const waste_vision_cfg *v,
+                             int *bh, int *bw, int *nh, int *nw);
+float *waste_image_load_ds41(const char *path, const waste_vision_cfg *v,
+                             int *out_gh, int *out_gw);
 float *waste_image_load_glm(const char *path, const waste_vision_cfg *v,
                             int *out_h, int *out_w);
 float *waste_image_load(const char *path, int max_patches,

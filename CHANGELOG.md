@@ -8,6 +8,254 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
+## 0.8.0 — 2026-09-15
+
+**DeepSeek-V4.1-Flash runs.** 552 B backbone plus 197 B of n-gram memory,
+510 GB as published, converted to a 299 GiB container and decoding at
+**3.77 tok/s over 64 tokens** on a 64 GB laptop — faster than
+GLM-5.3-Flash on a bank twice the size, and above the 1.5–2.5 that
+[docs/DS41.md](docs/DS41.md) projected before the download started. Against
+a PyTorch oracle reading the same container: 0.0025% relative L2, top-5
+identical.
+
+It is a fourth architecture rather than a variant of the three already
+here — CSA2, Engram, single-pass mHC, a third router score function, a
+third pre-tokenizer and a third prompt format — and bringing it up found
+defects in all of them. The one that matters outside this release is the
+JSON reader: `specials.json` had been read without decoding JSON escapes
+since 0.6.0, which no ASCII-marked container could notice.
+
+The other theme is a continuation of 0.7.2's. That release was about tests
+that compare a thing to itself; this one is about tests that are wrong
+about a thing that is right. The suite reported four failures against a
+correct engine, three of which were the check — see LEARNED §79 — and each
+had been green since 0.6.0 because three models happened to share an
+assumption nothing had written down.
+
+No ABI move: `src/waste.h` changes only its version macros.
+
+### Added
+
+- **`tools/hf_peek.py`** — read individual tensors out of a HuggingFace
+  safetensors repo over HTTP range requests, dequantizing E2M1/E4M3 against
+  an E8M0 scale stream. Gate 8 needed 24 experts out of 48 shards and cost
+  **190 MB of 510 GB**. `tools/quant_lab.py` grew `--npy` to take the
+  result. LEARNED §74.
+- **The DeepSeek-V4.1 pre-tokenizer** in `src/tokenizer.c`, selected by
+  `tokenizer_pattern` in the manifest and `waste_tok_set_pattern`. Three
+  isolating Splits in sequence rather than one pattern, punctuation and
+  symbols as classes of their own, and no contraction branch.
+  `tools/hf_tokenizer.py` recognizes it and refuses anything else, as
+  before.
+- **`tools/gen_unicode.py` and `src/unicode_classes.h`** — `\p{L}`,
+  `\p{M}`, `\p{N}`, `\p{P}`, `\p{S}` as generated range tables instead of
+  hand-written blocks. 30 KB of rodata, binary searched.
+- **`tools/tokdiff.py --wide N`** — a randomized corpus over the whole
+  codepoint space plus multi-byte whitespace runs, and a `tests/run.sh`
+  check that runs it.
+- **The DeepSeek-V4.1 container format and converter.** `waste_config`
+  gains CSA2 (`head_dim`, `o_groups`, `o_lora_rank`, `sliding_window`,
+  `compress_ratios`, `kv_source_layer_ids`, `index_source_layer_ids`,
+  `candidate_*`, `compress_rope_theta`), single-pass mHC, a third router
+  score function (`sqrtsoftplus`) with a second selection bias for image
+  spans, and Engram. `cfg_sane` bounds all of it, including the invariant
+  that a compressing layer's ratio matches the last KV source's — a
+  mismatch is not a shape error anywhere, it just divides the position by
+  the wrong number.
+- **Two rope schedules.** The window-only layers rotate at `rope_theta`
+  with YaRN off and the compressed ones at `compress_rope_theta` with it
+  on. This release states no `mscale`, so the shared `rope_init` would
+  refuse it — and writing the two keys in to get past that check would put
+  a 1.63x on the attention scale the model was not trained with.
+- **`tools/ds41_engram.py`** — the compressed token map, the bucket primes
+  and the hash multipliers, none of which is in the checkpoint. Checked two
+  ways against what the release states: the map came out 99,092 ids against
+  a stated 99,092, and the primes summed to 384,006,168 and 384,016,682
+  against the two stated row counts.
+- **`engram-L{n}.bin`**, streamed a chunk of rows at a time, because the
+  two tables are 98 GB each and 40% of the download. `--engram-bits` is 4
+  (110 GB) or 8 (209 GB); neither changes what a token reads.
+- **`make_test_container.py --ds41`** and `tests/test_convert_ds41.py`.
+  The container opens, and one missing `attn_sink` is refused by name —
+  a per-head temperature whose absence a forward-pass diff would show only
+  as drift.
+
+- **The DeepSeek-V4.1 forward pass**, text only. CSA2 (a sliding window of
+  raw KV and up to `index_topk` compressed positions in one softmax, an
+  attention sink per head, the query's rotation removed from the output,
+  and an output projection that is low-rank *and* block-diagonal over
+  `o_groups`), single-pass mHC, Engram at two layers, and the
+  sqrt-softplus router. **0.000018% relative L2** against
+  `tools/ds41_ref.py`, which reads the same container — so that is
+  arithmetic and not quantization — and the same on the residual stream
+  after every layer. Chunked prefill is bit-identical to the sequential
+  path, as on GLM.
+- **`tools/ds41_ref.py`**, the oracle, and a `tests/run.sh` check that runs
+  it over twelve tokens. Twelve because the test container's window is four
+  slots: below five tokens the ring never wraps, no compressed cache fills,
+  and the candidate filter has nothing to choose between. LEARNED §76 is
+  about the two bugs that found — one in the engine, one in the oracle.
+
+- **`serve/dsml.py`** — DeepSeek-V4.1's prompt format and its reply reader,
+  wired into the server ahead of the `chat.json` fallback and behind XTML.
+  A numeric reasoning effort (1–100, with low/high/max mapping onto
+  50/75/100), `<think>` channels, `<｜DSML｜ calls>` tool markup,
+  mid-conversation system turns, `<tool_result>` blocks in place of a
+  `tool` role, and the six internal task tokens.
+
+  Diffed against `encoding/encoding.py`, the release's five checked-in
+  golden outputs included, by `tests/serve/test_dsml_upstream.py` when
+  `DS41_DIR` names a release. `tests/serve/test_dsml.py` holds what a
+  string diff cannot see: **which segments are markup**. `｜DSML｜` is the
+  control token and the tag name is not, so `<｜DSML｜ calls>` is three
+  segments and a tool result containing that literal cannot open a block.
+- **Session state for DeepSeek-V4.1** — `waste_state_save`/`_load`, which
+  segfaulted on this container because the shared path wrote a latent
+  cache it does not have. CSA2 saves the window ring whole and, for the
+  four KV source layers, the compressed latents, the index keys and the
+  partly-filled pooling group; Engram saves its n-gram history, whose ids
+  are *compressed* by a map only the container has, so a caller holding
+  the original prompt cannot reconstruct it. `head_dim`, `sliding_window`
+  and the Engram row count join the header fields a mismatched state file
+  is refused on — restoring a window at the wrong width is a session that
+  resumes attending to the wrong tokens, not a short read — and the size
+  is checked before the first byte is read.
+- **`Engine.marker_ids_for`**, so a format can state its own markers rather
+  than sharing K3's four. All of them resolve or the format is refused: one
+  that half-resolves is the failure the probe exists to prevent.
+
+- **DeepSeek-V4.1's vision tower**, a third one. 32 blocks, no learned
+  position grid and no q/k norms, a fused `w1` for gate and up, and a
+  projector that is a 3x3 pixel-unshuffle into two dense layers.
+
+  Two things in it are not a variant of anything already here. The rotation
+  is **split-halves** — each head's dims halved and the first half rotated
+  against the second — where every other rotation in this engine pairs
+  adjacent elements. And the span is not the image: the LLM sees
+  `[start] ([image] * n_w [newline]) * n_h [end]`, so the tower emits the
+  three learned delimiters itself and the engine's media queue stays one
+  row per placeholder.
+
+  Preprocessing too: the image is contained and grey-padded rather than
+  stretched, and the grid is budgeted in LLM tokens rather than in patches.
+  `waste_image_plan_ds41` is that geometry on its own so an oracle can be
+  asked the same question.
+
+  6e-7 relative L2 against `tools/ds41_vision_ref.py` on five patch grids,
+  three of them not multiples of the downsample; the geometry agrees on
+  seven source sizes including both collapse cases.
+
+- **`tools/pipeline.sh` takes a `MODEL`**, so the unattended
+  download → probe → round-trip → convert → run → oracle path is no longer
+  K3's alone. `MODEL=ds41` and `MODEL=glm` join it; everything that differs
+  between the three — the repo, the default paths, the free space demanded,
+  which oracle can read the container and what it needs installed — is one
+  table at the top, and an unknown name is refused rather than defaulted.
+  `SRC`, `OUT` and `MIN_FREE_GB` still win if set, so a profile is a
+  default and not a constraint. Verified end to end on DeepSeek-V4.1: all
+  six stages, `rel 2.409e-05`, argmax match, top-10 identical.
+
+  Running it that way found a bug older than the change: the free-space
+  check compared the container's full size against *free* space alone, so
+  a resumed run on a finished 299 GiB container was refused for wanting
+  310 GiB on a volume with 197 left. It counts what the container already
+  occupies now, which is what "room for the finished container" means and
+  what every resumable stage below it assumed.
+- **`tools/spec_window.py`** — what a speculative batch of K tokens costs
+  an engine whose budget is bytes read per token, from a real
+  `WASTE_DUMP_ROUTE` trace. Gate 9 ran it on three containers: a window of
+  five consecutive decode tokens touches **3.45x** the expert records one
+  token does, on Kimi-Linear, GLM-5.3-Flash and K3 alike — two orders of
+  magnitude of scale and two different top-k, agreeing to a tenth of a
+  point at every K. So DSpark needs 3.45 of its 5 drafts accepted to break
+  even on bytes. LEARNED §77.
+
+- **Measured throughput**, replacing the projection docs/DS41.md carried
+  (which is kept as written beside it). **3.77 tok/s over 64 tokens and
+  3.71 over 200**, against 1.5–2.5 projected — faster than GLM-5.3-Flash
+  on a bank twice the size, because the working set is GLM's to within 1%.
+  It is the first container here that is *not* faster over the longer run:
+  the cache is at 93% by the 64th token and there is nothing left to fill.
+  docs/DS41.md has the cache-size curve, which is flat from 9.6 GB and
+  declines slightly after, and the phase profile at both ends of it —
+  expert I/O is 58.7% of a step at the 152 MB floor and 10.2% at 17 GB, so
+  this engine is disk-bound starved and compute-bound fed.
+- **`waste bench` now says when it measured a prefill.** It divides by the
+  tokens actually generated, and a model that ends its turn on the bare
+  continuation prompt it uses leaves that at 1: DeepSeek-V4.1 reported
+  "0.19 tok/s" for one decode step behind an 18-token prefill, with
+  nothing to say so. The rate was true; what it was a rate of was missing.
+
+Not implemented: DSpark, deferred by gate 9. A container's MTP weights are
+dropped at conversion.
+
+### Fixed
+
+**Two tokenizer defects that affect every existing container**, found by
+the wide corpus and invisible to the twenty-one curated strings, which
+scored 21/21 before and after. On 24021 strings, Kimi-Linear went from
+22937 identical to 24017 and GLM-5.3-Flash from 22914 to 24020 — so
+**about 4.5% of strings used to encode differently from the release**.
+LEARNED §75.
+
+- `\s+(?!\S)` backed off one **byte** where it must back off one
+  character, cutting a U+00A0 before a word into two replacement bytes.
+- `\p{N}` and `\s` were ASCII-only. Both patterns mean the Unicode
+  classes; which characters are in `\s` was probed against both releases
+  rather than assumed.
+- `tests/run.sh` tested the tokenizer with `grep -q identical`, and
+  `"22914/24021 identical"` contains that word. It now reads the counts.
+- **`tools/fetch_weights.sh` reported a vanished destination as a finished
+  download.** A USB enclosure dropped off the bus 184 GB into a 475 GB
+  pull; `$STATE` went with it, `wc -l` produced nothing, `[ "" -lt 48 ]` is
+  an error that `test` reports as false, and the run printed
+  `ALL SHARDS COMPLETE` with rc=0 over a directory that no longer existed.
+  The next thing that would have happened is `convert.py` writing a
+  container out of 39% of a model. It now asks whether the destination is
+  still there before believing anything counted from it, and refuses a
+  count that is not a number. Same shape as #35 one level up.
+- **A JSON reader that did not decode JSON.** `specials.json` is written
+  by `json.dump`, which escapes non-ASCII by default, so
+  DeepSeek-V4.1's control tokens reached the container as
+  `"<\uff5cUser\uff5c>"` — and both readers, `js_str` in `src/json.h` and
+  `load_specials` in `src/tokenizer.c`, copied the bytes between the
+  quotes. Every marker the release has is non-ASCII, so **none of them
+  resolved**: `waste_tokenize_markup` returned the same ids as
+  `waste_tokenize`, which is the security boundary in §"Prompt safety"
+  collapsed to nothing, DSML could not be served, and the CLI printed
+  `<\uff5cend\u2581of\u2581sentence\uff5c>` where the model had emitted EOS.
+  Every container before this one had ASCII-only markup — `<|open|>`,
+  `<|endoftext|>` — which is why a `memcpy` where a decoder belonged
+  shipped in 0.6.0 and survived every release since.
+
+  Both readers now share one `js_unescape`, surrogate pairs included, and
+  the converters write UTF-8 (`ensure_ascii=False`) so the file says what
+  it holds. A container written either way loads: the escaped one on disk
+  is what the regression check in `tests/run.sh` builds, since a reader
+  that only works against our own writer is the same bug waiting.
+- **`tools/verify_container.py` kept a second copy of how a checkpoint
+  names its experts** — an inline probe for DeepSeek-V3's
+  `mlp/gate_proj` with Mixtral's `block_sparse_moe/w1` as the fallback,
+  while `convert.py` had the same fact in `MOE_LAYOUTS`. DeepSeek-V4.1 is
+  neither (`layers.0.ffn.experts.0.w1.weight`, and no `model.` in front of
+  it), so the round-trip on the newest converter was the one that could
+  not run: a `KeyError` with its stderr swallowed by `tests/run.sh`. It
+  imports `moe_layout` and `source_prefixes` now. On the 299 GiB
+  container it passes across all 40 layers at **19.5–20.4% per-expert
+  error**, which is gate 8's projected 19.95–20.74% confirmed on the
+  weights rather than on 190 MB of range requests.
+- **The learned-hotlist check now skips where no hotlist can hit.** It
+  guarded only on the container's floor fitting under its 5G budget.
+  DeepSeek-V4.1's floor is 4.86 GB, so it opens — and leaves 310 MB of
+  expert cache against a 3.19 GB working set, under a tenth of one token,
+  where docs/ENGINE.md section 3 says the hit rate is zero and not low.
+  The check answered 284 misses -> 286 on one run and fewer on the next,
+  which is a verdict decided by noise. A missing prerequisite is a SKIP.
+- `mxfp4.ST` read an `int8` tensor with a `.scale` companion as if the
+  int8 were the values. That is DeepSeek-V4.1's spelling for packed fp4,
+  and no shape disagrees; it now refuses an int8 tensor with no scale
+  beside it rather than guess which of the two it is.
+
 ## 0.7.2 — 2026-08-28
 
 Six pull requests and two issues, and one theme running through all of

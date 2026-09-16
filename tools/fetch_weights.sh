@@ -134,7 +134,21 @@ fi
 mkdir -p "$DEST" || exit 1
 touch "$STATE"
 
-log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG"; }
+# The message goes to the terminal first and to the log file second. It was
+# one `tee` and the two shared a fate: $LOG lives on $DEST, and when a USB
+# enclosure drops off the bus mid-run every log() prints "tee: ... No such
+# file or directory" and swallows what it was told to say. The run that
+# found this refused correctly and said nothing about why -- so the failure
+# looked like the silence it was there to break.
+log() {
+    printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+    # 2>/dev/null BEFORE the append, not after. Redirections are applied
+    # left to right, so with the append first the shell reports "No such
+    # file or directory" on a stderr that has not been silenced yet -- which
+    # is the same message, from a different mouth.
+    printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" 2>/dev/null >> "$LOG"
+    return 0
+}
 
 # --- small files ----------------------------------------------------------
 # The index is needed by every mode, because it is what says which shards
@@ -329,6 +343,7 @@ PY
 if [ "$CHECK_ONLY" = 1 ]; then
     log "--check: verifying sizes on disk against the remote"
     bad=0
+    fixed=0
     while read -r f; do
         [ -f "$DEST/$f" ] || continue
         want=$(hcurl -sIL --max-time 60 "$RAW/$f" \
@@ -337,9 +352,18 @@ if [ "$CHECK_ONLY" = 1 ]; then
         if [ "$want" != "$got" ]; then
             log "  INCOMPLETE $f ($got / ${want:-?})"
             bad=$((bad + 1))
+        elif ! grep -qxF "$f" "$STATE" 2>/dev/null; then
+            # It matches the remote and the state file does not say so.
+            # The remote is the stronger evidence of the two, and this is
+            # the only place that has asked it — so record it, rather than
+            # leave convert.py reading a ledger that disagrees with the
+            # bytes on disk and refusing a checkpoint that is complete.
+            echo "$f" >> "$STATE"
+            fixed=$((fixed + 1))
         fi
     done < "$DEST/.shards"
-    log "--check done: $bad incomplete"
+    log "--check done: $bad incomplete$([ "$fixed" -gt 0 ] && \
+        printf ', %s verified against the remote and recorded' "$fixed")"
     rm -f "$DEST/.shards"
     exit $(( bad > 0 ))
 fi
@@ -416,7 +440,16 @@ for try in \$(seq 1 \$max_retry); do
                       || say "pull \$f (try \$try)"
     # -C - resumes; --speed-limit kills a connection that has stalled rather
     # than waiting out a TCP timeout that may never come.
-    hcurl -fL -C - --retry 3 --retry-delay 5 --speed-limit 1024 --speed-time 120 \\
+    #
+    # --http1.1 is not a preference. Over a long single transfer this CDN
+    # returns CURLE_HTTP2_STREAM (rc=92) often enough to matter: measured
+    # on the DeepSeek-V4.1 pull, one 7.4 GB shard took five resumes and an
+    # hour where its neighbours took twenty minutes each. The retry logic
+    # survives it and the throughput does not, and a multi-hundred-GB
+    # download is exactly where that compounds. HTTP/1.1 costs a little
+    # multiplexing this script never uses — one file per connection.
+    hcurl -fL --http1.1 -C - --retry 3 --retry-delay 5 \\
+          --speed-limit 1024 --speed-time 120 \\
           -o "\$dest/\$f" "\$raw/\$f" 2>/dev/null
     rc=\$?
     [ \$rc -eq 0 ] && continue          # the next pass verifies the size
@@ -435,6 +468,20 @@ for try in \$(seq 1 \$max_retry); do
     say "fail \$f rc=\$rc, retry in \${wait}s"
     sleep \$wait
 done
+# The size check happens at the TOP of the loop, so a transfer that
+# completed on the last attempt is never verified and never recorded. Seen
+# for real: two 7.4 GB shards finished, took an rc=18 on the retry after
+# that, and were reported GIVE UP while sitting on disk byte-exact — and
+# .download-state then disagreed with the remote for the rest of the run.
+# Ask once more before saying no.
+want=\$(hcurl -sIL --max-time 90 "\$raw/\$f" \\
+       | awk -F': ' '/^[Cc]ontent-[Ll]ength/{print \$2}' | tr -d '\r' | tail -1)
+got=\$(fsize "\$dest/\$f")
+if [ -n "\$want" ] && [ "\$got" = "\$want" ]; then
+    echo "\$f" >> "\$state"
+    say "ok   \$f (\$((got/1048576)) MB, on the last attempt)"
+    exit 0
+fi
 say "GIVE UP \$f after \$max_retry tries"
 exit 1
 WORKER
@@ -445,7 +492,42 @@ grep -vxF -f "$STATE" "$DEST/.shards" 2>/dev/null \
     | xargs -P "$JOBS" -n1 "$DEST/.worker.sh"
 rc=$?
 
-done_now=$(wc -l < "$STATE" | tr -d ' ')
+# How many shards are actually on disk, or a refusal.
+#
+# The destination can go away under a long run. A USB enclosure that drops
+# off the bus takes $STATE with it; `wc -l` then produces nothing, and
+# `[ "" -lt 48 ]` is an error that `test` reports as false — so the run fell
+# through every check after it and printed ALL SHARDS COMPLETE with rc=0
+# over a directory that no longer existed. Measured on 2026-09-15, 184 GB
+# into a 475 GB pull, and the next thing that would have happened is
+# convert.py writing a container out of 39% of a model.
+#
+# So: ask whether the destination is still there before believing anything
+# counted from it, and refuse a count that is not a number. #35 was this
+# same shape one level up — completion reported on evidence nobody read.
+count_done() {
+    # Its answer goes to stdout, so everything it says goes to stderr —
+    # otherwise the caller's $(count_done) would capture the diagnostics as
+    # if they were the count.
+    if [ ! -d "$DEST" ] || ! : > "$DEST/.writable" 2>/dev/null; then
+        log "FAILED: $DEST is gone or not writable. The download is NOT" >&2
+        log "        complete; reconnect the device and re-run — nothing" >&2
+        log "        already on disk is refetched." >&2
+        return 1
+    fi
+    rm -f "$DEST/.writable"
+    local n
+    n=$(wc -l < "$STATE" 2>/dev/null | tr -d ' ')
+    case "$n" in
+        ''|*[!0-9]*)
+            log "FAILED: cannot read $STATE, so how much is on disk is" >&2
+            log "        unknown. That is incomplete, not complete." >&2
+            return 1 ;;
+    esac
+    printf '%s\n' "$n"
+}
+
+done_now=$(count_done) || exit 1
 log "pass finished (rc=$rc): $done_now / $TOTAL shards complete, $(free_gb) GB free"
 if [ "$done_now" -lt "$TOTAL" ]; then
     log "re-run to continue; nothing already downloaded is refetched"

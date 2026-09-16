@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 SQLite Cloud, Inc.
+#
+# Test-only dependencies, pinned so the oracle checks in CI render the
+# upstream chat templates with the same Jinja2 everywhere. Nothing here is
+# needed to build or run the engine; tests/run.sh fetches jinja2 on the fly
+# via `uv run --with jinja2` for local development.
+#
+# 3.1.6 is the current 3.1.x stable and carries the sandbox security fixes
+# (CVE-2025-27516); the templates use the loopcontrols extension and a
+# custom `tojson` filter, nothing version-sensitive beyond that.
+Jinja2==3.1.6

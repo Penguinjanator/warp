@@ -33,12 +33,8 @@ KINDS = (("gate", "w1"), ("up", "w3"), ("down", "w2"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mxfp4 import ST                                              # noqa: E402
 from convert import (                                             # noqa: E402
-    qwen_packed_names, ple_source_loc, ple_shard_map)
-
-# Where the Qwen checkpoint puts its layers. The container's tensor_prefix
-# is "" on this family (see convert.source_prefixes), so it cannot be used
-# to build a *source* name.
-QWEN_SRC_PFX = "model.language_model."
+    moe_layout, ple_source_loc, ple_shard_map, qwen_packed_names,
+    source_prefixes)
 
 
 def dequant_q8g(payload, scales, shape, group=128):
@@ -145,10 +141,14 @@ def main():
           f"layers {list(man['layers'])}")
 
     sr = ST(args.src)
-    prefix = man.get("tensor_prefix", "")
     want = None
     if args.layers.strip():
         want = {int(x) for x in args.layers.split(",") if x.strip()}
+    # Where the CHECKPOINT puts `layers.N`, which is not the container's
+    # tensor_prefix with "model." glued on: GLM nests the two components the
+    # other way round and DeepSeek-V4.1 has neither.
+    _pfx, src_pfx, _cfg = source_prefixes(
+        json.load(open(os.path.join(args.src, "config.json"))))
     ok = True
     for lstr, meta in man["layers"].items():
         L = int(lstr)
@@ -163,7 +163,7 @@ def main():
         # no per-expert tensor to read a shape from and no per-expert slice
         # to compare against — both come out of the pair. Probed on the
         # source, like the DeepSeek naming below.
-        gname, dname = qwen_packed_names(QWEN_SRC_PFX, L)
+        gname, dname = qwen_packed_names(src_pfx, L)
         packed_cache = None
         if sr.have(gname):
             gate_up, down = sr.tensor(gname), sr.tensor(dname)
@@ -171,19 +171,20 @@ def main():
             hid = int(gate_up.shape[2])
             packed_cache = (gate_up, down, inter)
             shapes = [(inter, hid), (inter, hid), (hid, inter)]
-        elif sr.have(f"{prefix}model.layers.{L}.mlp.experts.0.gate_proj.weight"):
-            src_kinds = (
-                ("gate", "gate_proj"),
-                ("up", "up_proj"),
-                ("down", "down_proj"),
-            )
-            moe_segment = "mlp"
-
         if packed_cache is None:
+            layout, moe_segment, src_kinds = moe_layout(sr, src_pfx, L)
+            if layout is None:
+                print(f"  L{L}: no MoE experts under any known naming at "
+                      f"{src_pfx}layers.{L}.*.experts.0 — is --src the right "
+                      f"checkpoint?")
+                return 1
+
+            def ename(e, tag):
+                return (f"{src_pfx}layers.{L}.{moe_segment}.experts."
+                        f"{e}.{tag}.weight")
+
             for _kind, tag in src_kinds:
-                t = sr.tensor(
-                    f"{prefix}model.layers.{L}.{moe_segment}.experts.0.{tag}.weight"
-                )
+                t = sr.tensor(ename(0, tag))
                 shapes.append(tuple(t.shape))
 
         off, checked = 0, 0
@@ -196,9 +197,7 @@ def main():
                 if packed_cache is not None:
                     W = packed_expert_src(eid, kind, packed_cache)
                 else:
-                    W = sr.tensor(
-                        f"{prefix}model.layers.{L}.{moe_segment}.experts.{eid}.{tag}.weight"
-                    )
+                    W = sr.tensor(ename(eid, tag))
                 err = (W - rec[kind]).norm() / W.norm()
                 flag = "ok " if err < 0.30 else "BAD"
                 if err >= 0.30:

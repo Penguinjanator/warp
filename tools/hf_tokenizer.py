@@ -35,7 +35,10 @@ assumes:
 
   - the Han branch. Kimi's pattern has `[\\p{Han}]+` and GLM's does not, so
     the container is told which — see `tokenizer_han_split` in the manifest
-    and waste_tok_set_han_split.
+    and waste_tok_set_han_split. DeepSeek-V4.1 needs more than a flag: its
+    pre_tokenizer is three isolating Splits rather than one pattern, with
+    punctuation and symbols as classes of their own and no contraction
+    branch, so it gets a mode of its own and `tokenizer_pattern` says so.
 
   python3 tools/hf_tokenizer.py --src /path/to/glm --out model.waste
   python3 tools/hf_tokenizer.py --src /path/to/glm --out /tmp/probe --force
@@ -76,6 +79,21 @@ KNOWN_PATTERNS = {_pattern(h, m, d): (h, d)
 PAT_NO_HAN = _pattern(0, 0, 3)
 PAT_HAN = _pattern(1, 0, 3)
 
+# DeepSeek-V4.1 splits with three isolating Splits in sequence rather than
+# one pattern, and src/tokenizer.c implements the composition as a mode of
+# its own (WASTE_TOKPAT_DEEPSEEK). Compared literally, all three, in order:
+# a release that reorders them or widens one class splits differently, and
+# the difference is a shifted token stream rather than an error.
+PAT_DS41 = [
+    '\\p{N}{1,3}',
+    '[一-龥\u3040-ゟ゠-ヿ]+',
+    '[!"#$%&\'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+',
+]
+
+# Values of `tokenizer_pattern` in the manifest; mirrors WASTE_TOKPAT_* in
+# src/tokenizer.h.
+TOKPAT_CL100K, TOKPAT_DEEPSEEK = 0, 1
+
 
 def bytes_to_unicode():
     """GPT-2's map from byte to a printable codepoint, so a vocabulary can be
@@ -93,24 +111,31 @@ def bytes_to_unicode():
     return {chr(c): b for b, c in zip(bs, cs)}
 
 
-def split_pattern(tok):
-    """The Split regex out of the pre_tokenizer, whatever it is wrapped in."""
-    pre = tok.get("pre_tokenizer") or {}
-    stack = [pre]
-    while stack:
-        node = stack.pop()
+def split_patterns(tok):
+    """Every Split regex in the pre_tokenizer, in the order they apply.
+
+    Order matters and a set would lose it: DeepSeek's three Splits isolate
+    numbers, then CJK, then everything else, and running them in any other
+    order is a different tokenizer.
+    """
+    out = []
+
+    def walk(node):
         if not isinstance(node, dict):
-            continue
+            return
         if node.get("type") == "Split":
             pat = node.get("pattern") or {}
             if "Regex" in pat:
-                return pat["Regex"]
-        stack.extend(node.get("pretokenizers") or [])
-    return None
+                out.append(pat["Regex"])
+        for child in node.get("pretokenizers") or []:
+            walk(child)
+
+    walk(tok.get("pre_tokenizer") or {})
+    return out
 
 
 def convert(src, quiet=False):
-    """Returns (rank-file text, han_split, specials list, digit_run)."""
+    """Returns (rank text, han split, specials, digit run, pattern mode)."""
     path = os.path.join(src, "tokenizer.json")
     with io.open(path, encoding="utf-8") as f:
         tok = json.load(f)
@@ -124,19 +149,32 @@ def convert(src, quiet=False):
                          "spelled <0xNN> rather than byte-level escapes — "
                          "src/tokenizer.c reads the byte-level form")
 
-    pat = split_pattern(tok)
-    if pat not in KNOWN_PATTERNS:
+    pats = split_patterns(tok)
+    pat = pats[0] if pats else None
+    if pats == PAT_DS41:
+        han, digit_run, pattern = True, 3, TOKPAT_DEEPSEEK
+    elif len(pats) == 1 and pat in KNOWN_PATTERNS:
+        han, digit_run = KNOWN_PATTERNS[pat]
+        han, pattern = bool(han), TOKPAT_CL100K
+    else:
         raise SystemExit(
             "this release pre-tokenizes with a pattern src/tokenizer.c does "
             "not implement, and the difference would be silent:\n"
-            f"  release: {pat}\n"
-            + "".join(f"  known  : {k}\n" for k in KNOWN_PATTERNS)
-            + "See tools/hf_tokenizer.py.")
-    han, digit_run = KNOWN_PATTERNS[pat]
-    han = bool(han)
+            + "".join(f"  release: {p}\n" for p in pats or [None]) +
+            + "".join(f"  known  : {k}\n" for k in KNOWN_PATTERNS) +
+            "or DeepSeek-V4.1's three "
+            "Splits. See tools/hf_tokenizer.py.")
 
     dec = bytes_to_unicode()
     vocab = model["vocab"]
+
+    # Kimi and GLM append their control tokens after the BPE table; DeepSeek
+    # puts three of them (BOS, EOS, PAD) at ids 0-2 *inside* it. Those rows
+    # are not byte-level escapes and have no byte sequence that reaches them,
+    # so they belong in specials.json and not in the rank file — but only
+    # when the release itself declares them as added tokens. Anything else
+    # outside the escape map is still a refusal.
+    declared = {a["content"] for a in (tok.get("added_tokens") or [])}
 
     def raw(text):
         try:
@@ -168,8 +206,11 @@ def convert(src, quiet=False):
             f"from the release. Refusing to write a tokenizer that silently "
             f"disagrees.")
 
-    lines = []
+    lines, inline_specials = [], 0
     for text, rank in sorted(vocab.items(), key=lambda kv: kv[1]):
+        if text in declared:
+            inline_specials += 1
+            continue
         lines.append(base64.b64encode(raw(text)).decode("ascii") + " " +
                      str(rank))
 
@@ -178,10 +219,13 @@ def convert(src, quiet=False):
          for a in (tok.get("added_tokens") or [])),
         key=lambda e: e["id"])
     if not quiet:
-        print(f"tokenizer: {len(lines)} merges, {len(specials)} specials, "
-              f"pattern {'with' if han else 'without'} a Han branch, "
+        which = ("DeepSeek-V4.1's three Splits" if pattern == TOKPAT_DEEPSEEK
+                 else f"cl100k {'with' if han else 'without'} a Han branch")
+        print(f"tokenizer: {len(lines)} merges, {len(specials)} specials"
+              + (f" ({inline_specials} of them inside the BPE table)"
+                 if inline_specials else "") + f", pattern {which}, "
               f"up to {digit_run} digit(s) per piece")
-    return "\n".join(lines) + "\n", han, specials, digit_run
+    return "\n".join(lines) + "\n", han, specials, digit_run, pattern
 
 
 def main():
@@ -196,18 +240,25 @@ def main():
     if os.path.exists(dst) and not args.force:
         print(f"{dst} exists; --force to replace it", file=sys.stderr)
         return 1
-    text, han, specials, digit_run = convert(args.src)
+    text, han, specials, digit_run, pattern = convert(args.src)
     os.makedirs(args.out, exist_ok=True)
     with io.open(dst, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
     if specials:
         with io.open(os.path.join(args.out, "specials.json"), "w",
                      encoding="utf-8", newline="\n") as f:
-            json.dump(specials, f, indent=1)
-    print(f"wrote {dst}"
-          + ("" if han else "  (tokenizer_han_split must be false)")
-          + ("" if digit_run == 3 else
-             f"  (tokenizer_digit_run must be {digit_run})"))
+            # ensure_ascii=False for the reason convert.py's atomic_json
+            # gives: a control token that is not ASCII should be in the file
+            # as itself, not as \uXXXX.
+            json.dump(specials, f, indent=1, ensure_ascii=False)
+    notes = []
+    if not han:
+        notes.append("tokenizer_han_split must be false")
+    if pattern != TOKPAT_CL100K:
+        notes.append(f"tokenizer_pattern must be {pattern}")
+    if digit_run != 3:
+        notes.append(f"tokenizer_digit_run must be {digit_run}")
+    print(f"wrote {dst}" + (f"  ({'; '.join(notes)})" if notes else ""))
     return 0
 
 

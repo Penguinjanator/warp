@@ -4,7 +4,7 @@ WARP is an embeddable inference engine written in C, with no third-party runtime
 
 The project is driven by humans: the ideas, hypotheses, priorities, tests, and decisions are human. The code is written by LLMs. At this scale, that is the only way to iterate on new algorithms and test hypotheses fast enough.
 
-The goal is to run huge frontier models such as Kimi K3 on consumer hardware. Today, the complete 2.78-trillion-parameter Kimi K3 runs on a 64 GB MacBook Pro at about **0.6 tokens per second**, and the 313-billion-parameter GLM-5.3-Flash — text and images — at about **3.9**.
+The goal is to run huge frontier models such as Kimi K3 on consumer hardware. Today, the complete 2.78-trillion-parameter Kimi K3 runs on a 64 GB MacBook Pro at about **0.6 tokens per second**, the 552-billion-parameter DeepSeek-V4.1-Flash at about **3.8**, and the 313-billion-parameter GLM-5.3-Flash — text and images — at about **3.9**.
 
 **Ultimately we want WARP to execute Kimi K3 locally to improve itself** (we are currently using Opus 5 with extra thinking).
 
@@ -37,6 +37,7 @@ internal SSD:
 | Model | Container | Minimum RAM | 64 tokens | 200 tokens |
 |---|---:|---:|---:|---:|
 | Kimi K3 2.78T | 982 GB | 29.19 GB | 0.45–0.62 tok/s | — |
+| DeepSeek-V4.1-Flash 552B | 299 GB | 4.86 GB | 3.77 tok/s | 3.71 tok/s |
 | GLM-5.3-Flash 313B | 112 GB | 5.14 GB | 3.32 tok/s | **3.86 tok/s** |
 | Kimi-Linear 48B | 19 GB | 1.32 GB | 14.29 tok/s | **17.22 tok/s** |
 
@@ -44,6 +45,13 @@ The longer run is faster because the expert cache is still filling during
 the first few dozen tokens; both columns are what the same command prints,
 not a steady state extrapolated from it. K3 has no 200-token column here
 because one run of it takes ten minutes and reads 4.6 TB.
+
+DeepSeek-V4.1 is the exception to the first sentence: 3.77 over 64 and 3.71
+over 200, flat rather than climbing, because its cache is already at 93% by
+the 64th token and there is nothing left for the longer run to win.
+[docs/DS41.md](docs/DS41.md) has the cache-size curve behind that — the
+knee is at 9.6 GB and the automatic budget's 41.74 GB is slightly past the
+top, buying hit rate that no longer buys time.
 
 For K3, 64 GB is the practical minimum. A 32 GB machine can open the model but will page heavily. The default memory budget on the test machine is 46.39 GB, including a 17.56 GB expert cache.
 
@@ -96,7 +104,7 @@ Additional measurements, profiling data, router-lookahead results, and quantizat
 
 ## Vision
 
-Kimi K3 and GLM-5.3-Flash are both multimodal, and WARP can use one or more images together with text. Pass `--image` once per image:
+Kimi K3 and GLM-5.3-Flash are both multimodal, and WARP can use one or more images together with text. DeepSeek-V4.1's tower is implemented and checked against its oracle, but its container is converted text-only for now. Pass `--image` once per image:
 
 ```bash
 ./waste run ~/models/k3.waste "Describe this image" --image photo.jpg
@@ -240,6 +248,68 @@ when images are asked for.
 [docs/GLM.md](docs/GLM.md) has the architecture, the three places the
 release states something differently, and what is still left out.
 
+### DeepSeek-V4.1-Flash
+
+`deepseek-ai/DeepSeek-V4.1-Flash` — 552 B backbone plus 197 B of n-gram
+memory, 510 GB of fp4 and fp8 as published — is converted and running,
+text.
+
+```
+$ waste run ~/models/ds41.waste "The capital of France is"
+waste: no --budget, using 46.45 GB of 64.00 GB (expert cache 41.74 GB)
+The capital of France is Paris.
+[3 tokens, 0.84 s, 3.59 tok/s | experts 563 hit / 157 miss = 78%]
+```
+
+| | |
+|---|---:|
+| parameters | 552.37 B total, 16.62 B active per token |
+| container | 299 GiB — 4.00 GB trunk, 40 expert banks, 190 GB of experts |
+| minimum RAM | 4.86 GB |
+| default budget here | 46.45 GB, of which 41.74 GB expert cache |
+| decode | 3.77 tok/s over 64 tokens, 3.71 over 200 |
+
+Against a PyTorch oracle built from the same container: relative L2
+**0.0025%**, top-5 identical. The re-encoded tokenizer agrees with the
+release's own on **24021 of 24021** strings over the whole codepoint space.
+
+**It is the fastest large model here**, and the reason is that its working
+set is GLM's to within 1% — 240 expert records a token, 2.97 GB — on a bank
+twice the size. More of the model, the same amount of it per token.
+
+### What is new in it
+
+Four things, none of which is a variant of anything already here.
+
+**CSA2**, which is not MLA: one KV vector per token rather than one per
+head, a sliding window of 128 raw positions and up to 512 compressed ones
+concatenated into a single softmax, an attention sink per head that appears
+only in the denominator, the query's own rotation removed from the output,
+and an output projection that is low-rank *and* block-diagonal. It carries
+two rope schedules at once — the window-only layers at 10000 with YaRN off,
+the compressed ones at 160000 with it on — and no mscale anywhere.
+
+**Engram**, an n-gram hash memory at two layers holding 197 B of the
+parameters, addressed through a compressed token map and prime-sized
+disjoint buckets that the checkpoint does not ship: they are derived, and
+checked against the two row counts the release states.
+
+**Single-pass mHC**, where each sublayer's mixing projection produces the
+`pre` the next one collapses with, rather than GLM's two passes.
+
+**DSML**, its prompt format, with a numeric reasoning effort from 1 to 100.
+`｜DSML｜` is the only control token in a tag, so `<｜DSML｜ calls>` is three
+segments and a tool result containing that literal cannot open a block.
+`serve/dsml.py` matches the release's own `encoding.py` on 21 checks,
+including its five checked-in golden outputs.
+
+Its vision tower is implemented and agrees with its oracle to 6e-7, but the
+container is converted text-only for now, so `--image` is not wired up on
+this model.
+
+[docs/DS41.md](docs/DS41.md) has the architecture, the cache-size curve
+behind the throughput above, and what is deliberately left out.
+
 ## What you need
 
 To build and test WARP:
@@ -258,6 +328,14 @@ To run GLM-5.3-Flash, which is the one most machines can hold:
 - another **306 GiB of temporary storage** if converting the published
   weights yourself. This staging storage may be external and can be freed
   afterward, or reclaimed as the conversion proceeds.
+
+To run DeepSeek-V4.1-Flash, the fastest of the large ones here:
+
+- **16 GB of RAM is enough**; 4.86 GB is the hard floor at 4K context;
+- **299 GiB of internal NVMe storage** for the converted container;
+- another **475 GiB of temporary storage** if converting the published
+  weights yourself, which may be external and can be reclaimed as the
+  conversion proceeds.
 
 To run Kimi K3:
 
@@ -346,7 +424,9 @@ The text before `</think>` is the model's reasoning channel, which GLM
 always opens and closes itself. Over HTTP it comes back as
 `reasoning_content`, separate from the answer. `-n` counts both, so a
 question that needs thinking needs a larger budget than the answer alone
-suggests.
+suggests. The CLI defaults to 128 tokens per reply and now reports when
+that limit truncates a response, with a reminder to increase `-n` (for
+example, `-n 2048`). Interactive chat also displays the limit at startup.
 
 **What to expect on the way.** The first few dozen tokens are slower than
 the rest — the expert cache is still filling — so a short reply runs at
@@ -365,6 +445,65 @@ shards still owed instead of both in full. It is not reversible and
 `tools/verify_container.py` can no longer check the result against its
 source, so prove the recipe with `--reclaim dry` first — [docs/K3.md](docs/K3.md)
 has the refusals and the ledger discipline.
+
+### Quick start: DeepSeek-V4.1-Flash
+
+The same shape as the GLM recipe above, and the one command below does all
+of it unattended if you prefer.
+
+**Before you start**: **475 GiB** of published weights on the staging disk
+and **299 GiB** for the container, which belongs on internal NVMe. The
+staging weights can live anywhere and can be given back as the conversion
+consumes them.
+
+```bash
+# 1. Build.
+git clone https://github.com/sqliteai/warp
+cd waste
+make
+
+# 2. Check the download before starting it: shard count, size, free space.
+tools/fetch_weights.sh --repo deepseek-ai/DeepSeek-V4.1-Flash \
+    --dest /Volumes/staging/ds41 --dry-run
+
+# 3. Download. 48 shards, 475 GiB. Resumable — re-run it if it stops, and
+#    nothing already fetched is fetched twice.
+tools/fetch_weights.sh --repo deepseek-ai/DeepSeek-V4.1-Flash \
+    --dest /Volumes/staging/ds41
+
+# 4. Convert. 40 expert layers, then the trunk, then the two Engram tables.
+uv run --with torch python tools/convert.py \
+    --src /Volumes/staging/ds41 \
+    --out ~/models/ds41.waste \
+    --jobs 3
+
+# 5. Run it.
+./waste run  ~/models/ds41.waste "The capital of France is" -n 200
+./waste chat ~/models/ds41.waste
+```
+
+There are no DeepSeek-specific flags: the converter recognises the
+architecture, derives the Engram token map and bucket primes the checkpoint
+does not ship, writes the DSML chat format, and re-encodes the tokenizer.
+`--engram-bits 8` doubles the Engram tables to 209 GB and changes nothing a
+token reads; 4 is the default.
+
+**Or let the pipeline do all of it**, which is steps 3 to 5 plus a
+round-trip check against the source weights and a PyTorch oracle diff at
+the end:
+
+```bash
+MODEL=ds41 SRC=/Volumes/staging/ds41 OUT=~/models/ds41.waste \
+    tools/pipeline.sh
+```
+
+Every stage is resumable and refuses to start on a failed predecessor, so
+it can be killed and restarted at any point; it writes a running log and a
+final `REPORT.md` beside the container. `MODEL` also takes `k3` and `glm`,
+which is the only thing that differs between the three recipes. Add
+`RECLAIM=on` to delete each source shard as the converter finishes with it
+— peak disk becomes the container plus the shards still owed, rather than
+both in full. That is not reversible, so prove it with `RECLAIM=dry` first.
 
 ### Get Kimi K3, already converted
 
@@ -443,17 +582,19 @@ It supports streaming, tools, structured output, thinking controls, and images. 
 
 A GLM container is served the same way, from its own `chat.json`: plain
 conversation and images, with the reasoning channel returned as
-`reasoning_content` beside `content`. Tools are refused by name rather than
-half-rendered — four strings cannot express a tool declaration, and GLM's
-tokenizer carries no protocol that could.
+`reasoning_content` beside `content`. Tools work here too: GLM's tokenizer
+carries its own tool protocol (`<tool_call>`, `<arg_key>`, `<arg_value>`)
+as single tokens, so `serve/glmtools.py` renders a request and reads a
+reply the way GLM's own `chat_template.jinja` spells them — flat XML, an
+`<|observation|>` turn for results.
 
-Kimi-Linear's does. Since 0.7.2 a container whose tokenizer holds all five
-of Kimi's native tool-call markers gets tool calling over HTTP even though
-its `chat.json` describes only the ordinary turns — the format lives in
-`serve/kimitools.py`, and the server says which of the three capabilities a
-container has when it starts. All five or none: half of that rendering
-encodes as ordinary text, so a partial set is a different protocol rather
-than a smaller one.
+Kimi-Linear's is the other one. Since 0.7.2 a container whose tokenizer
+holds all five of Kimi's native tool-call markers gets tool calling over
+HTTP even though its `chat.json` describes only the ordinary turns — the
+format lives in `serve/kimitools.py`, and the server says which of the
+three capabilities a container has when it starts. All or none, for either
+protocol: half of that rendering encodes as ordinary text, so a partial set
+is a different protocol rather than a smaller one.
 
 ```bash
 python3 -m serve ~/models/glm53.waste --port 8000

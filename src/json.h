@@ -225,14 +225,101 @@ static inline int js_bool(const js_doc *d, int t, int dflt)
 }
 
 /* Copies at most cap-1 bytes; always NUL-terminates. */
+/* One \uXXXX, or -1. Reads exactly four hex digits and no further. */
+static inline int js_hex4(const char *p, const char *end)
+{
+    if (end - p < 4) return -1;
+    int v = 0;
+    for (int i = 0; i < 4; i++) {
+        const unsigned char c = (unsigned char)p[i];
+        int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else return -1;
+        v = v * 16 + d;
+    }
+    return v;
+}
+
+/* A JSON string's bytes, UNESCAPED into `buf`, NUL-terminated and
+ * truncated to `cap`. `p`..`end` is the span BETWEEN the quotes.
+ *
+ * It used to be a memcpy, which is right for ASCII and silent for
+ * everything else: Python's json.dump escapes non-ASCII by default, so
+ * DeepSeek-V4.1's control tokens reached the engine as the seven literal
+ * characters "\uff5c" and every one of them tokenized as prose. Every
+ * container before it had ASCII-only markup — <|open|>, <|endoftext|> —
+ * which is why a JSON reader that did not decode JSON shipped in 0.6.0 and
+ * went unnoticed through every release since.
+ *
+ * Returns the byte length written. Exposed because specials.json is read
+ * by a scanner of its own in tokenizer.c, and one of the two decoding and
+ * the other not is how this came to be wrong in two places at once. */
+static inline size_t js_unescape(const char *p, const char *end,
+                                 char *buf, size_t cap)
+{
+    size_t o = 0;
+    if (cap == 0) return 0;
+    while (p < end && o + 1 < cap) {
+        if (*p != '\\') { buf[o++] = *p++; continue; }
+        if (++p >= end) break;                    /* trailing backslash */
+        switch (*p) {
+        case 'b': buf[o++] = '\b'; p++; break;
+        case 'f': buf[o++] = '\f'; p++; break;
+        case 'n': buf[o++] = '\n'; p++; break;
+        case 'r': buf[o++] = '\r'; p++; break;
+        case 't': buf[o++] = '\t'; p++; break;
+        case 'u': {
+            int cp = js_hex4(p + 1, end);
+            if (cp < 0) { buf[o++] = *p++; break; }   /* not an escape */
+            p += 5;
+            if (cp >= 0xD800 && cp <= 0xDBFF && end - p >= 6 &&
+                p[0] == '\\' && p[1] == 'u') {
+                const int lo = js_hex4(p + 2, end);
+                if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    p += 6;
+                }
+            }
+            if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD;   /* lone half */
+            /* Written only when the whole sequence fits, so a truncated
+             * buffer ends on a character boundary rather than mid-glyph. */
+            const size_t need = cp < 0x80 ? 1 : cp < 0x800 ? 2
+                              : cp < 0x10000 ? 3 : 4;
+            if (o + need + 1 > cap) { p = end; break; }
+            if (cp < 0x80) {
+                buf[o++] = (char)cp;
+            } else if (cp < 0x800) {
+                buf[o++] = (char)(0xC0 | (cp >> 6));
+                buf[o++] = (char)(0x80 | (cp & 0x3F));
+            } else if (cp < 0x10000) {
+                buf[o++] = (char)(0xE0 | (cp >> 12));
+                buf[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                buf[o++] = (char)(0x80 | (cp & 0x3F));
+            } else {
+                buf[o++] = (char)(0xF0 | (cp >> 18));
+                buf[o++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                buf[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                buf[o++] = (char)(0x80 | (cp & 0x3F));
+            }
+            break;
+        }
+        default: buf[o++] = *p++; break;           /* \" \\ \/ and the rest */
+        }
+    }
+    buf[o] = 0;
+    return o;
+}
+
+/* Keys are still compared raw (js_streq): one written with an escape does
+ * not match, which is a lookup that fails rather than one that succeeds
+ * wrongly. */
 static inline const char *js_str(const js_doc *d, int t, char *buf, size_t cap)
 {
     buf[0] = 0;
-    if (t < 0 || t >= d->n || d->tok[t].type != JS_STR) return buf;
-    size_t len = (size_t)(d->tok[t].end - d->tok[t].start);
-    if (len >= cap) len = cap - 1;
-    memcpy(buf, d->src + d->tok[t].start, len);
-    buf[len] = 0;
+    if (t < 0 || t >= d->n || d->tok[t].type != JS_STR || cap == 0) return buf;
+    js_unescape(d->src + d->tok[t].start, d->src + d->tok[t].end, buf, cap);
     return buf;
 }
 

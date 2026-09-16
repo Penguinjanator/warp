@@ -21,7 +21,7 @@ if __package__ in (None, ""):                    # python3 serve/__main__.py
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     __package__ = "serve"
 
-from . import api, xtml                                      # noqa: E402
+from . import api, dsml, xtml                                      # noqa: E402
 from .engine import (CACHE_LFRU, CACHE_LRU,                  # noqa: E402
                      WASTE_E_ARG, WASTE_E_BUSY, WASTE_E_UNSUPPORTED,
                      Engine, EngineError, build_info, physical_ram,
@@ -239,6 +239,9 @@ examples:
     elif srv.chat_format is xtml:
         print(f"thinking {'off by default' if args.no_thinking else 'on'}"
               f" — reasoning_effort per request")
+    elif srv.chat_format is dsml:
+        print(f"DSML — thinking {'off by default' if args.no_thinking else 'on'}"
+              f", reasoning_effort 1-100 or low/high/max, tools, images")
     else:
         # Serving from chat.json rather than XTML. Say what this container
         # can and cannot do, in the same breath as saying it works — a
@@ -249,7 +252,8 @@ examples:
         think = ("a reasoning channel" if srv.chat_format.think
                  else "no reasoning channel")
         images = "images" if srv.chat_format.image else "no images"
-        tools = "native tools" if srv.chat_format.tool_markers else "no tools"
+        protocol = srv.chat_format.tool_protocol
+        tools = f"{protocol} tools" if protocol else "no tools"
         print(f"chat     from {model}/chat.json — plain conversation, "
               f"{think},\n         {images}, {tools}")
 

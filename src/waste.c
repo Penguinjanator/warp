@@ -885,6 +885,7 @@ waste_status waste_open(const char *model_path, const waste_cfg *cfg_in,
         waste_tok_set_eos(c->tok, c->m.cfg.eos_token_id);
         waste_tok_set_han_split(c->tok, c->m.cfg.tok_han_split);
         waste_tok_set_digit_run(c->tok, c->m.cfg.tok_digit_run);
+        waste_tok_set_pattern(c->tok, c->m.cfg.tok_pattern);
     }
     /* warm the cache from what previous runs learned, if anything */
     c->warmed = waste_model_warm_cache(&c->m, c->usage);
@@ -1001,22 +1002,38 @@ waste_status waste_image_add(waste_ctx *c, const char *path, size_t *n_out)
     if (!c->m.want_vision || !c->m.vcfg.layers) return WASTE_E_UNSUPPORTED;
     if (c->img_n >= WASTE_MAX_IMAGES) return WASTE_E_ARG;
 
-    const int glm = c->m.vcfg.tower == WASTE_TOWER_GLM;
-    const int mg = glm ? c->m.vcfg.merge : 2;
+    const waste_tower tw = (waste_tower)c->m.vcfg.tower;
+    const int glm = tw == WASTE_TOWER_GLM, ds41 = tw == WASTE_TOWER_DS41;
+    const int mg = (glm || ds41) ? c->m.vcfg.merge : 2;
     int gh = 0, gw = 0;
-    float *px = glm
+    float *px = ds41
+        ? waste_image_load_ds41(path, &c->m.vcfg, &gh, &gw)
+        : glm
         ? waste_image_load_glm(path, &c->m.vcfg, &gh, &gw)
         : waste_image_load(path, c->m.vcfg.max_patches,
                            c->m.vcfg.mean, c->m.vcfg.std, &gh, &gw);
     if (!px) return WASTE_E_IO;
 
-    const size_t rows = (size_t)(gh / mg) * (size_t)(gw / mg);
+    /* DeepSeek-V4.1's span is not just the image rows: one newline per
+     * token row and two delimiters, all three learned embeddings the tower
+     * writes itself. The count has to agree with waste_image_expand, which
+     * repeats the placeholder exactly this many times. */
+    size_t rows;
+    if (ds41) {
+        const size_t nh = (size_t)((gh + mg - 1) / mg);
+        const size_t nw = (size_t)((gw + mg - 1) / mg);
+        rows = nh * (nw + 1) + 2;
+    } else {
+        rows = (size_t)(gh / mg) * (size_t)(gw / mg);
+    }
     const size_t th = (size_t)c->m.vcfg.text_hidden;
     float *nb = (float *)realloc(c->img, (c->img_rows + rows) * th * sizeof(float));
     if (!nb) { free(px); return WASTE_E_OOM; }
     c->img = nb;
 
-    const int rc = glm
+    const int rc = ds41
+        ? waste_vision_encode_ds41(&c->m, px, gh, gw, c->img + c->img_rows * th)
+        : glm
         ? waste_vision_encode_glm(&c->m, px, gh, gw, c->img + c->img_rows * th)
         : waste_vision_encode(&c->m, px, gh, gw, c->img + c->img_rows * th);
     free(px);
@@ -1340,6 +1357,12 @@ waste_status waste_generate(waste_ctx *c, const int32_t *prompt, size_t n,
          * whether or not the answer happened to be finished. */
         if (!lg) { st = read_error_report(c); break; }
         if (stop) break;
+        if (t == p.max_tokens - 1) {
+            snprintf(c->detail, sizeof c->detail,
+                     "generation reached max_tokens (%u); the response may be incomplete",
+                     p.max_tokens);
+            break;
+        }
         cur = sample(lg, c->m.cfg.vocab, &p, &rng);
     }
     c->stats.experts_hit += c->m.cache.hits - h0;

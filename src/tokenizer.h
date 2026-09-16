@@ -52,6 +52,21 @@ void waste_tok_set_han_split(waste_tok *t, int on);
  * number differently from the model that was trained on it. */
 void waste_tok_set_digit_run(waste_tok *t, int n);
 
+/* Which pre-tokenization pattern the release splits with. The Kimi and GLM
+ * containers are all cl100k-shaped and differ only in the Han branch, which
+ * is why that one is a flag; DeepSeek-V4.1 splits with a different pattern
+ * entirely — three sequential isolating Splits, no contraction branch, and
+ * punctuation and symbols as classes of their own — so it is a mode and not
+ * a flag. An unknown value is refused at load rather than defaulted:
+ * picking a pattern the container did not ask for mis-splits every prompt
+ * and reports nothing. */
+enum {
+    WASTE_TOKPAT_CL100K   = 0,
+    WASTE_TOKPAT_DEEPSEEK = 1,
+    WASTE_TOKPAT__COUNT
+};
+void waste_tok_set_pattern(waste_tok *t, int pattern);
+
 /* Encodes `text` into `out` (capacity `cap`); returns the count, or -1 if
  * it would not fit. Special tokens in the text are NOT interpreted. */
 /* allow_special: 1 = `<|open|>` and friends become their control-token

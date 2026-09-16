@@ -47,9 +47,9 @@ extern "C" {
  * for an embeddable engine that may be updated independently.
  */
 #define WASTE_VERSION_MAJOR  0
-#define WASTE_VERSION_MINOR  7
-#define WASTE_VERSION_PATCH  2
-#define WASTE_VERSION_STRING "0.7.2"
+#define WASTE_VERSION_MINOR  8
+#define WASTE_VERSION_PATCH  0
+#define WASTE_VERSION_STRING "0.8.0"
 #define WASTE_VERSION_NUMBER (WASTE_VERSION_MAJOR * 10000 + \
                               WASTE_VERSION_MINOR * 100 + \
                               WASTE_VERSION_PATCH)
@@ -293,9 +293,9 @@ waste_status waste_memory_used(const waste_ctx *ctx, waste_memplan *out);
  * valid until the next eval or generate on it.
  *
  * Also set after a *successful* waste_generate that stopped because the
- * context filled rather than because the model finished or max_tokens
- * ran out. That is not an error — the tokens produced are good — but it
- * is the one ending a host cannot tell from the others by the status
+ * context filled or max_tokens ran out rather than because the model
+ * finished. That is not an error — the tokens produced are good — but
+ * these endings cannot be distinguished from completion by the status
  * alone, and a UI that says "the answer is complete" when it is not is
  * worse than one that says nothing.
  *

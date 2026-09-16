@@ -401,6 +401,53 @@ else
     kill $RSRV 2>/dev/null; wait $RSRV 2>/dev/null
 fi
 
+# Completion, reported on evidence. A USB enclosure dropping off the bus
+# mid-run took $STATE with it; `wc -l` produced nothing, `[ "" -lt 48 ]` is
+# an error that `test` reports as false, and the run printed ALL SHARDS
+# COMPLETE with rc=0 over a directory that no longer existed. 184 GB of 475.
+# Same shape as #35 one level up, and the same remedy: read the number.
+count_done_says() {                    # $1 = DEST; stdout = count, stderr = why
+    # The REAL log(), not a stub. It used to be one `tee` into $DEST/log, so
+    # when $DEST went away every message was replaced by "tee: No such file
+    # or directory" — the refusal fired and said nothing about why, which is
+    # the silence it exists to break.
+    { echo "DEST=$1; STATE=\$DEST/.st; LOG=\$DEST/download.log"
+      sed -n '/^log() {$/,/^}$/p' tools/fetch_weights.sh
+      sed -n '/^count_done() {$/,/^}$/p' tools/fetch_weights.sh
+      echo 'count_done'
+    } > "$FT/gencd.sh"
+    bash "$FT/gencd.sh" 2>/dev/null
+}
+count_done_why() {                     # the same, keeping only the messages
+    bash "$FT/gencd.sh" 2>&1 >/dev/null
+}
+
+# Nothing but bash and sed, so this one runs everywhere the suite does.
+{
+    CD="$FT/cd"
+    rm -rf "$CD"; mkdir -p "$CD"
+    printf 'a\nb\nc\n' > "$CD/.st"
+    got=$(count_done_says "$CD"); rc_ok=$?
+    # gone entirely, which is what an unplugged disk looks like
+    missing=$(count_done_says "$FT/definitely-not-here"); rc_gone=$?
+    # there, but with no state file to count
+    rm -f "$CD/.st"
+    nostate=$(count_done_says "$CD"); rc_nostate=$?
+    # and it has to SAY so: the message must survive $DEST being the thing
+    # that is gone, because that is where the log file lives.
+    count_done_says "$FT/definitely-not-here" >/dev/null 2>&1
+    why=$(count_done_why | tr -d '\n')
+    if [ "$rc_ok" = 0 ] && [ "$got" = 3 ] &&
+       [ "$rc_gone" != 0 ] && [ -z "$missing" ] &&
+       [ "$rc_nostate" != 0 ] && [ -z "$nostate" ] &&
+       printf '%s' "$why" | grep -q "FAILED"; then
+        ok "a download whose destination vanished is incomplete, and says so"
+    else
+        no "count_done: ok=$rc_ok/$got gone=$rc_gone nostate=$rc_nostate why=[$why]"
+    fi
+    rm -rf "$CD"
+}
+
 # get_small, the other half of the script, and the half that had no checks.
 # Its contract is that a file the repo's own listing names and the server
 # does not deliver is a failure and not a 404 (#35): one attempt with the
@@ -999,15 +1046,29 @@ PY
         hot_why=$(python3 - "$MODEL" <<'PYHOT'
 import json, os, subprocess, sys
 WASTE = os.path.join(os.curdir, "waste" + (".exe" if os.name == "nt" else ""))
-r = subprocess.run([WASTE, "plan", sys.argv[1], "--json"],
+r = subprocess.run([WASTE, "plan", sys.argv[1], "--json", "--budget", "5G"],
                    capture_output=True, text=True)
 try:
-    floor = json.loads(r.stdout)["floor_bytes"]
+    p = json.loads(r.stdout)
 except Exception:
     sys.exit(0)
-if floor > 5 * (1 << 30):
-    print(f"this container's floor is {floor / (1 << 30):.2f} GB and the "
+G = 1 << 30
+floor, ws = p["floor_bytes"], p["working_set_bytes"]
+cache = p.get("expert_cache_bytes", -1)
+if floor > 5 * G:
+    print(f"this container's floor is {floor / G:.2f} GB and the "
           f"check opens at 5G, which the engine refuses")
+elif 0 <= cache < ws:
+    # Opening is not the same as having room to learn anything. A cache
+    # below one token's working set has a hit rate of zero, not a low one
+    # (docs/ENGINE.md section 3): every record the hotlist preloads is
+    # evicted before the token that wanted it comes round again.
+    # DeepSeek-V4.1 is the first container here that fits under 5G and
+    # still cannot hold one — floor 4.86 GB, so 310 MB of cache against a
+    # 3.19 GB working set — and it answered 284 misses -> 286, which is
+    # the engine behaving as designed and this check calling it a defect.
+    print(f"a 5G budget leaves {cache / G:.2f} GB of expert cache and one "
+          f"token needs {ws / G:.2f} GB, so no hotlist can hit")
 PYHOT
 )
     fi
@@ -2273,17 +2334,109 @@ else
     sk "prompt text cannot forge control tokens" "needs a container with specials.json"
 fi
 
+# The same file, written the way Python writes it. json.dump escapes
+# non-ASCII by default, so DeepSeek-V4.1's full-width-bar control tokens
+# arrived in a container as "<\\uff5cUser\\uff5c>" — and load_specials
+# copied the bytes between the quotes without decoding them, so no marker
+# matched and markup mode tokenized every one of them as prose. The four
+# releases before it had ASCII-only control tokens, which is how a JSON
+# reader that did not decode JSON went unnoticed that long.
+#
+# The converter writes UTF-8 now, but a container built by some other tool
+# may still escape, so the reader must decode. This needs no real weights
+# and no non-ASCII vocabulary: what is under test is the decoder, so it
+# builds a small container with a tokenizer, rewrites one special to a
+# marker with 2-, 3- and 4-byte characters in it (the last as a surrogate
+# pair), escapes the whole file, and asks for that one id back.
+if python3 tools/make_test_container.py --tokenizer "$TMP/esc.waste" \
+        >/dev/null 2>&1 &&
+   python3 - "$TMP/esc.waste" "$TMP/esc.txt" "$TMP/esc.id" <<'ESCPY'
+import json, os, sys
+dst, txtf, idf = sys.argv[1:4]
+p = os.path.join(dst, "specials.json")
+sp = json.load(open(p))
+sp[0]["text"] = "<\u00e9\u2581\U0001d11e>"    # 2, 3 and 4 bytes of UTF-8
+
+def esc(s):
+    out = []
+    for ch in s:
+        cp = ord(ch)
+        if cp < 0x10000:
+            out.append("\\u%04x" % cp)
+        else:                                # one character or none: a pair
+            cp -= 0x10000                    # that decodes to two is wrong
+            out.append("\\u%04x\\u%04x"
+                       % (0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF)))
+    return "".join(out)
+
+body = ",\n".join('{"id": %d, "text": "%s"}' % (e["id"], esc(e["text"]))
+                  for e in sp)
+with open(p, "w") as f:
+    f.write("[\n" + body + "\n]\n")
+open(txtf, "w").write(sp[0]["text"])
+open(idf, "w").write(str(sp[0]["id"]))
+ESCPY
+then
+    want=$(cat "$TMP/esc.id")
+    got=$(./test_tokenizer "$TMP/esc.waste" "$(cat "$TMP/esc.txt")" \
+              2>/dev/null | head -1)
+    if [ "$got" = "1 $want" ]; then
+        ok "a \\uXXXX-escaped specials.json resolves to the same ids"
+    else
+        no "escaped specials.json: wanted \"1 $want\", got \"$got\""
+    fi
+else
+    sk "escaped specials.json resolves" "${PY_MISS:-could not build a tokenizer container}"
+fi
+
+# `grep -q identical` used to be the whole test here, and "22914/24021
+# identical" contains that word. It passed for as long as the character
+# classes in tokenizer.c were wrong, which was every release. Read the
+# numbers.
+tokdiff_all_identical() {
+    local line
+    line=$(printf '%s' "$1" | tail -1)
+    case "$line" in
+        *identical*) ;;
+        *) return 1 ;;
+    esac
+    local n d
+    n=${line%%/*}
+    d=${line#*/}
+    d=${d%% *}
+    [ -n "$n" ] && [ "$n" = "$d" ]
+}
+
 if [ "$SYNTHETIC" = 1 ]; then
     sk "tokenizer diff" "synthetic container carries no tokenizer"
+    sk "tokenizer diff over the whole codepoint space" "no tokenizer"
 elif [ -d "$MODEL" ] && command -v uv >/dev/null 2>&1 && [ -d "$SRC" ]; then
-    if run_uv run --quiet --with tiktoken --no-project python tools/tokdiff.py \
-           "$MODEL" "$SRC" 2>/dev/null | tail -1 | grep -q "identical"; then
-        ok "C tokenizer matches Python tiktoken"
+    out=$(run_uv run --quiet --with tiktoken --with tokenizers --no-project \
+          python tools/tokdiff.py "$MODEL" "$SRC" 2>/dev/null)
+    if tokdiff_all_identical "$out"; then
+        ok "C tokenizer matches the release's ($(printf '%s' "$out" | tail -1))"
     else
-        no "tokenizer differs from tiktoken"
+        no "tokenizer differs: $(printf '%s' "$out" | tail -1)"
+    fi
+    # The curated list is twenty-one strings and scored 21/21 through a bug
+    # that moved a thousand strings in four thousand. This is the corpus that
+    # found it: every codepoint, thinned, plus multi-byte whitespace runs.
+    # A handful of disagreements survive on codepoints assigned after the
+    # Unicode revision src/unicode_classes.h was generated from, so this
+    # reports the count rather than demanding equality.
+    out=$(run_uv run --quiet --with tiktoken --with tokenizers --no-project \
+          python tools/tokdiff.py --wide 20000 "$MODEL" "$SRC" 2>/dev/null)
+    line=$(printf '%s' "$out" | tail -1)
+    n=${line%%/*}; d=${line#*/}; d=${d%% *}
+    if [ -n "$n" ] && [ -n "$d" ] && [ "$d" -gt 0 ] 2>/dev/null &&
+       [ "$((100 * n / d))" -ge 99 ]; then
+        ok "C tokenizer over the whole codepoint space ($line)"
+    else
+        no "wide tokenizer diff: ${line:-no output}"
     fi
 else
     sk "tokenizer diff" "needs uv, a container and source weights"
+    sk "tokenizer diff over the whole codepoint space" "needs uv, a container and source weights"
 fi
 
 # ------------------------------------------------------------ converter ----
@@ -2390,6 +2543,159 @@ else
     esac
 fi
 
+# DeepSeek-V4.1 shares almost nothing above the expert record with the rest
+# of this family, so the converter has to rename every tensor and lift half
+# its config off the wrapper. All of it is silent when wrong: an
+# unrecognised name is written under the checkpoint's own spelling and the
+# load then refuses a container that holds every weight — after hours.
+if [ -n "$PY_MISS" ]; then
+    sk "convert.py DeepSeek-V4.1 names and config" "$PY_MISS"
+elif out=$(python3 tests/test_convert_ds41.py 2>&1); then
+    ok "DeepSeek-V4.1's 40 tensor kinds, its prefixes and its lifted config"
+else
+    no "convert.py DeepSeek-V4.1 names and config"
+    printf '%s\n' "$out" | grep -E "FAIL|Error|Traceback" | head -5
+fi
+
+# And the container it produces has to open. A synthetic one at test scale
+# reaches the parts no other container does: CSA2's shapes, the two-level
+# indexer, the Engram tables and their hashing, a second routing bias. The
+# forward pass is stage 5 of docs/DS41.md and is not here yet, so what this
+# asserts is that the *load* accepts it — config bounds, tensor validation,
+# the engram index — and that it then says so rather than crashing.
+if [ -n "$PY_MISS" ]; then
+    sk "DeepSeek-V4.1 container loads" "$PY_MISS"
+else
+    ds41_dir="$TMP/ds41.waste"
+    rm -rf "$ds41_dir"
+    if ! python3 tools/make_test_container.py --ds41 "$ds41_dir" >/dev/null 2>&1; then
+        no "DeepSeek-V4.1 synthetic container builds"
+    elif info=$(./waste info "$ds41_dir" 2>&1) &&
+         printf '%s' "$info" | grep -q "DeepseekV41"; then
+        ok "a DeepSeek-V4.1 container opens: config, tensor shapes, engram index"
+        # Every shape validate_text_tensors demands is demanded: drop one
+        # tensor from the trunk index and the load must refuse. attn_sink is
+        # the one whose absence is invisible in a forward pass — it is a
+        # per-head temperature and the answer just drifts.
+        python3 - "$ds41_dir" <<'PYEOF'
+import json, sys
+p = sys.argv[1] + "/manifest.json"
+m = json.load(open(p))
+m["trunk"] = [t for t in m["trunk"]
+              if not t["name"].endswith("layers.0.self_attn.attn_sink")]
+json.dump(m, open(p, "w"), indent=1)
+PYEOF
+        if ./waste info "$ds41_dir" >/dev/null 2>&1; then
+            no "a container missing attn_sink is accepted"
+        else
+            ok "and one missing a tensor it needs is refused, by name"
+        fi
+        # And the arithmetic, against an oracle reading the SAME container —
+        # so this measures the forward pass and not the quantization. Twelve
+        # tokens rather than four because the window is four slots wide: the
+        # ring has to wrap, the compressed caches have to fill, and layer 4's
+        # candidate filter has to have blocks to choose between. At four
+        # tokens none of that happens and the diff is green over three
+        # mechanisms that never ran.
+        rm -rf "$ds41_dir"
+        python3 tools/make_test_container.py --ds41 "$ds41_dir" >/dev/null 2>&1
+        DIDS=3,7,11,5,19,23,2,41,8,64,17,90
+        if ! command -v uv >/dev/null 2>&1; then
+            sk "DeepSeek-V4.1 vs a PyTorch oracle" "uv not installed"
+        elif run_uv run --quiet --with torch --no-project python tools/ds41_ref.py \
+                 --container "$ds41_dir" --ids "$DIDS" --top 1 \
+                 --dump "$TMP/ds41.ref" >/dev/null 2>&1 &&
+             ./test_forward "$ds41_dir" "$DIDS" "$TMP/ds41.eng" 0 >/dev/null 2>&1; then
+            rel=$(python3 - "$TMP/ds41.ref" "$TMP/ds41.eng" <<'PYEOF'
+import math, struct, sys
+a = open(sys.argv[1], "rb").read()
+b = open(sys.argv[2], "rb").read()
+n = min(len(a), len(b)) // 4
+x = struct.unpack(f"<{n}f", a[:n * 4])
+y = struct.unpack(f"<{n}f", b[:n * 4])
+num = math.sqrt(sum((p - q) ** 2 for p, q in zip(x, y)))
+den = math.sqrt(sum(p * p for p in x)) or 1.0
+print(f"{100.0 * num / den:.6f}")
+PYEOF
+)
+            if [ -n "$rel" ] && python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 0.01 else 1)" "$rel"; then
+                ok "CSA2, single-pass mHC, Engram and the sqrt-softplus router match an oracle (${rel}% rel L2)"
+            else
+                no "DeepSeek-V4.1 differs from the oracle: ${rel:-no output}% rel L2"
+            fi
+        else
+            no "DeepSeek-V4.1 oracle or engine did not run"
+        fi
+    else
+        no "a DeepSeek-V4.1 container opens"
+        printf '%s\n' "$info" | head -3
+    fi
+    rm -rf "$ds41_dir"
+fi
+
+# DeepSeek-V4.1's tower. A third one, and it shares a block shape with the
+# other two and nothing else: no learned position grid and no q/k norms, a
+# 2D rotation that pairs each head's HALVES where every other rotation here
+# pairs adjacent elements, one fused weight for gate and up, and a projector
+# that is a 3x3 pixel-unshuffle into two dense layers.
+#
+# Five grids, not one. Three of them are not multiples of the downsample, so
+# the unfold's zero padding on the right and bottom actually runs; on a
+# 6x6 grid it never does and the diff is green over it.
+if [ -n "$PY_MISS" ]; then
+    sk "DeepSeek-V4.1's vision tower" "$PY_MISS"
+elif ! command -v uv >/dev/null 2>&1; then
+    sk "DeepSeek-V4.1's vision tower" "uv not installed"
+else
+    vd="$TMP/ds41vis.waste"
+    rm -rf "$vd"
+    python3 tools/make_test_container.py --ds41 --vision "$vd" >/dev/null 2>&1
+    bad=0
+    for g in 3x3 4x5 6x6 7x4 2x9; do
+        gh=${g%x*}; gw=${g#*x}
+        python3 - "$gh" "$gw" "$TMP/ds41px.bin" <<'PYEOF'
+import random, struct, sys
+gh, gw, out = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+random.seed(gh * 7 + gw)
+n = gh * gw * 3 * 14 * 14
+open(out, "wb").write(struct.pack(f"<{n}f",
+                                  *[random.uniform(-1, 1) for _ in range(n)]))
+PYEOF
+        ./test_vision_ds41 tower "$vd" "$gh" "$gw" "$TMP/ds41px.bin" \
+            "$TMP/ds41tow.bin" >/dev/null 2>&1 || { bad=$((bad+1)); continue; }
+        run_uv run --quiet --with torch --no-project python \
+            tools/ds41_vision_ref.py --container "$vd" \
+            --pixels "$TMP/ds41px.bin" --grid "$g" \
+            --engine "$TMP/ds41tow.bin" >/dev/null 2>&1 || bad=$((bad+1))
+    done
+    if [ "$bad" = 0 ]; then
+        ok "32-block 2D-rope tower and the 3x3 pixel-unshuffle match the oracle"
+    else
+        no "DeepSeek-V4.1's tower differs from the oracle on $bad of 5 grids"
+    fi
+
+    # And the geometry, which decides how much of the context an image
+    # costs. A pure function on both sides, so it is asked the same
+    # question rather than inferred from a decoded file — including the two
+    # collapse cases, where a very tall image keeps two tokens of head-room
+    # and a very wide one three.
+    bad=0
+    for wh in 100x100 800x600 4000x300 300x4000 1x1 1920x1080 7000x7000; do
+        w=${wh%x*}; h=${wh#*x}
+        a=$(./test_vision_ds41 plan "$vd" "$w" "$h" 2>/dev/null)
+        b=$(run_uv run --quiet --with torch --no-project python \
+            tools/ds41_vision_ref.py --container "$vd" --plan "$wh" 2>/dev/null \
+            | grep box)
+        [ -n "$a" ] && [ "$a" = "$b" ] || bad=$((bad+1))
+    done
+    if [ "$bad" = 0 ]; then
+        ok "an image's pixel box and token span agree with the release's"
+    else
+        no "DeepSeek-V4.1 image geometry differs on $bad of 7 sizes"
+    fi
+    rm -rf "$vd"
+fi
+
 # The chat.json the converter installs has to be the one whose markup the
 # release's tokenizer carries. Installing the wrong one is silent: absent
 # markers encode as ordinary text, so the model reads its own turn structure
@@ -2458,6 +2764,27 @@ else
     sk "XTML vs encoding_k3.py" "no release at $K3_SRC (set K3_DIR)"
 fi
 
+# And for DeepSeek-V4.1's. serve/dsml.py is a port of encoding/encoding.py,
+# and a port is a second implementation of something whose only
+# specification is the first one — so it is diffed against that file, plus
+# the release's own five checked-in golden outputs. Those cover a
+# mid-conversation system turn, an internal task token and a two-image
+# vision turn, none of which this repo would have thought to write down.
+DS41_SRC="${DS41_DIR:-/Volumes/WasteDisk/ds41}"
+if [ ! -f "$DS41_SRC/encoding/encoding.py" ]; then
+    sk "DSML vs encoding.py" "no release at $DS41_SRC (set DS41_DIR)"
+elif [ -n "$PY_MISS" ]; then
+    sk "DSML vs encoding.py" "$PY_MISS"
+elif out=$(DS41_DIR="$DS41_SRC" python3 -m unittest discover -s tests/serve \
+           -t . -p "test_dsml_upstream.py" 2>&1) &&
+     printf '%s' "$out" | tail -3 | grep -q "^OK"; then
+    n=$(printf '%s' "$out" | grep -oE "Ran [0-9]+ tests" | grep -oE "[0-9]+")
+    ok "DSML prompts and replies match the release's encoding.py ($n checks)"
+else
+    no "DSML differs from encoding.py"
+    printf '%s\n' "$out" | grep -E "FAIL|Error|AssertionError" | head -3
+fi
+
 # The same question for the other format serve/ renders. Kimi-Linear's
 # tokenizer carries Kimi K2's five tool-call tokens and its release ships
 # no chat_template at all, so the vocabulary is stated and the grammar is
@@ -2479,6 +2806,31 @@ else
         ok "chat.json tool rendering matches K2's own chat_template"
     else
         no "chat.json tool rendering differs from K2's chat_template"
+    fi
+fi
+
+# And for the third: GLM's release ships its chat_template, and GLM's tool
+# grammar (`<tool_call>`, `<arg_key>`, `<arg_value>`) is that template's, not
+# anything this repo owns. Same rule — diff the rendering against it. Needs
+# the loopcontrols extension too, because the template uses `{% break %}`.
+# A copy of the upstream template is vendored at tests/serve/glm_upstream/
+# (see its README.md for provenance), so this runs out of a fresh clone;
+# GLM_DIR still points a real release directory over it if one is present.
+GLM_SRC="${GLM_DIR:-tests/serve/glm_upstream}"
+if [ ! -f "$GLM_SRC/chat_template.jinja" ] && [ ! -f "$GLM_SRC/tokenizer_config.json" ]; then
+    sk "chat.json tools vs GLM's chat_template" \
+       "no template at $GLM_SRC (set GLM_DIR; only chat_template.jinja is needed)"
+elif [ -n "$PY_MISS" ]; then
+    sk "chat.json tools vs GLM's chat_template" "$PY_MISS"
+elif ! command -v uv >/dev/null 2>&1; then
+    sk "chat.json tools vs GLM's chat_template" "uv not installed (needs jinja2)"
+else
+    if GLM_DIR="$GLM_SRC" run_uv run --no-project --with jinja2 \
+           python -m unittest tests.serve.test_glm_upstream 2>&1 \
+           | tail -3 | grep -q "^OK"; then
+        ok "chat.json tool rendering matches GLM's own chat_template"
+    else
+        no "chat.json tool rendering differs from GLM's chat_template"
     fi
 fi
 

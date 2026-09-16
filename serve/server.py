@@ -40,7 +40,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
-from . import api, xtml
+from . import api, dsml, glmtools, xtml
 from .chatfmt import ChatFormat, ChatFormatError, PlainParser
 from .engine import Cancelled, Engine, EngineError
 from .regions import RegionParser
@@ -111,13 +111,35 @@ class ChatServer(ThreadingHTTPServer):
             self.chat_format = None
             self.chat_error = str(e)
             self.stop_tokens = []
+            # DeepSeek-V4.1's DSML, before the declarative fallback and for
+            # the same reason XTML comes before both: it is a whole protocol
+            # — turns, thinking, tools, images — where chat.json is a plain
+            # conversation. The probe is every marker or none, so a
+            # container that is not this release falls through rather than
+            # half-resolving.
+            try:
+                self.markers = dsml.detect(engine)
+            except EngineError as e_ds:
+                self.markers = {}
+                e = f"{e}; and {e_ds}"
+            else:
+                self.chat_format = dsml
+                self.chat_error = None
+                self.stop_tokens = [tid for tid, text in self.markers.items()
+                                    if text == dsml.EOS]
+                # The generation prompt always opens a channel — <think> or
+                # </think> — so a DSML container cannot be asked to answer
+                # without one being chosen. Default it on, as the release
+                # does.
+                self.default_thinking = True
+                return
             try:
                 fmt = ChatFormat.load(engine)
             except ChatFormatError as e2:
                 # Both reasons, because either one alone misleads: "no XTML"
                 # reads as "wrong model" when the chat.json is simply
                 # missing, and the chat.json reason alone hides that the
-                # richer format was tried first.
+                # richer formats were tried first.
                 self.chat_error = f"{e}; and {e2}"
             else:
                 self.markers = fmt.markers
@@ -131,20 +153,30 @@ class ChatServer(ThreadingHTTPServer):
                 # be asked to answer without it either.
                 self.default_thinking = fmt.think is not None
 
-    def new_parser(self, thinking: bool):
+    def new_parser(self, thinking: bool, tools=None):
         """The reply reader for whichever format this container speaks.
 
-        `thinking` says which channel the generation prompt left open, and
-        only XTML has channels to leave open.
+        `thinking` says which channel the generation prompt left open.
+        XTML and DSML both have channels to leave open; a chat.json format
+        has one only when it names a think marker.
         """
         if self.chat_format is xtml:
             return RegionParser(in_think=thinking, in_response=not thinking,
                                 markers=self.markers)
+        if self.chat_format is dsml:
+            return dsml.DSMLParser(thinking=thinking, markers=self.markers)
         fmt = self.chat_format
+        # Which tool protocol the reply reader should own: a GLM container
+        # speaks its own `<tool_call>` grammar, anything else that reaches
+        # a PlainParser speaks Kimi K2's five control tokens.
+        tool_parser = None
+        if getattr(fmt, "tool_protocol", "") == "glm":
+            tool_parser = glmtools.ToolParser(tools=tools)
         return PlainParser(markers=self.markers,
                            think_close_id=getattr(fmt, "think_close_id", -1),
                            in_think=thinking and getattr(fmt, "think", None)
-                           is not None)
+                           is not None,
+                           tool_parser=tool_parser)
 
     def handle_error(self, request, client_address):
         """A client hanging up is not an error worth a traceback.
@@ -354,7 +386,7 @@ class Handler(BaseHTTPRequestHandler):
 
             request_id = api.new_id("chatcmpl")
             created = api.now()
-            parser = srv.new_parser(prompt.thinking)
+            parser = srv.new_parser(prompt.thinking, tools=body.get("tools"))
 
             if stream:
                 self._chat_stream(body, prompt, opts, stops, parser,

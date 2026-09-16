@@ -1587,6 +1587,52 @@ static int validate_text_tensors(waste_model *m)
             }
             REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attn.o_norm.weight", c->prefix, L), D);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L), hid, C);
+        } else if (c->ds41) {
+            /* CSA2. One KV vector per token rather than per head, a query
+             * that is low-rank, and an output projection that is low-rank
+             * AND block-diagonal over o_groups -- so wo_a's rows are the
+             * groups' ranks and its columns are one group's heads, which is
+             * the shape an ordinary Linear would not have. */
+            const int hd = c->head_dim, qh = c->n_heads * hd;
+            const char *sa = "%smodel.layers.%d.self_attn.%s";
+            REQUIRE_MATRIX(tname(sa, c->prefix, L, "q_a_proj.weight"), c->q_lora, hid);
+            REQUIRE_VECTOR(tname(sa, c->prefix, L, "q_a_layernorm.weight"), c->q_lora);
+            REQUIRE_MATRIX(tname(sa, c->prefix, L, "q_b_proj.weight"), qh, c->q_lora);
+            REQUIRE_MATRIX(tname(sa, c->prefix, L, "kv_proj.weight"), hd, hid);
+            REQUIRE_VECTOR(tname(sa, c->prefix, L, "kv_layernorm.weight"), hd);
+            REQUIRE_MATRIX(tname(sa, c->prefix, L, "o_a_proj.weight"),
+                           c->o_groups * c->o_lora, qh / c->o_groups);
+            REQUIRE_MATRIX(tname(sa, c->prefix, L, "o_b_proj.weight"),
+                           hid, c->o_groups * c->o_lora);
+            /* One learned scalar per head, added to the softmax denominator
+             * and to nothing else. Omitting it is a per-head temperature on
+             * the whole output, and nothing about the result looks wrong. */
+            REQUIRE_DATA(tname(sa, c->prefix, L, "attn_sink"), (size_t)c->n_heads);
+
+            if (c->kv_source[L]) {
+                REQUIRE_MATRIX(tname(sa, c->prefix, L, "compress.kv_proj.weight"), hd, hid);
+                REQUIRE_VECTOR(tname(sa, c->prefix, L, "compress.norm.weight"), hd);
+                /* At ratio 1 there is nothing to pool, so the release ships
+                 * no gate -- four wkv and three wgate, which is the shape
+                 * that gives this branch away if it is wrong. */
+                if (c->compress_ratio[L] > 1)
+                    REQUIRE_MATRIX(tname(sa, c->prefix, L, "compress.gate_proj.weight"), hd, hid);
+            }
+            if (c->index_source[L]) {
+                REQUIRE_MATRIX(tname(sa, c->prefix, L, "indexer.q_b_proj.weight"),
+                               c->index_heads * c->index_dim, c->q_lora);
+                REQUIRE_MATRIX(tname(sa, c->prefix, L, "indexer.weights_proj.weight"),
+                               c->index_heads, hid);
+                /* The index keys come off the compressor's latent, so only
+                 * a layer that compresses its own KV can build them; the
+                 * other four indexers read the keys that layer published. */
+                if (c->kv_source[L]) {
+                    REQUIRE_MATRIX(tname(sa, c->prefix, L, "indexer.k_proj.weight"),
+                                   c->index_dim, hd);
+                    REQUIRE_VECTOR(tname(sa, c->prefix, L, "indexer.k_layernorm.weight"),
+                                   c->index_dim);
+                }
+            }
         } else {
             const int qd = c->qk_nope + c->qk_rope;
             if (c->q_lora) {
@@ -1615,7 +1661,7 @@ static int validate_text_tensors(waste_model *m)
                 REQUIRE_DATA(tname("%smodel.layers.%d.hc_%s_scale", c->prefix, L, site[i]), 3);
             }
         }
-        if (c->index_topk && !c->kda_layer[L]) {
+        if (c->index_topk && !c->kda_layer[L] && !c->ds41) {
             const char *ix = "%smodel.layers.%d.self_attn.indexer.%s";
             REQUIRE_MATRIX(tname(ix, c->prefix, L, "wq_b.weight"),
                            c->index_heads * c->index_dim, c->q_lora);
@@ -1629,6 +1675,21 @@ static int validate_text_tensors(waste_model *m)
                          (size_t)c->index_kpool * c->index_dim);
         }
 
+        if (c->engram_layer[L]) {
+            /* The table itself is not here: 197 B parameters stay on disk
+             * and are read a row at a time, so it is checked by
+             * engram_open against the row count the manifest states. What
+             * is resident is the projection that turns a lookup into a key
+             * per hc copy plus one shared value, and the two gate vectors. */
+            const char *eg = "%smodel.layers.%d.engram.%s";
+            const int cols = (c->engram_ngram - 1) * c->engram_heads *
+                             c->engram_head_dim;
+            REQUIRE_MATRIX(tname(eg, c->prefix, L, "wkv.weight"),
+                           hid * (c->hc_mult + 1), cols);
+            REQUIRE_MATRIX(tname(eg, c->prefix, L, "q_weight"), c->hc_mult, hid);
+            REQUIRE_MATRIX(tname(eg, c->prefix, L, "k_weight"), c->hc_mult, hid);
+        }
+
         if (c->attn_res_block) {
             REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attention_res_norm.weight", c->prefix, L), hid);
             REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attention_res_proj.weight", c->prefix, L), hid);
@@ -1640,6 +1701,12 @@ static int validate_text_tensors(waste_model *m)
             const int lat = c->latent_dim ? c->latent_dim : hid;
             const int shared = c->moe_inter * (c->n_shared ? c->n_shared : 1);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L), c->n_experts, hid);
+            /* The correction bias steers selection and does not scale the
+             * weights. DeepSeek-V4.1 carries a second one for tokens inside
+             * an image span, and picks between them per token. */
+            if (c->route_bias_vl)
+                REQUIRE_DATA(tname("%smodel.layers.%d.block_sparse_moe.gate.e_score_correction_bias_vl", c->prefix, L),
+                             (size_t)c->n_experts);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.shared_experts.gate_proj.weight", c->prefix, L), shared, hid);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.shared_experts.up_proj.weight", c->prefix, L), shared, hid);
             REQUIRE_MATRIX(tname("%smodel.layers.%d.block_sparse_moe.shared_experts.down_proj.weight", c->prefix, L), hid, shared);
@@ -1665,6 +1732,78 @@ static int validate_text_tensors(waste_model *m)
 #undef REQUIRE_MATRIX
 #undef REQUIRE_VECTOR
 #undef REQUIRE_DATA
+
+/* Everything CSA2 and Engram need, bounded the way every other dimension
+ * here is. `ds41` is -1 when the reader found a list it could not use, so
+ * the refusal reaches this function rather than being decided there: one
+ * place says no, and it says no before anything is allocated.
+ *
+ * All-or-nothing on purpose. A container that states index_topk without an
+ * indexer's shapes, or engram layers without the tables' row counts, would
+ * run -- attending over nothing, or adding a lookup from a table it sizes
+ * wrong -- and report neither. */
+static int ds41_sane(const waste_config *c)
+{
+    if (c->ds41 == 0) return 1;
+    if (c->ds41 != 1) return 0;
+    if (c->head_dim < 1 || c->head_dim > (1 << 16)) return 0;
+    if (c->o_groups < 1 || c->o_groups > 1024) return 0;
+    if (c->o_lora < 1 || c->o_lora > (1 << 20)) return 0;
+    if (c->window < 1 || c->window > (1 << 20)) return 0;
+    if (c->n_heads < 1 || c->q_lora < 1) return 0;
+    /* wo_a is block-diagonal over o_groups, so the heads have to divide
+     * into them evenly or the block width is not an integer. */
+    if ((int64_t)c->n_heads * c->head_dim % c->o_groups) return 0;
+    if ((int64_t)c->n_heads * c->head_dim > INT_MAX) return 0;
+    if ((int64_t)c->o_groups * c->o_lora > INT_MAX) return 0;
+    if (c->qk_rope < 1 || c->qk_rope > c->head_dim) return 0;
+    if (c->hc_mult < 1) return 0;                /* mHC is not optional here */
+    if (c->index_topk < 1 || c->index_heads < 1 || c->index_dim < 1) return 0;
+    if (!(c->compress_rope_theta > 0.0f)) return 0;
+
+    /* Layers run in order and every source writes before its consumers
+     * read, so the whole scheme is one forward scan. `live` is the ratio of
+     * the most recent KV source, 0 before there has been one. */
+    int live = 0, index_live = 0;
+    for (int L = 0; L < c->n_layers; L++) {
+        const int r = c->compress_ratio[L];
+        if (r < 0) return 0;                     /* the reader's "not a ratio" */
+        if (c->kv_source[L]) {
+            if (!r) return 0;                    /* nothing to compress with */
+            live = r;
+        }
+        if (c->index_source[L]) {
+            if (!r) return 0;                    /* nothing to index */
+            index_live = 1;
+        }
+        if (!r) continue;
+        /* A compressing layer that is not itself a source reads the cache
+         * the last source wrote -- so there must be one, and it must have
+         * pooled at this layer's ratio. A mismatch is not a shape error
+         * anywhere: the reader would just divide the position by the wrong
+         * number and attend to the wrong tokens. */
+        if (live != r || !index_live) return 0;
+    }
+
+    if (c->cand_source >= c->n_layers) return 0;
+    if (c->cand_source >= 0) {
+        if (!c->index_source[c->cand_source]) return 0;
+        if (c->cand_block < 1 || c->cand_block > (1 << 16)) return 0;
+        if (c->cand_topk_blocks < 1) return 0;
+    }
+
+    if (c->engram_n < 0 || c->engram_n > WASTE_MAX_ENGRAM) return 0;
+    if (c->engram_n) {
+        if (c->engram_ngram < 2 || c->engram_ngram > 64) return 0;
+        if (c->engram_heads < 1 || c->engram_heads > 1024) return 0;
+        if (c->engram_head_dim < 1 || c->engram_head_dim > (1 << 16)) return 0;
+        for (int i = 0; i < c->engram_n; i++)
+            if (c->engram_rows[i] < 1 || c->engram_rows[i] > (int64_t)1 << 40)
+                return 0;
+    }
+    if (c->score_func < 0 || c->score_func > WASTE_SCORE_SQRTSOFTPLUS) return 0;
+    return 1;
+}
 
 /* A manifest is untrusted input, and these numbers size allocations and
  * bound loops that index fixed arrays. A config claiming 200 layers walks
@@ -1710,7 +1849,7 @@ static int cfg_sane(const waste_config *c)
         if (c->kda_heads < 1 || c->kda_dim < 1 || c->conv_k < 1) return 0;
         if ((int64_t)c->kda_heads * c->kda_dim > INT_MAX) return 0;
     }
-    if (!c->arch_qwen && n_kda < c->n_layers) {
+    if (!c->arch_qwen && !c->ds41 && n_kda < c->n_layers) {
         const int64_t qd = (int64_t)c->qk_nope + c->qk_rope;
         if (c->kv_lora < 1 || qd < 1 || c->v_head < 1) return 0;
         if ((int64_t)c->n_heads * qd > INT_MAX ||
@@ -1718,6 +1857,7 @@ static int cfg_sane(const waste_config *c)
             (int64_t)c->n_heads * (c->qk_nope + c->v_head) > INT_MAX)
             return 0;
     }
+    if (!ds41_sane(c)) return 0;
     /* mHC multiplies the resident residual stream and every buffer sized
      * from it, so it is bounded like a dimension rather than a flag. */
     if (c->hc_mult < 0 || c->hc_mult > 16) return 0;
@@ -1727,6 +1867,10 @@ static int cfg_sane(const waste_config *c)
         if ((int64_t)c->hc_mult * c->hidden > INT_MAX) return 0;
     }
     if (!(c->swiglu_limit >= 0.0f)) return 0;              /* also NaN */
+    /* A pattern this build does not have is refused rather than defaulted
+     * to cl100k: the wrong splitter encodes every prompt into a different
+     * token stream and reports nothing. */
+    if (c->tok_pattern < 0 || c->tok_pattern >= WASTE_TOKPAT__COUNT) return 0;
     /* The indexer is all-or-nothing: a container that states a topk without
      * the shapes to score with would silently attend over nothing. */
     if (c->index_kpool < 1 || c->index_kpool > 64) return 0;
@@ -1797,9 +1941,86 @@ static int cfg_sane(const waste_config *c)
  * same failure this function was added to fix: not a degraded answer but an
  * unordered one, and one that looks like weight-shaped logits.
  */
-static void rope_init(waste_config *c, const js_doc *d, int cfg)
+/* inv_freq without any scaling. Split out because DeepSeek-V4.1 needs two
+ * tables: its window-only layers rotate at rope_theta with YaRN off, and
+ * its compressed ones at compress_rope_theta with YaRN on, because one
+ * latent stands for compress_ratio tokens and its positions are that much
+ * further apart. */
+static void rope_plain(float *inv, int half, int dim, double base)
+{
+    for (int j = 0; j < half; j++)
+        inv[j] = (float)(1.0 / pow(base, (double)(2 * j) / dim));
+}
+
+/* YaRN's ramp, in place, following DeepseekV3YarnRotaryEmbedding. The
+ * mscale halves are NOT here: they are the part that differs between
+ * releases, and the one caller that wants them applies them itself. */
+static void rope_yarn(float *inv, int half, int dim, double base,
+                      double factor, double orig, double bf, double bs)
 {
     const double PI = 3.14159265358979323846;
+    if (factor <= 1.0) return;
+    double low = floor(dim * log(orig / (bf * 2.0 * PI)) / (2.0 * log(base)));
+    double high = ceil(dim * log(orig / (bs * 2.0 * PI)) / (2.0 * log(base)));
+    if (low < 0.0) low = 0.0;
+    if (high > dim - 1) high = dim - 1;
+    if (low == high) high += 0.001;             /* upstream's singularity guard */
+    for (int j = 0; j < half; j++) {
+        double ramp = ((double)j - low) / (high - low);
+        ramp = ramp < 0.0 ? 0.0 : ramp > 1.0 ? 1.0 : ramp;
+        const double mask = 1.0 - ramp;         /* 1 = extrapolate, 0 = interpolate */
+        const double extra = inv[j];
+        inv[j] = (float)((extra / factor) * (1.0 - mask) + extra * mask);
+    }
+}
+
+/* DeepSeek-V4.1's two schedules.
+ *
+ * Kept apart from rope_init rather than folded into it, because the shared
+ * function refuses a config whose mscale and mscale_all_dim differ -- and
+ * this release states neither, which under HF's defaults (1 and 0) is
+ * exactly that refusal. It is not an omission to paper over: the reference
+ * applies no mscale at all, on cos/sin or on the attention scale, so
+ * att_mul stays 1 and writing the two keys in to get past the check would
+ * put a 1.63x on the scale that the model was not trained with. */
+static void rope_init_ds41(waste_config *c, const js_doc *d, int cfg)
+{
+    const int dim = c->qk_rope, half = dim / 2;
+    c->att_mul = 1.0f;
+    c->rope_err[0] = 0;
+    c->mla_nope = 0;
+    if (half <= 0 || half > WASTE_MAX_ROPE_HALF) {
+        snprintf(c->rope_err, sizeof c->rope_err,
+                 "qk_rope_head_dim %d needs rotation, this build holds %d",
+                 dim, 2 * WASTE_MAX_ROPE_HALF);
+        return;
+    }
+    rope_plain(c->rope_inv_freq, half, dim,
+               js_num(d, js_get(d, cfg, "rope_theta"), 10000.0));
+
+    const double cbase = c->compress_rope_theta > 0.0f ? c->compress_rope_theta
+                                                       : 10000.0;
+    rope_plain(c->compress_inv_freq, half, dim, cbase);
+    const int rs = js_get(d, cfg, "rope_scaling");
+    if (rs < 0 || js_size(d, rs) == 0) return;
+    char type[24];
+    int ty = js_get(d, rs, "type");
+    if (ty < 0) ty = js_get(d, rs, "rope_type");
+    js_str(d, ty, type, sizeof type);
+    if (strcmp(type, "yarn") != 0) {
+        snprintf(c->rope_err, sizeof c->rope_err,
+                 "rope_scaling type \"%s\" is not implemented, only yarn", type);
+        return;
+    }
+    rope_yarn(c->compress_inv_freq, half, dim, cbase,
+              js_num(d, js_get(d, rs, "factor"), 1.0),
+              js_num(d, js_get(d, rs, "original_max_position_embeddings"), 4096.0),
+              js_num(d, js_get(d, rs, "beta_fast"), 32.0),
+              js_num(d, js_get(d, rs, "beta_slow"), 1.0));
+}
+
+static void rope_init(waste_config *c, const js_doc *d, int cfg)
+{
     c->att_mul = 1.0f;
     c->rope_err[0] = 0;
     /* By value, not by presence: a container carrying "mla_use_nope": false
@@ -1827,8 +2048,7 @@ static void rope_init(waste_config *c, const js_doc *d, int cfg)
     }
 
     const double base = js_num(d, js_get(d, cfg, "rope_theta"), 10000.0);
-    for (int j = 0; j < half; j++)
-        c->rope_inv_freq[j] = (float)(1.0 / pow(base, (double)(2 * j) / dim));
+    rope_plain(c->rope_inv_freq, half, dim, base);
 
     /* A key that is absent, null or {} all mean no scaling, and js_size is 0
      * for each — the plain-RoPE table above is already the whole answer.
@@ -1867,24 +2087,87 @@ static void rope_init(waste_config *c, const js_doc *d, int cfg)
         return;
     }
 
-    const double orig = js_num(d, js_get(d, rs, "original_max_position_embeddings"), 4096.0);
-    const double bf = js_num(d, js_get(d, rs, "beta_fast"), 32.0);
-    const double bs = js_num(d, js_get(d, rs, "beta_slow"), 1.0);
-    double low = floor(dim * log(orig / (bf * 2.0 * PI)) / (2.0 * log(base)));
-    double high = ceil(dim * log(orig / (bs * 2.0 * PI)) / (2.0 * log(base)));
-    if (low < 0.0) low = 0.0;
-    if (high > dim - 1) high = dim - 1;
-    if (low == high) high += 0.001;             /* upstream's singularity guard */
-    for (int j = 0; j < half; j++) {
-        double ramp = ((double)j - low) / (high - low);
-        ramp = ramp < 0.0 ? 0.0 : ramp > 1.0 ? 1.0 : ramp;
-        const double mask = 1.0 - ramp;         /* 1 = extrapolate, 0 = interpolate */
-        const double extra = c->rope_inv_freq[j];
-        c->rope_inv_freq[j] = (float)((extra / factor) * (1.0 - mask) + extra * mask);
-    }
+    rope_yarn(c->rope_inv_freq, half, dim, base, factor,
+              js_num(d, js_get(d, rs, "original_max_position_embeddings"), 4096.0),
+              js_num(d, js_get(d, rs, "beta_fast"), 32.0),
+              js_num(d, js_get(d, rs, "beta_slow"), 1.0));
     if (m_dim != 0.0) {
         const double ms = 0.1 * m_dim * log(factor) + 1.0;
         c->att_mul = (float)(ms * ms);
+    }
+}
+
+/* Reads a list of layer indices into a per-layer flag array. The release
+ * states these 0-based (kv_source_layer_ids, index_source_layer_ids,
+ * engram_layer_ids) -- unlike Kimi's kda_layers, which is 1-based, and
+ * unlike GLM's, which is 0-based and was copied through as if it were not.
+ * That is the bug this function exists to not repeat: an off-by-one here
+ * puts the compressor on the wrong layer, finds every tensor, checks every
+ * shape and answers noise. */
+static int ds41_layer_flags(const js_doc *d, int list, int8_t *out, int n)
+{
+    for (int i = 0; i < js_size(d, list); i++) {
+        const int v = (int)js_int(d, js_at(d, list, i), -1);
+        if (v < 0 || v >= n) return -1;          /* refused, not clamped */
+        out[v] = 1;
+    }
+    return 0;
+}
+
+static void ds41_from_json(waste_config *c, const js_doc *d, int cfg)
+{
+    c->ds41 = strstr(c->arch, "DeepseekV41") != NULL ||
+              strstr(c->arch, "DeepSeekV41") != NULL;
+    if (!c->ds41) return;
+
+    c->hc_single_pass = 1;
+    c->head_dim = (int)js_int(d, js_get(d, cfg, "head_dim"), 0);
+    c->o_groups = (int)js_int(d, js_get(d, cfg, "o_groups"), 0);
+    c->o_lora   = (int)js_int(d, js_get(d, cfg, "o_lora_rank"), 0);
+    c->window   = (int)js_int(d, js_get(d, cfg, "sliding_window"), 0);
+    c->attn_sink = 1;
+    c->route_bias_vl = js_get(d, cfg, "routing_bias_vl") >= 0;
+    c->compress_rope_theta =
+        (float)js_num(d, js_get(d, cfg, "compress_rope_theta"), 0.0);
+    c->cand_source = (int)js_int(d, js_get(d, cfg, "candidate_source_layer_id"), -1);
+    c->cand_topk_blocks = (int)js_int(d, js_get(d, cfg, "candidate_topk_blocks"), 0);
+    c->cand_block = (int)js_int(d, js_get(d, cfg, "candidate_block_size"), 0);
+
+    memset(c->compress_ratio, 0, sizeof c->compress_ratio);
+    memset(c->kv_source, 0, sizeof c->kv_source);
+    memset(c->index_source, 0, sizeof c->index_source);
+    /* One entry per layer, and the release's list is longer than n_layers:
+     * it covers the MTP draft layers too, which this container does not
+     * carry. Read the prefix and bound the rest. */
+    const int cr = js_get(d, cfg, "compress_ratios");
+    for (int L = 0; L < c->n_layers && L < js_size(d, cr); L++) {
+        const int r = (int)js_int(d, js_at(d, cr, L), -1);
+        c->compress_ratio[L] = (r >= 0 && r <= 64) ? (int8_t)r : (int8_t)-1;
+    }
+    if (ds41_layer_flags(d, js_get(d, cfg, "kv_source_layer_ids"),
+                         c->kv_source, c->n_layers) < 0 ||
+        ds41_layer_flags(d, js_get(d, cfg, "index_source_layer_ids"),
+                         c->index_source, c->n_layers) < 0) {
+        c->ds41 = -1;                            /* cfg_sane refuses it */
+        return;
+    }
+
+    memset(c->engram_layer, 0, sizeof c->engram_layer);
+    c->engram_ngram    = (int)js_int(d, js_get(d, cfg, "engram_max_ngram_size"), 0);
+    c->engram_heads    = (int)js_int(d, js_get(d, cfg, "engram_n_heads"), 0);
+    c->engram_head_dim = (int)js_int(d, js_get(d, cfg, "engram_head_dim"), 0);
+    const int el = js_get(d, cfg, "engram_layer_ids");
+    const int en = js_get(d, cfg, "engram_num_embeddings");
+    c->engram_n = js_size(d, el);
+    if (c->engram_n > WASTE_MAX_ENGRAM || c->engram_n != js_size(d, en)) {
+        c->ds41 = -1;
+        return;
+    }
+    for (int i = 0; i < c->engram_n; i++) {
+        const int L = (int)js_int(d, js_at(d, el, i), -1);
+        if (L < 0 || L >= c->n_layers) { c->ds41 = -1; return; }
+        c->engram_layer[L] = (int8_t)(i + 1);
+        c->engram_rows[i] = js_int(d, js_at(d, en, i), 0);
     }
 }
 
@@ -1911,6 +2194,15 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     c->eps = (float)js_num(d, js_get(d, cfg, "rms_norm_eps"), 1e-5);
     c->routed_scale = (float)js_num(d, js_get(d, cfg, "routed_scaling_factor"), 1.0);
     c->renorm = js_get(d, cfg, "moe_renormalize") >= 0;
+    {
+        /* Absent = sigmoid, which is every Kimi and GLM container and what
+         * this engine did before there was a key. */
+        char sf[32];
+        js_str(d, js_get(d, cfg, "scoring_func"), sf, sizeof sf);
+        c->score_func = strcmp(sf, "softmax") == 0 ? WASTE_SCORE_SOFTMAX
+                      : strcmp(sf, "sqrtsoftplus") == 0 ? WASTE_SCORE_SQRTSOFTPLUS
+                      : WASTE_SCORE_SIGMOID;
+    }
 
     c->latent_dim = (int)js_int(d, js_get(d, cfg, "routed_expert_hidden_size"), 0);
     c->latent_norm = js_get(d, cfg, "latent_moe_use_norm") >= 0;
@@ -1934,7 +2226,11 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
         js_str(d, js_at(d, a, 0), c->arch, sizeof c->arch);
     }
 
-    rope_init(c, d, cfg);
+    /* Before the rope dispatch, which branches on c->ds41, and after the
+     * `arch` block above, which is where it comes from. */
+    ds41_from_json(c, d, cfg);
+    if (c->ds41 > 0) rope_init_ds41(c, d, cfg);
+    else             rope_init(c, d, cfg);
 
     /* GLM-5.3-Flash: mHC, the clamped SwiGLU and the DSA indexer. Absent on
      * every Kimi container, where all of these read back 0 and the ordinary
@@ -1950,6 +2246,7 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     c->index_tail  = js_get(d, cfg, "index_kpool_always_select_tail") >= 0;
     c->tok_han_split = js_bool(d, js_get(d, cfg, "tokenizer_han_split"), 1);
     c->tok_digit_run = (int)js_int(d, js_get(d, cfg, "tokenizer_digit_run"), 3);
+    c->tok_pattern   = (int)js_int(d, js_get(d, cfg, "tokenizer_pattern"), 0);
 
     int lac = js_get(d, cfg, "linear_attn_config");
     c->full_rank_gate = js_get(d, lac, "use_full_rank_gate") >= 0;
@@ -2060,6 +2357,180 @@ static int bank_fetch(void *user, int layer, int expert, uint8_t *dst);
 static void start_readers(waste_model *m);
 static void start_fill(waste_model *m);
 static void stop_fill(waste_model *m);
+
+/* CSA2's per-layer state, and the Engram files.
+ *
+ * Sized from kv_cap the way the MLA latent cache is, with one difference
+ * that is the point of the whole design: only kv_source layers allocate a
+ * compressed cache. Thirty-six of DeepSeek-V4.1's forty layers allocate
+ * nothing but a 128-slot window, which is constant in context.
+ */
+static int csa2_alloc(waste_model *m, int kv_cap)
+{
+    const waste_config *c = &m->cfg;
+    const int hd = c->head_dim;
+    m->has_mla = 1;                  /* kv_cap is a real bound here too */
+    for (int L = 0; L < c->n_layers; L++) {
+        m->winkv[L] = (float *)calloc((size_t)c->window * hd, sizeof(float));
+        if (!m->winkv[L]) return -1;
+        if (!c->kv_source[L]) continue;
+        const int r = c->compress_ratio[L];
+        /* +1 because the last group can be partial and still publish. */
+        const size_t nlat = (size_t)(kv_cap / (r ? r : 1)) + 1;
+        m->ckvc[L] = (float *)calloc(nlat * hd, sizeof(float));
+        m->ikey[L] = (float *)calloc(nlat * c->index_dim, sizeof(float));
+        m->cpool[L] = (float *)calloc((size_t)r * 2 * hd, sizeof(float));
+        if (!m->ckvc[L] || !m->ikey[L] || !m->cpool[L]) return -1;
+    }
+    const size_t nlat_max = (size_t)kv_cap + 1;
+    const size_t slots = (size_t)c->window + c->index_topk;
+    const int wide = hd > c->index_dim ? hd : c->index_dim;
+    m->csel   = (int *)calloc((size_t)c->index_topk + 1, sizeof(int));
+    /* Scores, then the per-block maxima the candidate filter ranks, which
+     * is at most one per position. */
+    m->cscore = (float *)calloc(2 * nlat_max, sizeof(float));
+    m->cand   = (uint8_t *)calloc(nlat_max, 1);
+    /* The gathered KV is a list of POINTERS into the caches, not a copy:
+     * one step attends over 640 vectors of 512 floats, and gathering them
+     * would be 1.3 MB of memcpy per layer per token to save nothing. */
+    m->csa_kv = (const float **)calloc(slots, sizeof(float *));
+    m->csa_q  = (float *)calloc((size_t)c->n_heads * hd, sizeof(float));
+    m->csa_o  = (float *)calloc((size_t)c->n_heads * hd, sizeof(float));
+    m->csa_score = (float *)calloc((size_t)c->n_heads * slots, sizeof(float));
+    /* the latent, the index key, and the low-rank query, end to end */
+    m->csa_lat = (float *)calloc((size_t)2 * wide + c->q_lora, sizeof(float));
+    if (!m->csel || !m->cscore || !m->cand || !m->csa_q || !m->csa_kv ||
+        !m->csa_o || !m->csa_lat || !m->csa_score) return -1;
+    if (c->engram_n) {
+        m->eg_hist = (int32_t *)calloc((size_t)kv_cap, sizeof(int32_t));
+        const int cols = (c->engram_ngram - 1) * c->engram_heads;
+        m->eg_row = (float *)calloc((size_t)cols * c->engram_head_dim,
+                                    sizeof(float));
+        m->eg_raw = (uint8_t *)calloc((size_t)c->engram_head_dim, 1);
+        m->eg_kv  = (float *)calloc((size_t)c->hidden * (c->hc_mult + 1),
+                                    sizeof(float));
+        if (!m->eg_hist || !m->eg_row || !m->eg_raw || !m->eg_kv) return -1;
+        for (int i = 0; i < kv_cap; i++) m->eg_hist[i] = -1;
+    }
+    return 0;
+}
+
+/* Engram's tables and the hashing that addresses them.
+ *
+ * The tables are two files of 55-110 GB; what is read here is their index
+ * and the metadata that says which row a token's n-gram lands in. None of
+ * that metadata is in the checkpoint — it is derived at conversion from the
+ * tokenizer and a fixed RNG (tools/ds41_engram.py) — so the container
+ * carries it and this is where it is checked rather than trusted.
+ *
+ * Two checks, and they are the ones the release itself makes: a layer's
+ * table must have exactly as many rows as its primes sum to, and the
+ * compressed token map must be as long as the vocabulary. A table sized
+ * wrong is not an error anywhere downstream; the hashes simply land
+ * somewhere else and the lookup returns another token's memory.
+ *
+ * Returns 0 when the container has no Engram, which is every container but
+ * this one.
+ */
+static int engram_open(waste_model *m, const char *dir, const js_doc *d)
+{
+    waste_config *c = &m->cfg;
+    if (!c->engram_n) return 0;
+    char path[1024];
+
+    snprintf(path, sizeof path, "%s/engram.json", dir);
+    char *es = slurp(path, NULL);
+    if (!es) return -2;
+    js_doc ed;
+    if (js_parse(&ed, es) < 0) { free(es); return -2; }
+
+    const int nbuck = (c->engram_ngram - 1) * c->engram_heads;
+    int rc = -2;
+    const int el = js_get(&ed, 0, "layers");
+    if (js_size(&ed, el) != c->engram_n) goto done;
+    if ((int)js_int(&ed, js_get(&ed, 0, "head_dim"), 0) != c->engram_head_dim)
+        goto done;
+    m->eg_pad = (int)js_int(&ed, js_get(&ed, 0, "pad_id"), -1);
+    if (m->eg_pad < 0) goto done;
+
+    for (int i = 0; i < c->engram_n; i++) {
+        const int e = js_at(&ed, el, i);
+        const int pl = js_get(&ed, e, "primes");
+        const int ol = js_get(&ed, e, "offsets");
+        const int ml = js_get(&ed, e, "multipliers");
+        if (js_size(&ed, ol) != nbuck || js_size(&ed, ml) != c->engram_ngram ||
+            js_size(&ed, pl) != c->engram_ngram - 1)
+            goto done;
+        m->eg_prime[i] = (int64_t *)calloc((size_t)nbuck, sizeof(int64_t));
+        m->eg_off[i]   = (int64_t *)calloc((size_t)nbuck, sizeof(int64_t));
+        m->eg_mult[i]  = (int64_t *)calloc((size_t)c->engram_ngram,
+                                           sizeof(int64_t));
+        if (!m->eg_prime[i] || !m->eg_off[i] || !m->eg_mult[i]) { rc = -1; goto done; }
+        int64_t sum = 0;
+        for (int g = 0; g < c->engram_ngram - 1; g++) {
+            const int row = js_at(&ed, pl, g);
+            if (js_size(&ed, row) != c->engram_heads) goto done;
+            for (int h = 0; h < c->engram_heads; h++) {
+                const int64_t p = js_int(&ed, js_at(&ed, row, h), 0);
+                if (p < 1) goto done;
+                m->eg_prime[i][g * c->engram_heads + h] = p;
+                sum += p;
+            }
+        }
+        for (int b = 0; b < nbuck; b++)
+            m->eg_off[i][b] = js_int(&ed, js_at(&ed, ol, b), -1);
+        for (int g = 0; g < c->engram_ngram; g++)
+            m->eg_mult[i][g] = js_int(&ed, js_at(&ed, ml, g), 0);
+        /* The primes and the row count are two statements of one number.
+         * If they disagree, one of them is not this model. */
+        if (sum != c->engram_rows[i]) goto done;
+    }
+
+    /* the tables themselves */
+    const int idx = js_get(d, 0, "engram");
+    for (int i = 0, L = 0, seen = 0; L < c->n_layers; L++) {
+        if (!c->engram_layer[L]) continue;
+        i = c->engram_layer[L] - 1;
+        seen++;
+        char key[16];
+        snprintf(key, sizeof key, "%d", L);
+        const int e = js_get(d, idx, key);
+        if (e < 0) goto done;
+        const int64_t rows = js_int(d, js_get(d, e, "rows"), 0);
+        const int dim   = (int)js_int(d, js_get(d, e, "dim"), 0);
+        const int group = (int)js_int(d, js_get(d, e, "group"), 0);
+        const int bits  = (int)js_int(d, js_get(d, e, "bits"), 0);
+        const int rb    = (int)js_int(d, js_get(d, e, "row_bytes"), 0);
+        if (rows != c->engram_rows[i] || dim != c->engram_head_dim ||
+            group < 1 || dim % group || (bits != 4 && bits != 8) ||
+            rb != dim * bits / 8 + (dim / group) * 2)
+            goto done;
+        m->eg_rows[i] = rows; m->eg_rowbytes[i] = rb;
+        m->eg_bits[i] = bits; m->eg_group[i] = group;
+        snprintf(path, sizeof path, "%s/engram-L%d.bin", dir, L);
+        /* Buffered, not O_DIRECT: a lookup is 36-144 bytes and a token
+         * makes 24 of them per layer, so the page cache is working FOR
+         * this one — unlike an expert bank, where a container smaller than
+         * RAM would make the hit rate fiction. */
+        m->eg_fd[i] = open(path, O_RDONLY | WASTE_O_BINARY);
+        if (m->eg_fd[i] < 0) { rc = -1; goto done; }
+        (void)seen;
+    }
+
+    /* the compressed token map */
+    snprintf(path, sizeof path, "%s/engram-tokmap.bin", dir);
+    size_t mlen = 0;
+    char *mp = slurp(path, &mlen);
+    if (!mp) { rc = -1; goto done; }
+    if (mlen != (size_t)c->vocab * sizeof(int32_t)) { free(mp); goto done; }
+    m->eg_map = (int32_t *)mp;
+    m->eg_map_n = c->vocab;
+    rc = 0;
+done:
+    js_free(&ed);
+    free(es);
+    return rc;
+}
 
 /* Wire the resident trunk. The cache is the cold part of this engine —
  * 19 to 30% hit — and this is the hot one: 27.5 GB on K3, read in full
@@ -2266,10 +2737,42 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                      * every field twice. */
                     char tw[32];
                     js_str(&vd, js_get(&vd, 0, "tower"), tw, sizeof tw);
-                    v->tower = strcmp(tw, "glm5-next") == 0
-                             ? WASTE_TOWER_GLM : WASTE_TOWER_K3;
+                    v->tower = strcmp(tw, "glm5-next") == 0 ? WASTE_TOWER_GLM
+                             : strcmp(tw, "ds41") == 0 ? WASTE_TOWER_DS41
+                             : WASTE_TOWER_K3;
                 }
-                if (v->tower == WASTE_TOWER_GLM) {
+                if (v->tower == WASTE_TOWER_DS41) {
+                    /* The release's own key names, which are the ones the
+                     * converter copies through; `merge` is the aligner's
+                     * 3x3 pixel-unshuffle and `max_patches` is a budget in
+                     * LLM tokens rather than in patches. */
+                    v->hidden     = (int)js_int(&vd, js_get(&vd, 0, "hidden_size"), 1024);
+                    v->heads      = (int)js_int(&vd, js_get(&vd, 0, "num_attention_heads"), 16);
+                    v->qkv_hidden = v->hidden;
+                    v->inter      = (int)js_int(&vd, js_get(&vd, 0, "intermediate_size"), 2816);
+                    v->layers     = (int)js_int(&vd, js_get(&vd, 0, "num_hidden_layers"), 32);
+                    v->patch      = (int)js_int(&vd, js_get(&vd, 0, "patch_size"), 14);
+                    v->merge      = (int)js_int(&vd, js_get(&vd, 0, "downsample_ratio"), 3);
+                    v->temporal   = 1;
+                    v->out_hidden = (int)js_int(&vd, js_get(&vd, 0, "out_hidden_size"), 0);
+                    v->rope_theta = (float)js_num(&vd, js_get(&vd, 0, "rope_theta"), 10000.0);
+                    v->eps        = (float)js_num(&vd, js_get(&vd, 0, "rms_norm_eps"), 1e-6);
+                    v->max_patches = (int)js_int(&vd, js_get(&vd, 0, "max_image_tokens"), 1024);
+                    /* min_pixels, not min_tokens: this release states a
+                     * floor on the SOURCE area and not on the cost. */
+                    v->min_tokens = (int)js_int(&vd, js_get(&vd, 0, "min_pixels"), 0);
+                    v->media_token = (int)js_int(&vd, js_get(&vd, 0, "media_placeholder_token_id"), 0);
+                    v->text_hidden = v->out_hidden;
+                    /* No learned position grid at all — the rotation is the
+                     * only positional signal — but the bounds below are
+                     * shared, so give them something in range. */
+                    v->pos_h = v->pos_w = 1;
+                    v->proj_eps = v->eps;
+                    /* K3's block is the FALL-THROUGH of this chain, not
+                     * another branch of it: leaving without the goto lands
+                     * in it and quietly replaces every field above. */
+                    goto vision_pixels;
+                } else if (v->tower == WASTE_TOWER_GLM) {
                     v->hidden      = (int)js_int(&vd, js_get(&vd, 0, "hidden_size"), 1024);
                     v->heads       = (int)js_int(&vd, js_get(&vd, 0, "num_heads"), 16);
                     v->qkv_hidden  = v->hidden;      /* qkv is 3x hidden   */
@@ -2352,6 +2855,12 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                    v->pos_h > 0 && v->pos_h <= (1 << 16) &&
                    v->pos_w > 0 && v->pos_w <= (1 << 16) &&
                    v->text_hidden == c->hidden && v->patch == 14 &&
+                   (v->tower != WASTE_TOWER_DS41 ||
+                    (v->merge >= 1 && v->merge <= 8 &&
+                     v->out_hidden > 0 && v->out_hidden <= (1 << 20) &&
+                     v->hidden % v->heads == 0 &&
+                     ((v->hidden / v->heads) % 4) == 0 &&
+                     isfinite(v->rope_theta) && v->rope_theta > 0.0f)) &&
                    (v->tower != WASTE_TOWER_GLM ||
                     (v->merge >= 1 && v->merge <= 8 &&
                      v->temporal >= 1 && v->temporal <= 8 &&
@@ -2574,9 +3083,11 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         }
         if (m->bank[L].fd[0] < 0) { js_free(&d); free(src); return -1; }
     }
+    const int eg_rc = engram_open(m, dir, &d);
     js_free(&d);
     free(src);
 
+    if (eg_rc < 0) return eg_rc;
     if (!validate_text_tensors(m)) return -2;      /* -> WASTE_E_FORMAT */
 
     /* state + scratch */
@@ -2642,6 +3153,8 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                                       sizeof(float));
         m->moe_used = (uint8_t *)calloc((size_t)(c->n_experts > 0 ? c->n_experts : 1), 1);
         for (int i = 0; i < 8; i++) m->ple_prev[i] = c->eos_token_id;
+    } else if (c->ds41) {
+        if (csa2_alloc(m, kv_cap) < 0) return -1;
     } else {
         for (int L = 0; L < c->n_layers; L++) {
             if (c->kda_layer[L]) {
@@ -2867,6 +3380,10 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
             } else if (!m->qsa_k[L] || !m->qsa_v[L] || !m->qsa_rawk[L]) {
                 return -1;
             }
+        } else if (c->ds41) {
+            /* CSA2 caches a window rather than a latent, and only four of
+             * its forty layers cache anything more; csa2_alloc checked it. */
+            if (!m->winkv[L]) return -1;
         } else if (c->kda_layer[L]) {
             if (!m->S[L] || !m->conv[L]) return -1;
         } else if (!m->latcache[L]) {
@@ -2919,6 +3436,7 @@ void waste_model_free(waste_model *m)
         free(m->S[L]); free(m->conv[L]); free(m->latcache[L]);
         free(m->idxpool[L]); free(m->idxbuf[L]);
         free(m->qsa_k[L]); free(m->qsa_v[L]); free(m->qsa_rawk[L]);
+        free(m->winkv[L]); free(m->ckvc[L]); free(m->ikey[L]); free(m->cpool[L]);
         for (int s = 0; s < WASTE_MAX_SHARDS; s++)
             if (m->bank[L].fd[s] >= 0) close(m->bank[L].fd[s]);
     }
@@ -2943,6 +3461,15 @@ void waste_model_free(waste_model *m)
     free(m->cq8); free(m->cq8_scale);
     free(m->hcflat); free(m->hccol); free(m->hcmix);
     free(m->idxsel); free(m->idxscore); free(m->idxrank);
+    free(m->csel); free(m->cscore); free(m->cand);
+    free(m->csa_q); free(m->csa_kv); free(m->csa_o); free(m->csa_lat);
+    free(m->csa_score);
+    free(m->eg_map); free(m->eg_hist); free(m->eg_raw);
+    free(m->eg_row); free(m->eg_kv); free(m->eg_key);
+    for (int i = 0; i < WASTE_MAX_ENGRAM; i++) {
+        free(m->eg_prime[i]); free(m->eg_off[i]); free(m->eg_mult[i]);
+        if (m->eg_fd[i] > 0) close(m->eg_fd[i]);
+    }
     waste_ecache_free(&m->cache);
     pthread_mutex_destroy(&m->fetch_mu);
 }
@@ -4221,6 +4748,530 @@ static void mla_head_range(int lo, int hi, void *ap)
     }
 }
 
+/* ---- Engram -------------------------------------------------------------
+ *
+ * Two of DeepSeek-V4.1's forty layers add an n-gram lookup into the
+ * residual stream, gated by how well it matches that stream. The tables are
+ * 197 B parameters between them and stay on disk: a token reads 24 rows of
+ * 144 bytes per layer, which is one page each and nothing beside the 3.19
+ * GB of experts the same token reads.
+ *
+ * Which row is not in the checkpoint. A position is hashed as the 2-, 3-
+ * and 4-grams ending at it, over a COMPRESSED token id — a normalization
+ * that collapses " The", "the" and "THE" onto one — with a separate
+ * prime-sized bucket per (n-gram size, head). All of that is derived at
+ * conversion (tools/ds41_engram.py) and carried in engram.json; the engine
+ * reads it and checks it rather than recomputing it.
+ */
+
+/* One table row, dequantized. The layout is a row RECORD — payload then
+ * scales, contiguous — so this is one pread of one page and not two. */
+static int engram_row(waste_model *m, int i, int64_t row, float *dst)
+{
+    const int dim = m->cfg.engram_head_dim;
+    const int g = m->eg_group[i], bits = m->eg_bits[i];
+    const int ng = dim / g;
+    if (row < 0 || row >= m->eg_rows[i]) return -1;
+    if (pread_all(m->eg_fd[i], m->eg_raw, (size_t)m->eg_rowbytes[i],
+                  row * (int64_t)m->eg_rowbytes[i]))
+        return -1;
+    const uint8_t *q = m->eg_raw;
+    const uint16_t *sc = (const uint16_t *)(m->eg_raw + dim * bits / 8);
+    for (int k = 0; k < ng; k++) {
+        const float s = f16_to_f32(sc[k]);
+        for (int j = 0; j < g; j++) {
+            const int at = k * g + j;
+            int v;
+            if (bits == 4) {
+                const uint8_t byte = q[at / 2];
+                v = (at & 1) ? (byte >> 4) - 8 : (byte & 0x0F) - 8;
+            } else {
+                v = (int8_t)q[at];
+            }
+            dst[at] = (float)v * s;
+        }
+    }
+    return 0;
+}
+
+/* The n-gram hashes for one position, into `out` — (ngram-1) * n_heads of
+ * them for this Engram layer.
+ *
+ * The rolling XOR is the release's: after step i the running value is the
+ * hash of the (i+1)-gram, and each lands in its own prime-sized range. A
+ * look-back stops at the start of the sequence and at any dead token, so an
+ * n-gram never spans one; text-only containers have no dead tokens, and the
+ * history is seeded to -1 so the bound still holds at position 0. */
+static void engram_hash(waste_model *m, int i, int pos, int64_t *out)
+{
+    const waste_config *c = &m->cfg;
+    const int NG = c->engram_ngram, NH = c->engram_heads;
+    int64_t rolling = 0;
+    int blocked = 0;
+    for (int shift = 0; shift < NG; shift++) {
+        const int at = pos - shift;
+        const int32_t src = at >= 0 ? m->eg_hist[at] : -1;
+        if (at < 0 || src < 0) blocked = 1;
+        const int64_t tok = blocked ? (int64_t)m->eg_pad : (int64_t)src;
+        const int64_t prod = tok * m->eg_mult[i][shift];
+        if (shift == 0) { rolling = prod; continue; }
+        rolling ^= prod;
+        for (int h = 0; h < NH; h++) {
+            const int col = (shift - 1) * NH + h;
+            out[col] = rolling % m->eg_prime[i][col] + m->eg_off[i][col];
+        }
+    }
+}
+
+/* x <- x + gate * value, per hc stream. The gate is a normalized dot
+ * product of the stream against a key derived from the lookup, with a
+ * SIGNED square root before the sigmoid — which is the training kernel's
+ * and not an obvious thing to guess. */
+static void engram_apply(waste_model *m, int L, float *x, int pos)
+{
+    const waste_config *c = &m->cfg;
+    const int i = c->engram_layer[L] - 1;
+    const int NG = c->engram_ngram, NH = c->engram_heads;
+    const int dim = c->engram_head_dim, hid = c->hidden, H = c->hc_mult;
+    const int cols = (NG - 1) * NH;
+    int64_t ids[64 * 8];
+    if (cols > (int)(sizeof ids / sizeof *ids)) { m->read_error = 1; return; }
+    engram_hash(m, i, pos, ids);
+    for (int col = 0; col < cols; col++)
+        if (engram_row(m, i, ids[col], m->eg_row + (size_t)col * dim)) {
+            m->read_error = 1;
+            return;
+        }
+    matvec_t(m, m->eg_kv, waste_find(m, tname("%smodel.layers.%d.engram.wkv.weight",
+                                              c->prefix, L)),
+             m->eg_row, hid * (H + 1), cols * dim);
+    const float *key = m->eg_kv;                 /* [H][hid] */
+    const float *value = m->eg_kv + (size_t)H * hid;
+    const float *qw = T(m, "%smodel.layers.%d.engram.q_weight", c->prefix, L);
+    const float *kw = T(m, "%smodel.layers.%d.engram.k_weight", c->prefix, L);
+    const float scale = 1.0f / sqrtf((float)hid);
+    for (int s = 0; s < H; s++) {
+        const float *h = x + (size_t)s * hid;
+        const float *k = key + (size_t)s * hid;
+        const float *w = qw + (size_t)s * hid, *w2 = kw + (size_t)s * hid;
+        float hs = 0, ks = 0, dot = 0;
+        for (int d = 0; d < hid; d++) {
+            hs += h[d] * h[d];
+            ks += k[d] * k[d];
+            dot += h[d] * w[d] * w2[d] * k[d];
+        }
+        /* normalized per (token, stream) over hidden, NOT jointly over the
+         * streams — which is the same three numbers combined differently
+         * and produces a gate that looks entirely reasonable. */
+        dot *= (1.0f / sqrtf(hs / (float)hid + c->eps)) *
+               (1.0f / sqrtf(ks / (float)hid + c->eps)) * scale;
+        float a = fabsf(dot);
+        if (a < 1e-6f) a = 1e-6f;
+        const float g = dot < 0.0f ? -sqrtf(a) : sqrtf(a);
+        const float gate = 1.0f / (1.0f + expf(-g));
+        float *dst = x + (size_t)s * hid;
+        for (int d = 0; d < hid; d++) dst[d] += gate * value[d];
+    }
+}
+
+/* ---- CSA2: Compressed Sparse Attention, second generation ---------------
+ *
+ * DeepSeek-V4.1's attention, and a third one for this engine rather than a
+ * variant of either that came before. What a query attends over is two
+ * things concatenated into one softmax:
+ *
+ *   - a sliding window of `window` raw KV vectors, this layer's own, a ring
+ *     that is constant in context;
+ *   - when compress_ratios[L] > 0, up to `index_topk` COMPRESSED positions,
+ *     each standing for compress_ratio tokens, read from a cache that four
+ *     layers build and forty share.
+ *
+ * One KV vector per token, not one per head, and the query is low-rank. The
+ * output projection is low-rank *and* block-diagonal over o_groups. And
+ * three things have no analogue anywhere else here:
+ *
+ *   the attention sink   one learned scalar per head, added to the softmax
+ *                        denominator and to nothing else. Omitting it is a
+ *                        per-head temperature on the whole output and
+ *                        nothing about the result looks wrong.
+ *   the inverse rotation the output's rope dims are rotated by the
+ *                        conjugate of the query's rotation, which is what
+ *                        lets one cache serve layers at different thetas.
+ *   two rope schedules   window-only layers rotate at rope_theta with YaRN
+ *                        off, compressed ones at compress_rope_theta with
+ *                        it on, because one latent stands for `ratio`
+ *                        tokens and its positions are that much apart.
+ */
+
+/* The rope table this layer rotates with: a layer that reads compressed KV
+ * uses the compressed schedule for its query and its window alike, because
+ * upstream builds one freqs_cis per layer and picks it by the same test. */
+static const float *csa2_inv(const waste_config *c, int L)
+{
+    return c->compress_ratio[L] ? c->compress_inv_freq : c->rope_inv_freq;
+}
+
+static void csa2_tables(const waste_config *c, const float *inv, int pos,
+                        float *cs, float *sn)
+{
+    for (int j = 0; j < c->qk_rope / 2; j++) {
+        const float a = (float)pos * inv[j];
+        cs[j] = cosf(a);
+        sn[j] = sinf(a);
+    }
+}
+
+/* The compressor: pool `ratio` consecutive tokens into one latent with a
+ * learned softmax gate, per channel and in fp32, then RMS-norm.
+ *
+ * Returns 1 when a latent was produced. At ratio 1 that is every token and
+ * there is no gate at all -- which is exactly why the release ships four
+ * `wkv` and three `wgate`, and why a converter that assumed the fourth
+ * would look right and find nothing.
+ *
+ * Writes the latent, still UNROTATED, into `lat`: the indexer derives its
+ * keys from that form and has to run before the rotation.
+ */
+static int csa2_compress(waste_model *m, int L, const float *in, int pos,
+                         float *lat)
+{
+    const waste_config *c = &m->cfg;
+    const int hd = c->head_dim, r = c->compress_ratio[L];
+    const char *pfx = c->prefix;
+    if (r == 1) {
+        matvec_t(m, lat, waste_find(m, tname(
+            "%smodel.layers.%d.self_attn.compress.kv_proj.weight", pfx, L)),
+            in, hd, c->hidden);
+        waste_rmsnorm(lat, lat, T(m,
+            "%smodel.layers.%d.self_attn.compress.norm.weight", pfx, L),
+            hd, c->eps);
+        return 1;
+    }
+    float *kv = m->cpool[L] + (size_t)(pos % r) * 2 * hd;
+    float *sc = kv + hd;
+    matvec_t(m, kv, waste_find(m, tname(
+        "%smodel.layers.%d.self_attn.compress.kv_proj.weight", pfx, L)),
+        in, hd, c->hidden);
+    matvec_t(m, sc, waste_find(m, tname(
+        "%smodel.layers.%d.self_attn.compress.gate_proj.weight", pfx, L)),
+        in, hd, c->hidden);
+    if ((pos + 1) % r) return 0;                 /* group still filling */
+    /* softmax over the group's slots, one per channel -- not over the
+     * channels, which is the same tensor read the other way round and
+     * produces a latent that looks entirely reasonable. */
+    for (int d = 0; d < hd; d++) {
+        float mx = -1e30f;
+        for (int i = 0; i < r; i++) {
+            const float v = m->cpool[L][(size_t)i * 2 * hd + hd + d];
+            if (v > mx) mx = v;
+        }
+        float sum = 0, acc = 0;
+        for (int i = 0; i < r; i++) {
+            const float e = expf(m->cpool[L][(size_t)i * 2 * hd + hd + d] - mx);
+            sum += e;
+            acc += e * m->cpool[L][(size_t)i * 2 * hd + d];
+        }
+        lat[d] = acc / sum;
+    }
+    waste_rmsnorm(lat, lat, T(m,
+        "%smodel.layers.%d.self_attn.compress.norm.weight", pfx, L),
+        hd, c->eps);
+    return 1;
+}
+
+/* Level one of the two-level top-k: keep the `cand_topk_blocks` highest
+ * blocks of `cand_block` compressed positions, scored by their best member.
+ *
+ * The block holding the newest position is pinned in regardless: it is
+ * partly filled, holds the most recent tokens, and would otherwise be
+ * outscored by an older full one. */
+static void csa2_candidates(waste_model *m, const float *score, int n)
+{
+    const waste_config *c = &m->cfg;
+    const int bs = c->cand_block;
+    const int nb = (n + bs - 1) / bs;
+    const int last = (n - 1) / bs;
+    memset(m->cand, 0, (size_t)n);
+    int keep = c->cand_topk_blocks < nb ? c->cand_topk_blocks : nb;
+    /* Selection by repeated max over block scores: nb is 2048 at the
+     * release's size and keep is 2048 too, so this is linear in practice
+     * and a heap would buy nothing. */
+    float *bs_score = m->cscore + n;             /* scratch past the scores */
+    for (int b = 0; b < nb; b++) {
+        float mx = -1e30f;
+        for (int j = b * bs; j < (b + 1) * bs && j < n; j++)
+            if (score[j] > mx) mx = score[j];
+        bs_score[b] = (b == last) ? 1e30f : mx;
+    }
+    for (int k = 0; k < keep; k++) {
+        int best = -1;
+        float bv = -1e30f;
+        for (int b = 0; b < nb; b++)
+            if (bs_score[b] > bv) { bv = bs_score[b]; best = b; }
+        if (best < 0 || bv <= -1e29f) break;
+        bs_score[best] = -1e30f;
+        for (int j = best * bs; j < (best + 1) * bs && j < n; j++)
+            m->cand[j] = 1;
+    }
+}
+
+/* The indexer: score every compressed position with a small side attention
+ * and keep the best `index_topk`.
+ *
+ * `lat` is this layer's unrotated latent, or NULL when it did not produce
+ * one. Only a layer that compresses its own KV can build index keys, so the
+ * other four indexers read the keys that layer published -- which is why
+ * this has to run before the rotation overwrites the latent.
+ *
+ * Fills m->csel with positions into the compressed cache and returns how
+ * many. */
+static int csa2_index(waste_model *m, int L, const float *in, const float *qr,
+                      const float *lat, int pos, int nlat)
+{
+    const waste_config *c = &m->cfg;
+    const int D = c->index_dim, IH = c->index_heads, rd = c->qk_rope;
+    const int r = c->compress_ratio[L], hd = c->head_dim;
+    const char *pfx = c->prefix;
+    const float *inv = csa2_inv(c, L);
+    float cs[WASTE_MAX_ROPE_HALF], sn[WASTE_MAX_ROPE_HALF];
+
+    if (c->kv_source[L] && lat) {
+        /* A latent stands for the FIRST token of its group, so it rotates
+         * at that position and not at this one.
+         *
+         * The key gets its own half of csa_lat. It shared the buffer with
+         * the latent for exactly one afternoon: the indexer runs between
+         * the compressor and the rotation, so what got cached as this
+         * layer's compressed KV was the index key. The logits stayed
+         * plausible -- same argmax, 0.7% relative L2 -- and only a
+         * layer-by-layer diff against the oracle said where. */
+        float *k = m->csa_lat + (hd > c->index_dim ? hd : c->index_dim);
+        matvec_t(m, k, waste_find(m, tname(
+            "%smodel.layers.%d.self_attn.indexer.k_proj.weight", pfx, L)),
+            lat, D, hd);
+        waste_rmsnorm(k, k, T(m,
+            "%smodel.layers.%d.self_attn.indexer.k_layernorm.weight", pfx, L),
+            D, c->eps);
+        csa2_tables(c, inv, pos + 1 - r, cs, sn);
+        rope_apply(rd / 2, k + D - rd, cs, sn);
+        memcpy(m->ikey[L] + (size_t)(pos / r) * D, k, (size_t)D * sizeof(float));
+        m->cur_ikey = m->ikey[L];
+    }
+    if (!m->cur_ikey) return 0;
+
+    float *q = m->idxq, *w = q + (size_t)IH * D;
+    matvec_t(m, q, waste_find(m, tname(
+        "%smodel.layers.%d.self_attn.indexer.q_b_proj.weight", pfx, L)),
+        qr, IH * D, c->q_lora);
+    csa2_tables(c, inv, pos, cs, sn);
+    for (int h = 0; h < IH; h++)
+        rope_apply(rd / 2, q + (size_t)h * D + D - rd, cs, sn);
+    matvec_t(m, w, waste_find(m, tname(
+        "%smodel.layers.%d.self_attn.indexer.weights_proj.weight", pfx, L)),
+        in, IH, c->hidden);
+    const float wscale = (1.0f / sqrtf((float)D)) / sqrtf((float)IH);
+
+    for (int t = 0; t < nlat; t++) {
+        const float *k = m->cur_ikey + (size_t)t * D;
+        float acc = 0;
+        for (int h = 0; h < IH; h++) {
+            const float *qh = q + (size_t)h * D;
+            float dot = 0;
+            for (int d = 0; d < D; d++) dot += qh[d] * k[d];
+            if (dot > 0.0f) acc += dot * w[h] * wscale;   /* relu, then weight */
+        }
+        m->cscore[t] = acc;
+    }
+
+    if (c->cand_source == L) {
+        csa2_candidates(m, m->cscore, nlat);
+    } else if (c->cand_source >= 0 && c->cand_source < L) {
+        for (int t = 0; t < nlat; t++)
+            if (!m->cand[t]) m->cscore[t] = -1e30f;
+    }
+
+    int keep = c->index_topk < nlat ? c->index_topk : nlat;
+    /* top-k, then back into position order: the attention below walks the
+     * selection and does not care, but a session dump that did would. */
+    for (int k = 0; k < keep; k++) {
+        int best = -1;
+        float bv = -1e30f;
+        for (int t = 0; t < nlat; t++) {
+            int taken = 0;
+            for (int j = 0; j < k; j++) if (m->csel[j] == t) { taken = 1; break; }
+            if (!taken && m->cscore[t] > bv) { bv = m->cscore[t]; best = t; }
+        }
+        if (best < 0) { keep = k; break; }
+        m->csel[k] = best;
+    }
+    for (int a = 1; a < keep; a++) {             /* insertion sort, k <= 512 */
+        const int v = m->csel[a];
+        int b = a - 1;
+        while (b >= 0 && m->csel[b] > v) { m->csel[b + 1] = m->csel[b]; b--; }
+        m->csel[b + 1] = v;
+    }
+    return keep;
+}
+
+typedef struct {
+    waste_model *m;
+    const float *q, *sink;
+    const float **kv;
+    float *o;
+    int n, hd, nh, slots;
+    float scale;
+} csa2_par;
+
+/* One head: softmax over the gathered KV, with the sink in the denominator
+ * only. A head whose every score is -inf -- which cannot happen here, since
+ * the window always holds this token -- would come out zero, matching the
+ * training kernel's convention. */
+static void csa2_head_range(int beg, int end, void *user)
+{
+    csa2_par *a = (csa2_par *)user;
+    for (int h = beg; h < end; h++) {
+        const float *qh = a->q + (size_t)h * a->hd;
+        float *oh = a->o + (size_t)h * a->hd;
+        float mx = -1e30f;
+        float *sc = a->m->csa_score + (size_t)h * a->slots;
+        for (int t = 0; t < a->n; t++) {
+            const float *k = a->kv[t];
+            float dot = 0;
+            for (int d = 0; d < a->hd; d++) dot += qh[d] * k[d];
+            sc[t] = dot * a->scale;
+            if (sc[t] > mx) mx = sc[t];
+        }
+        float sum = expf(a->sink[h] - mx);       /* the sink, denominator only */
+        for (int t = 0; t < a->n; t++) {
+            sc[t] = expf(sc[t] - mx);
+            sum += sc[t];
+        }
+        for (int d = 0; d < a->hd; d++) oh[d] = 0.0f;
+        for (int t = 0; t < a->n; t++) {
+            const float *v = a->kv[t];
+            const float w = sc[t];
+            for (int d = 0; d < a->hd; d++) oh[d] += w * v[d];
+        }
+        const float inv = 1.0f / sum;
+        for (int d = 0; d < a->hd; d++) oh[d] *= inv;
+    }
+}
+
+static void csa2_layer(waste_model *m, int L, const float *in, float *out,
+                       int pos)
+{
+    const waste_config *c = &m->cfg;
+    const int hd = c->head_dim, nh = c->n_heads, rd = c->qk_rope;
+    const int win = c->window, hid = c->hidden;
+    const char *pfx = c->prefix;
+    const float *inv = csa2_inv(c, L);
+    float cs[WASTE_MAX_ROPE_HALF], sn[WASTE_MAX_ROPE_HALF];
+
+    /* --- the query, low-rank, then rotated --------------------------- */
+    float *qr = m->csa_lat + 2 * (hd > c->index_dim ? hd : c->index_dim);
+    matvec_t(m, qr, waste_find(m, tname(
+        "%smodel.layers.%d.self_attn.q_a_proj.weight", pfx, L)),
+        in, c->q_lora, hid);
+    waste_rmsnorm(qr, qr, T(m,
+        "%smodel.layers.%d.self_attn.q_a_layernorm.weight", pfx, L),
+        c->q_lora, c->eps);
+    float *q = m->csa_q;
+    matvec_t(m, q, waste_find(m, tname(
+        "%smodel.layers.%d.self_attn.q_b_proj.weight", pfx, L)),
+        qr, nh * hd, c->q_lora);
+    csa2_tables(c, inv, pos, cs, sn);
+    for (int h = 0; h < nh; h++)
+        rope_apply(rd / 2, q + (size_t)h * hd + hd - rd, cs, sn);
+
+    /* --- this token's window KV, rotated before it is cached --------- */
+    {
+        float *kv = m->winkv[L] + (size_t)(pos % win) * hd;
+        matvec_t(m, kv, waste_find(m, tname(
+            "%smodel.layers.%d.self_attn.kv_proj.weight", pfx, L)),
+            in, hd, hid);
+        waste_rmsnorm(kv, kv, T(m,
+            "%smodel.layers.%d.self_attn.kv_layernorm.weight", pfx, L),
+            hd, c->eps);
+        rope_apply(rd / 2, kv + hd - rd, cs, sn);
+    }
+
+    /* --- what this token attends over -------------------------------- */
+    const float **kvp = m->csa_kv;
+    int n = 0;
+    const int wvalid = (pos + 1) < win ? pos + 1 : win;
+    for (int s = 0; s < wvalid; s++)
+        kvp[n++] = m->winkv[L] + (size_t)s * hd;
+
+    const int r = c->compress_ratio[L];
+    if (r) {
+        const int nlat = (pos + 1) / r;          /* visible BEFORE this write */
+        float *lat = m->csa_lat;
+        int have = 0;
+        if (c->kv_source[L]) {
+            have = csa2_compress(m, L, in, pos, lat);
+            m->cur_ckv = m->ckvc[L];
+            m->cur_ratio = r;
+        }
+        if (c->index_source[L])
+            m->csel_n = csa2_index(m, L, in, qr, have ? lat : NULL, pos, nlat);
+        if (have) {
+            csa2_tables(c, inv, pos + 1 - r, cs, sn);
+            rope_apply(rd / 2, lat + hd - rd, cs, sn);
+            memcpy(m->ckvc[L] + (size_t)(pos / r) * hd, lat,
+                   (size_t)hd * sizeof(float));
+            m->n_lat[L] = pos / r + 1;
+            /* restore the query's tables for the inverse rotation below */
+            csa2_tables(c, inv, pos, cs, sn);
+        }
+        if (m->cur_ckv)
+            for (int i = 0; i < m->csel_n; i++)
+                if (m->csel[i] < nlat)
+                    kvp[n++] = m->cur_ckv + (size_t)m->csel[i] * hd;
+    }
+
+    /* --- attention --------------------------------------------------- */
+    {
+        csa2_par a;
+        a.m = m; a.q = q; a.o = m->csa_o; a.kv = kvp;
+        a.sink = T(m, "%smodel.layers.%d.self_attn.attn_sink", pfx, L);
+        a.n = n; a.hd = hd; a.nh = nh; a.slots = win + c->index_topk;
+        a.scale = c->att_mul / sqrtf((float)hd);
+        waste_parallel_for(nh, 1, csa2_head_range, &a);
+    }
+    /* The query's rotation, removed again. Without it the output carries a
+     * position the projection below was never trained to see. */
+    for (int j = 0; j < rd / 2; j++) sn[j] = -sn[j];
+    for (int h = 0; h < nh; h++)
+        rope_apply(rd / 2, m->csa_o + (size_t)h * hd + hd - rd, cs, sn);
+
+    /* --- the output projection: low-rank AND block-diagonal ---------- */
+    {
+        const int G = c->o_groups, R = c->o_lora, W = nh * hd / G;
+        float *acc = m->csa_q;                   /* q is dead by now */
+        const waste_tensor *wa = waste_find(m, tname(
+            "%smodel.layers.%d.self_attn.o_a_proj.weight", pfx, L));
+        /* wo_a is [G * o_lora, nh * head_dim / G] and is block-diagonal:
+         * group g's rows see group g's heads and nobody else's. An
+         * ordinary matvec would hand every row the same input, so each
+         * group runs against a row-offset VIEW of the same tensor —
+         * cheaper than G tensors in the container and it keeps the
+         * structure where the arithmetic is. */
+        const int ng = (W + wa->group - 1) / (wa->group ? wa->group : 1);
+        for (int g = 0; g < G; g++) {
+            waste_tensor v = *wa;
+            v.shape[0] = R;
+            v.n = (size_t)R * W;
+            if (v.q)  v.q  = wa->q  + (size_t)g * R * wa->rowbytes;
+            if (v.qs) v.qs = wa->qs + (size_t)g * R * ng;
+            if (v.data) v.data = wa->data + (size_t)g * R * W;
+            matvec_t(m, acc + (size_t)g * R, &v, m->csa_o + (size_t)g * W, R, W);
+        }
+        matvec_t(m, out, waste_find(m, tname(
+            "%smodel.layers.%d.self_attn.o_b_proj.weight", pfx, L)),
+            acc, hid, G * R);
+    }
+}
+
 static void mla_layer(waste_model *m, int L, const float *in, float *out, int pos)
 {
     const waste_config *c = &m->cfg;
@@ -4321,6 +5372,9 @@ static void ffn(waste_model *m, const waste_tensor *W1, const waste_tensor *W3,
     if (accum) for (int i = 0; i < hid; i++) out[i] += w * dst[i];
 }
 
+static void router_scores(const waste_config *c, const float *logit,
+                          float *score, int E);
+
 /* What layer L+1's router says about layer L's hidden state.
  *
  * The router of L+1 will really see the state after L's MoE and L+1's
@@ -4347,12 +5401,14 @@ static int predict_next_moe(waste_model *m, int L, const float *in, int *out, in
     matvec_t(m, sc, g, in, E, hid);
     const float *bias = T(m, "%smodel.layers.%d.block_sparse_moe.gate.e_score_correction_bias",
                           c->prefix, L + 1);
-    /* Selection order only, so the sigmoid is monotone and could be skipped
-     * — kept because the bias is added in probability space, as the real
+    /* Selection order only, so the squashing is monotone and could be
+     * skipped — kept because the bias is added in score space, as the real
      * router does it, and a different order here would be a different
-     * prediction rather than a faster one. */
-    for (int e = 0; e < E; e++)
-        p[e] = 1.0f / (1.0f + expf(-sc[e])) + (bias ? bias[e] : 0.0f);
+     * prediction rather than a faster one. Which squashing it is therefore
+     * matters too: sigmoid and sqrt-softplus rank the same logits the same
+     * way, but the bias lands differently against each. */
+    router_scores(c, sc, p, E);
+    for (int e = 0; e < E; e++) p[e] += bias ? bias[e] : 0.0f;
     for (int j = 0; j < n; j++) {
         int best = -1;
         float bv = -1e30f;
@@ -4366,6 +5422,40 @@ static int predict_next_moe(waste_model *m, int L, const float *in, int *out, in
     return n;
 }
 
+/* The router's score function.
+ *
+ * Three now, and the third is not bounded above: sqrt(softplus(x)) is what
+ * DeepSeek-V4.1 uses, and it is why norm_topk_prob divides by the sum with
+ * a fixed 1e-20 rather than with norm_eps -- the two happen to be the same
+ * number in that release, for unrelated reasons, and reading one as the
+ * other is the kind of coincidence that survives every test until a model
+ * changes one of them.
+ *
+ * The bias is added to the scores for SELECTION only; the gating weights
+ * come from the unbiased scores. That part is shared with K3 and is not
+ * here -- see moe_layer. */
+static void router_scores(const waste_config *c, const float *logit,
+                          float *score, int E)
+{
+    if (c->score_func == WASTE_SCORE_SQRTSOFTPLUS) {
+        for (int e = 0; e < E; e++) {
+            /* log1p(exp(x)) without the overflow: above ~30 it is x to
+             * every bit of a float, and expf(88) is already inf. */
+            const float x = logit[e];
+            const float sp = x > 30.0f ? x : log1pf(expf(x));
+            score[e] = sqrtf(sp);
+        }
+    } else if (c->score_func == WASTE_SCORE_SOFTMAX) {
+        float mx = -1e30f;
+        for (int e = 0; e < E; e++) if (logit[e] > mx) mx = logit[e];
+        float sum = 0;
+        for (int e = 0; e < E; e++) { score[e] = expf(logit[e] - mx); sum += score[e]; }
+        for (int e = 0; e < E; e++) score[e] /= sum;
+    } else {
+        for (int e = 0; e < E; e++) score[e] = 1.0f / (1.0f + expf(-logit[e]));
+    }
+}
+
 static void moe_layer(waste_model *m, int L, const float *in, float *out, int *routed)
 {
     const waste_config *c = &m->cfg;
@@ -4377,7 +5467,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
     matvec_t(m, sc, waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L)), in, E, hid);
     const float *bias = T(m, "%smodel.layers.%d.block_sparse_moe.gate.e_score_correction_bias", c->prefix, L);
     float *score = sc + E;
-    for (int e = 0; e < E; e++) score[e] = 1.0f / (1.0f + expf(-sc[e]));
+    router_scores(c, sc, score, E);
 
     /* Cache-conditional routing (arXiv:2412.00099), off unless WASTE_CCR_LAMBDA
      * asks for it. Experts already in the cache get a bonus **for ranking
@@ -4867,8 +5957,22 @@ static void hc_norm_cols(float *comb, int H, float eps)
 /* One mHC site. `site` is "attn" or "ffn"; the two differ only in which
  * (fn, base, scale) triple they read. Fills post/comb for hc_scatter and
  * writes the collapsed stream the sublayer runs on. */
+/* One mHC site. Computes the three coefficient sets, Sinkhorns `comb`, and
+ * collapses the streams into `collapsed`.
+ *
+ * `use_pre` is what makes DeepSeek-V4.1 different from GLM. On GLM each
+ * site collapses with the `pre` it has just computed; there, a site's `pre`
+ * belongs to the NEXT one — attention collapses with what the previous
+ * layer's FFN produced, the FFN with what this attention produced, and the
+ * final collapse before the head uses the last FFN's rather than hc_head's
+ * unweighted mean. Pass NULL for the GLM schedule. `out_pre`, when given,
+ * receives this site's own `pre` for whoever collapses next.
+ *
+ * Nothing about getting this wrong is a shape error: both schedules produce
+ * a plausible residual stream and plausible logits. */
 static void hc_collapse(waste_model *m, int L, const char *site, const float *x,
-                        float *post, float *comb, float *collapsed)
+                        float *post, float *comb, float *collapsed,
+                        const float *use_pre, float *out_pre)
 {
     const waste_config *c = &m->cfg;
     const int H = c->hc_mult, hid = c->hidden;
@@ -4913,9 +6017,11 @@ static void hc_collapse(waste_model *m, int L, const char *site, const float *x,
         hc_norm_cols(comb, H, c->hc_eps);
     }
 
+    if (out_pre) memcpy(out_pre, pre, (size_t)H * sizeof(float));
+    const float *use = use_pre ? use_pre : pre;
     for (int d = 0; d < hid; d++) {
         float acc = 0;
-        for (int i = 0; i < H; i++) acc += pre[i] * x[(size_t)i * hid + d];
+        for (int i = 0; i < H; i++) acc += use[i] * x[(size_t)i * hid + d];
         collapsed[d] = acc;
     }
 }
@@ -5024,6 +6130,12 @@ typedef struct {
      * words, and both have to be compared: a file written by one and read
      * by the other is the right length in neither direction. */
     int32_t  hc_mult, index_dim;
+    /* CSA2's shape. A state file is refused when these disagree, the way
+     * the MLA ones already are: a window restored at the wrong width or a
+     * latent cache at the wrong ratio is not a short read, it is a session
+     * that resumes attending to the wrong tokens. 0 on every other
+     * container, which is what makes the check backward-compatible. */
+    int32_t  head_dim, window, engram_n;
 } waste_state_hdr;
 
 static void state_fill(const waste_model *m, waste_state_hdr *h, int pos)
@@ -5061,6 +6173,9 @@ static void state_fill(const waste_model *m, waste_state_hdr *h, int pos)
     h->n_heads = c->n_heads; h->qk_nope = c->qk_nope; h->qk_rope = c->qk_rope;
     h->v_head = c->v_head; h->attn_res_block = c->attn_res_block;
     h->hc_mult = c->hc_mult; h->index_dim = c->index_topk ? c->index_dim : 0;
+    h->head_dim = c->ds41 ? c->head_dim : 0;
+    h->window   = c->ds41 ? c->window : 0;
+    h->engram_n = c->ds41 ? c->engram_n : 0;
     h->pos = pos; h->n_blockres = m->n_blockres;
 }
 
@@ -5365,7 +6480,25 @@ int waste_model_state_save(const waste_model *m, const char *path, int pos)
     } else {
     const int H = c->kda_heads, D = c->kda_dim, C = H * D;
     for (int L = 0; L < c->n_layers && !rc; L++) {
-        if (c->kda_layer[L]) {
+        if (c->ds41) {
+            /* The window is a ring and `pos` in the header says where its
+             * head is, so it goes whole. Only the four source layers have
+             * anything else: their compressed latents, the index keys
+             * derived from them, and the tail of the group still filling
+             * up — which is the piece a session cannot recompute, because
+             * the tokens that would fill it have already gone by. */
+            const size_t wn = (size_t)c->window * c->head_dim;
+            if (fwrite(m->winkv[L], sizeof(float), wn, f) != wn) { rc = -1; break; }
+            if (!c->kv_source[L]) continue;
+            const int32_t nl = m->n_lat[L];
+            if (fwrite(&nl, sizeof nl, 1, f) != 1) { rc = -1; break; }
+            const size_t cn = (size_t)nl * c->head_dim;
+            const size_t in = (size_t)nl * c->index_dim;
+            const size_t pn = (size_t)c->compress_ratio[L] * 2 * c->head_dim;
+            if (cn && fwrite(m->ckvc[L], sizeof(float), cn, f) != cn) rc = -1;
+            else if (in && fwrite(m->ikey[L], sizeof(float), in, f) != in) rc = -1;
+            else if (fwrite(m->cpool[L], sizeof(float), pn, f) != pn) rc = -1;
+        } else if (c->kda_layer[L]) {
             if (fwrite(m->S[L], sizeof(float), (size_t)H * D * D, f) != (size_t)H * D * D) rc = -1;
             const size_t cn = (size_t)3 * C * (c->conv_k - 1);
             if (!rc && fwrite(m->conv[L], sizeof(float), cn, f) != cn) rc = -1;
@@ -5386,6 +6519,15 @@ int waste_model_state_save(const waste_model *m, const char *path, int pos)
                 else if (fwrite(m->idxbuf[L], sizeof(float), bn, f) != bn) rc = -1;
             }
         }
+    }
+    /* The n-gram history. Not derivable from the prompt a caller still
+     * holds: the ids in it are COMPRESSED, and the map that compresses
+     * them is the container's. A session restored without it hashes the
+     * first few tokens against padding and reads another token's memory. */
+    if (!rc && c->ds41 && c->engram_n && m->eg_hist) {
+        const size_t n = (size_t)(pos > 0 ? pos : 0) + 1;
+        if (n <= (size_t)m->kv_cap &&
+            fwrite(m->eg_hist, sizeof(int32_t), n, f) != n) rc = -1;
     }
     if (!rc && c->attn_res_block && m->n_blockres > 0) {
         const size_t n = (size_t)m->n_blockres * c->hidden;
@@ -5422,7 +6564,9 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
         h.conv_k != want.conv_k || h.n_heads != want.n_heads ||
         h.qk_nope != want.qk_nope || h.qk_rope != want.qk_rope ||
         h.v_head != want.v_head || h.attn_res_block != want.attn_res_block ||
-        h.hc_mult != want.hc_mult || h.index_dim != want.index_dim) {
+        h.hc_mult != want.hc_mult || h.index_dim != want.index_dim ||
+        h.head_dim != want.head_dim || h.window != want.window ||
+        h.engram_n != want.engram_n) {
         fclose(f);
         return -2;
     }
@@ -5470,7 +6614,30 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
     } else {
     for (int L = 0; L < c->n_layers; L++) {
         uint64_t bytes = 0;
-        if (c->kda_layer[L]) {
+        if (c->ds41) {
+            /* The window is fixed; only a source layer carries a count,
+             * and that count is derivable from the position — so it is
+             * checked against the position rather than merely bounded,
+             * the same way the MLA branch checks nkv against h.pos. */
+            bytes = (uint64_t)c->window * c->head_dim * 4;
+            if (c->kv_source[L]) {
+                int32_t nl = 0;
+                const uint64_t at = off + bytes;
+                if (at > fsize || fsize - at < sizeof nl ||
+                    waste_pread(fileno(f), &nl, sizeof nl, (int64_t)at) != sizeof nl) {
+                    fclose(f); return -2;
+                }
+                /* h.pos is the NEXT position, as the MLA branch's
+                 * `nkv != h.pos` already assumes: after processing
+                 * position h.pos - 1 a ratio-r source has published
+                 * h.pos / r latents. */
+                const int r = c->compress_ratio[L] ? c->compress_ratio[L] : 1;
+                if (nl < 0 || nl != h.pos / r) { fclose(f); return -2; }
+                bytes += sizeof nl +
+                         ((uint64_t)nl * (c->head_dim + c->index_dim) +
+                          (uint64_t)c->compress_ratio[L] * 2 * c->head_dim) * 4;
+            }
+        } else if (c->kda_layer[L]) {
             bytes = ((uint64_t)H * D * D + (uint64_t)3 * C * (c->conv_k - 1)) * 4;
         } else {
             int32_t nkv = 0;
@@ -5501,7 +6668,12 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
         off += bytes;
     }
     {
-        const uint64_t tail = (uint64_t)h.n_blockres * c->hidden * 4 +
+        /* The n-gram history is one compressed id per position seen. */
+        const uint64_t eg = (c->ds41 && c->engram_n && m->eg_hist &&
+                             (uint64_t)h.pos + 1 <= (uint64_t)m->kv_cap)
+                          ? ((uint64_t)h.pos + 1) * sizeof(int32_t) : 0;
+        const uint64_t tail = eg +
+                              (uint64_t)h.n_blockres * c->hidden * 4 +
                               (uint64_t)(c->hc_mult ? c->hc_mult : 1) *
                               c->hidden * 4;
         if (off > fsize || tail > fsize - off || off + tail != fsize) {
@@ -5563,7 +6735,22 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
         if (!rc && fread(m->ple_prev, sizeof(int), 8, f) != 8) rc = -1;
     } else {
     for (int L = 0; L < c->n_layers && !rc; L++) {
-        if (c->kda_layer[L]) {
+        if (c->ds41) {
+            const size_t wn = (size_t)c->window * c->head_dim;
+            if (fread(m->winkv[L], sizeof(float), wn, f) != wn) { rc = -1; break; }
+            if (!c->kv_source[L]) continue;
+            int32_t nl = 0;
+            if (fread(&nl, sizeof nl, 1, f) != 1) { rc = -1; break; }
+            const int r = c->compress_ratio[L] ? c->compress_ratio[L] : 1;
+            if (nl < 0 || nl > m->kv_cap / r + 1) { rc = -1; break; }
+            const size_t cn = (size_t)nl * c->head_dim;
+            const size_t in = (size_t)nl * c->index_dim;
+            const size_t pn = (size_t)c->compress_ratio[L] * 2 * c->head_dim;
+            if (cn && fread(m->ckvc[L], sizeof(float), cn, f) != cn) rc = -1;
+            else if (in && fread(m->ikey[L], sizeof(float), in, f) != in) rc = -1;
+            else if (fread(m->cpool[L], sizeof(float), pn, f) != pn) rc = -1;
+            m->n_lat[L] = nl;
+        } else if (c->kda_layer[L]) {
             if (fread(m->S[L], sizeof(float), (size_t)H * D * D, f) != (size_t)H * D * D) rc = -1;
             const size_t cn = (size_t)3 * C * (c->conv_k - 1);
             if (!rc && fread(m->conv[L], sizeof(float), cn, f) != cn) rc = -1;
@@ -5585,6 +6772,11 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
                 m->n_pool[L] = np;
             }
         }
+    }
+    if (!rc && c->ds41 && c->engram_n && m->eg_hist) {
+        const size_t n = (size_t)(h.pos > 0 ? h.pos : 0) + 1;
+        if (n <= (size_t)m->kv_cap &&
+            fread(m->eg_hist, sizeof(int32_t), n, f) != n) rc = -1;
     }
     m->n_blockres = h.n_blockres;
     if (!rc && c->attn_res_block && h.n_blockres > 0) {
@@ -5900,7 +7092,7 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
     for (int t = 0; t < nT; t++) {
         matvec_t(m, sc, waste_find(m, tname("%smodel.layers.%d.block_sparse_moe.gate.weight",
                                             c->prefix, L)), in + (size_t)t * hid, E, hid);
-        for (int e = 0; e < E; e++) score[e] = 1.0f / (1.0f + expf(-sc[e]));
+        router_scores(c, sc, score, E);
         int *idx = route + (size_t)t * K;
         float *w = rw + (size_t)t * K;
         for (int j = 0; j < K; j++) {
@@ -6177,7 +7369,9 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
 
         /* attention: per token, but on the batched norm buffer */
         for (int t = 0; t < n; t++) {
-            if (c->kda_layer[L]) kda_layer(m, L, m->cnorm + (size_t)t * hid,
+            if (c->ds41) csa2_layer(m, L, m->cnorm + (size_t)t * hid,
+                                    m->cresid + (size_t)t * hid, pos0 + t);
+            else if (c->kda_layer[L]) kda_layer(m, L, m->cnorm + (size_t)t * hid,
                                            m->cresid + (size_t)t * hid);
             else mla_layer(m, L, m->cnorm + (size_t)t * hid,
                            m->cresid + (size_t)t * hid, pos0 + t);
@@ -7360,6 +8554,14 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     } else {
         waste_embed_row(m, token, m->x);
     }
+    /* Engram hashes over a COMPRESSED token id — the map that collapses
+     * " The", "the" and "THE" onto one. Recorded per position because an
+     * n-gram looks back, and seeded to -1 by csa2_alloc so a look-back past
+     * the start is blocked rather than reading a zero that means token 0. */
+    if (c->engram_n && m->eg_map && pos >= 0 && pos < m->kv_cap)
+        m->eg_hist[pos] = (token >= 0 && token < m->eg_map_n)
+                        ? m->eg_map[token] : (int32_t)m->eg_pad;
+
     /* mHC: every stream starts as a copy of the embedding — upstream
      * expands the embedding along a new axis of hc_mult before layer 0. */
     for (int i = 1; i < c->hc_mult; i++)
@@ -7370,7 +8572,15 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
     if (!resid || !norm) { free(resid); free(norm); return NULL; }
     const int ares_on = c->attn_res_block > 0;
     const int hc_on = c->hc_mult > 0;
+    const int ds41 = c->ds41;
     float hc_post[WASTE_MAX_HC], hc_comb[WASTE_MAX_HC * WASTE_MAX_HC];
+    /* Single-pass mHC carries two `pre` vectors: the one this sublayer
+     * collapses with, and the one it produces for the next. Layer 0's
+     * attention starts from a one-hot on stream 0, which is what upstream's
+     * make_identity_pre_mix builds. */
+    float hc_pre[WASTE_MAX_HC], hc_pre_attn[WASTE_MAX_HC];
+    for (int i = 0; i < WASTE_MAX_HC; i++) hc_pre[i] = hc_pre_attn[i] = 0.0f;
+    hc_pre[0] = 1.0f;
     float *ps = m->prefix_sum;
     int ps_live = 0;
     m->n_blockres = 0;
@@ -7395,11 +8605,19 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
             }
         }
 
+        /* Engram writes into the stream BEFORE this layer's mixes read it,
+         * which is where upstream puts it: the lookup is part of the
+         * residual the attention then collapses, not something added to
+         * the attention's output. */
+        if (c->engram_layer[L]) engram_apply(m, L, m->x, pos);
+
         snprintf(b, sizeof b, "%smodel.layers.%d.input_layernorm.weight", c->prefix, L);
-        if (hc_on) hc_collapse(m, L, "attn", m->x, hc_post, hc_comb, m->hccol);
+        if (hc_on) hc_collapse(m, L, "attn", m->x, hc_post, hc_comb, m->hccol,
+                               ds41 ? hc_pre : NULL, ds41 ? hc_pre_attn : NULL);
         waste_rmsnorm(norm, hc_on ? m->hccol : m->x, waste_find(m, b)->data,
                       hid, c->eps);
-        if (c->kda_layer[L]) { PROF_START(P_KDA); kda_layer(m, L, norm, resid); PROF_END(P_KDA); }
+        if (c->ds41) { PROF_START(P_MLA); csa2_layer(m, L, norm, resid, pos); PROF_END(P_MLA); }
+        else if (c->kda_layer[L]) { PROF_START(P_KDA); kda_layer(m, L, norm, resid); PROF_END(P_KDA); }
         else { PROF_START(P_MLA); mla_layer(m, L, norm, resid, pos); PROF_END(P_MLA); }
 
         if (hc_on) {
@@ -7416,7 +8634,8 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
         }
 
         snprintf(b, sizeof b, "%smodel.layers.%d.post_attention_layernorm.weight", c->prefix, L);
-        if (hc_on) hc_collapse(m, L, "ffn", m->x, hc_post, hc_comb, m->hccol);
+        if (hc_on) hc_collapse(m, L, "ffn", m->x, hc_post, hc_comb, m->hccol,
+                               ds41 ? hc_pre_attn : NULL, ds41 ? hc_pre : NULL);
         waste_rmsnorm(norm, hc_on ? m->hccol : m->x, waste_find(m, b)->data,
                       hid, c->eps);
         snprintf(b, sizeof b, "%smodel.layers.%d.block_sparse_moe.gate.weight", c->prefix, L);
@@ -7458,7 +8677,16 @@ const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
             waste_find(m, tname("%smodel.output_attn_res_norm.weight", c->prefix))->data,
             waste_find(m, tname("%smodel.output_attn_res_proj.weight", c->prefix))->data,
             m->x);
-    if (hc_on) hc_head(c, m->hccol, m->x);
+    /* The final collapse. GLM takes an unweighted mean; DeepSeek-V4.1 uses
+     * the last FFN's `pre`, which is the same schedule one step further on. */
+    if (hc_on && ds41) {
+        const int H = c->hc_mult;
+        for (int d = 0; d < hid; d++) {
+            float acc = 0;
+            for (int i = 0; i < H; i++) acc += hc_pre[i] * m->x[(size_t)i * hid + d];
+            m->hccol[d] = acc;
+        }
+    } else if (hc_on) hc_head(c, m->hccol, m->x);
     waste_rmsnorm(norm, hc_on ? m->hccol : m->x,
                   waste_find(m, tname("%smodel.norm.weight", c->prefix))->data,
                   hid, c->eps);

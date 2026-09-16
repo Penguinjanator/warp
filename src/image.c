@@ -362,3 +362,145 @@ float *waste_image_load_glm(const char *path, const waste_vision_cfg *v,
     *out_w = gw;
     return px;
 }
+
+/* ---- DeepSeek-V4.1's tower --------------------------------------------
+ *
+ * A third preprocessing, and it differs from the other two in the one way
+ * that is invisible afterwards: the image is CONTAINED and padded rather
+ * than stretched. The release resizes to fit inside the target box with
+ * the aspect ratio intact and fills the remainder with mid-grey, so a
+ * 16:9 photo reaching a square grid keeps its proportions and gains two
+ * grey bands. Stretching instead produces a tensor of exactly the right
+ * shape that shows the model a different picture.
+ *
+ * The grid itself is chosen by a budget in LLM tokens rather than in
+ * patches, because an image costs `n_llm_h * (n_llm_w + 1) + 2` of them —
+ * one newline per row and two delimiters — and that is what has to fit
+ * under vision_max_n_token.
+ */
+
+static int ds41_tokens(int nh, int nw) { return nh * (nw + 1) + 2; }
+
+static void ds41_llm_grid(int bh, int bw, int patch, int r, int *nh, int *nw)
+{
+    *nh = (bh / patch + r - 1) / r;
+    *nw = (bw / patch + r - 1) / r;
+}
+
+/* The largest aspect-preserving pixel size whose token grid still fits.
+ * Transcribed from solve_resize_ratio; the two collapse cases are the
+ * release's and they are not symmetric — a very tall image keeps two
+ * tokens of head-room and a very wide one three. */
+static void ds41_solve(int height, int width, int patch, int r, int max_tok,
+                       int *bh, int *bw)
+{
+    const int cell = patch * r;
+    const double ratio = (double)height / (double)width;
+    const double max_w = sqrt((max_tok - 2) / ratio + 0.25) - 0.5;
+    const double max_h = max_w * ratio;
+    if (max_w < 1.0) { *bh = (max_tok - 2) / 2 * cell; *bw = cell; return; }
+    if (max_h < 1.0) { *bh = cell; *bw = (max_tok - 3) * cell; return; }
+    const double a = floor(max_w) * cell / (double)width;
+    const double b = floor(max_h) * cell / (double)height;
+    const double beta = a < b ? a : b;
+    *bh = (int)floor(height * beta / patch) * patch;
+    *bw = (int)floor(width * beta / patch) * patch;
+}
+
+/* The pixel box and the LLM token grid for one image. A pure function of
+ * its arguments, so tools/ds41_vision_ref.py can be asked the same
+ * question and the two answers compared. */
+void waste_image_plan_ds41(int sw, int sh, const waste_vision_cfg *v,
+                           int *bh, int *bw, int *nh, int *nw)
+{
+    const int patch = v->patch > 0 ? v->patch : 14;
+    const int r = v->merge > 0 ? v->merge : 3;
+    const int max_tok = v->max_patches > 0 ? v->max_patches : 1024;
+    double w = sw, h = sh;
+    if (v->min_tokens > 0 && w * h > 0 && w * h < (double)v->min_tokens) {
+        const double s = sqrt((double)v->min_tokens / (w * h));
+        w = (int)(w * s);
+        h = (int)(h * s);
+    }
+    int W = (int)ceil(w / patch) * patch, H = (int)ceil(h / patch) * patch;
+    ds41_llm_grid(H, W, patch, r, nh, nw);
+    if (ds41_tokens(*nh, *nw) > max_tok) {
+        ds41_solve((int)h, (int)w, patch, r, max_tok, &H, &W);
+        ds41_llm_grid(H, W, patch, r, nh, nw);
+    }
+    *bh = H;
+    *bw = W;
+}
+
+float *waste_image_load_ds41(const char *path, const waste_vision_cfg *v,
+                             int *out_gh, int *out_gw)
+{
+    int sw = 0, sh = 0, ch = 0;
+    if (!stbi_info(path, &sw, &sh, &ch) || sw <= 0 || sh <= 0 ||
+        (uint64_t)sw * (uint64_t)sh > WASTE_MAX_SOURCE_PIXELS) {
+        fprintf(stderr, "waste: image dimensions are invalid or exceed the "
+                        "%u-pixel limit: %s\n",
+                WASTE_MAX_SOURCE_PIXELS, path ? path : "(null)");
+        return NULL;
+    }
+    unsigned char *img = stbi_load(path, &sw, &sh, &ch, 3);
+    if (!img) {
+        fprintf(stderr, "waste: cannot decode %s: %s\n", path,
+                stbi_failure_reason());
+        return NULL;
+    }
+
+    const int patch = v->patch > 0 ? v->patch : 14;
+    int H = 0, W = 0, nh = 0, nw = 0;
+    waste_image_plan_ds41(sw, sh, v, &H, &W, &nh, &nw);
+    const int gh = H / patch, gw = W / patch;
+    const int npix = 3 * patch * patch;
+
+    /* contain(): fit inside the box with the ratio intact. PIL compares the
+     * two ratios and resizes to the box when they match, so the branch is
+     * on the ratio and not on which side is longer. */
+    int rw = W, rh = H;
+    {
+        const double im = (double)sw / (double)sh;
+        const double dest = (double)W / (double)H;
+        if (im > dest) { rw = W; rh = (int)lround(W / im); }
+        else if (im < dest) { rh = H; rw = (int)lround(H * im); }
+        if (rw < 1) rw = 1;
+        if (rh < 1) rh = 1;
+    }
+    const int ox = (rw != W) ? (int)lround((W - rw) / 2.0) : 0;
+    const int oy = (rw != W) ? 0 : (int)lround((H - rh) / 2.0);
+
+    float *px = (float *)calloc((size_t)gh * gw * npix, sizeof(float));
+    float *rs = (float *)malloc((size_t)3 * rh * rw * sizeof(float));
+    if (!px || !rs || resize_bicubic(img, sw, sh, rs, rw, rh)) {
+        stbi_image_free(img); free(px); free(rs);
+        return NULL;
+    }
+    stbi_image_free(img);
+
+    /* The canvas is mid-grey, which normalizes to a hair under zero rather
+     * than to zero: 127/255 is 0.498, and (0.498 - 0.5) / 0.5 is -0.0078.
+     * Filling with zero instead would be a different colour. */
+    const float pad = (127.0f / 255.0f - 0.5f) / 0.5f;
+    for (int py = 0; py < gh; py++)
+        for (int pxi = 0; pxi < gw; pxi++) {
+            float *dst = px + ((size_t)py * gw + pxi) * npix;
+            for (int c = 0; c < 3; c++)
+                for (int j = 0; j < patch; j++)
+                    for (int i = 0; i < patch; i++) {
+                        const int y = py * patch + j, x = pxi * patch + i;
+                        float val = pad;
+                        if (y >= oy && y < oy + rh && x >= ox && x < ox + rw) {
+                            const size_t si = ((size_t)c * rh + (y - oy)) *
+                                              (size_t)rw + (x - ox);
+                            val = (rs[si] / 255.0f - 0.5f) / 0.5f;
+                        }
+                        dst[((size_t)c * patch + j) * patch + i] = val;
+                    }
+        }
+    free(rs);
+    *out_gh = gh;
+    *out_gw = gw;
+    return px;
+}

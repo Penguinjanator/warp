@@ -682,3 +682,279 @@ fail:
     free(cs); free(sn); free(bias);
     return -1;
 }
+
+/* ---- DeepSeek-V4.1's tower ----------------------------------------------
+ *
+ * A third one, and the block is the simplest of the three: RMSNorm, a fused
+ * qkv with a bias, full attention over the image, a fused SwiGLU with none.
+ * What is not simple is either side of it.
+ *
+ * The rotation is 2D and SPLIT-HALVES. Each head's 64 dims are halved, the
+ * first 32 rotated against the second, and the 32-wide table is itself two
+ * halves: sixteen frequencies of the row index and sixteen of the column.
+ * Every other rotation in this engine pairs ADJACENT elements — the text
+ * model's, K3's tower, GLM's — so reusing one of those here produces a
+ * tensor of the right shape with the positions scrambled.
+ *
+ * And the projector is a 3x3 pixel-unshuffle: nine neighbouring patches
+ * become one token, so an image costs a ninth of the patches it has. The
+ * grid is padded with zeros on the right and bottom, not cropped.
+ *
+ * The span it writes is not just the image rows. The LLM sees
+ *
+ *     [image_start] ([image] * n_w [image_newline]) * n_h [image_end]
+ *
+ * and the three delimiters are learned embeddings living in the TEXT trunk.
+ * Emitting them here rather than in model.c is what lets the engine's media
+ * queue stay what it is — one row per placeholder, consumed in order.
+ */
+
+static void ds41_rope_row(int y, int x, int hd, double theta,
+                          float *cs, float *sn)
+{
+    const int half = hd / 2, q = half / 2;   /* 32 and 16 on this release */
+    for (int j = 0; j < q; j++) {
+        const double inv = 1.0 / pow(theta, (double)(2 * j) / (double)half);
+        cs[j] = (float)cos(y * inv);
+        sn[j] = (float)sin(y * inv);
+        cs[q + j] = (float)cos(x * inv);
+        sn[q + j] = (float)sin(x * inv);
+    }
+}
+
+static void ds41_rope_apply(float *v, int hd, const float *cs, const float *sn)
+{
+    const int half = hd / 2;
+    for (int j = 0; j < half; j++) {
+        const float a = v[j], b = v[half + j];
+        v[j]        = a * cs[j] - b * sn[j];
+        v[half + j] = b * cs[j] + a * sn[j];
+    }
+}
+
+int waste_vision_encode_ds41(waste_model *m, const float *pixels, int gh,
+                             int gw, float *out)
+{
+    const waste_vision_cfg *c = &m->vcfg;
+    const int D = c->hidden, heads = c->heads, hd = D / heads;
+    const int L = gh * gw, r = c->merge, OD = c->out_hidden;
+    const int npix = 3 * c->patch * c->patch;
+    if (gh <= 0 || gw <= 0 || (hd & 3)) {
+        fprintf(stderr, "waste: vision grid %dx%d, head_dim %d\n", gh, gw, hd);
+        return -1;
+    }
+    const int nh = (gh + r - 1) / r, nw = (gw + r - 1) / r;
+
+    float *x   = (float *)malloc((size_t)L * D * sizeof(float));
+    float *y   = (float *)malloc((size_t)L * D * sizeof(float));
+    float *qkv = (float *)malloc((size_t)L * 3 * D * sizeof(float));
+    float *ob  = (float *)malloc((size_t)L * D * sizeof(float));
+    float *ff  = (float *)malloc((size_t)2 * L * c->inter * sizeof(float));
+    float *att = (float *)malloc((size_t)L * sizeof(float));
+    float *cs  = (float *)malloc((size_t)L * hd * sizeof(float));
+    float *sn  = (float *)malloc((size_t)L * hd * sizeof(float));
+    float *bias = (float *)malloc((size_t)(3 * D > OD ? 3 * D : OD) * sizeof(float));
+    float *win = NULL, *proj = NULL;
+    if (!x || !y || !qkv || !ob || !ff || !att || !cs || !sn || !bias) goto oom;
+
+    {
+        const waste_tensor *pw = waste_find(m, "vision_tower.patch_embed.proj.weight");
+        if (!pw) goto fail;
+        waste_matmul_t(m, x, pw, pixels, D, npix, L);
+        const float *pb = vt_bias(m, "vision_tower.patch_embed.proj.bias", bias, D);
+        if (pb) for (int i = 0; i < L; i++)
+            for (int k = 0; k < D; k++) x[(size_t)i * D + k] += pb[k];
+    }
+    if (stage_is("embed")) { memcpy(out, x, (size_t)L * D * sizeof(float)); goto done; }
+
+    for (int py = 0, row = 0; py < gh; py++)
+        for (int px = 0; px < gw; px++, row++)
+            ds41_rope_row(py, px, hd, c->rope_theta > 0 ? c->rope_theta : 10000.0,
+                          cs + (size_t)row * hd, sn + (size_t)row * hd);
+
+    {
+    const float scale = 1.0f / sqrtf((float)hd);
+    for (int b = 0; b < c->layers; b++) {
+        char nm[160];
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.norm1.weight", b);
+        const waste_tensor *n1 = waste_find(m, nm);
+        if (!n1 || !n1->data) goto fail;
+        rmsnorm_rows(y, x, n1->data, L, D, c->eps);
+
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.attn.wqkv.weight", b);
+        const waste_tensor *wq = waste_find(m, nm);
+        if (!wq) goto fail;
+        waste_matmul_t(m, qkv, wq, y, 3 * D, D, L);
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.attn.wqkv.bias", b);
+        {
+            const float *pb = vt_bias(m, nm, bias, 3 * D);
+            if (pb) for (int i = 0; i < L; i++)
+                for (int k = 0; k < 3 * D; k++) qkv[(size_t)i * 3 * D + k] += pb[k];
+        }
+        /* q and k rotate; v does not, and neither is normed — this tower
+         * has no q/k norms where GLM's does. */
+        for (int i = 0; i < L; i++) {
+            float *row = qkv + (size_t)i * 3 * D;
+            for (int hh = 0; hh < heads; hh++) {
+                ds41_rope_apply(row + (size_t)hh * hd, hd,
+                                cs + (size_t)i * hd, sn + (size_t)i * hd);
+                ds41_rope_apply(row + D + (size_t)hh * hd, hd,
+                                cs + (size_t)i * hd, sn + (size_t)i * hd);
+            }
+        }
+
+        for (int hh = 0; hh < heads; hh++)
+            for (int i = 0; i < L; i++) {
+                const float *q = qkv + (size_t)i * 3 * D + (size_t)hh * hd;
+                for (int j = 0; j < L; j++) {
+                    const float *k = qkv + (size_t)j * 3 * D + D + (size_t)hh * hd;
+                    float acc = 0;
+                    for (int t = 0; t < hd; t++) acc += q[t] * k[t];
+                    att[j] = acc * scale;
+                }
+                softmax_row(att, L);
+                float *o = ob + (size_t)i * D + (size_t)hh * hd;
+                for (int t = 0; t < hd; t++) o[t] = 0;
+                for (int j = 0; j < L; j++) {
+                    const float a = att[j];
+                    const float *v = qkv + (size_t)j * 3 * D + 2 * D + (size_t)hh * hd;
+                    for (int t = 0; t < hd; t++) o[t] += a * v[t];
+                }
+            }
+
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.attn.wo.weight", b);
+        const waste_tensor *wo = waste_find(m, nm);
+        if (!wo) goto fail;
+        waste_matmul_t(m, y, wo, ob, D, D, L);
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.attn.wo.bias", b);
+        {
+            const float *pb = vt_bias(m, nm, bias, D);
+            for (int i = 0; i < L; i++)
+                for (int k = 0; k < D; k++)
+                    x[(size_t)i * D + k] += y[(size_t)i * D + k] + (pb ? pb[k] : 0.0f);
+        }
+
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.norm2.weight", b);
+        const waste_tensor *n2 = waste_find(m, nm);
+        if (!n2 || !n2->data) goto fail;
+        rmsnorm_rows(y, x, n2->data, L, D, c->eps);
+
+        /* One weight for gate and up: w1 is [2 * inter, D] and the halves
+         * are its rows, not two tensors. */
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.mlp.w1.weight", b);
+        const waste_tensor *w1 = waste_find(m, nm);
+        if (!w1) goto fail;
+        waste_matmul_t(m, ff, w1, y, 2 * c->inter, D, L);
+        for (int i = 0; i < L; i++) {
+            float *g = ff + (size_t)i * 2 * c->inter;
+            const float *u = g + c->inter;
+            for (int k = 0; k < c->inter; k++)
+                g[k] = (g[k] / (1.0f + expf(-g[k]))) * u[k];
+        }
+        /* The SwiGLU output is every other half-row, so it is compacted
+         * before the down projection rather than strided through it. */
+        for (int i = 1; i < L; i++)
+            memmove(ff + (size_t)i * c->inter, ff + (size_t)i * 2 * c->inter,
+                    (size_t)c->inter * sizeof(float));
+        snprintf(nm, sizeof nm, "vision_tower.blocks.%d.mlp.w2.weight", b);
+        const waste_tensor *w2 = waste_find(m, nm);
+        if (!w2) goto fail;
+        waste_matmul_t(m, y, w2, ff, D, c->inter, L);
+        for (int i = 0; i < L; i++)
+            for (int k = 0; k < D; k++)
+                x[(size_t)i * D + k] += y[(size_t)i * D + k];
+        {
+            char want[32];
+            snprintf(want, sizeof want, "block%d", b);
+            if (stage_is(want)) {
+                memcpy(out, x, (size_t)L * D * sizeof(float));
+                goto done;
+            }
+        }
+    }
+    }
+
+    {
+        const waste_tensor *pn = waste_find(m, "vision_tower.norm.weight");
+        if (!pn || !pn->data) goto fail;
+        rmsnorm_rows(x, x, pn->data, L, D, c->eps);
+    }
+    if (stage_is("post")) { memcpy(out, x, (size_t)L * D * sizeof(float)); goto done; }
+
+    /* --- the aligner: 3x3 pixel-unshuffle, then two layers --------------
+     *
+     * The grid is padded with ZEROS on the right and bottom to a multiple
+     * of three, not cropped: a 5x7 patch grid becomes 2x3 tokens and the
+     * missing patches contribute nothing rather than shifting the ones
+     * that are there. */
+    {
+        const int win_dim = D * r * r, nb = nh * nw;
+        win  = (float *)calloc((size_t)nb * win_dim, sizeof(float));
+        proj = (float *)malloc((size_t)nb * OD * sizeof(float));
+        if (!win || !proj) goto oom;
+        for (int by = 0; by < nh; by++)
+            for (int bx = 0; bx < nw; bx++) {
+                float *dst = win + ((size_t)by * nw + bx) * win_dim;
+                for (int k = 0; k < D; k++)
+                    for (int i = 0; i < r; i++)
+                        for (int j = 0; j < r; j++) {
+                            const int py = by * r + i, px = bx * r + j;
+                            if (py >= gh || px >= gw) continue;   /* the pad */
+                            dst[((size_t)k * r + i) * r + j] =
+                                x[((size_t)py * gw + px) * D + k];
+                        }
+            }
+        const waste_tensor *a1 = waste_find(m, "mm_projector.w1.weight");
+        const waste_tensor *a2 = waste_find(m, "mm_projector.w2.weight");
+        if (!a1 || !a2) goto fail;
+        float *mid = (float *)malloc((size_t)nb * OD * sizeof(float));
+        if (!mid) goto oom;
+        waste_matmul_t(m, mid, a1, win, OD, win_dim, nb);
+        const float *b1 = vt_bias(m, "mm_projector.w1.bias", bias, OD);
+        for (int i = 0; i < nb; i++)
+            for (int k = 0; k < OD; k++) {
+                float v = mid[(size_t)i * OD + k] + (b1 ? b1[k] : 0.0f);
+                mid[(size_t)i * OD + k] = gelu_erf(v);
+            }
+        waste_matmul_t(m, proj, a2, mid, OD, OD, nb);
+        free(mid);
+        const float *b2 = vt_bias(m, "mm_projector.w2.bias", bias, OD);
+        if (b2) for (int i = 0; i < nb; i++)
+            for (int k = 0; k < OD; k++) proj[(size_t)i * OD + k] += b2[k];
+    }
+
+    /* --- the span ------------------------------------------------------ */
+    {
+        char nm[160];
+        snprintf(nm, sizeof nm, "%smodel.image_start", m->cfg.prefix);
+        const waste_tensor *ts = waste_find(m, nm);
+        snprintf(nm, sizeof nm, "%smodel.image_end", m->cfg.prefix);
+        const waste_tensor *te = waste_find(m, nm);
+        snprintf(nm, sizeof nm, "%smodel.image_newline", m->cfg.prefix);
+        const waste_tensor *tn = waste_find(m, nm);
+        if (!ts || !te || !tn) goto fail;
+        const float *st = ts->data, *en = te->data, *nl = tn->data;
+        if (!st || !en || !nl) goto fail;
+        size_t row = 0;
+        memcpy(out + row * OD, st, (size_t)OD * sizeof(float)); row++;
+        for (int by = 0; by < nh; by++) {
+            for (int bx = 0; bx < nw; bx++, row++)
+                memcpy(out + row * OD, proj + ((size_t)by * nw + bx) * OD,
+                       (size_t)OD * sizeof(float));
+            memcpy(out + row * OD, nl, (size_t)OD * sizeof(float)); row++;
+        }
+        memcpy(out + row * OD, en, (size_t)OD * sizeof(float));
+    }
+
+done:
+    free(x); free(y); free(qkv); free(ob); free(ff); free(att);
+    free(cs); free(sn); free(bias); free(win); free(proj);
+    return 0;
+fail:
+    fprintf(stderr, "waste: the container is missing a DeepSeek-V4.1 vision "
+                    "tensor\n");
+oom:
+    free(x); free(y); free(qkv); free(ob); free(ff); free(att);
+    free(cs); free(sn); free(bias); free(win); free(proj);
+    return -1;
+}
