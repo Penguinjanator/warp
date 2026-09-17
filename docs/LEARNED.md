@@ -5413,7 +5413,320 @@ is the other half. **A test that only compares a thing to itself is not a
 weak oracle, it is not an oracle**, and the three protocols this repo
 renders now each have one.
 
-## 74. Qwen3.8-Flash-Next: what was new, and what only looked new (2026-09-04)
+## 74. A feasibility gate does not need the download (2026-09-15)
+
+DeepSeek-V4.1-Flash is 510 GB in 48 shards. The gate that had to run before
+any of it was fetched — does 3-bit VQ survive experts that are *already* fp4?
+— needed 24 experts. A safetensors file states every tensor's byte offset in
+its own header, and HuggingFace serves ranges, so 24 experts is **190 MB**
+and four minutes. `tools/hf_peek.py` is that generalized: header first, then
+one range request per tensor, then dequantize E2M1/E4M3 against the E8M0
+scale stream. It should be the first thing pointed at any new release.
+
+The answer was no change at all. 19.97% / 20.74% / 19.95% on `layers.0.w1`,
+`layers.0.w2` and `layers.20.w1`, against §23's already-recorded **20.3% for
+a K3 expert at 3 bits from MXFP4** and gate 3's 19.4% from bf16. Three
+sources — bf16, K3's MXFP4, this release's fp4 — and one number. Whatever
+3-bit residual VQ costs, it costs it against the tensor you hand it, and an
+upstream quantizer having been there first does not compound the way the
+gate assumed. [GATES.md](GATES.md) gate 8.
+
+What the gate did not expect to find is how little is left in these tensors
+to begin with. 94 M parameters of `layers.0.w1` hold **28 distinct values**,
+because the ue8m0 scale stream — nominally one exponent per 32 inputs per
+row — takes four or five values across the entire matrix, two of them
+covering 96.6% of the blocks. The published format is per-block and the
+trained content is very nearly one global grid.
+
+Priced as information: 2.861 bits for the magnitude, plus a sign that is
+44.1% positive on the 88.2% of weights that are nonzero, is **3.74
+bits/weight**. So a lossless container is 4.25 bits (the nibbles verbatim
+plus the scale stream) and an entropy-coded one could not beat 3.74 —
+against VQ3R's 3.00 at 20% error. That is a *narrower* window than any
+previous model in this family gave, and it is the first time the choice of
+3 bits has been a choice between "lossy and small" and "exact and 52%
+bigger" rather than against 16-bit weights. It still goes to 3 bits, on
+§20's exchange rate: 85 GB more bank costs more hit rate than 20% expert
+error costs accuracy — on K3, measured. Whether it costs the same here is
+open, and it is the one quantization question stage 5's oracle diff should
+be asked to answer rather than assumed.
+
+Method note, because it generalizes past this model: **the cheap part of a
+gate is usually the measurement and the expensive part is getting the
+bytes.** Two of the eight gates in this file spent their cost on a download
+or a conversion that the measurement itself did not need. Range requests
+against a published index is a way to not do that again.
+
+## 75. Twenty-one strings is not a tokenizer corpus, and it never was (2026-09-15)
+
+`tools/tokdiff.py` opens with a comment saying "twelve short ASCII strings
+is not a tokenizer corpus". It then lists twenty-one strings and, until
+today, tested against those. Adding DeepSeek-V4.1's pre-tokenizer made the
+inadequacy measurable, because unlike cl100k's its pattern has five
+character classes and no catch-all.
+
+`src/tokenizer.c` codes the patterns directly rather than carrying a regex
+engine, so `\p{L}`, `\p{N}` and `\s` were hand-written ranges — the blocks
+the two Kimi releases and GLM had been tried on. In cl100k that was
+survivable by accident: a letter the table did not know fell into
+`[^\s\p{L}\p{N}]+`, which is a catch-all, so it still produced *a* piece.
+In DeepSeek's pattern the same character becomes `\p{S}`, joins the
+punctuation run beside it, and shifts every id after it.
+
+`tokdiff.py --wide 20000` — every codepoint thinned by a stride, plus a
+block of multi-byte whitespace runs — on the two releases that were
+**already supported and passing**:
+
+| | curated 21 | wide 24021 before | after |
+|---|---|---:|---:|
+| Kimi-Linear | 21/21 both times | 22937 | 24017 |
+| GLM-5.3-Flash | 21/21 both times | 22914 | 24020 |
+
+Four and a half percent of strings encoded differently from the release,
+under a green board, for the whole life of those two containers. The
+remaining handful are codepoints assigned after the Unicode revision
+`src/unicode_classes.h` was generated from — regenerating on a CPython with
+Unicode 16.0 instead of 15.0 was worth three strings on one and two on the
+other.
+
+Two distinct defects came out of it, and neither is DeepSeek-specific:
+
+- **`\s+(?!\S)` backed off one byte.** It has to keep all but the last
+  *character* of a whitespace run when text follows, and `is_space()`
+  admits U+00A0. A no-break space before a word was cut down the middle
+  into two replacement bytes. Worth 1080 of 4000 strings in the whitespace
+  corner of the corpus on its own.
+- **`\p{N}` and `\s` were ASCII.** Both patterns in the file mean the
+  Unicode classes — the tiktoken one is compiled by Python's `regex` and
+  the `tokenizers` one by Oniguruma, and both were *probed* rather than
+  assumed, because the two plausible answers differ on U+3000 and agree on
+  U+00A0. `"²³x"` is `"²³"` + `"x"`.
+
+And one that is: DeepSeek's three Splits run in sequence, so pass 3 never
+sees across a number or a CJK run. `\s+(?!\S)` therefore succeeds at a
+segment boundary — `"  ०"` is one whitespace piece, not two — and a `\p{P}`
+run must stop at U+30FB, the katakana middle dot, which is punctuation
+*and* inside pass 2's range. Both were found by the wide corpus and neither
+would have been found by reading the pattern.
+
+The lesson is not "write more test strings". It is that a hand-written
+Unicode class **cannot fail loudly**: there is no character it rejects that
+produces an error, only one that produces a different split. The table is
+generated now, from `unicodedata`, by `tools/gen_unicode.py` — 30 KB of
+rodata against a whole category of silent wrongness — and the check reads
+the numbers instead of grepping its own output for the word "identical",
+which is what it did before and is why "22914/24021 identical" passed.
+That last part is §73 again, in the one file that had already written the
+warning down.
+
+## 76. The oracle was wrong, and only the shape of the error said so (2026-09-15)
+
+DeepSeek-V4.1's forward pass came up 0.7% off against `tools/ds41_ref.py`
+on the first run — same argmax, plausible logits, a number that could have
+been anything. `WASTE_DUMP_HIDDEN` against the oracle's `--hidden` put the
+first divergence at layer 2, the first layer that compresses its own KV,
+and that one was mine: the indexer derives its key from the compressor's
+*unrotated* latent, so it runs between the compressor and the rotation, and
+it had been handed the same scratch buffer. What got cached as the layer's
+compressed KV was the index key.
+
+The second was not mine, and it is the one worth writing down.
+
+With that fixed the diff moved to layer 3 at 0.0096% — which is small
+enough to read as accumulation and is not. Running the same diff at one,
+two, three and four tokens gave:
+
+| tokens | 1 | 2 | 3 | 4 |
+|---|---:|---:|---:|---:|
+| worst layer | 1e-7 | 1e-7 | **6.5%** | 0.039% |
+
+A bug that is exact at one, two and four tokens and 6% at three is not
+accumulation and is not a kernel. At ratio 2 the compressor publishes a
+latent on odd positions only, so position 2 is the first step where a
+compressing layer runs with *no* latent of its own — and upstream keeps
+what a source published in a module-level singleton, with a comment saying
+why: "layers run in order and every source writes before its consumers
+read, so one slot each is enough and nothing needs resetting between
+forwards." The oracle rebuilt that dictionary per step. On every step
+without a fresh latent it therefore lost the index keys, reported none, and
+the layer attended over its sliding window alone.
+
+**The engine was right and the oracle was wrong.** With the singleton
+persistent, every layer at every token count agrees to 1.9e-7.
+
+Three things this is evidence for:
+
+- **An oracle is a second implementation, not a specification.** §73 said a
+  test that only compares a thing to itself is not an oracle; this is the
+  other failure — two implementations, one of them wrong, and no way to
+  tell which from a single number. What told them apart was running the
+  diff at several sequence lengths and reading the *pattern*.
+- **Per-step state is where a decode-shaped engine and a batch-shaped
+  reference disagree.** The release's `model.py` prefills a whole chunk at
+  once, and in that form the compressor's "nothing to publish this step"
+  case barely exists. Transcribing it one token at a time is where it
+  becomes the common case.
+- **The test corpus has to reach the mechanism.** Four tokens against a
+  four-slot window never wraps the ring, never fills a compressed cache and
+  never gives the candidate filter two blocks to choose between. Twelve
+  does. §75 was the same lesson about a tokenizer corpus, three commits
+  earlier, and it did not transfer on its own.
+
+## 77. A speculative batch of five reads 3.45 tokens' worth (2026-09-15)
+
+Speculative decoding verifies K draft tokens in one backbone pass, and on a
+GPU that is nearly free — the pass is compute-bound and the K tokens ride
+along in the same matmuls. Here the pass *is* the expert reads, so the
+question is not the acceptance rate on its own. It is the acceptance rate
+against how much the union of K routes grows.
+
+`tools/spec_window.py` over a real `WASTE_DUMP_ROUTE` trace, on the three
+containers this machine has:
+
+| K | Kimi-Linear 48 B, top-8, 26 L | GLM-5.3-Flash 313 B, top-8, 42 L | K3 2.78 T, top-16, 92 L |
+|---|---:|---:|---:|
+| 2 | 85.6% | 85.4% | 84.4% |
+| 3 | 78.1% | 78.1% | 76.2% |
+| 4 | 73.0% | 72.8% | 70.7% |
+| **5** | **68.9%** | **69.0%** | **66.7%** |
+| 8 | 60.8% | 60.9% | 58.5% |
+
+Two orders of magnitude of scale, two different top-k, and the curve agrees
+to a tenth of a point at every K. That is the finding: **the union growth of
+consecutive routes is a property of top-k routing at this sparsity, not of
+any one model.** A number that stable is worth acting on before the model it
+is about has finished downloading.
+
+At K = 5 a batch touches 3.45 times what one token does, so 3.45 of the five
+drafts have to survive for it to read no more per accepted token than plain
+decoding. Σ p^i = 3.45 puts the per-position acceptance that needs at 0.88.
+At three accepted it reads 15% *more*; the best case, all five, saves 31%.
+
+Two things this is the other half of. Gate 0 measured 43.5% next-token
+expert reuse on OLMoE and called it "moderate, not the strong locality the
+literature assumed" — this is the same quantity read forwards, as what a
+batch costs rather than as what a cache saves, and it now has three
+first-party models under it. And §44: `WASTE_XPAR` is worth 1.18x on
+Kimi-Linear and a regression on K3 because "the batch that gives it
+parallelism is the same batch that barriers the read-ahead". Batching is not
+free on this engine at any level, and the reason is the same one twice.
+
+K3's top-16 does slightly better than the two top-8 models — more experts
+per token means more of them shared — which is worth knowing in the other
+direction: a *sparser* router makes speculation worse, and
+DeepSeek-V4.1's top-6 of 384 is sparser than all three.
+
+The gate is deferred rather than refuted (GATES.md gate 9). What DSpark's
+acceptance actually is on this model is not published, the release's own
+inference code says the speculative loop "is out of scope for this repo",
+and it is the one number left. What is settled is everything else: the
+threshold it has to clear, and that a batched CSA2/mHC forward path is the
+price of finding out.
+
+## 78. Four releases of a JSON reader that did not decode JSON (2026-09-15)
+
+DeepSeek-V4.1 loaded, ran, matched its oracle to 0.0025% on the real
+container — and could not tokenize `<｜User｜>`. Markup mode returned
+exactly what plain mode did: `5 30 28217 6756 28217 32`, six tokens of
+prose. `<think>` resolved. Everything else did not.
+
+What separates those two is that `<think>` is ASCII. `specials.json` is
+written by `json.dump`, whose `ensure_ascii` defaults to True, so the file
+holds `"<\uff5cUser\uff5c>"` — and the two readers of it, `js_str` in
+`src/json.h` and `load_specials` in `src/tokenizer.c`, both copied the
+bytes between the quotes. The marker in memory was the eighteen literal
+characters `<\uff5cUser\uff5c>`, and nothing a user could type would ever
+equal it.
+
+The bug shipped in 0.6.0 and survived every release since. The four
+containers that existed — K3, Kimi-Linear, GLM and the synthetic one — all
+spell their control tokens `<|open|>`, `<|endoftext|>`,
+`<|tool_call_begin|>` — ASCII, where an escaping writer and a
+non-decoding reader agree. DeepSeek-V4.1 is the first release here whose
+markup is full-width bars and `▁`, and it found it on contact.
+
+Three things are worth keeping from it.
+
+**A parser is only tested by input it did not write.** Both ends of this
+were ours: `convert.py` escaped, `tokenizer.c` copied, and the round trip
+through our own writer was the only round trip anyone had ever run. It is
+the same failure as §73 — a protocol checked only against itself — one
+layer down, in a file format rather than a wire format. The fix is
+therefore *both* directions and neither alone: the converters now write
+UTF-8, and the reader decodes, because a container from someone else's
+tool may still escape and must still load. `tests/run.sh` builds a
+deliberately escaped container to hold that side down; against the
+previous binary it comes back as 11 tokens instead of 1.
+
+**The failure was silent in the one place it must not be.** The split
+between `waste_tokenize_markup` and `waste_tokenize` is the security
+boundary in CLAUDE.md: content must not be able to write conversation
+structure. With no marker resolving, markup mode *became* plain mode —
+the boundary held, vacuously, by failing closed in the safe direction.
+That is luck, not design, and it is why the run.sh injection check reads
+`markup != plain` and not just `no control ids in plain`. Reading only the
+second half, this release would have passed.
+
+**The visible symptom was somewhere else entirely.** What a person
+actually saw first was the CLI printing
+`<｜end▁of▁sentence｜>` at the end of "The capital of
+France is Paris." — the detokenizer rendering a special's text, which is
+the same corrupted string read from the same file. A rendering artifact at
+the end of a correct generation looks like a cosmetic bug in the printer.
+It was the tokenizer's security boundary, seen from the other side.
+
+## 79. Three checks that were wrong about a correct engine (2026-09-15)
+
+The DeepSeek-V4.1 container converted, matched its oracle to 0.0025% and
+answered "The capital of France is" with " Paris." — and the suite said 4
+failures. Every one of them was the check, not the engine.
+
+- **`tests/run.sh` tested the tokenizer with `grep -q identical`**, and the
+  string `"22914/24021 identical"` contains that word. §75.
+- **`verify_container.py` kept a second copy of how a checkpoint names its
+  experts**, an inline probe for `mlp/gate_proj` falling back to
+  `block_sparse_moe/w1`, while `convert.py` had the same fact in
+  `MOE_LAYOUTS`. DeepSeek-V4.1 is neither, so the checker raised a
+  `KeyError` — into a `2>/dev/null` — and run.sh reported it as the
+  *container* failing to round-trip.
+- **The learned-hotlist check guarded on the wrong quantity.** It asked
+  whether the container's floor fits under its 5G budget. This one's does,
+  at 4.86 GB, which leaves 0.29 GB of expert cache against a 2.97 GB
+  working set — a tenth of one token, where §3 of ENGINE.md says the hit
+  rate is zero and not low. It answered 284 misses → 286 on one run and
+  fewer on the next: a verdict decided by noise.
+
+Plus §78, the escaped `specials.json`, which was a real defect — so the
+board read 4 failures over 1 bug.
+
+**A suite is only exercised by a model it has not seen.** These three sat
+under green boards since 0.6.0 because Kimi-Linear, GLM and K3 all
+satisfy their unstated assumptions: ASCII control tokens, one of two
+expert namings, a working set small enough that 5G is a real cache. None
+of those is a property anything checked; each was a coincidence three
+models shared. The fourth model was the test.
+
+The practical consequence is about *reading* a red board rather than
+writing one. The first instinct on 4 failures against a new architecture
+is that the new architecture is broken, and here that instinct was wrong
+four times out of four — but only because the engine had an independent
+oracle to be right against. Without `ds41_ref.py` saying 0.0025%, there is
+no way to tell a checker bug from an engine bug except by looking, and
+looking is expensive enough that the default assumption usually wins.
+
+Two small rules fall out, both cheap:
+
+**Never swallow a checker's stderr.** `2>/dev/null` on the round-trip
+turned "the checker crashed" into "the container is wrong", which is the
+one substitution that costs the most to undo. `run.sh` now shows it.
+
+**A check with an unstated prerequisite should state it and SKIP.** The
+hotlist check knew how to say "this container's floor is too high"; it
+just did not know that opening is not the same as having room to learn
+anything. Both guards read the same JSON from `waste plan`. The second one
+cost one line.
+
+## 80. Qwen3.8-Flash-Next: what was new, and what only looked new (2026-09-04)
 
 Four architectural pieces this engine had never run — Gated DeltaNet,
 Qwen Sparse Attention, HyperConnection, and a per-layer n-gram embedding —
@@ -5467,10 +5780,10 @@ should be rounding to bf16. The suite gates at the measured value so the
 number cannot grow while nobody is looking, which is the least a check can
 do about a thing it does not understand.
 
-## 75. Where a Qwen decode step goes, and a cache curve that climbs to 17 GiB (2026-09-11)
+## 81. Where a Qwen decode step goes, and a cache curve that climbs to 17 GiB (2026-09-11)
 
 `WASTE_PROFILE` stopped at Qwen's door. The forward pass had timers only
-in the expert-parallel branch of its MoE, so §74 could say how fast a token
+in the expert-parallel branch of its MoE, so §80 could say how fast a token
 was and not where it went. It now times HyperConnection, PLE, GDN with its
 recurrence as a sub-phase, QSA with block selection and attention as a
 sub-phase, the router, the shared expert and the head, and both routed
@@ -5550,18 +5863,18 @@ cache size is 95% or 80% depending on what is being written. On 48 GiB a
 the whole distinct set of a run this long, and a longer one will keep
 asking for more.
 
-**§74's flat top does not survive a longer run.** §74 measured 4.97 tok/s
+**§80's flat top does not survive a longer run.** §80 measured 4.97 tok/s
 at 8 GiB and 4.92 at 16 over 48 tokens and concluded that above 8 GiB a
 better hit rate buys nothing. Over 200 tokens the same step is worth 11%
 (6.33 to 7.01). The runs differ in length, prompt and thread count, and
-this entry does not isolate which of those flattened §74's curve.
+this entry does not isolate which of those flattened §80's curve.
 
 **The first PLE number was a cold page cache.** 3.54 ms/step on the first
 run after the container came back from network storage, 0.58 on every run
 after it. `trunk.bin` is opened without `F_NOCACHE`, unlike the expert
 banks, so on-disk n-gram rows go through the page cache.
 
-## 76. One dispatch per Qwen layer, when the cache already holds it (2026-09-11)
+## 82. One dispatch per Qwen layer, when the cache already holds it (2026-09-11)
 
 The pre-rewrite branch had two measured Qwen CPU defaults that the rewrite
 dropped: the expert-parallel path forced on at a batch of four (+12.8%),
@@ -5574,7 +5887,7 @@ builds the gate and up tables once and hands all K to one
 `waste_parallel_for` — which is this branch's expert-parallel loop with a
 batch of K. Its struct was a seam for a Metal backend; the CPU speed was
 the batch. So both changes could be measured from the environment before
-writing any code, on §75's protocol, 16 GiB arms alternated:
+writing any code, on §81's protocol, 16 GiB arms alternated:
 
 | arm | 16 GiB tok/s | 8 GiB tok/s |
 |---|---:|---:|
@@ -5611,12 +5924,12 @@ layers find all ten resident, and the path those layers take is unchanged.
 Kimi's and GLM's `moe_layer` keep a batch of four: the reasoning carries
 over, but nobody has measured it there.
 
-All 27 real-container runs in §75 and here generated the same 200 tokens.
+All 27 real-container runs in §81 and here generated the same 200 tokens.
 
 **Two harness mistakes, neither of which changed a conclusion.** The
 synthetic Qwen fixture opens with no expert cache under `test_forward`'s
 defaults, and the expert-parallel path needs four slots per routed expert.
-So every "both paths" comparison made on it — §75's profiling check and
+So every "both paths" comparison made on it — §81's profiling check and
 the first version of this entry's suite check — compared the row split with
 itself. With `WASTE_CACHE_MB=1`, 256 slots and the whole bank, the row
 split, forced batches of 4 and 64 and the default give identical logits and
@@ -5627,9 +5940,9 @@ whitespace field of `[  0] 248068`, which below step 100 is the step index,
 so they compared 100 tokens rather than 200. Re-read from the saved logs
 with the index stripped, all 200 agree in every run.
 
-## 77. Qwen's trunk through i8mm: 29% for a difference the text cannot see (2026-09-13)
+## 83. Qwen's trunk through i8mm: 29% for a difference the text cannot see (2026-09-13)
 
-§75 left GDN at 35.7 ms a step and HyperConnection at 18.0. Both looked
+§81 left GDN at 35.7 ms a step and HyperConnection at 18.0. Both looked
 like places for NEON loops — HyperConnection alone runs a sigmoid over
 10,240 values 96 times a token. They are not. `WASTE_PROFILE` now splits
 every phase into how much of it was trunk matvec (`PROF_START` notes the
@@ -5757,9 +6070,9 @@ unmeasured.
 the capture it compares. `kernel_kl` reads routes from
 `waste_model_step`'s own argument instead.
 
-## 78. HyperConnection's down projection was waiting for the pool to wake (2026-09-13)
+## 84. HyperConnection's down projection was waiting for the pool to wake (2026-09-13)
 
-§77 left HyperConnection's 320×10,240 down projection at 31.6 GB/s under
+§83 left HyperConnection's 320×10,240 down projection at 31.6 GB/s under
 i8mm, a third of `in_proj_qkv`'s 99. Two explanations fit that: the
 activation quantizer, scalar and on the calling thread, has four times the
 input to chew on at that shape; or the kernel is slower there. The profile
@@ -5838,9 +6151,9 @@ was emptied twice mid-session and took reference logs with it. Every
 comparison above ran in one command against a build of `HEAD` made with
 `git archive`, so none of it depends on a file surviving between runs.
 
-## 79. GDN's recurrence, one value head per task (2026-09-14)
+## 85. GDN's recurrence, one value head per task (2026-09-14)
 
-§78 ended on the largest serial stretch left in a Qwen decode step: GDN's
+§84 ended on the largest serial stretch left in a Qwen decode step: GDN's
 recurrence, 5.3 ms a step on the calling thread — 147 µs in each of 36
 layers, between `in_proj_qkv` and `out_proj`. Its 48 value heads share
 nothing they write. A head reads its own rows of `v`, the decay and `beta`
@@ -5872,16 +6185,16 @@ What it did not do is the other half of the reason given for it. GDN's
 `out_proj`, which followed the serial recurrence and so was expected to be
 paying for a parked pool, measured about 88 GB/s against 86 before. That
 projection is 7.9 MB and was already long enough to hide a wake; the gaps
-§78 found were costly in front of HyperConnection's 1.6 MB matvecs, not
+§84 found were costly in front of HyperConnection's 1.6 MB matvecs, not
 in front of every matvec.
 
 The largest serial stretch left is QSA's block selection and attention,
 4 ms a step across 12 layers.
 
-## 80. QSA's attention was a third of a long-context step, on one core (2026-09-14)
+## 86. QSA's attention was a third of a long-context step, on one core (2026-09-14)
 
 Every profile until now ran at a context of about 220 tokens, and at that
-length QSA's selection and attention looked like the 4 ms §79 ended on.
+length QSA's selection and attention looked like the 4 ms §85 ended on.
 Three of its four parts grow with the context rather than the token, so
 that number could not say what a long conversation costs. The profile now
 splits it into the RoPE table the block scores rotate by, block pooling
@@ -5936,9 +6249,9 @@ complete block re-pooled, though a full block never changes, then a top-k
 that rescans every block once per block kept) and the gather (the whole
 selection converted on one core).
 
-## 81. The rest of QSA: work redone every token, and an argmax per block (2026-09-14)
+## 87. The rest of QSA: work redone every token, and an argmax per block (2026-09-14)
 
-§80 left 15 ms a step of QSA at 2,830 tokens that grows with the context.
+§86 left 15 ms a step of QSA at 2,830 tokens that grows with the context.
 All three parts are now bit-identical rewrites; none adds state.
 
 **The RoPE table.** Every token, every QSA layer rewrote the cos/sin rows
@@ -5968,7 +6281,7 @@ scoring them at once already took the part to 1.3 ms from 5.2.
 and its own slot of the selection, so the BF16 conversion goes in ranges:
 5.3 → 1.2 ms.
 
-Against a build of §80's commit, unprofiled:
+Against a build of §86's commit, unprofiled:
 
 | | before | after |
 |---|---:|---:|
@@ -5977,16 +6290,16 @@ Against a build of §80's commit, unprofiled:
 | 2,801-token context, reading the prompt | 9.37 | 9.83 (+5%) |
 
 First-position logits byte-identical and every token the same in all seven
-runs. Across §80 and §81, decode at 2,801 tokens went from 5.95 to 9.47
+runs. Across §86 and §87, decode at 2,801 tokens went from 5.95 to 9.47
 tok/s and QSA at that length from 77.7 ms a step to 15.0, of which the
 attention — on the pool now — is 8.3.
 
 The step at either length is now mostly MoE: 57 ms of it at 2,801 tokens,
 and its expert arithmetic the largest single part.
 
-## 82. A layer missing one expert ran all ten as rows (2026-09-14)
+## 88. A layer missing one expert ran all ten as rows (2026-09-14)
 
-§81 left MoE the largest part of a Qwen step. On §75's protocol (18-token
+§87 left MoE the largest part of a Qwen step. On §81's protocol (18-token
 prompt, 200 decode tokens, 16 GiB cache, eight threads) it was 55.7 ms of
 it, and 42.8 of those the routed experts' arithmetic. The profile hid where:
 its LUT apply row is timed only on the row split, so the expert-parallel
@@ -5999,7 +6312,7 @@ layers showed up as a remainder of about 19 ms with no row of its own.
 | expert-parallel, all ten resident | 5,741 | 0.69 |
 | row split, anything missing | 4,723 | 1.71 |
 
-§76's rule sent a layer down the row split if any of its ten records was
+§82's rule sent a layer down the row split if any of its ten records was
 absent, and 2,343 of those 4,723 layers were missing exactly one. For one
 read, nine resident experts gave up the single dispatch and took thirty,
 over rows too short to fill the pool.
@@ -6021,7 +6334,7 @@ those run underneath. Then the misses are held and run: as rows when there
 are fewer than four, as tasks when there are more, because one expert on
 one thread is slower than its rows on eight. The shared expert, which needs
 no record either, is computed between the two stages. A forced `WASTE_XPAR`
-or an explicit `WASTE_XPAR_BATCH` keeps §76's fixed batches.
+or an explicit `WASTE_XPAR_BATCH` keeps §82's fixed batches.
 
 Each expert writes its own slice, and the sum still runs in route order
 afterwards, so the order the experts are computed in does not reach the
@@ -6035,7 +6348,7 @@ The threshold of four, as single runs on an instrumented build before the
 shared expert moved: 11.57 tok/s at four, 11.16 with every miss a task,
 11.33 with every miss as rows.
 
-Against a build of §81's commit, unprofiled:
+Against a build of §87's commit, unprofiled:
 
 | | before | after |
 |---|---:|---:|
@@ -6076,15 +6389,15 @@ What would help is starting those reads earlier than the layer's own
 router. Kimi's `moe_layer` already does, through `predict_next_moe`
 (§34), and Qwen's does not.
 
-## 83. Qwen's router lookahead: the cheap half of the next layer's mix (2026-09-14)
+## 89. Qwen's router lookahead: the cheap half of the next layer's mix (2026-09-14)
 
-§82 ended on expert I/O: 8.2 ms of a step spent waiting for the reads of
+§88 ended on expert I/O: 8.2 ms of a step spent waiting for the reads of
 experts no layer had asked for until its own router ran. Kimi starts them
 a layer early (§34, §35); Qwen did not. Its default `WASTE_LOOKAHEAD` of 6
 now applies to Qwen as well, with a predictor of its own.
 
 **Which input to give layer L+1's router**, measured before any of it read
-a byte: per layer transition over §75's 200 decode tokens at a 16 GiB
+a byte: per layer transition over §81's 200 decode tokens at a 16 GiB
 cache, against L+1's real routing and the cache's residency at that
 moment. 0.71 of L+1's ten experts missed per transition.
 
@@ -6133,7 +6446,7 @@ a step against 4.19 at 16 GiB, 16.47 against 16.27 at 8. What is still
 waited for is the misses no top-6 guess contains, not guesses that land
 late — so the guess stays where the buffers it needs are already dead.
 
-**Against a build of §82's commit**, unprofiled:
+**Against a build of §88's commit**, unprofiled:
 
 | | before | after |
 |---|---|---|
@@ -6163,9 +6476,9 @@ cutoff — prefetch a guess only when its score clears the rest by a margin —
 might keep the useful reads and drop some of the wasted ones. It is not
 measured.
 
-## 84. The expert kernel was not waiting on memory, it was waiting on a thread with two (2026-09-14)
+## 90. The expert kernel was not waiting on memory, it was waiting on a thread with two (2026-09-14)
 
-After §83, 16 GiB and eight threads, the step was 85.6 ms and 34.7 of it
+After §89, 16 GiB and eight threads, the step was 85.6 ms and 34.7 of it
 the routed experts' arithmetic. Across thread counts, 64 decode tokens each:
 
 | ms/step | 1 thread | 2 | 4 | 8 | 12 | 1 → 8 |
@@ -6200,7 +6513,7 @@ sharing power — and memory traffic added at most 1% on top. So the table
 was not quantized; `WASTE_VQ8`'s case rests on its kernel being faster, not
 on memory being the wall, and this entry did not test it.
 
-**What it was.** §82 gave every routed expert one task. Ten experts of
+**What it was.** §88 gave every routed expert one task. Ten experts of
 equal size on eight threads is two threads with two experts and a barrier
 waiting for them: ten experts of work in two experts of wall time, 5x at
 best, and 4.4x measured. `experts_staged` cuts the work into equal pieces
@@ -6209,10 +6522,10 @@ up rows 128 at a time, then each expert's activation and down table, then
 every expert's down rows 128 at a time. Three dispatches a layer, each
 piece writing only its own rows through the same `vq_rows` and
 `lutb_range` the per-expert task called, so the logits are unchanged. It
-runs both of §82's stages, and replaces the split between rows and tasks
+runs both of §88's stages, and replaces the split between rows and tasks
 for the misses: every threshold of that split was slower.
 
-Against a build of §83's commit, unprofiled, logits byte-identical, every
+Against a build of §89's commit, unprofiled, logits byte-identical, every
 token the same and the bytes read unchanged in all eleven runs:
 
 | | before | after |
@@ -6248,11 +6561,11 @@ GB/s at 0.59 ms a 1.77 MB record, two get 4.4 GB/s at 0.84 ms, four get
 a record, beside eight memcpy threads 1.15 — the engine's 0.88 ms is this
 drive plus the arithmetic beside it. Two readers is the drive's best.
 
-## 85. A bigger cache is a long-context fix, and one quantization per vector (2026-09-15)
+## 91. A bigger cache is a long-context fix, and one quantization per vector (2026-09-15)
 
-Two of the three places §84 left to look.
+Two of the three places §90 left to look.
 
-**The cache.** 16 GiB has been every Qwen measurement's protocol since §76,
+**The cache.** 16 GiB has been every Qwen measurement's protocol since §82,
 not a recommendation. On the same build, one process per run, peak RSS from
 `/usr/bin/time -l`, swap unused before and after:
 
@@ -6277,7 +6590,7 @@ None of it needs a change. `waste run` with no `--budget` already takes
 35.18 of this machine's 48 GB, 32.31 of it expert cache.
 
 **One quantization per vector.** The trunk's calls under 1 MB ran at 25.9
-GB/s against the same kernel's 15 GB/s on one core (§84): per call, an
+GB/s against the same kernel's 15 GB/s on one core (§90): per call, an
 activation quantization and a dispatch of their own. Qwen reads one vector
 three and four times over. GDN projects its input through `in_proj_qkv`,
 `_z`, `_a` and `_b`; QSA through q, k, v and the indexer; the MoE through
@@ -6294,7 +6607,7 @@ expert keeps its gate and up outputs in `m->ff` until it runs; the serial
 loop is the one path that writes there, and it has the shared expert
 redo them.
 
-Against a build of §84's commit, unprofiled:
+Against a build of §90's commit, unprofiled:
 
 | | before | after |
 |---|---|---|
@@ -6317,13 +6630,13 @@ The router row now carries the shared expert's gate and up projections;
 the profile splits a batch's time among its tensors by bytes.
 
 **For the CLI, not measured on it.** `--threads 0` is one thread per logical
-CPU, twelve here, and §84 measured twelve 6% slower than eight on Qwen:
+CPU, twelve here, and §90 measured twelve 6% slower than eight on Qwen:
 the efficiency cores are stragglers. A default that counted performance
 cores would be worth measuring on every model before it is one.
 
-## 86. The pool parks 300 times a token, and closing gaps is worth 2% (2026-09-16)
+## 92. The pool parks 300 times a token, and closing gaps is worth 2% (2026-09-16)
 
-§84 left seven milliseconds of the expert stages above their eight-thread
+§90 left seven milliseconds of the expert stages above their eight-thread
 ideal and HyperConnection's non-matvec work at 4.3 ms. Timed inside, with
 clock reads around each piece, 200 decode tokens at 16 GiB:
 
@@ -6357,7 +6670,7 @@ Per token, the dispatches that followed a stretch longer than a worker's
 
 | next dispatch | per token | after a gap | serial ms |
 |---|---:|---:|---:|
-| GDN, QSA and router batches (§85) | 96 | 96 | 1.47 |
+| GDN, QSA and router batches (§91) | 96 | 96 | 1.47 |
 | HyperConnection norm | 97 | 65 | 1.53 |
 | GDN recurrence | 36 | 36 | 1.66 |
 | i8mm matvecs | 339 | 55 | 1.41 |
@@ -6380,7 +6693,7 @@ times, until the first and the last acknowledged:
 
 No cheaper wake to swap in, and a barrier waits for the last one.
 
-**Spinning through them is §78's trade again.** Unprofiled, same build,
+**Spinning through them is §84's trade again.** Unprofiled, same build,
 user+system CPU for the whole run:
 
 | `WASTE_SPIN` | tok/s | CPU s |
@@ -6391,7 +6704,7 @@ user+system CPU for the whole run:
 | 200,000 | 13.50, 13.68 | 114.9, 112.3 |
 
 +6.5% for +12% CPU. The instrumented build said +10%: clock reads lengthen
-the gaps being measured, as §78 found of the profiler.
+the gaps being measured, as §84 found of the profiler.
 
 **Closing gaps instead**, each the same function over the same elements in
 the same order, so the logits do not move:
@@ -6418,7 +6731,7 @@ batches' parked count 96 → 82, which is how we know most of their gap is
 not those two.
 
 Three runs a side could not see any of it — the arms landed within 0.2
-tok/s of each other in both directions. Against a build of §85's commit,
+tok/s of each other in both directions. Against a build of §91's commit,
 six alternated pairs:
 
 | | tok/s | mean | CPU s |
@@ -6437,10 +6750,10 @@ Two percent here was not obviously worth the code. It went in because the
 gaps are a property of this machine's wake latency and eight cores, and a
 machine with more cores or a slower scheduler pays more for each one.
 
-## 87. QSA's attention, four scores at a time — and the product that must not fuse (2026-09-16)
+## 93. QSA's attention, four scores at a time — and the product that must not fuse (2026-09-16)
 
 At a 2,801-token context QSA's attention was 8.3 ms of a 87 ms step, on
-the pool since §80 and scalar inside: per selected token a 256-wide dot
+the pool since §86 and scalar inside: per selected token a 256-wide dot
 against the query, then a 256-wide accumulation of that token's values.
 
 The dot was not short of arithmetic, it was short of independence — each
@@ -6452,7 +6765,7 @@ value accumulation is the other way round — every output dimension sums
 the tokens in order — so its lanes run along the dimension, four vectors
 at a time. Both leave every element's sequence where it was.
 
-Against a build of §86's commit, 16 GiB, three pairs:
+Against a build of §92's commit, 16 GiB, three pairs:
 
 | | before | after |
 |---|---|---|
@@ -6491,317 +6804,5 @@ kernel. `tests/test_qsa_attn.c` holds the old loops verbatim and compares
 them with the new ones over 40 random cases with out-of-range selections
 mixed in, in one translation unit, where a compiler that transforms one
 and not the other is exactly what is being looked for. It is the same
-shape as §81's `test_qsa_pick`, and it was written after the fact rather
+shape as §87's `test_qsa_pick`, and it was written after the fact rather
 than before, which is the part to do differently next time.
-## 88. A feasibility gate does not need the download (2026-09-15)
-
-DeepSeek-V4.1-Flash is 510 GB in 48 shards. The gate that had to run before
-any of it was fetched — does 3-bit VQ survive experts that are *already* fp4?
-— needed 24 experts. A safetensors file states every tensor's byte offset in
-its own header, and HuggingFace serves ranges, so 24 experts is **190 MB**
-and four minutes. `tools/hf_peek.py` is that generalized: header first, then
-one range request per tensor, then dequantize E2M1/E4M3 against the E8M0
-scale stream. It should be the first thing pointed at any new release.
-
-The answer was no change at all. 19.97% / 20.74% / 19.95% on `layers.0.w1`,
-`layers.0.w2` and `layers.20.w1`, against §23's already-recorded **20.3% for
-a K3 expert at 3 bits from MXFP4** and gate 3's 19.4% from bf16. Three
-sources — bf16, K3's MXFP4, this release's fp4 — and one number. Whatever
-3-bit residual VQ costs, it costs it against the tensor you hand it, and an
-upstream quantizer having been there first does not compound the way the
-gate assumed. [GATES.md](GATES.md) gate 8.
-
-What the gate did not expect to find is how little is left in these tensors
-to begin with. 94 M parameters of `layers.0.w1` hold **28 distinct values**,
-because the ue8m0 scale stream — nominally one exponent per 32 inputs per
-row — takes four or five values across the entire matrix, two of them
-covering 96.6% of the blocks. The published format is per-block and the
-trained content is very nearly one global grid.
-
-Priced as information: 2.861 bits for the magnitude, plus a sign that is
-44.1% positive on the 88.2% of weights that are nonzero, is **3.74
-bits/weight**. So a lossless container is 4.25 bits (the nibbles verbatim
-plus the scale stream) and an entropy-coded one could not beat 3.74 —
-against VQ3R's 3.00 at 20% error. That is a *narrower* window than any
-previous model in this family gave, and it is the first time the choice of
-3 bits has been a choice between "lossy and small" and "exact and 52%
-bigger" rather than against 16-bit weights. It still goes to 3 bits, on
-§20's exchange rate: 85 GB more bank costs more hit rate than 20% expert
-error costs accuracy — on K3, measured. Whether it costs the same here is
-open, and it is the one quantization question stage 5's oracle diff should
-be asked to answer rather than assumed.
-
-Method note, because it generalizes past this model: **the cheap part of a
-gate is usually the measurement and the expensive part is getting the
-bytes.** Two of the eight gates in this file spent their cost on a download
-or a conversion that the measurement itself did not need. Range requests
-against a published index is a way to not do that again.
-
-## 89. Twenty-one strings is not a tokenizer corpus, and it never was (2026-09-15)
-
-`tools/tokdiff.py` opens with a comment saying "twelve short ASCII strings
-is not a tokenizer corpus". It then lists twenty-one strings and, until
-today, tested against those. Adding DeepSeek-V4.1's pre-tokenizer made the
-inadequacy measurable, because unlike cl100k's its pattern has five
-character classes and no catch-all.
-
-`src/tokenizer.c` codes the patterns directly rather than carrying a regex
-engine, so `\p{L}`, `\p{N}` and `\s` were hand-written ranges — the blocks
-the two Kimi releases and GLM had been tried on. In cl100k that was
-survivable by accident: a letter the table did not know fell into
-`[^\s\p{L}\p{N}]+`, which is a catch-all, so it still produced *a* piece.
-In DeepSeek's pattern the same character becomes `\p{S}`, joins the
-punctuation run beside it, and shifts every id after it.
-
-`tokdiff.py --wide 20000` — every codepoint thinned by a stride, plus a
-block of multi-byte whitespace runs — on the two releases that were
-**already supported and passing**:
-
-| | curated 21 | wide 24021 before | after |
-|---|---|---:|---:|
-| Kimi-Linear | 21/21 both times | 22937 | 24017 |
-| GLM-5.3-Flash | 21/21 both times | 22914 | 24020 |
-
-Four and a half percent of strings encoded differently from the release,
-under a green board, for the whole life of those two containers. The
-remaining handful are codepoints assigned after the Unicode revision
-`src/unicode_classes.h` was generated from — regenerating on a CPython with
-Unicode 16.0 instead of 15.0 was worth three strings on one and two on the
-other.
-
-Two distinct defects came out of it, and neither is DeepSeek-specific:
-
-- **`\s+(?!\S)` backed off one byte.** It has to keep all but the last
-  *character* of a whitespace run when text follows, and `is_space()`
-  admits U+00A0. A no-break space before a word was cut down the middle
-  into two replacement bytes. Worth 1080 of 4000 strings in the whitespace
-  corner of the corpus on its own.
-- **`\p{N}` and `\s` were ASCII.** Both patterns in the file mean the
-  Unicode classes — the tiktoken one is compiled by Python's `regex` and
-  the `tokenizers` one by Oniguruma, and both were *probed* rather than
-  assumed, because the two plausible answers differ on U+3000 and agree on
-  U+00A0. `"²³x"` is `"²³"` + `"x"`.
-
-And one that is: DeepSeek's three Splits run in sequence, so pass 3 never
-sees across a number or a CJK run. `\s+(?!\S)` therefore succeeds at a
-segment boundary — `"  ०"` is one whitespace piece, not two — and a `\p{P}`
-run must stop at U+30FB, the katakana middle dot, which is punctuation
-*and* inside pass 2's range. Both were found by the wide corpus and neither
-would have been found by reading the pattern.
-
-The lesson is not "write more test strings". It is that a hand-written
-Unicode class **cannot fail loudly**: there is no character it rejects that
-produces an error, only one that produces a different split. The table is
-generated now, from `unicodedata`, by `tools/gen_unicode.py` — 30 KB of
-rodata against a whole category of silent wrongness — and the check reads
-the numbers instead of grepping its own output for the word "identical",
-which is what it did before and is why "22914/24021 identical" passed.
-That last part is §73 again, in the one file that had already written the
-warning down.
-
-## 90. The oracle was wrong, and only the shape of the error said so (2026-09-15)
-
-DeepSeek-V4.1's forward pass came up 0.7% off against `tools/ds41_ref.py`
-on the first run — same argmax, plausible logits, a number that could have
-been anything. `WASTE_DUMP_HIDDEN` against the oracle's `--hidden` put the
-first divergence at layer 2, the first layer that compresses its own KV,
-and that one was mine: the indexer derives its key from the compressor's
-*unrotated* latent, so it runs between the compressor and the rotation, and
-it had been handed the same scratch buffer. What got cached as the layer's
-compressed KV was the index key.
-
-The second was not mine, and it is the one worth writing down.
-
-With that fixed the diff moved to layer 3 at 0.0096% — which is small
-enough to read as accumulation and is not. Running the same diff at one,
-two, three and four tokens gave:
-
-| tokens | 1 | 2 | 3 | 4 |
-|---|---:|---:|---:|---:|
-| worst layer | 1e-7 | 1e-7 | **6.5%** | 0.039% |
-
-A bug that is exact at one, two and four tokens and 6% at three is not
-accumulation and is not a kernel. At ratio 2 the compressor publishes a
-latent on odd positions only, so position 2 is the first step where a
-compressing layer runs with *no* latent of its own — and upstream keeps
-what a source published in a module-level singleton, with a comment saying
-why: "layers run in order and every source writes before its consumers
-read, so one slot each is enough and nothing needs resetting between
-forwards." The oracle rebuilt that dictionary per step. On every step
-without a fresh latent it therefore lost the index keys, reported none, and
-the layer attended over its sliding window alone.
-
-**The engine was right and the oracle was wrong.** With the singleton
-persistent, every layer at every token count agrees to 1.9e-7.
-
-Three things this is evidence for:
-
-- **An oracle is a second implementation, not a specification.** §73 said a
-  test that only compares a thing to itself is not an oracle; this is the
-  other failure — two implementations, one of them wrong, and no way to
-  tell which from a single number. What told them apart was running the
-  diff at several sequence lengths and reading the *pattern*.
-- **Per-step state is where a decode-shaped engine and a batch-shaped
-  reference disagree.** The release's `model.py` prefills a whole chunk at
-  once, and in that form the compressor's "nothing to publish this step"
-  case barely exists. Transcribing it one token at a time is where it
-  becomes the common case.
-- **The test corpus has to reach the mechanism.** Four tokens against a
-  four-slot window never wraps the ring, never fills a compressed cache and
-  never gives the candidate filter two blocks to choose between. Twelve
-  does. §89 was the same lesson about a tokenizer corpus, three commits
-  earlier, and it did not transfer on its own.
-
-## 91. A speculative batch of five reads 3.45 tokens' worth (2026-09-15)
-
-Speculative decoding verifies K draft tokens in one backbone pass, and on a
-GPU that is nearly free — the pass is compute-bound and the K tokens ride
-along in the same matmuls. Here the pass *is* the expert reads, so the
-question is not the acceptance rate on its own. It is the acceptance rate
-against how much the union of K routes grows.
-
-`tools/spec_window.py` over a real `WASTE_DUMP_ROUTE` trace, on the three
-containers this machine has:
-
-| K | Kimi-Linear 48 B, top-8, 26 L | GLM-5.3-Flash 313 B, top-8, 42 L | K3 2.78 T, top-16, 92 L |
-|---|---:|---:|---:|
-| 2 | 85.6% | 85.4% | 84.4% |
-| 3 | 78.1% | 78.1% | 76.2% |
-| 4 | 73.0% | 72.8% | 70.7% |
-| **5** | **68.9%** | **69.0%** | **66.7%** |
-| 8 | 60.8% | 60.9% | 58.5% |
-
-Two orders of magnitude of scale, two different top-k, and the curve agrees
-to a tenth of a point at every K. That is the finding: **the union growth of
-consecutive routes is a property of top-k routing at this sparsity, not of
-any one model.** A number that stable is worth acting on before the model it
-is about has finished downloading.
-
-At K = 5 a batch touches 3.45 times what one token does, so 3.45 of the five
-drafts have to survive for it to read no more per accepted token than plain
-decoding. Σ p^i = 3.45 puts the per-position acceptance that needs at 0.88.
-At three accepted it reads 15% *more*; the best case, all five, saves 31%.
-
-Two things this is the other half of. Gate 0 measured 43.5% next-token
-expert reuse on OLMoE and called it "moderate, not the strong locality the
-literature assumed" — this is the same quantity read forwards, as what a
-batch costs rather than as what a cache saves, and it now has three
-first-party models under it. And §44: `WASTE_XPAR` is worth 1.18x on
-Kimi-Linear and a regression on K3 because "the batch that gives it
-parallelism is the same batch that barriers the read-ahead". Batching is not
-free on this engine at any level, and the reason is the same one twice.
-
-K3's top-16 does slightly better than the two top-8 models — more experts
-per token means more of them shared — which is worth knowing in the other
-direction: a *sparser* router makes speculation worse, and
-DeepSeek-V4.1's top-6 of 384 is sparser than all three.
-
-The gate is deferred rather than refuted (GATES.md gate 9). What DSpark's
-acceptance actually is on this model is not published, the release's own
-inference code says the speculative loop "is out of scope for this repo",
-and it is the one number left. What is settled is everything else: the
-threshold it has to clear, and that a batched CSA2/mHC forward path is the
-price of finding out.
-
-## 92. Four releases of a JSON reader that did not decode JSON (2026-09-15)
-
-DeepSeek-V4.1 loaded, ran, matched its oracle to 0.0025% on the real
-container — and could not tokenize `<｜User｜>`. Markup mode returned
-exactly what plain mode did: `5 30 28217 6756 28217 32`, six tokens of
-prose. `<think>` resolved. Everything else did not.
-
-What separates those two is that `<think>` is ASCII. `specials.json` is
-written by `json.dump`, whose `ensure_ascii` defaults to True, so the file
-holds `"<\uff5cUser\uff5c>"` — and the two readers of it, `js_str` in
-`src/json.h` and `load_specials` in `src/tokenizer.c`, both copied the
-bytes between the quotes. The marker in memory was the eighteen literal
-characters `<\uff5cUser\uff5c>`, and nothing a user could type would ever
-equal it.
-
-The bug shipped in 0.6.0 and survived every release since. The four
-containers that existed — K3, Kimi-Linear, GLM and the synthetic one — all
-spell their control tokens `<|open|>`, `<|endoftext|>`,
-`<|tool_call_begin|>` — ASCII, where an escaping writer and a
-non-decoding reader agree. DeepSeek-V4.1 is the first release here whose
-markup is full-width bars and `▁`, and it found it on contact.
-
-Three things are worth keeping from it.
-
-**A parser is only tested by input it did not write.** Both ends of this
-were ours: `convert.py` escaped, `tokenizer.c` copied, and the round trip
-through our own writer was the only round trip anyone had ever run. It is
-the same failure as §73 — a protocol checked only against itself — one
-layer down, in a file format rather than a wire format. The fix is
-therefore *both* directions and neither alone: the converters now write
-UTF-8, and the reader decodes, because a container from someone else's
-tool may still escape and must still load. `tests/run.sh` builds a
-deliberately escaped container to hold that side down; against the
-previous binary it comes back as 11 tokens instead of 1.
-
-**The failure was silent in the one place it must not be.** The split
-between `waste_tokenize_markup` and `waste_tokenize` is the security
-boundary in CLAUDE.md: content must not be able to write conversation
-structure. With no marker resolving, markup mode *became* plain mode —
-the boundary held, vacuously, by failing closed in the safe direction.
-That is luck, not design, and it is why the run.sh injection check reads
-`markup != plain` and not just `no control ids in plain`. Reading only the
-second half, this release would have passed.
-
-**The visible symptom was somewhere else entirely.** What a person
-actually saw first was the CLI printing
-`<｜end▁of▁sentence｜>` at the end of "The capital of
-France is Paris." — the detokenizer rendering a special's text, which is
-the same corrupted string read from the same file. A rendering artifact at
-the end of a correct generation looks like a cosmetic bug in the printer.
-It was the tokenizer's security boundary, seen from the other side.
-
-## 93. Three checks that were wrong about a correct engine (2026-09-15)
-
-The DeepSeek-V4.1 container converted, matched its oracle to 0.0025% and
-answered "The capital of France is" with " Paris." — and the suite said 4
-failures. Every one of them was the check, not the engine.
-
-- **`tests/run.sh` tested the tokenizer with `grep -q identical`**, and the
-  string `"22914/24021 identical"` contains that word. §89.
-- **`verify_container.py` kept a second copy of how a checkpoint names its
-  experts**, an inline probe for `mlp/gate_proj` falling back to
-  `block_sparse_moe/w1`, while `convert.py` had the same fact in
-  `MOE_LAYOUTS`. DeepSeek-V4.1 is neither, so the checker raised a
-  `KeyError` — into a `2>/dev/null` — and run.sh reported it as the
-  *container* failing to round-trip.
-- **The learned-hotlist check guarded on the wrong quantity.** It asked
-  whether the container's floor fits under its 5G budget. This one's does,
-  at 4.86 GB, which leaves 0.29 GB of expert cache against a 2.97 GB
-  working set — a tenth of one token, where §3 of ENGINE.md says the hit
-  rate is zero and not low. It answered 284 misses → 286 on one run and
-  fewer on the next: a verdict decided by noise.
-
-Plus §92, the escaped `specials.json`, which was a real defect — so the
-board read 4 failures over 1 bug.
-
-**A suite is only exercised by a model it has not seen.** These three sat
-under green boards since 0.6.0 because Kimi-Linear, GLM and K3 all
-satisfy their unstated assumptions: ASCII control tokens, one of two
-expert namings, a working set small enough that 5G is a real cache. None
-of those is a property anything checked; each was a coincidence three
-models shared. The fourth model was the test.
-
-The practical consequence is about *reading* a red board rather than
-writing one. The first instinct on 4 failures against a new architecture
-is that the new architecture is broken, and here that instinct was wrong
-four times out of four — but only because the engine had an independent
-oracle to be right against. Without `ds41_ref.py` saying 0.0025%, there is
-no way to tell a checker bug from an engine bug except by looking, and
-looking is expensive enough that the default assumption usually wins.
-
-Two small rules fall out, both cheap:
-
-**Never swallow a checker's stderr.** `2>/dev/null` on the round-trip
-turned "the checker crashed" into "the container is wrong", which is the
-one substitution that costs the most to undo. `run.sh` now shows it.
-
-**A check with an unstated prerequisite should state it and SKIP.** The
-hotlist check knew how to say "this container's floor is too high"; it
-just did not know that opening is not the same as having room to learn
-anything. Both guards read the same JSON from `waste plan`. The second one
-cost one line.

@@ -1888,7 +1888,11 @@ static int cfg_sane(const waste_config *c)
      * an allocation or indexes a loop below. A container that omits one is
      * refused here rather than opened and read out of bounds. */
     if (c->arch_qwen) {
+        const int max_inter = c->dense_inter > c->moe_inter
+                            ? c->dense_inter : c->moe_inter;
         if (c->qwen_n_layer_types != c->n_layers) return 0;
+        if (c->shared_inter < 1 || c->shared_inter > max_inter) return 0;
+        if (c->conv_k < 1) return 0;
         if (c->gdn_k_heads < 1 || c->gdn_v_heads < 1 ||
             c->gdn_k_dim < 1 || c->gdn_v_dim < 1) return 0;
         if (c->gdn_v_heads % c->gdn_k_heads != 0) return 0;
@@ -1901,6 +1905,7 @@ static int cfg_sane(const waste_config *c)
         if (c->idx_kv_heads != 1) return 0;
         if (c->n_heads % c->qsa_n_kv != 0) return 0;
         if (c->ngram_size < 1 || c->ngram_size > 8) return 0;
+        if (c->ple_layer >= 0 && c->ngram_size < 2) return 0;
         if (c->rotary_dim < 0 || c->rotary_dim > 256) return 0;
         if (c->rotary_dim / 2 > WASTE_MAX_ROPE_HALF) return 0;
         if ((int64_t)c->hc_count * c->hidden > INT_MAX) return 0;

@@ -1818,6 +1818,12 @@ PYQ
             'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"]["layer_types"]=m["config"]["layer_types"][:1];json.dump(m,open(p,"w"))'
         qwen_refused "a PLE conv kernel the ring cannot hold" \
             'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"]["ple_conv_kernel_size"]=0;json.dump(m,open(p,"w"))'
+        qwen_refused "a shared expert wider than the allocated FFN scratch" \
+            'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));c=m["config"];c["shared_expert_intermediate_size"]=max(c["moe_intermediate_size"],c.get("intermediate_size",0))+1;json.dump(m,open(p,"w"))'
+        qwen_refused "a PLE n-gram order that divides by zero" \
+            'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"]["ngram_size"]=1;json.dump(m,open(p,"w"))'
+        qwen_refused "a zero-width GDN convolution kernel" \
+            'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"]["linear_conv_kernel_dim"]=0;json.dump(m,open(p,"w"))'
     fi
 
     # The isolated ops against an independent PyTorch reference written
