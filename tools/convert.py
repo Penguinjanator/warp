@@ -1619,7 +1619,6 @@ def main():
         if ds41:
             engram = build_engram(st, args.out, cfg, args.engram_bits)
             build_engram_meta(args.src, cfg, args.out)
-            build_engram_meta(args.src, cfg, args.out)
         reclaim(debt, args.reclaim, ShardDebt.TRUNK, "trunk")
 
         # A resumed conversion is holding the shards of every layer an
@@ -1989,6 +1988,7 @@ def main():
             return 1
         if ds41:
             engram = build_engram(st, args.out, cfg, args.engram_bits)
+            build_engram_meta(args.src, cfg, args.out)
     trunk_path = os.path.join(args.out, "trunk.bin")
     trunk_tmp = trunk_path + ".tmp"
 

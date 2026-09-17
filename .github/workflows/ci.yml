@@ -324,6 +324,45 @@ jobs:
           fi
           echo "ok: all source files carry the header"
 
+      # convert.py has two trunk paths and only the --reclaim one called
+      # build_engram_meta(), so a default DeepSeek-V4.1 conversion wrote the
+      # 110 GB of Engram tables and none of the index that addresses them.
+      # The container then failed to open with five words and no subject,
+      # because engram_open() was also the one -2 in the load path that
+      # printed nothing (#71) — six and a half hours of conversion to find
+      # out. No test that lacks real weights can see either half, so the
+      # invariant is checked on the source instead.
+      #
+      # It is checked per BLOCK and not by counting call sites, because the
+      # bug shipped alongside a duplicated build_engram_meta() on the other
+      # path: two tables, two indexes, totals equal, and the default path
+      # still wrote nothing. A counting guard passes on the broken tree.
+      - name: every block writing Engram tables also writes the index
+        run: |
+          python3 - <<'EOF'
+          import ast, sys
+          tree = ast.parse(open("tools/convert.py").read())
+          def names(stmt):
+              return {n.func.id for n in ast.walk(stmt)
+                      if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+          bad = []
+          for node in ast.walk(tree):
+              for field in ("body", "orelse", "finalbody"):
+                  block = getattr(node, field, None)
+                  if not isinstance(block, list):
+                      continue
+                  called = set().union(*(names(s) for s in block)) if block else set()
+                  if "build_engram" in called and "build_engram_meta" not in called:
+                      bad.append(min(s.lineno for s in block))
+          for line in sorted(set(bad)):
+              print(f"FAIL: block at tools/convert.py:{line} calls build_engram() "
+                    f"but not build_engram_meta()")
+          if bad:
+              print("A container whose Engram tables have no engram.json cannot be opened.")
+              sys.exit(1)
+          print("ok: every block that writes Engram tables also writes the index")
+          EOF
+
   # The cross-build job proves the code compiles for Windows and the run job
   # proves those binaries execute. Neither builds *on* Windows, so neither
   # ever ran the Makefile's platform detection, the shell harness, or the
