@@ -130,7 +130,7 @@ def main():
        "a two-dimensional gate_up is not a packed layer")
     gate, up = CONV.split_packed_gate_up_shape((512, 1280, 2560), 640)
     ck(gate == (512, 640, 2560) and up == (512, 640, 2560),
-       f"gate/up split along dim 1 → {gate} {up}")
+       f"gate/up split along dim 1 -> {gate} {up}")
 
     print("packed expert source names")
     g, d = CONV.qwen_packed_names("model.language_model.", 0)
@@ -139,7 +139,7 @@ def main():
     ck(d == "model.language_model.layers.0.mlp.experts.down_proj",
        f"down name {d}")
 
-    print("PLE 128 shards → 16 heads")
+    print("PLE 128 shards -> 16 heads")
     offsets = [0, 20000003, 40000026]
     sizes = [20000003, 20000023, 20000033]
     slices = CONV.ple_head_slices(offsets, sizes)

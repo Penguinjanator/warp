@@ -1666,8 +1666,12 @@ if ! python3 tools/make_test_container.py --qwen "$QWENC" >/dev/null 2>&1; then
 else
     # Format first: a fixture that quietly stopped being a real container
     # would make every check below vacuous.
-    qman=$(python3 -c "import json;m=json.load(open('$QWENC/manifest.json'));print(m['format_version'], m['arch'])" 2>/dev/null)
-    qmagic=$(python3 -c "import struct;print(struct.unpack('<I', open('$QWENC/experts-L0.bin','rb').read(4))[0] == 0x50584557)" 2>/dev/null)
+    # The path goes in as an argument, not into the program text: MSYS2
+    # rewrites a POSIX path in a native program's argv and leaves one inside
+    # a -c string alone, so on Windows the embedded form opened /tmp/... and
+    # read nothing — which reported the fixture as not loading.
+    qman=$(python3 -c "import json,sys;m=json.load(open(sys.argv[1]+'/manifest.json'));print(m['format_version'], m['arch'])" "$QWENC" 2>/dev/null)
+    qmagic=$(python3 -c "import struct,sys;print(struct.unpack('<I', open(sys.argv[1]+'/experts-L0.bin','rb').read(4))[0] == 0x50584557)" "$QWENC" 2>/dev/null)
     qinfo=$(./waste info "$QWENC" 2>&1)
     ./test_forward "$QWENC" 3,7,11 "$TMP/qwen_seq.bin" 0 >"$TMP/qwen_fwd.log" 2>&1
     if [ "$qman" = "0 qwen4_exp_text" ] && [ "$qmagic" = "True" ] &&
