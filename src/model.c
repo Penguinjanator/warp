@@ -2452,7 +2452,16 @@ static int engram_open(waste_model *m, const char *dir, const js_doc *d)
 
     snprintf(path, sizeof path, "%s/engram.json", dir);
     char *es = slurp(path, NULL);
-    if (!es) return -2;
+    /* Name the file. This was the one -2 in the whole load path that printed
+     * nothing, and DeepSeek-V4.1 is the only architecture that can reach it,
+     * so a container missing its Engram index failed with five words and no
+     * subject: "open: malformed container". Every other WASTE_E_FORMAT site
+     * says what it did not like. */
+    if (!es) {
+        fprintf(stderr, "waste: %s is missing — the Engram tables are there "
+                        "but the index that addresses them is not\n", path);
+        return -2;
+    }
     js_doc ed;
     if (js_parse(&ed, es) < 0) { free(es); return -2; }
 
