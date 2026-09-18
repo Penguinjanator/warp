@@ -15,7 +15,14 @@
  * `s += q * k` the same arithmetic contracts to a fused multiply-add, which
  * rounds once. Both versions of that mistake produced logits that differed
  * in the last bits and generated different text a few hundred tokens in.
- * The old loops are copied verbatim below.
+ * The old loops are copied below, with one change: the score loop is
+ * written with its product and its sum as separate statements. Verbatim,
+ * `s += q * k` is not a fixed reference — its rounding is the compiler's
+ * choice, separate at -O2 and fused at -O1 — so this test passed on a
+ * release build and failed under `make asan` on arm64 against a kernel that
+ * had not changed. Separate statements are the form -O2 gave the old loop,
+ * and one no optimization level contracts. The value loop stays verbatim:
+ * it is contracted at every level, which is what vfmaq_f32 matches.
  */
 #include <math.h>
 #include <stdio.h>
@@ -43,7 +50,7 @@ static void old_attn(int h0, int h1, const float *q, int Hq, int D,
             if (t < 0 || t >= T) { scores[i] = -1e30f; continue; }
             const float *kh = k + ((size_t)t * Hkv + hv) * D;
             float s = 0.0f;
-            for (int d = 0; d < D; d++) s += qh[d] * kh[d];
+            for (int d = 0; d < D; d++) { const float p = qh[d] * kh[d]; s = s + p; }
             s *= scale;
             scores[i] = s;
             if (s > m) m = s;

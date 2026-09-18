@@ -248,7 +248,18 @@ void waste_qwen_qsa_attn_heads(int h0, int h1, const float *q, int Hq, int D,
             if (t < 0 || t >= T) { scores[i] = -1e30f; continue; }
             const float *kh = k + ((size_t)t * Hkv + hv) * D;
             float s = 0.0f;
-            for (int d = 0; d < D; d++) s += qh[d] * kh[d];
+            /* Product and sum as separate statements, as in the four-wide
+             * loop above and for the same reason. Written `s += q * k` the
+             * rounding of this loop is the compiler's choice rather than the
+             * language's: clang at -O2 vectorizes the products and rounds
+             * each on its own, at -O1 it emits one fused multiply-add per
+             * element. So a -O1 build (make asan) scored the tail tokens of a
+             * selection differently from the tokens scored four at a time,
+             * and differently from its own -O2 build. Separate statements
+             * are never contracted under -ffp-contract=on, at any level, and
+             * are what -O2 compiled the old form to — the release build's
+             * numbers do not move. */
+            for (int d = 0; d < D; d++) { const float p = qh[d] * kh[d]; s = s + p; }
             s *= scale;
             scores[i] = s;
             if (s > m) m = s;
