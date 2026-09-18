@@ -108,8 +108,8 @@ WASTE_BACKEND=cpu WASTE_DUMP_ROUTE=b.route ./test_forward M IDS b.bin 0
 tests/route_diff.py --ref a.route --other b.route --scores a.scores
 
 python3 -m unittest discover -s tests/serve -t . -p "test_*.py"   # all serve tests
-python3 -m unittest tests.serve.test_regions -t .                 # one module
-K3_DIR=... python3 -m unittest tests.serve.test_xtml.TestAgainstUpstream -t .
+python3 -m unittest tests.serve.test_regions                    # one module (-t is discover-only)
+K3_DIR=... python3 -m unittest tests.serve.test_xtml.TestAgainstUpstream
 K2_DIR=... uv run --with jinja2 python -m unittest tests.serve.test_chatfmt_upstream
 ```
 

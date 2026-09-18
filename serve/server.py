@@ -58,6 +58,13 @@ class ChatServer(ThreadingHTTPServer):
 
     daemon_threads = True
     allow_reuse_address = True
+    # socketserver's listen backlog is 5. Every request holds the engine
+    # lock for a whole generation, so clients arrive in bursts that all
+    # connect before the accept loop drains them, and a burst of 8 (what
+    # TestConcurrency sends) overflowed it: macOS 27 answered the surplus
+    # connects with a reset, and the test failed about half its runs. 128
+    # is macOS's default somaxconn, so a larger value would be clipped.
+    request_queue_size = 128
 
     def __init__(self, addr, handler, *, engine: Engine, model_id: str,
                  api_key: Optional[str] = None,
