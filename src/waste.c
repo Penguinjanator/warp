@@ -1442,7 +1442,7 @@ waste_status waste_model_get_info(const waste_ctx *c, waste_model_info *out)
     out->arch = strstr(cf->arch, "KimiK3")     ? "kimi-k3"
               : strstr(cf->arch, "KimiLinear") ? "kimi-linear"
               : strstr(cf->arch, "Glm5Next")   ? "glm5-next"
-              : strstr(cf->arch, "Qwen4Exp")   ? "qwen4_exp_text"
+              : strstr(cf->arch, "Qwen4Exp")   ? "qwen4-exp-text"
               : cf->arch[0]                    ? cf->arch
                                                : "unknown";
     out->quant_summary = c->quant;

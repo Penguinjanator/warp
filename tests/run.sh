@@ -1671,9 +1671,9 @@ else
     qinfo=$(./waste info "$QWENC" 2>&1)
     ./test_forward "$QWENC" 3,7,11 "$TMP/qwen_seq.bin" 0 >"$TMP/qwen_fwd.log" 2>&1
     if [ "$qman" = "0 qwen4_exp_text" ] && [ "$qmagic" = "True" ] &&
-       printf '%s' "$qinfo" | grep -q "qwen4_exp_text" &&
+       printf '%s' "$qinfo" | grep -q "qwen4-exp-text" &&
        [ -s "$TMP/qwen_seq.bin" ]; then
-        ok "the Qwen fixture is format v0 with WEXP records and loads as qwen4_exp_text"
+        ok "the Qwen fixture is format v0 with WEXP records and loads as qwen4-exp-text"
     else
         no "the Qwen fixture did not load (manifest='$qman' wexp=$qmagic)"
         printf '%s\n' "$qinfo" | tail -5
@@ -2187,7 +2187,7 @@ hf = ((c.get("_outer", {}).get("architectures") or c.get("architectures")
 # fail here for spelling rather than for describing the wrong container.
 arch = ("kimi-k3" if "KimiK3" in hf else "kimi-linear" if "KimiLinear" in hf
         else "glm5-next" if "Glm5Next" in hf
-        else "qwen4_exp_text" if "Qwen4Exp" in hf
+        else "qwen4-exp-text" if "Qwen4Exp" in hf
         else hf or "unknown")     # a container that names nothing gets that
 
 NAMES = {0: "F32", 1: "F16", 2: "Q8G", 3: "Q4G", 7: "Q3G"}
