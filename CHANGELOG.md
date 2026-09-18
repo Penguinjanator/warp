@@ -8,10 +8,108 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
-## Unreleased
+## 0.8.1 — 2026-09-18
+
+**Qwen3.8-Flash-Next runs**, text only — contributed by @Skibisky in #63.
+It is a fifth architecture: Gated DeltaNet rather than KDA, Qwen Sparse
+Attention over the original K/V rather than a latent, four HyperConnection
+residual streams, a softmax router with a gated shared expert, and a
+per-layer n-gram embedding whose 16 tables live on the trunk and are read a
+row per head per token. That last part is what lets a model of 176.94 B
+parameters open with a 3.11 GB floor. The throughput figures in
+[docs/QWEN.md](docs/QWEN.md) and LEARNED §80–93 are the contributor's,
+measured on a 48 GiB Apple silicon laptop. The checkpoint is not on the
+machine this release was cut on, so they have not been re-measured here.
+What was measured on this commit: against the container-native oracle, the
+routes match exactly at every layer, and the logits agree to 1.9e-06 on
+the synthetic fixture and to 2.4e-06 on one with a shared expert 64x the
+hidden width.
+
+For anyone already on 0.8.0: **a DeepSeek-V4.1 conversion without
+`--reclaim` produced a container that could not be opened** (#71). The
+Engram index was never written, and nothing said so. That is fixed, and
+there is a repair for containers already converted.
+
+No ABI move: `src/waste.h` changes only its version macros.
+
+### Added
+
+- **The Qwen3.8-Flash-Next forward pass** (`qwen4_exp_text`): GDN, QSA,
+  HyperConnection, PLE and the softmax top-k router, each checked against
+  an independent PyTorch reference (`tests/test_qwenparts.c`,
+  `tools/qwenparts_ref.py`) and all of them together against
+  `tools/qwen_container_ref.py`. Chunked prefill is bit-identical to the
+  sequential path, and so are the row split, the fixed batches and the
+  per-expert staged schedule of `qwen_moe_layer`.
+- **Its converter.** Nested `text_config`, packed `gate_up_proj` /
+  `down_proj` split into ordinary WEXP records (the format stays v0), 128
+  PLE source shards written as 16 Q8G heads a row batch at a time, and a
+  `--reclaim` ledger that treats the n-gram shards as a consumer of their
+  own. `--jobs` defaults to 1 for Qwen, since one worker holds a whole
+  layer's packed pair. `tools/verify_container.py` reads packed sources and
+  spot-checks PLE rows.
+- **`tokenizer_digit_run`** — Qwen splits every digit into its own
+  pre-token, where Kimi and GLM take up to three.
+- **`cfg_sane` bounds every Qwen dimension that sizes a buffer or a loop.**
+  The shared expert's width is bounded the way its siblings are, and
+  `m->ff`, `m->xq` and `m->xs` are sized from it. `tests/run.sh`'s
+  refusals now pass only when `cfg_sane` itself refused — not on any
+  non-zero exit, which a crash also produces — and
+  `make_test_container.py --qwen-shared N` builds a wide shared expert that
+  runs under `make asan` and matches the oracle.
+- **`tests/kernel_kl.c`** — two trunk kernels over a long prompt, compared
+  at every position: KL, argmax, routes, and perplexity on the real text.
+- **`WASTE_PROFILE=decode`** leaves the prompt steps out of the profile.
+  On a Qwen container the profile also prints a per-phase tree and a trunk
+  matvec table broken down by tensor role.
+- **A CI guard** that checks, block by block, that every block of
+  `convert.py` writing Engram tables also writes the index (#72). It fails
+  on the tree before that fix, and so does a merge that puts the call in
+  the wrong place.
+- **A strict CI job for the K2 tool protocol**, the one GLM has had and
+  which `ci.yml` used to have to exempt K2 from in so many words: "the same
+  ground-truth rule the K2 template check in tests/run.sh applies, except
+  this one may not skip". Now neither may. `CI_K2_ORACLE_STRICT=1` turns
+  every skip path — missing template, missing jinja2, unresolved markers —
+  into a failure, and the job asserts all **seven** checks ran, so it
+  cannot be green by having done nothing. Vendoring the template is what
+  made it possible: no download, no weights, no machine-local `~/models`.
+
+### Changed
+
+- **A Qwen load selects the i8mm trunk kernel for the whole process**,
+  containers already open included, unless `WASTE_TRUNK_KERNEL` pins it.
+  That is not exact arithmetic. For Qwen it is worth 29%, and the
+  contributor measured next-token perplexity of 3.698 against 3.712 for
+  f32. The side effect on other containers is #68, which tracks moving the
+  choice onto each model.
+- **QSA forms every product-and-sum through one definition**,
+  `waste_qwen_qsa_mac`: `fmaf` where the target can fuse, two statements
+  where it cannot. Left to the compiler, the four-wide loop and its
+  reference rounded differently on gcc for arm64 at `-O1` and `-O2`,
+  whatever the contraction flag said, and on clang at `-O1`. On arm64, selections of 32 tokens or more
+  now round once per element where the branch's measurements rounded
+  twice. The last bits of those numbers move. `kernel_kl` on the real
+  checkpoint has been asked for.
+- **`convert.py` writes tensor bytes in one copy.** `raw_bytes` used to go
+  through a Python list with one int per byte, for every family's
+  conversion.
 
 ### Fixed
 
+- **DeepSeek-V4.1 without `--reclaim`: the Engram index was never
+  written** (#71, #72 — found and fixed by @helenkwok converting the
+  release on an EPYC 7713). Only the `--reclaim` path called
+  `build_engram_meta()`, and it called it twice. The default path wrote
+  110 GB of Engram tables and no `engram.json`, and `engram_open()` —
+  the one silent `-2` in the load path — turned that into a bare
+  `open: malformed container`. Both paths now write the index, and the
+  loader names the missing file. #72 has the script that repairs a
+  container converted without it.
+- **The server refused connections under load.** `ChatServer` kept
+  socketserver's listen backlog of 5, so eight concurrent connects had
+  their surplus reset. On macOS 27 `TestConcurrency` failed 11 of 20 runs;
+  with `request_queue_size = 128` it failed 0 of 30.
 - **The K2 tool-grammar check defaulted to a path on an external volume**,
   which is a description of one machine rather than a default: everywhere
   else — CI, a fresh clone, this machine with the disk unplugged — it read
@@ -25,16 +123,27 @@ changed. Each entry names the section to read for the numbers behind it.
   `glm_upstream/` already was; `K2_DIR` still points a real release over
   it. The suite goes to 85 passed, 0 failed, 2 skipped with nothing set.
 
-### Added
+### Measured and not adopted
 
-- **A strict CI job for the K2 tool protocol**, the one GLM has had and
-  which `ci.yml` used to have to exempt K2 from in so many words: "the same
-  ground-truth rule the K2 template check in tests/run.sh applies, except
-  this one may not skip". Now neither may. `CI_K2_ORACLE_STRICT=1` turns
-  every skip path — missing template, missing jinja2, unresolved markers —
-  into a failure, and the job asserts all **seven** checks ran, so it
-  cannot be green by having done nothing. Vendoring the template is what
-  made it possible: no download, no weights, no machine-local `~/models`.
+- **The i8mm trunk kernel as DeepSeek-V4.1's default.** 3.87–3.97 tok/s
+  becomes 4.52–4.56. Of 2,080 routing decisions it flips one, a tie the
+  reference itself cannot resolve, and the 201 others that differ all
+  follow from that one. It waits for #68, so that a
+  per-model default does not reach other models in the same process
+  (#70). Along the way it showed that the DS41 oracle gate's fixture is
+  53x quieter than the real model on the same change: 6 layers against 40.
+  LEARNED §94, §96.
+- **`WASTE_VQ8=1` on DeepSeek-V4.1.** A further +21%, and 574 of 880
+  routing decisions change, the first of them a real disagreement. That is
+  a different model, not a faster one. LEARNED §96.
+- **The Qwen branch's batched trunk matvec and staged expert schedule,
+  ported to DeepSeek-V4.1.** Both are bit-identical, and neither makes any
+  difference. Both are about work units too small to be worth a dispatch,
+  and DS41's projections are 512 rows or more and its experts 2,304.
+  The code is on `perf/mvb-ds41` and `perf/xpar-staged-ds41`. LEARNED §94,
+  §95.
+- **`WASTE_METAL_MOE=1` and the thread count on DeepSeek-V4.1.** Metal is a
+  wash, and 6 to 18 threads is flat. LEARNED §96.
 
 ## 0.8.0 — 2026-09-15
 
