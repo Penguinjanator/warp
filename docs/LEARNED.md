@@ -6951,3 +6951,137 @@ branch measured it within noise on its own, and DS41 routes six experts in
 batches of four, which the equal split already cuts one apiece.
 
 Code on `perf/xpar-staged-ds41`, not merged.
+
+## 96. The DeepSeek oracle gate is six layers deep and the model is forty (2026-09-16)
+
+§94 found that the one thing of the Qwen branch's speed work that ports to
+DeepSeek-V4.1 is the i8mm trunk kernel, +14.8%. This is what happened when
+that was taken seriously enough to check. Same protocol as §94: M5 Pro,
+`ds41.waste`, `WASTE_CACHE_MB=17000`, arms rotated.
+
+**Two switches, and both are already in the tree.** `docs/EXP1.md` built
+them and measured them on K3 and Kimi-Linear; neither had been pointed at
+DeepSeek-V4.1, which did not exist when that branch was written.
+
+| | tok/s | vs today |
+|---|---:|---:|
+| today — f32 trunk, VQ3R | 3.87–3.97 | 1.00x |
+| `WASTE_TRUNK_KERNEL=2` | 4.52–4.56 | 1.15x |
+| `+ WASTE_VQ8=1` | 5.35–5.43 | **1.38x** |
+
+`WASTE_VQ8=1` is the register-resident int8 VQ3R table. It takes the
+`LUT apply` bucket from 2.32 s to 0.59 s — **3.9x** — and the expert
+arithmetic that bucket is part of, 65.5% of a DS41 step, from 7.65 s to
+6.03 s. It pays 0.30 s back in `LUT build`, which is the table being
+quantized. EXP1 measured it at 1.05x end to end on K3; here it is
+1.19x, and that is the largest single number anything in this repo has
+produced on this container.
+
+**It is also not a speed switch.** `WASTE_DUMP_ROUTE` and
+`tests/route_diff.py`, 880 decisions:
+
+| | decisions differing | the first one |
+|---|---:|---|
+| i8mm | 0 of 880 | — |
+| i8mm + VQ8 | **574 of 880** | a real disagreement at relative margin 1.13e-04 |
+
+Two thirds of the routing changes, and the first divergence is one the
+reference separated by ten times the tie threshold. §43 said an int8
+table makes the engine discontinuous and EXP1 recorded a route set of
+89.3% on K3; on DeepSeek it is 35%. Top-6 of 384 is sparser than K3's top-8 and
+there are forty layers to accumulate in. The forty generated token ids
+matched, which is exactly the evidence CLAUDE.md says not to accept.
+
+Over 2,080 decisions i8mm alone has 202 differing, and `route_diff` puts
+the first at relative margin 1.663e-06 — a tie the reference itself cannot
+resolve, with the other 201 downstream of it. §71's case, and clean.
+
+**So i8mm went to the oracle, and the oracle is where this entry earns its
+number.** `tools/ds41_ref.py` on the real container, 12 tokens:
+
+| | rel L2 | max abs | top-10 |
+|---|---:|---:|---|
+| engine f32 | 0.001407% | 2.0e-04 | identical |
+| engine i8mm | **0.056379%** | 7.5e-03 | identical |
+
+Forty times the error, against a suite threshold of 0.01%. Then the same
+comparison on the fixture `tests/run.sh` actually runs:
+
+| container | layers | hidden | f32 | i8mm | gate |
+|---|---:|---:|---:|---:|---|
+| `make_test_container.py --ds41` | 6 | 128 | 0.000018% | 0.001066% | PASS |
+| the real one | 40 | 5120 | 0.001407% | **0.056379%** | **FAIL** |
+
+**The fixture is 53x quieter than the model on the same change**, and every
+part of that is accumulation: six layers against forty, 128 hidden against
+5,120. The check is not wrong and it is not weak for what it covers — it
+caught real defects when DS41 landed — but it cannot see a per-matvec error
+that compounds with depth, and a numerical change that passes it has not
+been told anything about the model. CLAUDE.md already says this about
+`--trunk8` containers; it is the same sentence with a different subject,
+and it applies to any future kernel, not to i8mm.
+
+**What that settles, and what it does not.** The first reading of this was
+that i8mm fails the gate and therefore waits. That is the wrong reading,
+and naming why is the point of writing it down.
+
+**0.01% is a bug detector, not a numerics budget.** The check exists to
+catch a wrong CSA2, mHC, Engram or router — it fires when a kernel is
+incorrect, not when a kernel is deliberately approximate. The oracle reads
+the same quantized container the engine does, so f32's 0.0014% is
+summation order and nothing else; the container around it is 3-bit experts
+and a 4-bit trunk, approximations orders of magnitude coarser than the
+0.056% being weighed. Holding an approximate kernel to a threshold set for
+an exact one asks a question the number cannot answer.
+
+**On a MoE the evidence that bears on "is this the same model" is the
+routing and the top-k**, which is this file's own rule and CLAUDE.md's.
+Both are clean here: one unresolvable tie in 2,080 decisions, and a top-10
+identical to the oracle. That is the same standard §71 set, and i8mm meets
+it where `WASTE_VQ8=1`, at 574 real disagreements, does not.
+
+The Qwen branch decided the identical question on evidence of the right
+kind — perplexity and top-1 over 5,918 tokens of real text
+(`tests/kernel_kl.c`: 3.698 against f32's 3.712, 96.5% top-1) — and i8mm
+came out *ahead* on that sample, which says the error is noise-shaped
+rather than biased. **So i8mm is a defensible default for DeepSeek now**,
+with `kernel_kl` owed as confirmation when #63 lands rather than as a
+precondition. What the gate comparison above actually establishes is about
+the gate, not about the kernel.
+
+**Gate 9's break-even is in bytes, and this engine has moved.** The gate
+defers DSpark on the premise that "the pass IS the expert reads", so a
+window of five drafts touching 3.45x one token's records must accept 3.45
+of 5 to break even. Where a DS41 step goes at 17 GB and 90.8% hit:
+
+| | share of step |
+|---|---:|
+| moe, all of it | 82.1% |
+| ├ expert matmul | **65.5%** |
+| └ expert I/O | **8.8%** |
+| attention (CSA2) | 15.9% |
+| trunk matvec, across both | 24.6% |
+
+§46 already recorded this drift for K3 and said the claim was worth
+re-checking rather than inheriting. At this operating point the bytes are
+not the budget, and a batched verification amortizes the index stream and
+the held records across the window rather than the disk. That is a
+different sum from the one gate 9 computed. It is not an argument that the
+verdict flips — the batched CSA2 and mHC path it needs is still the
+expensive part — only that the deciding number should be recomputed on this
+profile.
+
+**What measured nothing, so the next person need not.** `WASTE_METAL_MOE=1`
+on DeepSeek, never tried there before: 4.30–4.39 against 4.56 on the CPU, a
+wash or slightly worse, which is what EXP1 found on K3. Thread count is
+flat from 6 to 18 (4.32–4.46), so §47's efficiency-core straggler does not
+bite a model whose applies are this large. The two ports in §94 and §95.
+The one unstarted lever on EXP1's board, a GPU LUT build, has a 2.1%
+ceiling here.
+
+Externally: T-MAC (arXiv 2407.00088) and Vec-LUT (arXiv 2512.06443) are the
+in-register table lookup this repo already implements — `vqtbl4q_s8` in
+`src/kda_neon.c`, `_mm512_permutexvar_epi8` in `src/simd_avx512.c` — and
+confirm the direction without offering anything to import. The MoE
+offloading literature assumes the bottleneck is moving experts; at 8.8% it
+cannot pay here whatever it does.
