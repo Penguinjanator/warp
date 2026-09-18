@@ -8,6 +8,34 @@ measurement is the useful part.
 `docs/LEARNED.md` carries the full reasoning; this file carries what
 changed. Each entry names the section to read for the numbers behind it.
 
+## Unreleased
+
+### Fixed
+
+- **The K2 tool-grammar check defaulted to a path on an external volume**,
+  which is a description of one machine rather than a default: everywhere
+  else — CI, a fresh clone, this machine with the disk unplugged — it read
+  as "no template" and skipped, and it is the *only* check of that grammar.
+  Kimi-Linear's tokenizer carries K2's five tool-call tokens and its own
+  release ships no `chat_template` at all, so without it the rendering is
+  checked against a parser that reads back what the renderer wrote.
+
+  The template is vendored at `tests/serve/k2_upstream/` with its
+  provenance, upstream revision, file hash and licence, the way
+  `glm_upstream/` already was; `K2_DIR` still points a real release over
+  it. The suite goes to 85 passed, 0 failed, 2 skipped with nothing set.
+
+### Added
+
+- **A strict CI job for the K2 tool protocol**, the one GLM has had and
+  which `ci.yml` used to have to exempt K2 from in so many words: "the same
+  ground-truth rule the K2 template check in tests/run.sh applies, except
+  this one may not skip". Now neither may. `CI_K2_ORACLE_STRICT=1` turns
+  every skip path — missing template, missing jinja2, unresolved markers —
+  into a failure, and the job asserts all **seven** checks ran, so it
+  cannot be green by having done nothing. Vendoring the template is what
+  made it possible: no download, no weights, no machine-local `~/models`.
+
 ## 0.8.0 — 2026-09-15
 
 **DeepSeek-V4.1-Flash runs.** 552 B backbone plus 197 B of n-gram memory,

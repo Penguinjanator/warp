@@ -2797,7 +2797,15 @@ fi
 # not — the grammar is K2's, and K2 publishes it. Without this the tool
 # rendering is checked only against a parser that reads back what the
 # renderer wrote, which agrees with itself whatever the format is.
-K2_SRC="${K2_DIR:-/Volumes/WasteDisk/kimi-k2}"
+#
+# The template is vendored at tests/serve/k2_upstream/ (see its README.md
+# for provenance), so this runs out of a fresh clone, the way GLM's below
+# already did. It used to default to a path on an external volume, which
+# is not a default so much as a description of one machine: everywhere
+# else — CI included — it read as "no template" and skipped, and the only
+# check of this grammar skipped with it. K2_DIR still points a real
+# release directory over the vendored copy if one is present.
+K2_SRC="${K2_DIR:-tests/serve/k2_upstream}"
 if [ ! -f "$K2_SRC/chat_template.jinja" ] && [ ! -f "$K2_SRC/tokenizer_config.json" ]; then
     sk "chat.json tools vs K2's chat_template" \
        "no template at $K2_SRC (set K2_DIR; only chat_template.jinja is needed)"
