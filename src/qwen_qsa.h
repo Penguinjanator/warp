@@ -12,9 +12,38 @@
 #ifndef WASTE_QWEN_QSA_H
 #define WASTE_QWEN_QSA_H
 
+#include <math.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* One product added into a running sum, rounded the same way everywhere QSA
+ * forms one: the four-wide score loop, the one-token loop, the value sum,
+ * and the reference tests/test_qsa_attn.c checks them against.
+ *
+ * Written as `acc += a * b`, or as two statements, the rounding belongs to
+ * the compiler rather than to the language. Clang contracts within an
+ * expression and gcc across statements, and gcc's vectorizer turns a
+ * one-accumulator dot product into in-order vector products, each rounded
+ * on its own, while it leaves a four-accumulator loop scalar and fused. So
+ * the same kernel matched its reference on clang at -O2 and not at -O1, and
+ * on gcc at no optimization level with the vectorizer on — linux-arm64 in
+ * CI, 40 cases of 40 — whatever -ffp-contract said.
+ *
+ * Where the target can fuse, fmaf says so: one rounding by the language's
+ * definition, one instruction (fmadd, vfmadd), and nothing a flag or a
+ * vectorizer can round a second time. Where it cannot, no compiler can
+ * fuse either, and two statements are two roundings. */
+static inline float waste_qwen_qsa_mac(float acc, float a, float b)
+{
+#if defined(__ARM_FEATURE_FMA) || defined(__FMA__)
+    return fmaf(a, b, acc);
+#else
+    const float p = a * b;
+    return acc + p;
+#endif
+}
 
 /* Interleaved MRoPE: freqs [3][half] -> out [half]. section is 3 ints. */
 void waste_qwen_mrope_interleave(const float *freqs_t, const float *freqs_h,

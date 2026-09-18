@@ -188,8 +188,10 @@ void waste_qwen_qsa_attn(const float *q, int Hq, int D,
  * order it did — the same trick, and the same reason, as the VQ gather's
  * four rows (LEARNED §41). The value accumulation is the other way round:
  * every output dimension sums the selected tokens in order, so the lanes
- * run along `d` and each element's sequence is untouched. Both are bit
- * for bit what the scalar loops produced; §93 has the check.
+ * run along `d` and each element's sequence is untouched. So both are bit
+ * for bit what one token at a time produces — provided every product and
+ * add rounds the same way in both, which is what waste_qwen_qsa_mac is for
+ * (qwen_qsa.h says why that had to be written down). §93 has the check.
  */
 void waste_qwen_qsa_attn_heads(int h0, int h1, const float *q, int Hq, int D,
                                const float *k, const float *v, int Hkv, int T,
@@ -219,21 +221,16 @@ void waste_qwen_qsa_attn_heads(int h0, int h1, const float *q, int Hq, int D,
             const float *k2 = k + ((size_t)t2 * Hkv + hv) * D;
             const float *k3 = k + ((size_t)t3 * Hkv + hv) * D;
             float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
-            /* The product and the sum are separate statements on purpose.
-             * The loop this replaces compiles to four products a time in
-             * one vector and a scalar chain of adds — the products are
-             * independent, the order of the adds is not — so each product
-             * is rounded on its own. Written as `s += q * k` the compiler
-             * may contract the pair into one fused multiply-add, which
-             * rounds once instead of twice and is a different number.
-             * Across a 2,048-token selection that difference moves a
-             * logit. */
+            /* Each chain rounds exactly as the one-token loop below does:
+             * a different rounding of one product moves a logit across a
+             * 2,048-token selection, and which rounding `s += q * k` gets is
+             * up to the compiler (waste_qwen_qsa_mac). */
             for (int d = 0; d < D; d++) {
                 const float qd = qh[d];
-                const float p0 = qd * k0[d], p1 = qd * k1[d];
-                const float p2 = qd * k2[d], p3 = qd * k3[d];
-                s0 = s0 + p0; s1 = s1 + p1;
-                s2 = s2 + p2; s3 = s3 + p3;
+                s0 = waste_qwen_qsa_mac(s0, qd, k0[d]);
+                s1 = waste_qwen_qsa_mac(s1, qd, k1[d]);
+                s2 = waste_qwen_qsa_mac(s2, qd, k2[d]);
+                s3 = waste_qwen_qsa_mac(s3, qd, k3[d]);
             }
             s0 *= scale; s1 *= scale; s2 *= scale; s3 *= scale;
             scores[i] = s0; scores[i + 1] = s1;
@@ -248,18 +245,7 @@ void waste_qwen_qsa_attn_heads(int h0, int h1, const float *q, int Hq, int D,
             if (t < 0 || t >= T) { scores[i] = -1e30f; continue; }
             const float *kh = k + ((size_t)t * Hkv + hv) * D;
             float s = 0.0f;
-            /* Product and sum as separate statements, as in the four-wide
-             * loop above and for the same reason. Written `s += q * k` the
-             * rounding of this loop is the compiler's choice rather than the
-             * language's: clang at -O2 vectorizes the products and rounds
-             * each on its own, at -O1 it emits one fused multiply-add per
-             * element. So a -O1 build (make asan) scored the tail tokens of a
-             * selection differently from the tokens scored four at a time,
-             * and differently from its own -O2 build. Separate statements
-             * are never contracted under -ffp-contract=on, at any level, and
-             * are what -O2 compiled the old form to — the release build's
-             * numbers do not move. */
-            for (int d = 0; d < D; d++) { const float p = qh[d] * kh[d]; s = s + p; }
+            for (int d = 0; d < D; d++) s = waste_qwen_qsa_mac(s, qh[d], kh[d]);
             s *= scale;
             scores[i] = s;
             if (s > m) m = s;
@@ -277,7 +263,9 @@ void waste_qwen_qsa_attn_heads(int h0, int h1, const float *q, int Hq, int D,
             const float w = scores[j] / z;
             const float *vh = v + ((size_t)t * Hkv + hv) * D;
             int d = 0;
-#if defined(__ARM_NEON) || defined(__aarch64__)
+            /* vfmaq_f32 is the fused waste_qwen_qsa_mac four lanes at a
+             * time, so it is taken only where that one is fused too. */
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_FMA)
             const float32x4_t wv = vdupq_n_f32(w);
             for (; d + 16 <= D; d += 16) {
                 vst1q_f32(oh + d,      vfmaq_f32(vld1q_f32(oh + d),      wv, vld1q_f32(vh + d)));
@@ -286,7 +274,7 @@ void waste_qwen_qsa_attn_heads(int h0, int h1, const float *q, int Hq, int D,
                 vst1q_f32(oh + d + 12, vfmaq_f32(vld1q_f32(oh + d + 12), wv, vld1q_f32(vh + d + 12)));
             }
 #endif
-            for (; d < D; d++) oh[d] += w * vh[d];
+            for (; d < D; d++) oh[d] = waste_qwen_qsa_mac(oh[d], w, vh[d]);
         }
     }
 }

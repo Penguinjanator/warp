@@ -15,14 +15,15 @@
  * `s += q * k` the same arithmetic contracts to a fused multiply-add, which
  * rounds once. Both versions of that mistake produced logits that differed
  * in the last bits and generated different text a few hundred tokens in.
- * The old loops are copied below, with one change: the score loop is
- * written with its product and its sum as separate statements. Verbatim,
- * `s += q * k` is not a fixed reference — its rounding is the compiler's
- * choice, separate at -O2 and fused at -O1 — so this test passed on a
- * release build and failed under `make asan` on arm64 against a kernel that
- * had not changed. Separate statements are the form -O2 gave the old loop,
- * and one no optimization level contracts. The value loop stays verbatim:
- * it is contracted at every level, which is what vfmaq_f32 matches.
+ * The reference below is the kernel's old one-token-at-a-time shape, with
+ * each product and add written as waste_qwen_qsa_mac — the same definition
+ * the kernel uses. Copied verbatim, `s += q * k` was not a fixed reference:
+ * its rounding was the compiler's, so this test passed on clang at -O2,
+ * failed on clang at -O1 (make asan on arm64) and failed on gcc on arm64
+ * at every level with the vectorizer on, against a kernel that had not
+ * changed. What it checks now is the claim the kernel makes: that four
+ * tokens at a time, and values sixteen lanes at a time, give exactly what
+ * one token at a time gives.
  */
 #include <math.h>
 #include <stdio.h>
@@ -50,7 +51,7 @@ static void old_attn(int h0, int h1, const float *q, int Hq, int D,
             if (t < 0 || t >= T) { scores[i] = -1e30f; continue; }
             const float *kh = k + ((size_t)t * Hkv + hv) * D;
             float s = 0.0f;
-            for (int d = 0; d < D; d++) { const float p = qh[d] * kh[d]; s = s + p; }
+            for (int d = 0; d < D; d++) s = waste_qwen_qsa_mac(s, qh[d], kh[d]);
             s *= scale;
             scores[i] = s;
             if (s > m) m = s;
@@ -67,7 +68,7 @@ static void old_attn(int h0, int h1, const float *q, int Hq, int D,
             if (t < 0 || t >= T) continue;
             const float w = scores[i] / z;
             const float *vh = v + ((size_t)t * Hkv + hv) * D;
-            for (int d = 0; d < D; d++) oh[d] += w * vh[d];
+            for (int d = 0; d < D; d++) oh[d] = waste_qwen_qsa_mac(oh[d], w, vh[d]);
         }
     }
 }
