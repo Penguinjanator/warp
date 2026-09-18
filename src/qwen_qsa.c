@@ -189,7 +189,7 @@ void waste_qwen_qsa_attn(const float *q, int Hq, int D,
  * four rows (LEARNED §41). The value accumulation is the other way round:
  * every output dimension sums the selected tokens in order, so the lanes
  * run along `d` and each element's sequence is untouched. Both are bit
- * for bit what the scalar loops produced; §87 has the check.
+ * for bit what the scalar loops produced; §93 has the check.
  */
 void waste_qwen_qsa_attn_heads(int h0, int h1, const float *q, int Hq, int D,
                                const float *k, const float *v, int Hkv, int T,

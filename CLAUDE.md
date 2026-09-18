@@ -133,7 +133,7 @@ docs/LEARNED.md §67),
 on a 4-bit trunk, so it is out of reach on K3), `WASTE_I8MM=1`,
 `WASTE_TRUNK_KERNEL` (the 4-bit trunk matvec: 0 f32, the exact reference;
 1 SDOT; 2 i8mm, which a Qwen load selects when this is unset; 3 SMLAL —
-LEARNED §77),
+LEARNED §83),
 `WASTE_TOK_PLAIN=1`, `WASTE_VIS_STAGE`, `WASTE_DUMP_LATENT/HIDDEN`,
 `WASTE_DUMP_DSA` (the sparse-attention selection: which pools won and on
 what scores, so two implementations can be diffed on the decision rather
@@ -252,7 +252,7 @@ expert when the layer's experts are already cached and one per row range
 when they are not, because holding K records before doing any arithmetic is
 a barrier against the read-ahead. `qwen_moe_layer` asks per expert instead:
 the resident ones run first as tasks while the misses read, then the misses
-(LEARNED §82). `WASTE_XPAR=0/1` forces it; the default
+(LEARNED §88). `WASTE_XPAR=0/1` forces it; the default
 asks the cache. The paths are **bit-identical** and `tests/run.sh`
 asserts it — an automatic choice that changed the numbers would make results
 depend on how warm the cache happened to be.

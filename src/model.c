@@ -1010,7 +1010,7 @@ static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
  * the same vector three and four times over: GDN's four input projections,
  * QSA's four, the router beside the shared expert's gate and up — and each
  * of those was a quantization and a dispatch of its own, half of them too
- * small to wake the pool for (LEARNED §85).
+ * small to wake the pool for (LEARNED §91).
  *
  * Anything the shared planes do not fit — another kernel, another group, a
  * float tensor, the trunk check — goes through matvec_t as before. */
@@ -2682,7 +2682,7 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
      * K3 kind that a recurrence carries forward: against f32 over 5,918
      * tokens of real text, perplexity 3.712 against 3.698, no growth past
      * QSA's 2,048-token selection budget, for 7.57 -> 9.59 tok/s
-     * (LEARNED §77). The kernel is one setting for the whole process, so a
+     * (LEARNED §83). The kernel is one setting for the whole process, so a
      * process that loads Qwen and then another architecture keeps i8mm for
      * both; the variable pins it either way. */
     if (m->cfg.arch_qwen && !trunk_kern_env)
@@ -4239,7 +4239,7 @@ static void moe_expert_range(int b, int e, void *p)
  * ten equal experts on eight threads is two experts of wall time for ten of
  * work, 5x at best, and Qwen's measured 4.4x on eight cores. It is not the
  * memory — on one thread the kernel lost no more to six cores of random
- * reads over 1 GB than to six cores spinning (LEARNED §84). So the work is
+ * reads over 1 GB than to six cores spinning (LEARNED §90). So the work is
  * cut into equal pieces instead, in the three stages an expert's arithmetic
  * depends on:
  *
@@ -7608,7 +7608,7 @@ static void hc_gate_mix_piece(int b, int e, void *p)
  * combine (3.5 us), the down projection's quantization, the sum over streams
  * (4.4 us) and the inject projection (5 us). It is now three dispatches, the
  * norm and the gate each carrying the work that sat between them and the
- * matvecs (LEARNED §86). */
+ * matvecs (LEARNED §92). */
 static void qwen_hc_mix_t(waste_model *m, float *hyper,
                           const float *cblock, const float *cinj,
                           const waste_tensor *nw, const waste_tensor *down,
@@ -8224,7 +8224,7 @@ static void qwen_moe_layer(waste_model *m, int L, const float *in, float *out, i
 
     /* When the cache decides, it decides per expert and not per layer.
      *
-     * §76 took the expert-parallel path only when all ten records were
+     * §82 took the expert-parallel path only when all ten records were
      * resident, and a layer missing one went to the row split for all ten:
      * thirty dispatches of rows too short to fill the pool. At a 16 GiB
      * cache that was 4,723 of 10,464 layers in a 200-token run, at 1.71 ms
@@ -8237,13 +8237,13 @@ static void qwen_moe_layer(waste_model *m, int L, const float *in, float *out, i
      *
      * Both stages run through experts_staged, in equal row ranges rather
      * than one task per expert, so neither a batch of ten nor a lone miss
-     * leaves threads idle. §82 had split the misses between rows and tasks
-     * at four; the row ranges beat both (LEARNED §84).
+     * leaves threads idle. §88 had split the misses between rows and tasks
+     * at four; the row ranges beat both (LEARNED §90).
      *
      * The order experts are computed in is not the order they are summed
      * in — each writes its own slice and the sum below runs in route order —
      * so this path, the fixed batches and the serial loop are bit-identical.
-     * A forced WASTE_XPAR, or an explicit WASTE_XPAR_BATCH, keeps §76's
+     * A forced WASTE_XPAR, or an explicit WASTE_XPAR_BATCH, keeps §82's
      * fixed batches; WASTE_XPAR=0 the serial loop. */
     if (xpar_on < 0 && !xpar_batch_set && m->xga && K > 1 &&
         K <= WASTE_PF_MAX && m->cache.n_slots >= 4 * K) {
@@ -8297,7 +8297,7 @@ static void qwen_moe_layer(waste_model *m, int L, const float *in, float *out, i
         shared_done = 0;
     }
 
-    /* Forced, or batched explicitly: §76's fixed batches, the barrier and
+    /* Forced, or batched explicitly: §82's fixed batches, the barrier and
      * all. WASTE_XPAR=0/1 forces the path either way. */
     const int xpar_here = xpar_on >= 0
         ? xpar_on
@@ -8407,7 +8407,7 @@ qwen_moe_shared:
  * 4.6% slower end to end. This is its cheap half: each stream normalized
  * with L+1's MLP mix weights and averaged, the dynamic gate left out. 43%
  * for 0.23, at the price of four norms and one router projection. LEARNED
- * §83 has the other predictors and the widths.
+ * §89 has the other predictors and the widths.
  *
  * `m->x`, the block output and the router area are all dead here — the
  * next layer's attention mix writes the first, its attention the second —
