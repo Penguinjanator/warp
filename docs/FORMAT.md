@@ -89,6 +89,28 @@ fuzzer in `tools/fuzz_container.py` exists for this file). Keys:
 | `layers` | per MoE layer: `file`, `experts`, `bytes`, `codebook_base` |
 | `trunk` | per tensor: `name`, `fmt`, `off`, `shape`, `group`, `scale_off`, `bytes` |
 
+Qwen containers retain the release's model fields inside `config` and add
+the PLE lookup metadata produced during conversion. The Qwen-specific fields
+the reader consumes are:
+
+| key | what it holds |
+|---|---|
+| `layer_types` | one entry per layer: `linear_attention` selects Gated DeltaNet; `full_attention` selects Qwen Sparse Attention |
+| `linear_num_key_heads`, `linear_num_value_heads` | Gated DeltaNet key and value head counts |
+| `linear_key_head_dim`, `linear_value_head_dim`, `linear_conv_kernel_dim` | Gated DeltaNet head widths and short-convolution width |
+| `hc_count`, `hc_lowrank` | HyperConnection stream count and projection rank |
+| `indexer_n_heads`, `indexer_kv_heads`, `indexer_head_dim` | sparse-attention indexer geometry; this reader requires one KV head |
+| `indexer_budget`, `indexer_compress_ratio` | selected-token budget and mean-pooling block width |
+| `ngram_size`, `heads_per_ngram`, `ple_embed_dim`, `ple_conv_kernel_size` | PLE n-gram and projection geometry |
+| `ple_layer_ids` | the PLE layer as a one-element, 1-based list |
+| `ple_head_offsets`, `ple_head_vocab_sizes` | trunk row offset and row count for each of the 16 PLE head tables |
+| `ple_layer_multipliers` | per-n-gram-order hash multipliers derived by the converter |
+
+`layer_types` must contain exactly `num_hidden_layers` entries. PLE head
+offsets address the concatenated tables in `trunk.bin`; they are not byte
+offsets. The engine treats all of these values as untrusted and validates
+their dimensions before checking tensor shapes.
+
 Two fields from the original design are **not** here. There is no
 `bits[]`: the GEMQ-style per-expert bit allocator was specified, measured
 (design goal 5 above, [LEARNED.md](LEARNED.md) §20) and dropped, so every

@@ -41,8 +41,8 @@
 /* Filled by src/model.c under WASTE_PROFILE=1. Reported per arm because
  * the question "does a big cache make the rest of the engine slower" is a
  * rate question, and a rate is only comparable inside one process. */
-extern double waste_prof[16];
-extern uint64_t waste_prof_n[16];
+extern double waste_prof[32];
+extern uint64_t waste_prof_n[32];
 extern uint64_t waste_tmv_bytes;
 extern int *waste_route_cap;
 extern int waste_route_n, waste_route_cap_n;

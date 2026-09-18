@@ -98,6 +98,10 @@ WASTE_CHUNK=1 ./test_forward ...                         # chunked prefill inste
 ./test_image /tmp && ./test_state MODEL && ./test_tokenizer MODEL "text"
 ./test_k3parts out.bin && uv run --with torch python tools/k3parts_ref.py out.bin
 
+# two trunk kernels over a long prompt, every position: KL, argmax, routes,
+# perplexity on the real text. Run 0 against 0 first — it must be all zero.
+./kernel_kl MODEL ids.txt 256 0 2,3 512
+
 # why two paths disagree: identical routes, a tie, or a real divergence
 WASTE_DUMP_ROUTE=a.route WASTE_DUMP_SCORES=a.scores ./test_forward M IDS a.bin 0
 WASTE_BACKEND=cpu WASTE_DUMP_ROUTE=b.route ./test_forward M IDS b.bin 0
@@ -127,6 +131,9 @@ fast group rather than waking the whole pool — 4 MB, measured; see
 docs/LEARNED.md §67),
 `WASTE_Q8=0` (dequantize the trunk to f32 at load, any width — 8x the RAM
 on a 4-bit trunk, so it is out of reach on K3), `WASTE_I8MM=1`,
+`WASTE_TRUNK_KERNEL` (the 4-bit trunk matvec: 0 f32, the exact reference;
+1 SDOT; 2 i8mm, which a Qwen load selects when this is unset; 3 SMLAL —
+LEARNED §83),
 `WASTE_TOK_PLAIN=1`, `WASTE_VIS_STAGE`, `WASTE_DUMP_LATENT/HIDDEN`,
 `WASTE_DUMP_DSA` (the sparse-attention selection: which pools won and on
 what scores, so two implementations can be diffed on the decision rather
@@ -152,6 +159,12 @@ int8 lookup table raises the bar that far.
 
 Profiling a decode step:
 `WASTE_PROFILE=1 WASTE_CACHE_MB=17735 ./test_forward MODEL ids out.bin 5`.
+`WASTE_PROFILE=decode` leaves the prompt steps out — they are the ones that
+find the cache empty, so on a short run they are most of the expert I/O. A
+Qwen container prints its own phase tree (HyperConnection, PLE, GDN, QSA,
+router, shared expert) with ms/step; the gap between `wall` and `accounted`
+is what no phase covers, and more than a few percent means a phase is
+missing.
 
 ## Architecture
 
@@ -237,8 +250,10 @@ RSS actually stays inside the ceiling.
 Residency also decides *scheduling*: `moe_layer` runs one task per routed
 expert when the layer's experts are already cached and one per row range
 when they are not, because holding K records before doing any arithmetic is
-a barrier against the read-ahead. `WASTE_XPAR=0/1` forces it; the default
-asks the cache. The two paths are **bit-identical** and `tests/run.sh`
+a barrier against the read-ahead. `qwen_moe_layer` asks per expert instead:
+the resident ones run first as tasks while the misses read, then the misses
+(LEARNED §88). `WASTE_XPAR=0/1` forces it; the default
+asks the cache. The paths are **bit-identical** and `tests/run.sh`
 asserts it — an automatic choice that changed the numbers would make results
 depend on how warm the cache happened to be.
 

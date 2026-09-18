@@ -28,6 +28,11 @@
 #include "platform.h"
 #include "threads.h"
 #include "kda.h"
+#include "qwen_gdn.h"
+#include "qwen_hc.h"
+#include "qwen_moe.h"
+#include "qwen_ple.h"
+#include "qwen_qsa.h"
 #include "simd.h"
 #include "waste_backend.h"
 #include "waste_metal.h"
@@ -37,8 +42,13 @@
 
 /* ---- lightweight phase profiling (WASTE_PROFILE=1) --------------------- */
 #include <time.h>
-double waste_prof[16];
-uint64_t waste_prof_n[16];
+double waste_prof[32];
+uint64_t waste_prof_n[32];
+/* How much of each phase was trunk matvec: P_TMV's total as it moved while
+ * the phase ran. A phase that is mostly projections and a phase that is
+ * mostly the loops between them look the same in waste_prof, and they are
+ * not fixed the same way. */
+double waste_prof_tmv[32];
 uint64_t waste_tmv_bytes;
 int *waste_route_cap; int waste_route_n, waste_route_cap_n;
 /* WASTE_TRUNK_CHECK=1: run the f32 reference beside whichever quantized
@@ -53,8 +63,26 @@ unsigned long long waste_tcheck_n;
 /* matvec_t by call size: [<1MB, <8MB, <32MB, rest] */
 double waste_tmv_t[4];
 uint64_t waste_tmv_b[4], waste_tmv_c[4];
+/* Slots are read by number in tests/test_forward.c and tests/sweep.c, so a
+ * phase is appended, never inserted. Qwen reuses the roles it shares with
+ * Kimi — P_KDA is its recurrent layer (GDN), P_MLA its attention layer
+ * (QSA), P_KDAK the recurrence inside the first, P_ROUTE the whole MoE —
+ * and gets slots of its own for the pieces nothing else has. */
 enum { P_LUTB, P_KDA, P_MLA, P_ROUTE, P_EDEQ, P_EMM, P_HEAD, P_LUTA, P_MM,
-       P_TMV, P_KDAK };
+       P_TMV, P_KDAK,
+       P_QHC,     /* HyperConnection mixes and combines, final mixer too */
+       P_QPLE,    /* n-gram embedding: row reads, projections, conv      */
+       P_QSHX,    /* shared expert and its gate                          */
+       P_QSAK,    /* QSA block selection, K/V gather, attention          */
+       P_QRTR,    /* router projection and top-k                         */
+       /* Inside P_QSAK. Three of the four grow with the context rather
+        * than the token, so which one matters depends on how long the
+        * context is, and a short-prompt profile cannot say. */
+       P_QSAR,    /* the RoPE cos/sin table the block scores rotate by   */
+       P_QSAS,    /* block pooling, scoring and top-k                    */
+       P_QSAG,    /* selected K/V, BF16 to F32                           */
+       P_QSAA,    /* attention over the selection                        */
+       P_QLAH };  /* router lookahead: the next layer's guess, inside P_ROUTE */
 static int prof_on = -1;
 static pthread_mutex_t prof_mu = PTHREAD_MUTEX_INITIALIZER;
 static double pnow(void)
@@ -62,9 +90,11 @@ static double pnow(void)
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + t.tv_nsec / 1e9;
 }
-#define PROF_START(b) double _t##b = prof_on ? pnow() : 0
+#define PROF_START(b) double _t##b = prof_on ? pnow() : 0, \
+    _m##b = prof_on ? waste_prof[P_TMV] : 0
 #define PROF_END(b)   do { if (prof_on) { pthread_mutex_lock(&prof_mu); \
     waste_prof[b] += pnow() - _t##b; waste_prof_n[b]++; \
+    waste_prof_tmv[b] += waste_prof[P_TMV] - _m##b; \
     pthread_mutex_unlock(&prof_mu); } } while (0)
 
 static char *slurp(const char *path, size_t *len)
@@ -184,6 +214,7 @@ static int sdot_on = 0;    /* 1 = also quantize activations (SDOT path)  */
  * costs in accuracy. */
 enum { TK_F32 = 0, TK_SDOT = 1, TK_I8MM = 2, TK_SMLAL = 3 };
 static int trunk_kern = TK_F32;   /* WASTE_TRUNK_KERNEL                   */
+static int trunk_kern_env = 0;    /* set explicitly; waste_model_load     */
 static int sdot4_sg = 32;  /* TK_SDOT only: activations per int8 scale    */
 static int i8mm_on = 0;    /* SMMLA batched matmul; costs activation int8 */
 static const char *dump_route = NULL;  /* WASTE_DUMP_ROUTE, see moe_layer */
@@ -231,6 +262,7 @@ static inline void pf_wide(int bit, int n, int min_chunk, waste_range_fn fn,
     else waste_parallel_for(n, min_chunk, fn, arg);
 }
 static int xpar_batch = 4;             /* WASTE_XPAR_BATCH, see moe_layer  */
+static int xpar_batch_set = 0;         /* given explicitly; qwen_moe_layer */
 static pthread_once_t model_opts_once = PTHREAD_ONCE_INIT;
 
 static void model_opts_init(void)
@@ -271,6 +303,7 @@ static void model_opts_init(void)
      * is also why the same kernel measures KL 0.0013 on Kimi-Linear's 27
      * layers. i8mm buys 43x the accuracy for 83% of the speed. */
     e = getenv("WASTE_TRUNK_KERNEL");
+    trunk_kern_env = e != NULL;
     trunk_kern = e ? atoi(e) : TK_F32;
     if (trunk_kern < 0 || trunk_kern > TK_SMLAL) trunk_kern = TK_F32;
     if ((trunk_kern == TK_SDOT || trunk_kern == TK_I8MM) &&
@@ -340,6 +373,7 @@ static void model_opts_init(void)
     /* Experts held — and so barriered — at a time. Small keeps the reads
      * overlapping the arithmetic; large gives the pool more to chew on. */
     { const char *e2 = getenv("WASTE_XPAR_BATCH");
+      xpar_batch_set = e2 != NULL;
       xpar_batch = e2 ? atoi(e2) : 4;
       if (xpar_batch < 1) xpar_batch = 1;
       if (xpar_batch > WASTE_PF_MAX) xpar_batch = WASTE_PF_MAX; }
@@ -616,10 +650,10 @@ static void mvq4_rows_smlal(int b, int e, void *p)
  * Inside the same guard as its only caller, or -Wunused-function fires on
  * every build that cannot reach it. */
 #if defined(__ARM_NEON) || defined(__aarch64__)
-static void quant_act4_mm(const float *x, int n, int g, int8_t *q, float *sc)
+static void quant_act4_mm_group(const float *x, int n, int g, int k,
+                                int8_t *q, float *sc)
 {
-    const int ng = (n + g - 1) / g;
-    for (int k = 0; k < ng; k++) {
+    {
         const int beg = k * g, end = (beg + g < n) ? beg + g : n;
         float amax = 0;
         for (int i = beg; i < end; i++) {
@@ -646,6 +680,28 @@ static void quant_act4_mm(const float *x, int n, int g, int8_t *q, float *sc)
             pl[(h >> 3) * 16 + 8 + (h & 7)] = (int8_t)lo;
         }
     }
+}
+
+typedef struct { const float *x; int n, g; int8_t *q; float *sc; } qa4_arg;
+
+static void quant_act4_mm_range(int b, int e, void *p)
+{
+    const qa4_arg *a = (const qa4_arg *)p;
+    for (int k = b; k < e; k++) quant_act4_mm_group(a->x, a->n, a->g, k, a->q, a->sc);
+}
+
+/* Every group reads its own activations and writes its own planes and
+ * scale, so the groups go to the pool as they are and the bytes are the
+ * serial loop's. Serially this sat on the calling thread in front of every
+ * i8mm matvec — about 15 us before Qwen's 10,240-wide HyperConnection down
+ * projection, twice a pool worker's 8 us spin, so that matvec started by
+ * waking the pool. Below 32 groups the dispatch is not worth it. */
+static void quant_act4_mm(const float *x, int n, int g, int8_t *q, float *sc)
+{
+    const int ng = (n + g - 1) / g;
+    qa4_arg a = { x, n, g, q, sc };
+    if (ng >= 32) waste_parallel_for_fast(ng, 4, quant_act4_mm_range, &a);
+    else quant_act4_mm_range(0, ng, &a);
 }
 
 #endif
@@ -785,20 +841,99 @@ static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
  * Q4G read once per token — the single largest byte term in a decode step
  * (docs/LEARNED.md §59). It has no bucket of its own in the profile, which
  * is why "kda 29%" was being read as if it were all recurrence. */
+waste_tmv_role waste_tmv_roles[WASTE_TMV_ROLES];
+int waste_tmv_nroles;
+/* The quantization inside the matvec call being timed. Only matvec_t's
+ * calling thread writes it, and only under WASTE_PROFILE. */
+static double tmv_quant_dt;
+
+/* "model.layers.17.linear_attn.in_proj_z.weight" -> "linear_attn.in_proj_z" */
+static void tmv_role_name(const char *name, char *dst, size_t cap)
+{
+    const char *p = strstr(name, "layers.");
+    if (p) {
+        p += 7;
+        while (*p >= '0' && *p <= '9') p++;
+        if (*p == '.') p++;
+    } else {
+        p = name;
+        if (!strncmp(p, "model.", 6)) p += 6;
+    }
+    snprintf(dst, cap, "%s", p);
+    const size_t n = strlen(dst);
+    if (n > 7 && !strcmp(dst + n - 7, ".weight")) dst[n - 7] = 0;
+}
+
+/* One call's worth of profile: the P_TMV total, its size bucket, and the
+ * tensor's role row. Caller holds prof_mu. */
+static void tmv_account(const waste_tensor *t, int out, int in, double dt, double dtq)
+{
+    const uint64_t nb = t ? (uint64_t)out * t->rowbytes : 0;
+    const int bk = nb < (1u<<20) ? 0 : nb < (8u<<20) ? 1 : nb < (32u<<20) ? 2 : 3;
+    waste_prof[P_TMV] += dt; waste_prof_n[P_TMV]++;
+    waste_tmv_bytes += nb;
+    waste_tmv_t[bk] += dt; waste_tmv_b[bk] += nb; waste_tmv_c[bk]++;
+    if (t) {
+        /* The slot is the profiler's own cache on a struct the model owns,
+         * so writing through the const is writing to what was calloc'd. */
+        waste_tensor *tw = (waste_tensor *)t;
+        int si = tw->prof_slot - 1;
+        if (si < 0) {
+            char role[96];
+            tmv_role_name(t->name, role, sizeof role);
+            for (si = 0; si < waste_tmv_nroles; si++)
+                if (!strcmp(waste_tmv_roles[si].role, role)) break;
+            if (si == waste_tmv_nroles && si < WASTE_TMV_ROLES) {
+                waste_tmv_role *r = &waste_tmv_roles[si];
+                memset(r, 0, sizeof *r);
+                snprintf(r->role, sizeof r->role, "%s", role);
+                r->out = out; r->in = in; r->bits = t->q ? t->bits : 32;
+                waste_tmv_nroles++;
+            }
+            if (si < WASTE_TMV_ROLES) tw->prof_slot = si + 1;
+        }
+        if (si >= 0 && si < WASTE_TMV_ROLES) {
+            waste_tmv_role *r = &waste_tmv_roles[si];
+            r->calls++;
+            r->bytes += t->q ? nb : (uint64_t)out * (uint64_t)in * sizeof(float);
+            r->t += dt;
+            r->tq += dtq;
+        }
+    }
+}
+
 static void matvec_t(waste_model *m, float *y, const waste_tensor *t,
                      const float *x, int out, int in)
 {
     if (!prof_on) { matvec_t_inner(m, y, t, x, out, in); return; }
+    tmv_quant_dt = 0;
     const double t0 = pnow();
     matvec_t_inner(m, y, t, x, out, in);
     const double dt = pnow() - t0;
-    const uint64_t nb = t ? (uint64_t)out * t->rowbytes : 0;
-    const int bk = nb < (1u<<20) ? 0 : nb < (8u<<20) ? 1 : nb < (32u<<20) ? 2 : 3;
     pthread_mutex_lock(&prof_mu);
-    waste_prof[P_TMV] += dt; waste_prof_n[P_TMV]++;
-    waste_tmv_bytes += nb;
-    waste_tmv_t[bk] += dt; waste_tmv_b[bk] += nb; waste_tmv_c[bk]++;
+    tmv_account(t, out, in, dt, tmv_quant_dt);
     pthread_mutex_unlock(&prof_mu);
+}
+
+/* Rows per matvec chunk. A floor of 64 rows was right for wide calls and
+ * starved narrow ones, because the pool rounds a chunk up to a multiple of
+ * its floor: on eight threads Qwen's 320-row HyperConnection down
+ * projection split into five chunks, the shared expert's 640 rows into
+ * five, and GDN's 48-row in_proj_a never left the calling thread. Sized by
+ * bytes instead, about 16 KB of weights a chunk, and kept a power of two
+ * of at least two — so every chunk but the last has an even row count and
+ * i8mm's two-row tiles fall on exactly the rows they did before.
+ *
+ * Below 256 KB of weights the whole call stays on the calling thread, as
+ * those 48 rows always had: split up, in_proj_a measured 2.7 GB/s against
+ * 7.5 left alone, the dispatch costing more than the work it shared. */
+static int mv_chunk(int out, size_t rowbytes)
+{
+    if ((size_t)out * rowbytes < ((size_t)256 << 10)) return out > 0 ? out : 1;
+    const size_t per = rowbytes ? ((size_t)16 << 10) / rowbytes : 64;
+    int c = 2;
+    while (c < 64 && (size_t)c * 2 <= per) c *= 2;
+    return c;
 }
 
 static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
@@ -807,10 +942,12 @@ static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
     if (!t || (!t->q && !t->data)) { memset(y, 0, (size_t)out * sizeof(float)); return; }
     if (!t->q) { matvec(y, t->data, x, out, in); return; }
     const int g = t->group, ng = (in + g - 1) / g;
+    const int mc = mv_chunk(out, t->rowbytes);
     if (trunk_kern != TK_F32 && t->bits == 4 && (g & 31) == 0) {
         mvq4_arg a = { y, (const uint8_t *)t->q, t->qs, m->xq, m->xs,
                        in, ng, g, sdot4_sg, g / sdot4_sg, t->rowbytes };
         waste_range_fn fn = NULL;
+        const double tq0 = prof_on ? pnow() : 0;
         if (trunk_kern == TK_SDOT && g % sdot4_sg == 0) {
             quant_act4(x, in, g, sdot4_sg, m->xq, m->xs);
             fn = mvq4_rows_sdot;
@@ -823,8 +960,9 @@ static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
             quant_act4_16(x, in, g, m->xq, m->xs);
             fn = mvq4_rows_smlal;
         }
+        if (prof_on) tmv_quant_dt = pnow() - tq0;
         if (fn) {
-            waste_parallel_for_work(out, 64, fn, &a,
+            waste_parallel_for_work(out, mc, fn, &a,
                                     (size_t)out * t->rowbytes);
             if (trunk_check) {
                 float *ref = (float *)malloc((size_t)out * sizeof(float));
@@ -852,13 +990,142 @@ static void matvec_t_inner(waste_model *m, float *y, const waste_tensor *t,
     if (sdot_on && t->bits == 8) {
         quant_act(x, in, g, m->xq, m->xs);
         mvq_arg a = { y, t->q, t->qs, m->xq, m->xs, in, ng, g, 8, (size_t)ng * g };
-        waste_parallel_for_work(out, 64, mvq_rows, &a,
+        waste_parallel_for_work(out, mc, mvq_rows, &a,
                                 (size_t)out * t->rowbytes);
     } else {
         mvq_arg a = { y, t->q, t->qs, NULL, x, in, ng, g, t->bits, t->rowbytes };
-        run_rows(out, 64, waste_k.mvq_rows_f32, &a,
+        run_rows(out, mc, waste_k.mvq_rows_f32, &a,
                  (size_t)out * t->rowbytes);
     }
+}
+
+/* Several projections of the same vector, as one.
+ *
+ * i8mm's activation planes are a function of the vector and the group size
+ * alone, so projections that read the same input can share them: quantized
+ * once, and every tensor's rows cut at the multiples mv_chunk would have cut
+ * them at — even boundaries, so i8mm's two-row tiles fall where they did —
+ * and handed to the pool as one job. Each row is the same kernel call on the
+ * same bytes as matvec_t's, so the outputs are its bit for bit. Qwen reads
+ * the same vector three and four times over: GDN's four input projections,
+ * QSA's four, the router beside the shared expert's gate and up — and each
+ * of those was a quantization and a dispatch of its own, half of them too
+ * small to wake the pool for (LEARNED §91).
+ *
+ * Anything the shared planes do not fit — another kernel, another group, a
+ * float tensor, the trunk check — goes through matvec_t as before. */
+typedef struct { float *y; const waste_tensor *t; int out; } mvb_item;
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+enum { MVB_MAX = 8 };
+typedef struct {
+    mvq4_arg a[MVB_MAX];
+    int base[MVB_MAX + 1], mc[MVB_MAX], out[MVB_MAX], n;
+} mvb_arg;
+
+static void mvb_pieces(int b, int e, void *p)
+{
+    const mvb_arg *a = (const mvb_arg *)p;
+    int i = 0;
+    for (int k = b; k < e; k++) {
+        while (k >= a->base[i + 1]) i++;
+        const int r0 = (k - a->base[i]) * a->mc[i];
+        const int r1 = r0 + a->mc[i] < a->out[i] ? r0 + a->mc[i] : a->out[i];
+        waste_mvq4_rows_i8mm(r0, r1, (void *)&a->a[i]);
+    }
+}
+#endif
+
+static void matvec_t_batch(waste_model *m, const float *x, int in,
+                           const mvb_item *it, int n)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    const int shared = trunk_kern == TK_I8MM && !trunk_check && n > 1 &&
+                       n <= MVB_MAX && it[0].t && it[0].t->q;
+    const int g = shared ? it[0].t->group : 0;
+    mvb_arg a;
+    a.n = 0;
+    a.base[0] = 0;
+    int left[MVB_MAX], nleft = 0;
+    size_t bytes = 0;
+    for (int i = 0; i < n; i++) {
+        const waste_tensor *t = it[i].t;
+        if (shared && t && t->q && t->bits == 4 && t->group == g && (g & 31) == 0) {
+            const int k = a.n++;
+            a.a[k] = (mvq4_arg){ it[i].y, (const uint8_t *)t->q, t->qs, m->xq, m->xs,
+                                 in, (in + g - 1) / g, g, sdot4_sg, g / sdot4_sg,
+                                 t->rowbytes };
+            a.mc[k] = mv_chunk(it[i].out, t->rowbytes);
+            a.out[k] = it[i].out;
+            a.base[k + 1] = a.base[k] + (it[i].out + a.mc[k] - 1) / a.mc[k];
+            bytes += (size_t)it[i].out * t->rowbytes;
+        } else {
+            left[nleft++] = i;
+        }
+    }
+    if (a.n >= 2) {
+        const double t0 = prof_on ? pnow() : 0;
+        quant_act4_mm(x, in, g, m->xq, m->xs);
+        const double tq = prof_on ? pnow() - t0 : 0;
+        waste_parallel_for_work(a.base[a.n], 1, mvb_pieces, &a, bytes);
+        if (prof_on) {
+            const double dt = pnow() - t0;
+            pthread_mutex_lock(&prof_mu);
+            for (int i = 0; i < n; i++) {
+                const waste_tensor *t = it[i].t;
+                if (!(t && t->q && t->bits == 4 && t->group == g && (g & 31) == 0)) continue;
+                const double share = bytes ? (double)it[i].out * t->rowbytes / bytes : 0;
+                tmv_account(t, it[i].out, in, dt * share, tq * share);
+            }
+            pthread_mutex_unlock(&prof_mu);
+        }
+        for (int j = 0; j < nleft; j++)
+            matvec_t(m, it[left[j]].y, it[left[j]].t, x, it[left[j]].out, in);
+        return;
+    }
+#endif
+    for (int i = 0; i < n; i++) matvec_t(m, it[i].y, it[i].t, x, it[i].out, in);
+}
+
+/* The same kernel over planes the caller has already filled.
+ *
+ * i8mm quantizes each weight group of the input on its own, so a caller
+ * that computes the input a piece at a time — a HyperConnection stream, a
+ * GDN value head — can quantize each piece's groups in the task that wrote
+ * it, instead of leaving a serial stretch and a second dispatch in front of
+ * the projection. `prequant_ok` says whether `t` reads planes laid out that
+ * way: i8mm, four bits, a group the kernel takes, and `span` — the size of
+ * the caller's pieces — a whole number of groups. */
+static int prequant_ok(const waste_tensor *t, int span)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    return t && t->q && trunk_kern == TK_I8MM && !trunk_check && t->bits == 4 &&
+           t->group > 0 && (t->group & 31) == 0 && span % t->group == 0;
+#else
+    (void)t; (void)span;
+    return 0;
+#endif
+}
+
+static void matvec_t_prequant(waste_model *m, float *y, const waste_tensor *t,
+                              int out, int in)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    const double t0 = prof_on ? pnow() : 0;
+    const int g = t->group;
+    mvq4_arg a = { y, (const uint8_t *)t->q, t->qs, m->xq, m->xs,
+                   in, (in + g - 1) / g, g, sdot4_sg, g / sdot4_sg, t->rowbytes };
+    waste_parallel_for_work(out, mv_chunk(out, t->rowbytes), waste_mvq4_rows_i8mm, &a,
+                            (size_t)out * t->rowbytes);
+    if (prof_on) {
+        const double dt = pnow() - t0;
+        pthread_mutex_lock(&prof_mu);
+        tmv_account(t, out, in, dt, 0.0);
+        pthread_mutex_unlock(&prof_mu);
+    }
+#else
+    (void)m; (void)y; (void)t; (void)out; (void)in;
+#endif
 }
 
 /* Dequantize one row of a trunk tensor into dst[cols].
@@ -1115,7 +1382,8 @@ static int load_trunk(waste_model *m, const char *dir, const js_doc *d, int trun
              * row is read per token. Keeping 1.11 GB resident to touch 7 KB
              * of it is a bad trade against the expert cache, so leave it on
              * disk and pread the row. */
-            if (strstr(t->name, "embed_tokens.weight")) {
+            if (strstr(t->name, "embed_tokens.weight") ||
+                strstr(t->name, "ngram_head.")) {
                 t->on_disk = 1;
                 t->file_off = off;
                 t->file_scale_off = soff;
@@ -1206,12 +1474,87 @@ static int bad_tensor(const char *name)
     do { const char *rn_ = (name); if (!tensor_data_ok(m, rn_, (n))) \
         return bad_tensor(rn_); } while (0)
 
+static int validate_qwen_tensors(waste_model *m)
+{
+    const waste_config *c = &m->cfg;
+    const int hid = c->hidden, hc = c->hc_count, lr = c->hc_lowrank;
+    const int H = hc * hid;
+    REQUIRE_MATRIX(tname("%smodel.embed_tokens.weight", c->prefix), c->vocab, hid);
+    REQUIRE_MATRIX(tname("%slm_head.weight", c->prefix), c->vocab, hid);
+    REQUIRE_VECTOR(tname("%smodel.hyper_connection_mixer.hc_norm.weight", c->prefix), H);
+    REQUIRE_MATRIX(tname("%smodel.hyper_connection_mixer.input_mix_weight_down.weight", c->prefix), lr, H);
+    REQUIRE_MATRIX(tname("%smodel.hyper_connection_mixer.input_mix_weight_up.weight", c->prefix), H, lr);
+
+    const int Hk = c->gdn_k_heads, Hv = c->gdn_v_heads;
+    const int Dk = c->gdn_k_dim, Dv = c->gdn_v_dim;
+    const int qkv = 2 * Hk * Dk + Hv * Dv;
+    const int qd = c->n_heads * c->qsa_head_dim;
+    const int kvd = c->qsa_n_kv * c->qsa_head_dim;
+    const int idxd = (c->idx_n_heads + c->idx_kv_heads) * c->idx_head_dim;
+    const int shared = c->shared_inter;
+
+    for (int L = 0; L < c->n_layers; L++) {
+        const char *side[2] = { "attn_hyper_connection", "mlp_hyper_connection" };
+        for (int s = 0; s < 2; s++) {
+            REQUIRE_VECTOR(tname("%smodel.layers.%d.%s.hc_norm.weight", c->prefix, L, side[s]), H);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.%s.block_inject_weight.weight", c->prefix, L, side[s]), hc, H);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.%s.input_mix_weight_down.weight", c->prefix, L, side[s]), lr, H);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.%s.input_mix_weight_up.weight", c->prefix, L, side[s]), H, lr);
+        }
+        if (!c->qwen_full[L]) {
+            REQUIRE_DATA(tname("%smodel.layers.%d.linear_attn.A_log", c->prefix, L), Hv);
+            REQUIRE_DATA(tname("%smodel.layers.%d.linear_attn.dt_bias", c->prefix, L), Hv);
+            REQUIRE_DATA(tname("%smodel.layers.%d.linear_attn.conv1d.weight", c->prefix, L),
+                         (size_t)qkv * c->conv_k);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.linear_attn.in_proj_qkv.weight", c->prefix, L), qkv, hid);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.linear_attn.in_proj_z.weight", c->prefix, L), Hv * Dv, hid);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.linear_attn.in_proj_a.weight", c->prefix, L), Hv, hid);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.linear_attn.in_proj_b.weight", c->prefix, L), Hv, hid);
+            REQUIRE_VECTOR(tname("%smodel.layers.%d.linear_attn.norm.weight", c->prefix, L), Dv);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.linear_attn.out_proj.weight", c->prefix, L), hid, Hv * Dv);
+        } else {
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.q_proj.weight", c->prefix, L), qd * 2, hid);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.k_proj.weight", c->prefix, L), kvd, hid);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.v_proj.weight", c->prefix, L), kvd, hid);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.o_proj.weight", c->prefix, L), hid, qd);
+            REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attn.q_norm.weight", c->prefix, L), c->qsa_head_dim);
+            REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attn.k_norm.weight", c->prefix, L), c->qsa_head_dim);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.self_attn.indexer.index_qk_proj.weight", c->prefix, L), idxd, hid);
+            REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attn.indexer.q_layernorm.weight", c->prefix, L), c->idx_head_dim);
+            REQUIRE_VECTOR(tname("%smodel.layers.%d.self_attn.indexer.k_layernorm.weight", c->prefix, L), c->idx_head_dim);
+        }
+        REQUIRE_MATRIX(tname("%smodel.layers.%d.mlp.gate.weight", c->prefix, L), c->n_experts, hid);
+        REQUIRE_MATRIX(tname("%smodel.layers.%d.mlp.shared_expert.gate_proj.weight", c->prefix, L), shared, hid);
+        REQUIRE_MATRIX(tname("%smodel.layers.%d.mlp.shared_expert.up_proj.weight", c->prefix, L), shared, hid);
+        REQUIRE_MATRIX(tname("%smodel.layers.%d.mlp.shared_expert.down_proj.weight", c->prefix, L), hid, shared);
+        REQUIRE_MATRIX(tname("%smodel.layers.%d.mlp.shared_expert_gate.weight", c->prefix, L), 1, hid);
+        if (L == c->ple_layer) {
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.ple.key_proj.weight", c->prefix, L), H, c->ple_embed ? c->ple_embed : hid);
+            REQUIRE_MATRIX(tname("%smodel.layers.%d.ple.value_proj.weight", c->prefix, L), hid, c->ple_embed ? c->ple_embed : hid);
+            REQUIRE_VECTOR(tname("%smodel.layers.%d.ple.norm_key.weight", c->prefix, L), H);
+            REQUIRE_VECTOR(tname("%smodel.layers.%d.ple.norm_query.weight", c->prefix, L), H);
+            REQUIRE_VECTOR(tname("%smodel.layers.%d.ple.norm_conv.weight", c->prefix, L), H);
+            REQUIRE_DATA(tname("%smodel.layers.%d.ple.conv1d.weight", c->prefix, L),
+                         (size_t)H * c->ple_conv_k);
+            for (int h = 0; h < WASTE_QWEN_PLE_HEADS; h++) {
+                const int rows = c->ple_sz[h] > 0 ? (int)c->ple_sz[h] : 1;
+                const int width = (c->ple_embed && c->heads_per_ngram)
+                    ? c->ple_embed / ((c->ngram_size - 1) * c->heads_per_ngram) : 8;
+                REQUIRE_MATRIX(tname("%smodel.layers.%d.ple.ple_embedding.ngram_head.%d.weight",
+                                     c->prefix, L, h), rows, width);
+            }
+        }
+    }
+    return 1;
+}
+
 /* Validate every tensor shape the text forward pass indexes.  Kernel calls
  * receive dimensions from config rather than from the tensor, so merely
  * checking that a name exists is not enough: a shorter, correctly named
  * tensor is an out-of-bounds read. */
 static int validate_text_tensors(waste_model *m)
 {
+    if (m->cfg.arch_qwen) return validate_qwen_tensors(m);
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
     REQUIRE_MATRIX(tname("%smodel.embed_tokens.weight", c->prefix), c->vocab, hid);
@@ -1484,6 +1827,13 @@ static int cfg_sane(const waste_config *c)
     if (c->kda_heads < 0 || c->kda_heads > (1 << 16)) return 0;
     if (c->kda_dim   < 0 || c->kda_dim   > (1 << 16)) return 0;
     if (c->conv_k    < 0 || c->conv_k    > 64) return 0;
+    /* A PLE conv kernel of 0 allocates a zero-length ring while the
+     * weight check and the step walk as if it were 4, so a container
+     * the loader should have refused reads past the allocation. Only
+     * a container that declares a PLE layer ever reaches the ring;
+     * the field stays 0 elsewhere and is meaningless there. */
+    if (c->ple_layer >= 0 && (c->ple_conv_k < 1 || c->ple_conv_k > 64))
+        return 0;
     if (c->kv_lora < 0 || c->kv_lora > (1 << 20) ||
         c->q_lora < 0 || c->q_lora > (1 << 20)) return 0;
     if (c->qk_nope < 0 || c->qk_nope > (1 << 20) ||
@@ -1499,7 +1849,7 @@ static int cfg_sane(const waste_config *c)
         if (c->kda_heads < 1 || c->kda_dim < 1 || c->conv_k < 1) return 0;
         if ((int64_t)c->kda_heads * c->kda_dim > INT_MAX) return 0;
     }
-    if (n_kda < c->n_layers && !c->ds41) {
+    if (!c->arch_qwen && !c->ds41 && n_kda < c->n_layers) {
         const int64_t qd = (int64_t)c->qk_nope + c->qk_rope;
         if (c->kv_lora < 1 || qd < 1 || c->v_head < 1) return 0;
         if ((int64_t)c->n_heads * qd > INT_MAX ||
@@ -1533,6 +1883,52 @@ static int cfg_sane(const waste_config *c)
         if ((int64_t)c->index_heads * c->index_dim > INT_MAX) return 0;
     } else if (c->index_heads || c->index_dim) {
         return 0;
+    }
+    /* Qwen states its shapes in its own keys, and every one of them sizes
+     * an allocation or indexes a loop below. A container that omits one is
+     * refused here rather than opened and read out of bounds. */
+    if (c->arch_qwen) {
+        if (c->qwen_n_layer_types != c->n_layers) return 0;
+        /* The shared expert's width is a dimension of its own, not a
+         * fraction of the other two — Qwen2-57B-A14B ships it wider than
+         * both — so it is bounded the way they are rather than by them,
+         * and every buffer a vector of that width passes through is sized
+         * from it at load: m->ff for its gate and up, and m->xq, which
+         * quantizes its down projection's input. Bounding it by
+         * max(moe, dense) instead left m->xq short whenever moe_inter
+         * exceeded the hidden width, and a container with both at 2048
+         * over a 32-wide hidden state wrote past it on the first token. */
+        if (c->shared_inter < 1 || c->shared_inter > (1 << 20)) return 0;
+        if (c->conv_k < 1) return 0;
+        if (c->gdn_k_heads < 1 || c->gdn_v_heads < 1 ||
+            c->gdn_k_dim < 1 || c->gdn_v_dim < 1) return 0;
+        if (c->gdn_v_heads % c->gdn_k_heads != 0) return 0;
+        if (c->hc_count < 1 || c->hc_count > 16 ||
+            c->hc_lowrank < 1 || c->hc_lowrank > (1 << 16)) return 0;
+        if (c->qsa_head_dim < 1 || c->qsa_n_kv < 1) return 0;
+        if (c->idx_n_heads < 1 || c->idx_head_dim < 1 ||
+            c->idx_compress < 1 || c->idx_budget < 1) return 0;
+        if (c->idx_budget % c->idx_compress != 0) return 0;
+        if (c->idx_kv_heads != 1) return 0;
+        if (c->n_heads % c->qsa_n_kv != 0) return 0;
+        if (c->ngram_size < 1 || c->ngram_size > 8) return 0;
+        if (c->ple_layer >= 0 && c->ngram_size < 2) return 0;
+        if (c->rotary_dim < 0 || c->rotary_dim > 256) return 0;
+        if (c->rotary_dim / 2 > WASTE_MAX_ROPE_HALF) return 0;
+        if ((int64_t)c->hc_count * c->hidden > INT_MAX) return 0;
+        if ((int64_t)c->gdn_v_heads * c->gdn_k_dim * c->gdn_v_dim > INT_MAX)
+            return 0;
+        /* The QSA query buffers are n_heads * head_dim and the indexer's
+         * work is idx_n_heads * idx_head_dim; both are computed as int
+         * before they reach a size_t, so bound the products, not just the
+         * factors. */
+        if ((int64_t)c->n_heads * c->qsa_head_dim > INT_MAX / 4) return 0;
+        if ((int64_t)c->idx_n_heads * c->idx_head_dim > INT_MAX / 4) return 0;
+        if ((int64_t)c->idx_budget + c->idx_compress > INT_MAX / 4) return 0;
+        if (c->ple_layer >= 0) {
+            for (int h = 0; h < WASTE_QWEN_PLE_HEADS; h++)
+                if (c->ple_sz[h] <= 0) return 0;
+        }
     }
     if (c->n_experts && c->moe_inter < 1) return 0;
     if ((!c->n_experts || c->first_dense) && c->dense_inter < 1) return 0;
@@ -1793,6 +2189,8 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     c->hidden = (int)js_int(d, js_get(d, cfg, "hidden_size"), 0);
     c->n_experts = (int)js_int(d, js_get(d, cfg, "num_experts"), 0);
     c->top_k = (int)js_int(d, js_get(d, cfg, "num_experts_per_token"), 0);
+    if (!c->top_k)
+        c->top_k = (int)js_int(d, js_get(d, cfg, "num_experts_per_tok"), 0);
     c->moe_inter = (int)js_int(d, js_get(d, cfg, "moe_intermediate_size"), 0);
     c->dense_inter = (int)js_int(d, js_get(d, cfg, "intermediate_size"), 0);
     c->n_shared = (int)js_int(d, js_get(d, cfg, "num_shared_experts"), 0);
@@ -1859,6 +2257,7 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     c->index_dim   = (int)js_int(d, js_get(d, cfg, "index_head_dim"), 0);
     c->index_tail  = js_get(d, cfg, "index_kpool_always_select_tail") >= 0;
     c->tok_han_split = js_bool(d, js_get(d, cfg, "tokenizer_han_split"), 1);
+    c->tok_digit_run = (int)js_int(d, js_get(d, cfg, "tokenizer_digit_run"), 3);
     c->tok_pattern   = (int)js_int(d, js_get(d, cfg, "tokenizer_pattern"), 0);
 
     int lac = js_get(d, cfg, "linear_attn_config");
@@ -1872,6 +2271,96 @@ static void cfg_from_json(waste_config *c, const js_doc *d, int cfg)
     for (int i = 0; i < js_size(d, kl); i++) {
         int v = (int)js_int(d, js_at(d, kl, i), -1) - 1;   /* list is 1-based */
         if (v >= 0 && v < 128) c->kda_layer[v] = 1;
+    }
+
+    c->arch_qwen = 0;
+    c->ple_layer = -1;
+    {
+        char mt[40];
+        js_str(d, js_get(d, cfg, "model_type"), mt, sizeof mt);
+        if (strcmp(mt, "qwen4_exp_text") == 0 ||
+            strstr(c->arch, "Qwen4Exp") != NULL)
+            c->arch_qwen = 1;
+    }
+    if (!c->arch_qwen) return;
+
+    /* Qwen is not Kimi: do not fill kda_layer from a missing linear_attn_config. */
+    memset(c->kda_layer, 0, sizeof c->kda_layer);
+    c->qsa_n_kv = (int)js_int(d, js_get(d, cfg, "num_key_value_heads"), 0);
+    c->qsa_head_dim = (int)js_int(d, js_get(d, cfg, "head_dim"), 0);
+    c->gdn_k_heads = (int)js_int(d, js_get(d, cfg, "linear_num_key_heads"), 0);
+    c->gdn_v_heads = (int)js_int(d, js_get(d, cfg, "linear_num_value_heads"), 0);
+    c->gdn_k_dim = (int)js_int(d, js_get(d, cfg, "linear_key_head_dim"), 0);
+    c->gdn_v_dim = (int)js_int(d, js_get(d, cfg, "linear_value_head_dim"), 0);
+    c->conv_k = (int)js_int(d, js_get(d, cfg, "linear_conv_kernel_dim"), 4);
+    c->hc_count = (int)js_int(d, js_get(d, cfg, "hc_count"), 0);
+    c->hc_lowrank = (int)js_int(d, js_get(d, cfg, "hc_lowrank"), 0);
+    c->idx_n_heads = (int)js_int(d, js_get(d, cfg, "indexer_n_heads"), 4);
+    c->idx_kv_heads = (int)js_int(d, js_get(d, cfg, "indexer_kv_heads"), 1);
+    c->idx_head_dim = (int)js_int(d, js_get(d, cfg, "indexer_head_dim"), 128);
+    c->idx_budget = (int)js_int(d, js_get(d, cfg, "indexer_budget"), 2048);
+    c->idx_compress = (int)js_int(d, js_get(d, cfg, "indexer_compress_ratio"), 4);
+    c->ngram_size = (int)js_int(d, js_get(d, cfg, "ngram_size"), 3);
+    c->heads_per_ngram = (int)js_int(d, js_get(d, cfg, "heads_per_ngram"), 8);
+    c->ple_embed = (int)js_int(d, js_get(d, cfg, "ple_embed_dim"), 0);
+    c->ple_conv_k = (int)js_int(d, js_get(d, cfg, "ple_conv_kernel_size"), 4);
+    c->shared_inter = (int)js_int(d, js_get(d, cfg, "shared_expert_intermediate_size"),
+                                  c->moe_inter);
+    /* Not read from the config: Qwen4ExpTextTopKRouter renormalizes
+     * unconditionally, so a container that happens to omit the key must
+     * still renormalize. */
+    c->renorm = 1;
+    {
+        const int lt = js_get(d, cfg, "layer_types");
+        memset(c->qwen_full, 0, sizeof c->qwen_full);
+        /* Kept so cfg_sane can insist on one entry per layer. All-zero is
+         * a valid-looking answer that means "every layer is GDN", and a
+         * container whose `layer_types` is missing or short would attend
+         * with a recurrence on layers that need sparse attention — wrong
+         * everywhere and diagnosable nowhere. */
+        c->qwen_n_layer_types = js_size(d, lt);
+        for (int i = 0; i < js_size(d, lt) && i < WASTE_MAX_LAYERS; i++) {
+            char kind[32];
+            js_str(d, js_at(d, lt, i), kind, sizeof kind);
+            c->qwen_full[i] = (strcmp(kind, "full_attention") == 0);
+        }
+    }
+    {
+        const int ids = js_get(d, cfg, "ple_layer_ids");
+        if (js_size(d, ids) > 0) {
+            const int one = (int)js_int(d, js_at(d, ids, 0), 0);
+            c->ple_layer = one > 0 ? one - 1 : -1;
+        }
+    }
+    {
+        const int off = js_get(d, cfg, "ple_head_offsets");
+        const int sz = js_get(d, cfg, "ple_head_vocab_sizes");
+        const int mul = js_get(d, cfg, "ple_layer_multipliers");
+        for (int h = 0; h < WASTE_QWEN_PLE_HEADS; h++) {
+            c->ple_off[h] = js_int(d, js_at(d, off, h), 0);
+            c->ple_sz[h] = js_int(d, js_at(d, sz, h), 0);
+        }
+        for (int i = 0; i < 8; i++)
+            c->ple_mult[i] = js_int(d, js_at(d, mul, i), 0);
+    }
+    {
+        const int rp = js_get(d, cfg, "rope_parameters");
+        const double pf = js_num(d, js_get(d, rp, "partial_rotary_factor"),
+                                 js_num(d, js_get(d, cfg, "partial_rotary_factor"), 0.25));
+        const int hd = c->qsa_head_dim ? c->qsa_head_dim : 256;
+        c->rotary_dim = (int)(hd * pf);
+        const int sec = js_get(d, rp, "mrope_section");
+        c->mrope_section[0] = (int)js_int(d, js_at(d, sec, 0), 11);
+        c->mrope_section[1] = (int)js_int(d, js_at(d, sec, 1), 11);
+        c->mrope_section[2] = (int)js_int(d, js_at(d, sec, 2), 10);
+        const double base = js_num(d, js_get(d, rp, "rope_theta"),
+                                   js_num(d, js_get(d, cfg, "rope_theta"), 10000000.0));
+        const int half = c->rotary_dim / 2;
+        if (half > 0 && half <= WASTE_MAX_ROPE_HALF) {
+            for (int j = 0; j < half; j++)
+                c->rope_inv_freq[j] = (float)(1.0 / pow(base, (double)(2 * j) / c->rotary_dim));
+            c->rope_err[0] = 0;
+        }
     }
 }
 
@@ -2185,6 +2674,9 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                 snprintf(m->cfg.prefix, sizeof m->cfg.prefix, "language_model.");
         }
         cfg_from_json(&m->cfg, &d, cfg);
+        /* Qwen containers are accepted once the kernels and planner exist.
+         * Kimi still never sees Qwen tensors: arch_qwen selects a distinct
+         * forward, not KDA/MLA/AttnRes. */
     }
     if (!cfg_sane(&m->cfg)) {
         fprintf(stderr, "waste: manifest config is out of range "
@@ -2194,6 +2686,16 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         js_free(&d); free(src);
         return -2;                        /* -> WASTE_E_FORMAT */
     }
+    /* Qwen's 4-bit trunk goes through i8mm unless WASTE_TRUNK_KERNEL says
+     * otherwise. It is not the exact arithmetic, and the error is not the
+     * K3 kind that a recurrence carries forward: against f32 over 5,918
+     * tokens of real text, perplexity 3.712 against 3.698, no growth past
+     * QSA's 2,048-token selection budget, for 7.57 -> 9.59 tok/s
+     * (LEARNED §83). The kernel is one setting for the whole process, so a
+     * process that loads Qwen and then another architecture keeps i8mm for
+     * both; the variable pins it either way. */
+    if (m->cfg.arch_qwen && !trunk_kern_env)
+        waste_model_set_sdot4(TK_I8MM, sdot4_sg);
     /* rope_init leaves no table for a shape it does not implement. Running
      * anyway would apply no rotation, which is not a degraded result but an
      * unordered one, so refuse instead. */
@@ -2615,22 +3117,81 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
      * closes: kv_cap tokens make exactly kv_cap/kpool of them, and rounding
      * up costs one vector and removes a bound to get wrong. */
     m->pool_cap = c->index_kpool ? kv_cap / c->index_kpool + 1 : 0;
-    if (c->ds41 && csa2_alloc(m, kv_cap) < 0) return -1;
-    for (int L = 0; L < c->n_layers; L++) {
-        if (c->ds41) continue;                   /* csa2_alloc did this */
-        if (c->kda_layer[L]) {
-            m->S[L] = (float *)calloc((size_t)H * D * D, sizeof(float));
-            m->conv[L] = (float *)calloc((size_t)3 * C * (c->conv_k - 1), sizeof(float));
-        } else {
-            m->has_mla = 1;      /* this is what makes kv_cap a real bound */
-            m->latcache[L] = (float *)calloc(
-                (size_t)kv_cap * (c->kv_lora + c->qk_rope), sizeof(float));
-            if (c->index_topk) {
-                m->idxpool[L] = (float *)calloc(
-                    (size_t)m->pool_cap * c->index_dim, sizeof(float));
-                m->idxbuf[L] = (float *)calloc(
-                    (size_t)c->index_kpool * 2 * c->index_dim, sizeof(float));
-                if (!m->idxpool[L] || !m->idxbuf[L]) return -1;
+    if (c->arch_qwen) {
+        const int Hv = c->gdn_v_heads, Dk = c->gdn_k_dim, Dv = c->gdn_v_dim;
+        const int Hk = c->gdn_k_heads;
+        const int qkv = 2 * Hk * Dk + Hv * Dv;
+        const int nkv = c->qsa_n_kv, hd = c->qsa_head_dim;
+        const int idim = c->idx_head_dim;
+        const int compress = c->idx_compress > 0 ? c->idx_compress : 4;
+        const int nblk = compress > 0 ? (kv_cap + compress - 1) / compress : 0;
+        const int max_sel = c->idx_budget + compress;
+        const int rot = c->rotary_dim > 0 ? c->rotary_dim : 1;
+        for (int L = 0; L < c->n_layers; L++) {
+            if (!c->qwen_full[L]) {
+                m->S[L] = (float *)calloc((size_t)Hv * Dk * Dv, sizeof(float));
+                m->conv[L] = (float *)calloc((size_t)qkv * (c->conv_k > 0 ? c->conv_k - 1 : 0),
+                                             sizeof(float));
+            } else {
+                m->has_qsa = 1;
+                m->qsa_k[L] = (uint16_t *)calloc((size_t)kv_cap * nkv * hd, 2);
+                m->qsa_v[L] = (uint16_t *)calloc((size_t)kv_cap * nkv * hd, 2);
+                m->qsa_rawk[L] = (float *)calloc((size_t)kv_cap * idim, sizeof(float));
+            }
+        }
+        m->hcx = (float *)calloc((size_t)c->hc_count * c->hidden, sizeof(float));
+        {
+            const int R = (c->ple_conv_k > 1 && c->ngram_size > 0)
+                ? (c->ple_conv_k - 1) * c->ngram_size : 0;
+            m->ple_ring = (float *)calloc((size_t)c->hc_count * c->hidden * (R > 0 ? R : 1),
+                                          sizeof(float));
+        }
+        {
+            const int pe = c->ple_embed ? c->ple_embed : c->hidden;
+            m->ple_emb = (float *)calloc((size_t)(pe > 0 ? pe : 1), sizeof(float));
+        }
+        m->gdn_g = (float *)calloc((size_t)(Hv > 0 ? Hv : 1), sizeof(float));
+        {
+            const int qd = c->n_heads * hd;
+            m->qsa_q = (float *)calloc((size_t)(qd > 0 ? qd : 1), sizeof(float));
+            m->qsa_gate = (float *)calloc((size_t)(qd > 0 ? qd : 1), sizeof(float));
+            m->qsa_attn = (float *)calloc((size_t)(qd > 0 ? qd : 1), sizeof(float));
+            const size_t compact = (size_t)(max_sel > 0 ? max_sel : 1) * (size_t)nkv * hd;
+            m->qsa_kf = (float *)calloc(compact > 0 ? compact : 1, sizeof(float));
+            m->qsa_vf = (float *)calloc(compact > 0 ? compact : 1, sizeof(float));
+            /* One row of scores per query head, so the heads can attend at
+             * once (qwen_qsa_layer). src/waste.c plans the same size. */
+            m->qsa_scr = (float *)calloc((size_t)(max_sel > 0 ? max_sel : 1) *
+                                         (size_t)(c->n_heads > 0 ? c->n_heads : 1),
+                                         sizeof(float));
+            m->qsa_sel = (int *)calloc((size_t)(max_sel > 0 ? max_sel : 1), sizeof(int));
+            const size_t work = (size_t)nblk * idim + (size_t)nblk + (size_t)idim;
+            m->qsa_work = (float *)calloc(work > 0 ? work : 1, sizeof(float));
+            m->qsa_taken = (int *)calloc((size_t)(nblk > 0 ? nblk : 1), sizeof(int));
+            m->qsa_cs = (float *)calloc((size_t)2 * kv_cap * rot, sizeof(float));
+        }
+        m->moe_prob = (float *)calloc((size_t)(c->n_experts > 0 ? c->n_experts : 1),
+                                      sizeof(float));
+        m->moe_used = (uint8_t *)calloc((size_t)(c->n_experts > 0 ? c->n_experts : 1), 1);
+        for (int i = 0; i < 8; i++) m->ple_prev[i] = c->eos_token_id;
+    } else if (c->ds41) {
+        if (csa2_alloc(m, kv_cap) < 0) return -1;
+    } else {
+        for (int L = 0; L < c->n_layers; L++) {
+            if (c->kda_layer[L]) {
+                m->S[L] = (float *)calloc((size_t)H * D * D, sizeof(float));
+                m->conv[L] = (float *)calloc((size_t)3 * C * (c->conv_k - 1), sizeof(float));
+            } else {
+                m->has_mla = 1;      /* this is what makes kv_cap a real bound */
+                m->latcache[L] = (float *)calloc(
+                    (size_t)kv_cap * (c->kv_lora + c->qk_rope), sizeof(float));
+                if (c->index_topk) {
+                    m->idxpool[L] = (float *)calloc(
+                        (size_t)m->pool_cap * c->index_dim, sizeof(float));
+                    m->idxbuf[L] = (float *)calloc(
+                        (size_t)c->index_kpool * 2 * c->index_dim, sizeof(float));
+                    if (!m->idxpool[L] || !m->idxbuf[L]) return -1;
+                }
             }
         }
     }
@@ -2645,7 +3206,16 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                                   c->index_heads, sizeof(float));
         if (!m->idxsel || !m->idxscore || !m->idxrank || !m->idxq) return -1;
     }
-    const int big = c->hidden > C ? c->hidden : C;
+    int big = c->hidden > C ? c->hidden : C;
+    if (c->arch_qwen) {
+        const int qkv = 2 * c->gdn_k_heads * c->gdn_k_dim +
+                        c->gdn_v_heads * c->gdn_v_dim;
+        const int hcH = c->hc_count * c->hidden;
+        const int qsa = c->n_heads * c->qsa_head_dim * 2;
+        if (qkv > big) big = qkv;
+        if (hcH > big) big = hcH;
+        if (qsa > big) big = qsa;
+    }
     /* mHC keeps hc_mult residual streams instead of one. Every other user
      * of m->x reads stream 0, which is where the single-stream models put
      * the whole thing, so the multiplier is confined to this allocation
@@ -2663,16 +3233,19 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
     }
     m->h = (float *)calloc((size_t)c->hidden, sizeof(float));
     m->tmp = (float *)calloc((size_t)8 * big + 8 * c->moe_inter + 8 * c->dense_inter
-                             + (size_t)4 * c->n_heads * (c->v_head + c->qk_nope + c->qk_rope)
+                             + (size_t)4 * c->n_heads * (c->v_head + c->qk_nope + c->qk_rope
+                                                         + c->qsa_head_dim)
                              + (size_t)2 * (c->q_lora ? c->q_lora : 1) + 256,
                              sizeof(float));
     /* Sized for every user of the buffer, not just the one it is named
      * after — see WASTE_ATT_ROUTER_OFF in model.h. */
     {
-        size_t need = (size_t)kv_cap * (size_t)c->n_heads;   /* MLA scores  */
+        size_t need = (size_t)kv_cap * (size_t)c->n_heads;   /* MLA/QSA scores */
         const size_t kda = (size_t)c->kda_heads * (size_t)c->kda_dim;
+        const size_t gdn = (size_t)c->gdn_v_heads * (size_t)c->gdn_k_dim;
         const size_t route = WASTE_ATT_ROUTER_OFF + 2u * (size_t)c->n_experts;
         if (kda > need) need = kda;
+        if (gdn > need) need = gdn;
         if (route > need) need = route;
         m->att = (float *)calloc(need + 1024, sizeof(float));
     }
@@ -2717,7 +3290,12 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         m->mrow = (float *)calloc(n, sizeof(float));
     }
     m->logits = (float *)calloc((size_t)c->vocab, sizeof(float));
-    m->ff = (float *)calloc((size_t)2 * (c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter), sizeof(float));
+    {   /* The dense FFN's gate and up, a routed expert's on the serial
+         * path, and Qwen's shared expert's (0 everywhere else). */
+        int ffw = c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter;
+        if (c->shared_inter > ffw) ffw = c->shared_inter;
+        m->ff = (float *)calloc((size_t)2 * ffw, sizeof(float));
+    }
     m->e_gate = (float *)malloc((size_t)c->moe_inter * c->hidden * sizeof(float));
     m->e_up = (float *)malloc((size_t)c->moe_inter * c->hidden * sizeof(float));
     m->e_down = (float *)malloc((size_t)c->hidden * c->moe_inter * sizeof(float));
@@ -2735,9 +3313,15 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
          * matvec in the model: 16384 against the dense FFN's 12288. Sized
          * from the FFN alone this buffer is 4096 activations short of what
          * hc_collapse quantizes into it, and the 1024 bytes of slack below
-         * hide that at test scale and not at model scale. */
-        const int64_t hcw = (int64_t)(c->hc_mult ? c->hc_mult : 1) * c->hidden;
+         * hide that at test scale and not at model scale. Qwen's
+         * HyperConnection mix reads the same shape under its own key. */
+        const int64_t hcw = (int64_t)(c->hc_mult ? c->hc_mult :
+                                      c->arch_qwen && c->hc_count ? c->hc_count : 1)
+                          * c->hidden;
         if (hcw > nmax) nmax = (int)hcw;
+        /* And Qwen's shared expert: its down projection reads a vector
+         * shared_inter wide, which nothing above bounds. */
+        if (c->shared_inter > nmax) nmax = c->shared_inter;
         /* Two bytes per activation: the i8mm path writes two int8 planes
          * and the SMLAL path writes int16, both over the padded group
          * count rather than over `in`. */
@@ -2819,13 +3403,28 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         return -1;
     if (m->index_bits == 6 && (!m->lut8 || !m->lut8_scale)) return -1;
     for (int L = 0; L < c->n_layers; L++) {
-        /* CSA2 caches a window rather than a latent, and only four of its
-         * forty layers cache anything more — csa2_alloc has already
-         * checked its own. */
-        if (c->ds41) { if (!m->winkv[L]) return -1; }
-        else if (c->kda_layer[L]) { if (!m->S[L] || !m->conv[L]) return -1; }
-        else if (!m->latcache[L]) return -1;
+        if (c->arch_qwen) {
+            if (!c->qwen_full[L]) {
+                if (!m->S[L] || !m->conv[L]) return -1;
+            } else if (!m->qsa_k[L] || !m->qsa_v[L] || !m->qsa_rawk[L]) {
+                return -1;
+            }
+        } else if (c->ds41) {
+            /* CSA2 caches a window rather than a latent, and only four of
+             * its forty layers cache anything more; csa2_alloc checked it. */
+            if (!m->winkv[L]) return -1;
+        } else if (c->kda_layer[L]) {
+            if (!m->S[L] || !m->conv[L]) return -1;
+        } else if (!m->latcache[L]) {
+            return -1;
+        }
     }
+    if (c->arch_qwen && (!m->hcx || !m->ple_ring || !m->ple_emb || !m->gdn_g ||
+                         !m->qsa_q || !m->qsa_gate || !m->qsa_attn ||
+                         !m->qsa_kf || !m->qsa_vf || !m->qsa_scr || !m->qsa_work ||
+                         !m->qsa_cs || !m->qsa_sel || !m->qsa_taken ||
+                         !m->moe_prob || !m->moe_used))
+        return -1;
     if (c->attn_res_block && !m->blockres) return -1;
     /* Last, so a load that fails leaves no thread reading a model nobody
      * owns — every return above this line is a failure. */
@@ -2865,10 +3464,19 @@ void waste_model_free(waste_model *m)
     for (int L = 0; L < 128; L++) {
         free(m->S[L]); free(m->conv[L]); free(m->latcache[L]);
         free(m->idxpool[L]); free(m->idxbuf[L]);
+        free(m->qsa_k[L]); free(m->qsa_v[L]); free(m->qsa_rawk[L]);
         free(m->winkv[L]); free(m->ckvc[L]); free(m->ikey[L]); free(m->cpool[L]);
         for (int s = 0; s < WASTE_MAX_SHARDS; s++)
             if (m->bank[L].fd[s] >= 0) close(m->bank[L].fd[s]);
     }
+    free(m->hcx);
+    free(m->ple_ring);
+    free(m->ple_emb);
+    free(m->gdn_g);
+    free(m->qsa_q); free(m->qsa_gate); free(m->qsa_attn);
+    free(m->qsa_kf); free(m->qsa_vf); free(m->qsa_scr); free(m->qsa_work);
+    free(m->qsa_cs); free(m->qsa_sel); free(m->qsa_taken);
+    free(m->moe_prob); free(m->moe_used);
     free(m->x); free(m->h); free(m->tmp); free(m->att); free(m->logits);
     free(m->ff); free(m->e_gate); free(m->e_up); free(m->e_down); waste_dio_free(m->lut);
     free(m->lut8); free(m->lut8_scale);
@@ -3180,7 +3788,7 @@ void waste_model_clear_read_error(waste_model *m)
  * position and is not bounded here. */
 int waste_model_ctx_max(const waste_model *m)
 {
-    return m->has_mla ? m->kv_cap : 0;
+    return (m->has_mla || m->has_qsa) ? m->kv_cap : 0;
 }
 
 int waste_model_ctx_full(const waste_model *m) { return m->ctx_full; }
@@ -3594,6 +4202,7 @@ typedef struct {
     const float *lut_gate, *lut_up;
     const int8_t *q_gate, *q_up;
     const float *qs_gate, *qs_up;
+    const int *jmap;                 /* task t is expert jmap[t]; NULL: j_off+t */
 } xpar_arg;
 
 static void moe_expert_range(int b, int e, void *p)
@@ -3604,7 +4213,7 @@ static void moe_expert_range(int b, int e, void *p)
     const int inter = a->inter, lat = a->lat;
 
     for (int t = b; t < e; t++) {
-        const int j = a->j_off + t;
+        const int j = a->jmap ? a->jmap[t] : a->j_off + t;
         const uint8_t *rec = a->recs[j];
         const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
         const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
@@ -3631,6 +4240,104 @@ static void moe_expert_range(int b, int e, void *p)
          * changes the scale and moves every entry near a rounding boundary
          * by one LSB. That measured as 0.68 on a logit. */
     }
+}
+
+/* ---- routed experts in row ranges, a stage at a time ---------------------
+ *
+ * One task per expert leaves the barrier waiting on whichever thread got two:
+ * ten equal experts on eight threads is two experts of wall time for ten of
+ * work, 5x at best, and Qwen's measured 4.4x on eight cores. It is not the
+ * memory — on one thread the kernel lost no more to six cores of random
+ * reads over 1 GB than to six cores spinning (LEARNED §90). So the work is
+ * cut into equal pieces instead, in the three stages an expert's arithmetic
+ * depends on:
+ *
+ *   1. every expert's gate and up rows, VQ_TILE * VQ_SUPER rows a task
+ *   2. every expert's activation and down table, one task each
+ *   3. every expert's down rows, in the same ranges
+ *
+ * Each piece writes only its own rows, through the kernels vq_apply_serial
+ * and vq_matvec_serial call, so the result is moe_expert_range's bit for
+ * bit. VQ3R with float tables only: that is what Qwen's experts use, and a
+ * VQ4P or WASTE_VQ8 layer keeps the per-expert tasks. */
+enum { XS_ROWS = VQ_TILE * VQ_SUPER };
+
+typedef struct {
+    waste_model *m;
+    const uint8_t **recs;
+    const int *list;                 /* piece t's expert is list[t / per]  */
+    int inter, hid, n_gu, n_dn;      /* row ranges per matrix              */
+    const float *lut_gate, *lut_up;
+} xstage_arg;
+
+static void xstage_gate_up(int b, int e, void *p)
+{
+    const xstage_arg *a = (const xstage_arg *)p;
+    waste_model *m = a->m;
+    const int inter = a->inter, per = 2 * a->n_gu;
+    for (int k = b; k < e; k++) {
+        const int j = a->list[k / per], mat = (k % per) / a->n_gu;
+        const int r0 = ((k % per) % a->n_gu) * XS_ROWS;
+        const int r1 = r0 + XS_ROWS < inter ? r0 + XS_ROWS : inter;
+        const uint8_t *rec = a->recs[j];
+        const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
+        const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
+        vq_arg va = { (mat ? m->xub : m->xga) + (size_t)j * inter,
+                      rec + (mat ? h->up_off : h->gate_off), sc + mat * inter,
+                      mat ? a->lut_up : a->lut_gate,
+                      a->hid / m->vec_dim, m->stages, m->cb_entries };
+        vq_rows(r0, r1, &va);
+    }
+}
+
+static void xstage_down_lut(int b, int e, void *p)
+{
+    const xstage_arg *a = (const xstage_arg *)p;
+    waste_model *m = a->m;
+    const int inter = a->inter;
+    for (int t = b; t < e; t++) {
+        const int j = a->list[t];
+        const waste_expert_hdr *h = (const waste_expert_hdr *)a->recs[j];
+        float *ga = m->xga + (size_t)j * inter;
+        waste_act_pair_range(&m->cfg, ga, m->xub + (size_t)j * inter, inter);
+        lutb_arg la = { m->xlut + (size_t)j * m->xlut_sz, m->codebooksT, ga,
+                        h->codebook_id + 2 * m->stages, m->stages,
+                        m->cb_entries, m->vec_dim };
+        waste_k.lutb_range(0, inter / m->vec_dim, &la);
+    }
+}
+
+static void xstage_down(int b, int e, void *p)
+{
+    const xstage_arg *a = (const xstage_arg *)p;
+    waste_model *m = a->m;
+    const int inter = a->inter, hid = a->hid;
+    for (int k = b; k < e; k++) {
+        const int j = a->list[k / a->n_dn];
+        const int r0 = (k % a->n_dn) * XS_ROWS;
+        const int r1 = r0 + XS_ROWS < hid ? r0 + XS_ROWS : hid;
+        const uint8_t *rec = a->recs[j];
+        const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
+        const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
+        vq_arg va = { m->xacc + (size_t)j * hid, rec + h->down_off, sc + 2 * inter,
+                      m->xlut + (size_t)j * m->xlut_sz,
+                      inter / m->vec_dim, m->stages, m->cb_entries };
+        vq_rows(r0, r1, &va);
+    }
+}
+
+/* n experts, named by list, into their xacc slices. */
+static void experts_staged(waste_model *m, const uint8_t **recs, const int *list,
+                           int n, int inter, int hid,
+                           const float *lut_gate, const float *lut_up)
+{
+    xstage_arg a = { m, recs, list, inter, hid,
+                     (inter + XS_ROWS - 1) / XS_ROWS, (hid + XS_ROWS - 1) / XS_ROWS,
+                     lut_gate, lut_up };
+    const int w = g_pool.nthreads;
+    waste_parallel_for_each(n * 2 * a.n_gu, xstage_gate_up, &a, w);
+    waste_parallel_for_each(n, xstage_down_lut, &a, w);
+    waste_parallel_for_each(n * a.n_dn, xstage_down, &a, w);
 }
 
 /* ---- layers ------------------------------------------------------------ */
@@ -5143,7 +5850,7 @@ static void moe_layer(waste_model *m, int L, const float *in, float *out, int *r
                 lut_done = 1;
             }
             xpar_arg pa = { m, c, recs, w, j0, inter, lat, lut_gate, lut_up,
-                            q_gate, q_up, qs_gate, qs_up };
+                            q_gate, q_up, qs_gate, qs_up, NULL };
             waste_parallel_for(j1 - j0, 1, moe_expert_range, &pa);
             PROF_END(P_EMM);
             waste_ecache_release(&m->cache);
@@ -5465,6 +6172,30 @@ static void state_fill(const waste_model *m, waste_state_hdr *h, int pos)
     const waste_config *c = &m->cfg;
     memset(h, 0, sizeof *h);
     h->magic = WASTE_MAGIC_KDASTATE;
+    h->n_layers = c->n_layers;
+    h->hidden = c->hidden;
+    h->pos = pos;
+    if (c->arch_qwen) {
+        /* Version 2: GDN/QSA/HC/PLE state. The fields keep their Kimi
+         * names and carry Qwen's shapes, so the struct stays one size and
+         * every shape this file's length depends on is still compared.
+         * `hc_mult` and `index_dim` are free to reuse here because Qwen
+         * has neither mHC nor the DSA indexer — the version guards the
+         * two readings apart. */
+        h->version = 2;
+        h->kda_heads = c->gdn_v_heads;
+        h->kda_dim = c->gdn_k_dim;
+        h->conv_k = c->conv_k;
+        h->n_heads = c->qsa_n_kv;
+        h->qk_nope = c->hc_count;
+        h->qk_rope = c->qsa_head_dim;
+        h->v_head = c->idx_head_dim;
+        h->attn_res_block = c->idx_compress;
+        h->hc_mult = c->gdn_v_dim;
+        h->index_dim = c->gdn_k_heads;
+        h->n_blockres = 0;
+        return;
+    }
     h->version = 1;
     h->n_layers = c->n_layers; h->hidden = c->hidden;
     h->kda_heads = c->kda_heads; h->kda_dim = c->kda_dim; h->conv_k = c->conv_k;
@@ -5477,6 +6208,42 @@ static void state_fill(const waste_model *m, waste_state_hdr *h, int pos)
     h->pos = pos; h->n_blockres = m->n_blockres;
 }
 
+static int qwen_state_hdr_ok(const waste_config *c, const waste_state_hdr *h)
+{
+    return h->version == 2 && h->n_layers == c->n_layers &&
+           h->hidden == c->hidden && h->kda_heads == c->gdn_v_heads &&
+           h->kda_dim == c->gdn_k_dim && h->conv_k == c->conv_k &&
+           h->n_heads == c->qsa_n_kv && h->qk_nope == c->hc_count &&
+           h->qk_rope == c->qsa_head_dim && h->v_head == c->idx_head_dim &&
+           h->attn_res_block == c->idx_compress &&
+           h->hc_mult == c->gdn_v_dim &&
+           h->index_dim == c->gdn_k_heads && h->n_blockres == 0;
+}
+
+static uint64_t qwen_layer_state_bytes(const waste_config *c, int L, int T)
+{
+    if (c->qwen_full[L]) {
+        const int Hkv = c->qsa_n_kv, D = c->qsa_head_dim, Dk = c->idx_head_dim;
+        return 12ULL + (uint64_t)T * (uint64_t)Dk * 4ULL +
+               (uint64_t)T * (uint64_t)Hkv * (uint64_t)D * 4ULL;
+    }
+    const int Hv = c->gdn_v_heads, Dk = c->gdn_k_dim, Dv = c->gdn_v_dim;
+    const int Hk = c->gdn_k_heads;
+    const int qkv = 2 * Hk * Dk + Hv * Dv;
+    const int ck = c->conv_k > 0 ? c->conv_k - 1 : 0;
+    return (uint64_t)Hv * (uint64_t)Dk * (uint64_t)Dv * 4ULL +
+           (uint64_t)qkv * (uint64_t)ck * 4ULL;
+}
+
+static uint64_t qwen_state_tail_bytes(const waste_config *c)
+{
+    const int R = (c->ple_conv_k > 1 && c->ngram_size > 0)
+                ? (c->ple_conv_k - 1) * c->ngram_size : 0;
+    return (uint64_t)c->hc_count * (uint64_t)c->hidden * 4ULL +
+           (uint64_t)c->hc_count * (uint64_t)c->hidden *
+           (uint64_t)(R > 0 ? R : 1) * 4ULL + 8ULL * 4ULL;
+}
+
 /* Every buffer a session accumulates into, back to the state of a fresh
  * open. Lived in waste.c reaching into the model's fields; it is here so
  * there is one copy, and so a measurement harness that drives the model
@@ -5485,17 +6252,42 @@ void waste_model_reset(waste_model *m)
 {
     const waste_config *c = &m->cfg;
     for (int L = 0; L < c->n_layers; L++) {
-        if (m->S[L])
-            memset(m->S[L], 0, (size_t)c->kda_heads * c->kda_dim * c->kda_dim * sizeof(float));
-        if (m->conv[L])
-            memset(m->conv[L], 0,
-                   (size_t)3 * c->kda_heads * c->kda_dim * (c->conv_k - 1) * sizeof(float));
+        if (c->arch_qwen) {
+            const int Hv = c->gdn_v_heads, Dk = c->gdn_k_dim, Dv = c->gdn_v_dim;
+            const int qkv = 2 * c->gdn_k_heads * Dk + Hv * Dv;
+            if (m->S[L])
+                memset(m->S[L], 0, (size_t)Hv * Dk * Dv * sizeof(float));
+            if (m->conv[L])
+                memset(m->conv[L], 0,
+                       (size_t)qkv * (c->conv_k > 0 ? c->conv_k - 1 : 0) * sizeof(float));
+            m->n_qsa_blk[L] = 0;
+            m->n_qsa_tail[L] = 0;
+            if (m->qsa_rawk[L])
+                memset(m->qsa_rawk[L], 0,
+                       (size_t)m->kv_cap * c->idx_head_dim * sizeof(float));
+        } else {
+            if (m->S[L])
+                memset(m->S[L], 0, (size_t)c->kda_heads * c->kda_dim * c->kda_dim * sizeof(float));
+            if (m->conv[L])
+                memset(m->conv[L], 0,
+                       (size_t)3 * c->kda_heads * c->kda_dim * (c->conv_k - 1) * sizeof(float));
+        }
         m->n_kv[L] = 0;
     }
     m->n_blockres = 0;
     if (m->x) memset(m->x, 0, (size_t)(c->hc_mult ? c->hc_mult : 1) *
                               c->hidden * sizeof(float));
     for (int L = 0; L < c->n_layers; L++) m->n_pool[L] = 0;
+    if (c->arch_qwen) {
+        if (m->hcx)
+            memset(m->hcx, 0, (size_t)c->hc_count * c->hidden * sizeof(float));
+        if (m->ple_ring) {
+            const int R = (c->ple_conv_k > 1 && c->ngram_size > 0)
+                ? (c->ple_conv_k - 1) * c->ngram_size : 0;
+            memset(m->ple_ring, 0, (size_t)c->hc_count * c->hidden * (R > 0 ? R : 1) * sizeof(float));
+        }
+        for (int i = 0; i < 8; i++) m->ple_prev[i] = c->eos_token_id;
+    }
     if (m->blockres && c->attn_res_block) {
         const int nb = c->n_layers / c->attn_res_block + 2;
         memset(m->blockres, 0, (size_t)nb * c->hidden * sizeof(float));
@@ -5666,6 +6458,55 @@ int waste_model_state_save(const waste_model *m, const char *path, int pos)
     state_fill(m, &h, pos);
     int rc = fwrite(&h, sizeof h, 1, f) == 1 ? 0 : -1;
 
+    if (c->arch_qwen) {
+        for (int L = 0; L < c->n_layers && !rc; L++) {
+            if (c->qwen_full[L]) {
+                const int32_t T = m->n_kv[L];
+                const int Hkv = c->qsa_n_kv, D = c->qsa_head_dim, Dk = c->idx_head_dim;
+                const int32_t blk = m->n_qsa_blk[L], tail = m->n_qsa_tail[L];
+                if (fwrite(&T, sizeof T, 1, f) != 1 ||
+                    fwrite(&blk, sizeof blk, 1, f) != 1 ||
+                    fwrite(&tail, sizeof tail, 1, f) != 1) {
+                    rc = -1;
+                    break;
+                }
+                if (T > 0 && m->qsa_rawk[L] &&
+                    fwrite(m->qsa_rawk[L], sizeof(float),
+                           (size_t)T * (size_t)Dk, f) != (size_t)T * (size_t)Dk)
+                    rc = -1;
+                const size_t kvbf = (size_t)T * (size_t)Hkv * (size_t)D;
+                if (!rc && kvbf && m->qsa_k[L] &&
+                    fwrite(m->qsa_k[L], 2, kvbf, f) != kvbf)
+                    rc = -1;
+                if (!rc && kvbf && m->qsa_v[L] &&
+                    fwrite(m->qsa_v[L], 2, kvbf, f) != kvbf)
+                    rc = -1;
+            } else {
+                const int Hv = c->gdn_v_heads, Dk = c->gdn_k_dim, Dv = c->gdn_v_dim;
+                const int Hk = c->gdn_k_heads;
+                const int qkv = 2 * Hk * Dk + Hv * Dv;
+                const size_t sn = (size_t)Hv * (size_t)Dk * (size_t)Dv;
+                const size_t cn = (size_t)qkv *
+                    (size_t)(c->conv_k > 0 ? c->conv_k - 1 : 0);
+                if (fwrite(m->S[L], sizeof(float), sn, f) != sn) rc = -1;
+                if (!rc && cn && fwrite(m->conv[L], sizeof(float), cn, f) != cn) rc = -1;
+            }
+        }
+        const int hcH = c->hc_count * c->hidden;
+        if (!rc && hcH && m->hcx &&
+            fwrite(m->hcx, sizeof(float), (size_t)hcH, f) != (size_t)hcH)
+            rc = -1;
+        {
+            const int R = (c->ple_conv_k > 1 && c->ngram_size > 0)
+                        ? (c->ple_conv_k - 1) * c->ngram_size : 0;
+            const size_t pr = (size_t)c->hc_count * (size_t)c->hidden *
+                              (size_t)(R > 0 ? R : 1);
+            if (!rc && pr && m->ple_ring &&
+                fwrite(m->ple_ring, sizeof(float), pr, f) != pr)
+                rc = -1;
+        }
+        if (!rc && fwrite(m->ple_prev, sizeof(int), 8, f) != 8) rc = -1;
+    } else {
     const int H = c->kda_heads, D = c->kda_dim, C = H * D;
     for (int L = 0; L < c->n_layers && !rc; L++) {
         if (c->ds41) {
@@ -5725,6 +6566,8 @@ int waste_model_state_save(const waste_model *m, const char *path, int pos)
         const size_t xn = (size_t)(c->hc_mult ? c->hc_mult : 1) * c->hidden;
         if (!rc && fwrite(m->x, sizeof(float), xn, f) != xn) rc = -1;
     }
+    }   /* end of the non-Qwen state: Qwen's residual is m->hcx, and it
+         * has neither blockres nor a widened m->x. */
     if (!rc && waste_sync_file(f)) rc = -1;
     if (fclose(f)) rc = -1;
     if (!rc && waste_replace_file(tmp, path)) rc = -1;
@@ -5741,10 +6584,10 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
     waste_state_hdr h, want;
     state_fill(m, &want, 0);
     if (fread(&h, sizeof h, 1, f) != 1) { fclose(f); return -1; }
-    /* Every shape must match; pos and n_blockres are payload, but they also
-     * bound array indices and therefore need validation before the first
-     * byte of live state is replaced. */
-    if (h.magic != want.magic || h.version != want.version ||
+    if (h.magic != want.magic) { fclose(f); return -2; }
+    if (c->arch_qwen) {
+        if (!qwen_state_hdr_ok(c, &h)) { fclose(f); return -2; }
+    } else if (h.version != want.version ||
         h.n_layers != want.n_layers || h.hidden != want.hidden ||
         h.kda_heads != want.kda_heads || h.kda_dim != want.kda_dim ||
         h.conv_k != want.conv_k || h.n_heads != want.n_heads ||
@@ -5754,26 +6597,50 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
         h.head_dim != want.head_dim || h.window != want.window ||
         h.engram_n != want.engram_n) {
         fclose(f);
-        return -2;                       /* state does not belong to this model */
+        return -2;
     }
 
     const int H = c->kda_heads, D = c->kda_dim, C = H * D;
     const int nb_max = c->attn_res_block
                      ? c->n_layers / c->attn_res_block + 2 : 0;
     if (h.pos < 0 || h.pos == INT32_MAX ||
-        (m->has_mla && h.pos > m->kv_cap) ||
-        h.n_blockres < 0 || h.n_blockres > nb_max) {
+        (c->arch_qwen ? h.pos > m->kv_cap :
+         (m->has_mla && h.pos > m->kv_cap)) ||
+        (!c->arch_qwen && (h.n_blockres < 0 || h.n_blockres > nb_max))) {
         fclose(f);
         return -2;
     }
 
-    /* First walk the complete payload without touching the model.  This
-     * rejects truncated files and bad per-layer KV counts up front, so the
-     * ordinary failure paths preserve the current conversation. */
     const int64_t fsize_i = waste_file_size(fileno(f));
     uint64_t off = sizeof h;
     if (fsize_i < 0) { fclose(f); return -1; }
     const uint64_t fsize = (uint64_t)fsize_i;
+    if (c->arch_qwen) {
+        for (int L = 0; L < c->n_layers; L++) {
+            uint64_t bytes = 0;
+            if (c->qwen_full[L]) {
+                int32_t T = 0, blk = 0, tail = 0;
+                if (off > fsize || fsize - off < 12 ||
+                    waste_pread(fileno(f), &T, 4, (int64_t)off) != 4 ||
+                    waste_pread(fileno(f), &blk, 4, (int64_t)(off + 4)) != 4 ||
+                    waste_pread(fileno(f), &tail, 4, (int64_t)(off + 8)) != 4) {
+                    fclose(f); return -2;
+                }
+                if (T < 0 || T > m->kv_cap || T != h.pos) {
+                    fclose(f); return -2;
+                }
+                bytes = qwen_layer_state_bytes(c, L, T);
+            } else {
+                bytes = qwen_layer_state_bytes(c, L, 0);
+            }
+            if (off > fsize || bytes > fsize - off) { fclose(f); return -2; }
+            off += bytes;
+        }
+        const uint64_t tail = qwen_state_tail_bytes(c);
+        if (off > fsize || tail > fsize - off || off + tail != fsize) {
+            fclose(f); return -2;
+        }
+    } else {
     for (int L = 0; L < c->n_layers; L++) {
         uint64_t bytes = 0;
         if (c->ds41) {
@@ -5842,9 +6709,60 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
             fclose(f); return -2;
         }
     }
+    }
     if (fseek(f, (long)sizeof h, SEEK_SET)) { fclose(f); return -1; }
 
     int rc = 0;
+    if (c->arch_qwen) {
+        for (int L = 0; L < c->n_layers && !rc; L++) {
+            if (c->qwen_full[L]) {
+                int32_t T = 0, blk = 0, tail = 0;
+                const int Hkv = c->qsa_n_kv, Dq = c->qsa_head_dim, Dk = c->idx_head_dim;
+                if (fread(&T, sizeof T, 1, f) != 1 ||
+                    fread(&blk, sizeof blk, 1, f) != 1 ||
+                    fread(&tail, sizeof tail, 1, f) != 1) {
+                    rc = -1; break;
+                }
+                if (T > 0 && m->qsa_rawk[L] &&
+                    fread(m->qsa_rawk[L], sizeof(float),
+                          (size_t)T * (size_t)Dk, f) != (size_t)T * (size_t)Dk)
+                    rc = -1;
+                const size_t kvbf = (size_t)T * (size_t)Hkv * (size_t)Dq;
+                if (!rc && kvbf && m->qsa_k[L] &&
+                    fread(m->qsa_k[L], 2, kvbf, f) != kvbf)
+                    rc = -1;
+                if (!rc && kvbf && m->qsa_v[L] &&
+                    fread(m->qsa_v[L], 2, kvbf, f) != kvbf)
+                    rc = -1;
+                m->n_kv[L] = T;
+                m->n_qsa_blk[L] = blk;
+                m->n_qsa_tail[L] = tail;
+            } else {
+                const int Hv = c->gdn_v_heads, Dk = c->gdn_k_dim, Dv = c->gdn_v_dim;
+                const int Hk = c->gdn_k_heads;
+                const int qkv = 2 * Hk * Dk + Hv * Dv;
+                const size_t sn = (size_t)Hv * (size_t)Dk * (size_t)Dv;
+                const size_t cn = (size_t)qkv *
+                    (size_t)(c->conv_k > 0 ? c->conv_k - 1 : 0);
+                if (fread(m->S[L], sizeof(float), sn, f) != sn) rc = -1;
+                if (!rc && cn && fread(m->conv[L], sizeof(float), cn, f) != cn) rc = -1;
+            }
+        }
+        const int hcH = c->hc_count * c->hidden;
+        if (!rc && hcH && m->hcx &&
+            fread(m->hcx, sizeof(float), (size_t)hcH, f) != (size_t)hcH)
+            rc = -1;
+        {
+            const int R = (c->ple_conv_k > 1 && c->ngram_size > 0)
+                        ? (c->ple_conv_k - 1) * c->ngram_size : 0;
+            const size_t pr = (size_t)c->hc_count * (size_t)c->hidden *
+                              (size_t)(R > 0 ? R : 1);
+            if (!rc && pr && m->ple_ring &&
+                fread(m->ple_ring, sizeof(float), pr, f) != pr)
+                rc = -1;
+        }
+        if (!rc && fread(m->ple_prev, sizeof(int), 8, f) != 8) rc = -1;
+    } else {
     for (int L = 0; L < c->n_layers && !rc; L++) {
         if (c->ds41) {
             const size_t wn = (size_t)c->window * c->head_dim;
@@ -5898,6 +6816,8 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
         const size_t xn = (size_t)(c->hc_mult ? c->hc_mult : 1) * c->hidden;
         if (!rc && fread(m->x, sizeof(float), xn, f) != xn) rc = -1;
     }
+    }   /* end of the non-Qwen state: Qwen's residual is m->hcx, and it
+         * has neither blockres nor a widened m->x. */
     fclose(f);
     if (!rc && pos) *pos = h.pos;
     /* -3 means the file changed or the device failed after the successful
@@ -6389,6 +7309,14 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
     if (n <= 0) return m->logits;
+    if (c->arch_qwen) {
+        const float *lg = NULL;
+        for (int t = 0; t < n; t++) {
+            lg = waste_model_step(m, tokens[t], pos0 + t, NULL);
+            if (!lg) return NULL;
+        }
+        return lg;
+    }
     if (n == 1) return waste_model_step(m, tokens[0], pos0, NULL);
     /* The chunked path carries one residual per token and one dense
      * attention per layer. mHC's parallel streams and the DSA indexer's
@@ -6543,8 +7471,1097 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     return m->read_error ? NULL : m->logits;
 }
 
+/* ---- Qwen3.8-Flash-Next forward (not KDA/MLA/AttnRes) ---------------- */
+
+static uint16_t f32_to_bf16(float x)
+{
+    union { float f; uint32_t u; } a;
+    a.f = x;
+    const uint32_t u = a.u;
+    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+
+static float bf16_to_f32(uint16_t b)
+{
+    union { float f; uint32_t u; } a;
+    a.u = (uint32_t)b << 16;
+    return a.f;
+}
+
+static void qwen_row(waste_model *m, const waste_tensor *t, long row, float *dst)
+{
+    const int cols = t->shape[t->ndim - 1];
+    if (!t->on_disk && t->data) {
+        memcpy(dst, t->data + (size_t)row * (size_t)cols, (size_t)cols * sizeof(float));
+        return;
+    }
+    if (!t->on_disk && t->q) {
+        waste_deq_row(t, row, cols, dst);
+        return;
+    }
+    const int g = t->group, ng = (cols + g - 1) / g;
+    const int8_t *q; const uint16_t *sc;
+    trunk_row(m, t, row, &q, &sc);
+    for (int k = 0; k < ng; k++) {
+        const float sv = f16_to_f32(sc[k]);
+        for (int i = 0; i < g && k * g + i < cols; i++) {
+            int v;
+            if (t->bits == 4) {
+                const uint8_t byte = ((const uint8_t *)q)[(k * g + i) / 2];
+                v = (i & 1) ? (byte >> 4) - 8 : (byte & 0x0F) - 8;
+            } else {
+                v = q[k * g + i];
+            }
+            dst[k * g + i] = (float)v * sv;
+        }
+    }
+}
+
+static void qwen_rope_cs(const waste_config *c, int pos, float *cos, float *sin)
+{
+    const int half = c->rotary_dim / 2;
+    float ft[WASTE_MAX_ROPE_HALF], fh[WASTE_MAX_ROPE_HALF];
+    float fw[WASTE_MAX_ROPE_HALF], freqs[WASTE_MAX_ROPE_HALF];
+    if (half <= 0 || half > WASTE_MAX_ROPE_HALF) return;
+    for (int j = 0; j < half; j++) {
+        const float a = (float)pos * c->rope_inv_freq[j];
+        ft[j] = fh[j] = fw[j] = a;
+    }
+    waste_qwen_mrope_interleave(ft, fh, fw, c->mrope_section, half, freqs);
+    for (int j = 0; j < half; j++) {
+        const float cj = cosf(freqs[j]), sj = sinf(freqs[j]);
+        cos[j] = cj; sin[j] = sj;
+        cos[j + half] = cj; sin[j + half] = sj;
+    }
+}
+
+/* One stream of a HyperConnection mix's front half: the combine that
+ * finishes the previous block when there is one, the RMSNorm, and — when
+ * the down projection can take them — the i8mm planes of the stream's
+ * groups. Each is the same function over the same elements as the serial
+ * loop it replaced, one stream at a time. */
+typedef struct {
+    float *o, *x;
+    const float *w;
+    int group;
+    float eps;
+    const float *block, *inj;        /* combine into x first, unless NULL  */
+    int qg, n;                       /* quantize o in groups of qg, if > 0 */
+    int8_t *q;
+    float *sc;
+} hcn_arg;
+
+static void hc_norm_range(int b, int e, void *p)
+{
+    const hcn_arg *a = (const hcn_arg *)p;
+    for (int s = b; s < e; s++) {
+        const size_t off = (size_t)s * (size_t)a->group;
+        if (a->block)
+            waste_qwen_hc_combine(a->x + off, a->block, a->inj + s, 1, a->group,
+                                  a->x + off);
+        waste_qwen_rmsnorm(a->o + off, a->x + off, a->w + off,
+                           a->group, a->group, a->eps);
+#if defined(__ARM_NEON) || defined(__aarch64__)
+        if (a->qg) {
+            const int per = a->group / a->qg;
+            for (int k = s * per; k < (s + 1) * per; k++)
+                quant_act4_mm_group(a->o, a->n, a->qg, k, a->q, a->sc);
+        }
+#endif
+    }
+}
+
+/* The back half, as pieces of one job: the sigmoid of every stream's gate
+ * and the weighted sum over streams, a hidden range at a time, and the
+ * inject projection's rows. The sigmoid is a scalar expf per element and
+ * the sum runs over streams in order for each element, as the serial loop
+ * did; an inject row is the dotf matvec() would have taken. */
+enum { HC_SPAN = 256 };
+typedef struct {
+    float *gate, *mixed, *yi;
+    const float *normed, *W;         /* W: float inject rows, or NULL      */
+    int hc, hid, n_mix;
+} hcg_arg;
+
+static void hc_gate_mix_piece(int b, int e, void *p)
+{
+    const hcg_arg *a = (const hcg_arg *)p;
+    const int hc = a->hc, hid = a->hid;
+    for (int k = b; k < e; k++) {
+        if (k < a->n_mix) {
+            const int d0 = k * HC_SPAN, d1 = d0 + HC_SPAN < hid ? d0 + HC_SPAN : hid;
+            for (int st = 0; st < hc; st++) {
+                float *v = a->gate + (size_t)st * hid;
+                for (int d = d0; d < d1; d++) v[d] = 1.0f / (1.0f + expf(-v[d]));
+            }
+            for (int d = d0; d < d1; d++) {
+                float s = 0.0f;
+                for (int st = 0; st < hc; st++)
+                    s += a->gate[st * hid + d] * a->normed[st * hid + d];
+                a->mixed[d] = s / (float)hc;
+            }
+        } else {
+            const int o = k - a->n_mix, H = hc * hid;
+            a->yi[o] = dotf(a->W + (size_t)o * H, a->normed, H);
+        }
+    }
+}
+
+/* `cblock`, when given, is the block the streams have not taken in yet:
+ * the combine with the previous mix's `cinj` weights happens here, stream by
+ * stream in the same tasks as the norm, rather than as a serial pass in front
+ * of it. `cinj` may be `inj_w` itself — it is copied before anything writes.
+ *
+ * The mix used to be six dispatches and four serial stretches, and each
+ * stretch long enough for the pool to park before the next dispatch: the
+ * combine (3.5 us), the down projection's quantization, the sum over streams
+ * (4.4 us) and the inject projection (5 us). It is now three dispatches, the
+ * norm and the gate each carrying the work that sat between them and the
+ * matvecs (LEARNED §92). */
+static void qwen_hc_mix_t(waste_model *m, float *hyper,
+                          const float *cblock, const float *cinj,
+                          const waste_tensor *nw, const waste_tensor *down,
+                          const waste_tensor *up, const waste_tensor *inject,
+                          int use_inj, float *mixed, float *inj_w)
+{
+    const waste_config *c = &m->cfg;
+    const int hc = c->hc_count, hid = c->hidden, rank = c->hc_lowrank;
+    const int H = hc * hid;
+    float inj_prev[16];
+    if (cblock) memcpy(inj_prev, cinj, (size_t)hc * sizeof(float));
+    if (!nw || !nw->data || !down || !up) {
+        if (cblock) waste_qwen_hc_combine(hyper, cblock, inj_prev, hc, hid, hyper);
+        memset(mixed, 0, (size_t)hid * sizeof(float));
+        if (inj_w) memset(inj_w, 0, (size_t)hc * sizeof(float));
+        return;
+    }
+    float *normed = m->tmp;
+    float *lo = normed + H;
+    float *gate = lo + rank;
+    const int pq = prequant_ok(down, hid);
+    {
+        hcn_arg na = { normed, hyper, nw->data, hid, c->eps,
+                       cblock, inj_prev, pq ? down->group : 0, H, m->xq, m->xs };
+        waste_parallel_for_fast(hc, 1, hc_norm_range, &na);
+    }
+    if (pq) matvec_t_prequant(m, lo, down, rank, H);
+    else matvec_t(m, lo, down, normed, rank, H);
+    for (int i = 0; i < rank; i++) lo[i] = silu(lo[i] / (float)hc);
+    matvec_t(m, gate, up, lo, H, rank);
+
+    const int want_inj = use_inj && inject && inj_w && hc <= 16;
+    const int inj_rows = want_inj && !inject->q && inject->data;
+    float tmpi[16];
+    {
+        const int n_mix = (hid + HC_SPAN - 1) / HC_SPAN;
+        hcg_arg ga = { gate, mixed, tmpi, normed, inj_rows ? inject->data : NULL,
+                       hc, hid, n_mix };
+        const double t0 = prof_on && inj_rows ? pnow() : 0;
+        waste_parallel_for_each(n_mix + (inj_rows ? hc : 0), hc_gate_mix_piece, &ga,
+                                waste_pool_fast());
+        if (prof_on && inj_rows) {
+            /* The inject rows share a job with the mix; the matvec table
+             * gets their share of it by piece count, which is an estimate. */
+            pthread_mutex_lock(&prof_mu);
+            tmv_account(inject, hc, H, (pnow() - t0) * hc / (n_mix + hc), 0.0);
+            pthread_mutex_unlock(&prof_mu);
+        }
+    }
+    if (want_inj) {
+        if (!inj_rows) matvec_t(m, tmpi, inject, normed, hc, H);
+        for (int b = 0; b < hc; b++)
+            inj_w[b] = 2.0f / (1.0f + expf(-tmpi[b] / (float)hc));
+    }
+}
+
+static void qwen_dilated_conv_step(int C, int KS, int dil, const float *w,
+                                   float *ring, const float *x, float *y)
+{
+    const int R = (KS - 1) * dil;
+    for (int c = 0; c < C; c++) {
+        const float *wc = w + (size_t)c * KS;
+        float *rc = ring + (size_t)c * R;
+        float acc = x[c] * wc[KS - 1];
+        for (int k = 0; k < KS - 1; k++)
+            acc += rc[k * dil] * wc[k];
+        for (int j = 0; j + 1 < R; j++) rc[j] = rc[j + 1];
+        if (R > 0) rc[R - 1] = x[c];
+        y[c] = silu(acc);
+    }
+}
+
+static void qwen_ple_inject(waste_model *m, int token)
+{
+    const waste_config *c = &m->cfg;
+    const int L = c->ple_layer;
+    if (L < 0) return;
+    const int hid = c->hidden, hc = c->hc_count, H = hc * hid;
+    const int pe = c->ple_embed ? c->ple_embed : hid;
+    const int ngram = c->ngram_size > 0 ? c->ngram_size : 3;
+    const int heads = (ngram - 1) * (c->heads_per_ngram ? c->heads_per_ngram : 8);
+    const int ctxn = ngram - 1;
+    int ids[8];
+    for (int i = 0; i < ctxn && i < 8; i++) ids[i] = m->ple_prev[i];
+    ids[ctxn] = token;
+    const int n = ctxn + 1;
+    int local[WASTE_QWEN_PLE_HEADS];
+    waste_qwen_ple_row_ids(ids, n, ctxn, c->eos_token_id, ngram,
+                           c->heads_per_ngram ? c->heads_per_ngram : 8,
+                           c->ple_mult, c->ple_sz, local);
+    float *emb = m->ple_emb;
+    if (!emb) return;
+    memset(emb, 0, (size_t)pe * sizeof(float));
+    int off = 0;
+    for (int h = 0; h < heads && h < WASTE_QWEN_PLE_HEADS; h++) {
+        if (c->ple_sz[h] <= 0) return;
+        const waste_tensor *ht = waste_find(m, tname(
+            "%smodel.layers.%d.ple.ple_embedding.ngram_head.%d.weight",
+            c->prefix, L, h));
+        if (!ht) continue;
+        const int width = ht->shape[ht->ndim - 1];
+        if (off + width > pe) break;
+        qwen_row(m, ht, local[h], emb + off);
+        m->ple_reads++;
+        off += width;
+    }
+    float *key = m->tmp, *val = key + H, *qnorm = val + hid;
+    matvec_t(m, key, waste_find(m, tname("%smodel.layers.%d.ple.key_proj.weight",
+                                         c->prefix, L)), emb, H, pe);
+    matvec_t(m, val, waste_find(m, tname("%smodel.layers.%d.ple.value_proj.weight",
+                                         c->prefix, L)), emb, hid, pe);
+    const waste_tensor *tnk = waste_find(m, tname("%smodel.layers.%d.ple.norm_key.weight",
+                                                  c->prefix, L));
+    const waste_tensor *tnq = waste_find(m, tname("%smodel.layers.%d.ple.norm_query.weight",
+                                                  c->prefix, L));
+    const waste_tensor *tnc = waste_find(m, tname("%smodel.layers.%d.ple.norm_conv.weight",
+                                                  c->prefix, L));
+    if (!tnk || !tnk->data || !tnq || !tnq->data || !tnc || !tnc->data) return;
+    const float *nk = tnk->data, *nq = tnq->data, *nc = tnc->data;
+    waste_qwen_rmsnorm(key, key, nk, H, hid, c->eps);
+    waste_qwen_rmsnorm(qnorm, m->hcx, nq, H, hid, c->eps);
+    float *gated = qnorm + H;
+    const float inv = 1.0f / sqrtf((float)hid);
+    for (int b = 0; b < hc; b++) {
+        float g = 0.0f;
+        for (int d = 0; d < hid; d++)
+            g += key[b * hid + d] * qnorm[b * hid + d];
+        g *= inv;
+        const float mag = sqrtf(fabsf(g) < 1e-6f ? 1e-6f : fabsf(g));
+        g = copysignf(mag, g);
+        const float sg = 1.0f / (1.0f + expf(-g));
+        for (int d = 0; d < hid; d++) gated[b * hid + d] = sg * val[d];
+    }
+    float *gnorm = gated + H;
+    waste_qwen_rmsnorm(gnorm, gated, nc, H, hid, c->eps);
+    const waste_tensor *cw = waste_find(m, tname("%smodel.layers.%d.ple.conv1d.weight",
+                                                 c->prefix, L));
+    const int KS = c->ple_conv_k;
+    float *conv_y = gnorm + H;
+    if (cw && cw->data)
+        qwen_dilated_conv_step(H, KS, ngram, cw->data, m->ple_ring, gnorm, conv_y);
+    else
+        memcpy(conv_y, gnorm, (size_t)H * sizeof(float));
+    for (int i = 0; i < H; i++) m->hcx[i] += gated[i] + conv_y[i];
+    for (int i = 0; i < ctxn - 1 && i < 7; i++) m->ple_prev[i] = m->ple_prev[i + 1];
+    if (ctxn > 0) m->ple_prev[ctxn - 1] = token;
+}
+
+typedef struct {
+    int Hk, Hv, Dk, Dv;
+    const float *q, *k, *v, *g_log, *beta;
+    float *S, *o;
+} gdn_arg;
+
+enum { GDN_SCRATCH = 1024 };
+
+static void gdn_heads_range(int b, int e, void *p)
+{
+    const gdn_arg *a = (const gdn_arg *)p;
+    float u[GDN_SCRATCH];
+    waste_qwen_gdn_step_heads(b, e, a->Hk, a->Hv, a->Dk, a->Dv, a->q, a->k, a->v,
+                              a->g_log, a->beta, a->S, a->o, u);
+}
+
+/* GDN's short conv, a range of channels at a time. Each channel reads its
+ * own ring and input and writes its own output, through the same kernel the
+ * whole-layer call used. On the calling thread it was 46 us a layer of
+ * SiLU — the pool asleep by the time the recurrence reached it. */
+typedef struct { int KS; const float *w; float *ring; const float *x; float *y; } gconv_arg;
+
+static void gdn_conv_range(int b, int e, void *p)
+{
+    const gconv_arg *a = (const gconv_arg *)p;
+    const int R = a->KS - 1;
+    waste_k.short_conv_step(e - b, a->KS, a->w + (size_t)b * a->KS, NULL,
+                            a->ring + (size_t)b * R, a->x + b, a->y + b);
+}
+
+/* A value head from the recurrence to the output projection's input: its
+ * state update, its gated RMSNorm, and — when out_proj can take them — the
+ * i8mm planes of its groups. The norm used to be a serial loop over the heads
+ * after the recurrence's dispatch, and out_proj's quantization a dispatch
+ * after that, which found the pool parked 47 times a token. */
+typedef struct {
+    gdn_arg r;
+    const float *z, *nw;
+    float eps;
+    float *normed;
+    int qg, n;                       /* quantize normed in groups, if > 0  */
+    int8_t *q;
+    float *sc;
+} gdnf_arg;
+
+static void gdn_heads_out_range(int b, int e, void *p)
+{
+    const gdnf_arg *a = (const gdnf_arg *)p;
+    const int Dv = a->r.Dv;
+    float u[GDN_SCRATCH];
+    waste_qwen_gdn_step_heads(b, e, a->r.Hk, a->r.Hv, a->r.Dk, Dv, a->r.q, a->r.k,
+                              a->r.v, a->r.g_log, a->r.beta, a->r.S, a->r.o, u);
+    for (int h = b; h < e; h++)
+        waste_k.rmsnorm_gated(Dv, a->r.o + (size_t)h * Dv, a->z + (size_t)h * Dv,
+                              a->nw, a->eps, a->normed + (size_t)h * Dv);
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    if (a->qg) {
+        const int per = Dv / a->qg;
+        for (int k = b * per; k < e * per; k++)
+            quant_act4_mm_group(a->normed, a->n, a->qg, k, a->q, a->sc);
+    }
+#endif
+}
+
+static void qwen_gdn_layer(waste_model *m, int L, const float *in, float *out)
+{
+    const waste_config *c = &m->cfg;
+    const int hid = c->hidden, Hk = c->gdn_k_heads, Hv = c->gdn_v_heads;
+    const int Dk = c->gdn_k_dim, Dv = c->gdn_v_dim;
+    const int qkv = 2 * Hk * Dk + Hv * Dv;
+    memset(out, 0, (size_t)hid * sizeof(float));
+    if (!m->gdn_g) return;
+    float *mixed = m->tmp;
+    float *conv_y = mixed + qkv;
+    float *z = conv_y + qkv;
+    float *a = z + Hv * Dv;
+    float *b = a + Hv;
+    float *core = b + Hv;
+    {
+        /* Four projections of one vector, as one job. The conv reads only
+         * the first, so it follows all four. */
+        const mvb_item proj[4] = {
+            { mixed, waste_find(m, tname("%smodel.layers.%d.linear_attn.in_proj_qkv.weight",
+                                         c->prefix, L)), qkv },
+            { z, waste_find(m, tname("%smodel.layers.%d.linear_attn.in_proj_z.weight",
+                                     c->prefix, L)), Hv * Dv },
+            { a, waste_find(m, tname("%smodel.layers.%d.linear_attn.in_proj_a.weight",
+                                     c->prefix, L)), Hv },
+            { b, waste_find(m, tname("%smodel.layers.%d.linear_attn.in_proj_b.weight",
+                                     c->prefix, L)), Hv },
+        };
+        matvec_t_batch(m, in, hid, proj, 4);
+    }
+    const waste_tensor *cw = waste_find(m, tname("%smodel.layers.%d.linear_attn.conv1d.weight",
+                                                 c->prefix, L));
+    if (cw && cw->data) {
+        gconv_arg ca = { c->conv_k, cw->data, m->conv[L], mixed, conv_y };
+        waste_parallel_for_fast(qkv, 512, gdn_conv_range, &ca);
+    } else {
+        memcpy(conv_y, mixed, (size_t)qkv * sizeof(float));
+    }
+    for (int h = 0; h < Hv; h++) b[h] = 1.0f / (1.0f + expf(-b[h]));
+    const waste_tensor *tA = waste_find(m, tname("%smodel.layers.%d.linear_attn.A_log",
+                                                 c->prefix, L));
+    const waste_tensor *tdt = waste_find(m, tname("%smodel.layers.%d.linear_attn.dt_bias",
+                                                  c->prefix, L));
+    if (!tA || !tA->data || !tdt || !tdt->data) return;
+    PROF_START(P_KDAK);
+    waste_qwen_gdn_decay(a, tA->data, tdt->data, Hv, m->gdn_g);
+    const float *q = conv_y;
+    const float *k = conv_y + Hk * Dk;
+    const float *v = conv_y + 2 * Hk * Dk;
+    /* One task per value head's range. On the calling thread this was 5.3 ms
+     * of a step — 147 us a layer, eighteen times the 8 us a pool worker waits
+     * before parking — between in_proj_qkv and out_proj, so it both ran on
+     * one core and put the pool to sleep for the projection after it. The
+     * heads share nothing but the QK rows they read (see qwen_gdn.h), and
+     * each runs the same code in the same order, so the state and output are
+     * the serial loop's bit for bit. */
+    const waste_tensor *tnw = waste_find(m, tname("%smodel.layers.%d.linear_attn.norm.weight",
+                                                  c->prefix, L));
+    const waste_tensor *top = waste_find(m, tname("%smodel.layers.%d.linear_attn.out_proj.weight",
+                                                  c->prefix, L));
+    if (Dv <= GDN_SCRATCH && tnw && tnw->data) {
+        /* `normed` is `mixed`: in_proj_qkv's output, which nothing reads
+         * after the conv, so the heads can write it while they run. */
+        const int pq = prequant_ok(top, Dv);
+        gdnf_arg fa = { { Hk, Hv, Dk, Dv, q, k, v, m->gdn_g, b, m->S[L], core },
+                        z, tnw->data, c->eps, mixed,
+                        pq ? top->group : 0, Hv * Dv, m->xq, m->xs };
+        waste_parallel_for_fast(Hv, 1, gdn_heads_out_range, &fa);
+        PROF_END(P_KDAK);
+        if (pq) matvec_t_prequant(m, out, top, hid, Hv * Dv);
+        else matvec_t(m, out, top, mixed, hid, Hv * Dv);
+        return;
+    }
+    if (Dv <= GDN_SCRATCH) {
+        gdn_arg ga = { Hk, Hv, Dk, Dv, q, k, v, m->gdn_g, b, m->S[L], core };
+        waste_parallel_for_fast(Hv, 1, gdn_heads_range, &ga);
+    } else {
+        waste_qwen_gdn_step(Hk, Hv, Dk, Dv, q, k, v, m->gdn_g, b, m->S[L], core, m->att);
+    }
+    PROF_END(P_KDAK);
+    if (!tnw || !tnw->data) return;
+    float *normed = mixed;
+    for (int h = 0; h < Hv; h++)
+        waste_k.rmsnorm_gated(Dv, core + (size_t)h * Dv, z + (size_t)h * Dv,
+                              tnw->data, c->eps, normed + (size_t)h * Dv);
+    matvec_t(m, out, top, normed, hid, Hv * Dv);
+}
+
+typedef struct {
+    const float *q, *k, *v;
+    const int *sel;
+    float *out, *scr;
+    int Hq, D, Hkv, n_sel;
+    float scale;
+} qsaa_arg;
+
+typedef struct {
+    const float *q_idx, *raw_k, *cos, *sin, *k_ln_w;
+    float *pooled, *scores;
+    int Hq, Dk, rot, compress;
+    float eps;
+} qsas_arg;
+
+static void qsa_score_range(int b, int e, void *p)
+{
+    const qsas_arg *a = (const qsas_arg *)p;
+    waste_qwen_qsa_score_blocks(b, e, a->q_idx, a->Hq, a->Dk, a->raw_k, a->cos, a->sin,
+                                a->rot, a->k_ln_w, a->eps, a->compress, a->pooled,
+                                a->scores);
+}
+
+typedef struct {
+    const uint16_t *kq, *vq;
+    float *kf, *vf;
+    int *sel;
+    int Hkv, D, kvd, T;
+} qsag_arg;
+
+static void qsa_gather_range(int b, int e, void *p)
+{
+    const qsag_arg *a = (const qsag_arg *)p;
+    for (int i = b; i < e; i++) {
+        const int t = a->sel[i];
+        a->sel[i] = i;
+        const int in = t >= 0 && t < a->T;
+        const uint16_t *kb = in ? a->kq + (size_t)t * a->Hkv * a->D : NULL;
+        const uint16_t *vb = in ? a->vq + (size_t)t * a->Hkv * a->D : NULL;
+        for (int j = 0; j < a->kvd; j++) {
+            a->kf[(size_t)i * a->kvd + j] = in ? bf16_to_f32(kb[j]) : 0.0f;
+            a->vf[(size_t)i * a->kvd + j] = in ? bf16_to_f32(vb[j]) : 0.0f;
+        }
+    }
+}
+
+/* Each head gets the row of scr at h * n_sel, which qsa_scr is sized for. */
+static void qsa_attn_range(int b, int e, void *p)
+{
+    const qsaa_arg *a = (const qsaa_arg *)p;
+    for (int h = b; h < e; h++)
+        waste_qwen_qsa_attn_heads(h, h + 1, a->q, a->Hq, a->D, a->k, a->v, a->Hkv,
+                                  a->n_sel, a->sel, a->n_sel, a->scale, a->out,
+                                  a->scr + (size_t)h * (size_t)a->n_sel);
+}
+
+static void qwen_qsa_layer(waste_model *m, int L, const float *in, float *out, int pos)
+{
+    const waste_config *c = &m->cfg;
+    const int hid = c->hidden, Hq = c->n_heads, Hkv = c->qsa_n_kv, D = c->qsa_head_dim;
+    const int Dk = c->idx_head_dim, compress = c->idx_compress > 0 ? c->idx_compress : 4;
+    const int qd = Hq * D, kvd = Hkv * D;
+    const int idxd = (c->idx_n_heads + c->idx_kv_heads) * Dk;
+    const int rot = c->rotary_dim;
+    memset(out, 0, (size_t)hid * sizeof(float));
+    if (!m->qsa_q || !m->qsa_gate || !m->qsa_attn || !m->qsa_sel ||
+        !m->qsa_kf || !m->qsa_vf || !m->qsa_rawk[L])
+        return;
+    float *qgate = m->tmp;
+    float *k = qgate + qd * 2;
+    float *v = k + kvd;
+    float *idx = v + kvd;
+    {
+        const mvb_item proj[4] = {
+            { qgate, waste_find(m, tname("%smodel.layers.%d.self_attn.q_proj.weight",
+                                         c->prefix, L)), qd * 2 },
+            { k, waste_find(m, tname("%smodel.layers.%d.self_attn.k_proj.weight",
+                                     c->prefix, L)), kvd },
+            { v, waste_find(m, tname("%smodel.layers.%d.self_attn.v_proj.weight",
+                                     c->prefix, L)), kvd },
+            { idx, waste_find(m, tname("%smodel.layers.%d.self_attn.indexer.index_qk_proj.weight",
+                                       c->prefix, L)), idxd },
+        };
+        matvec_t_batch(m, in, hid, proj, 4);
+    }
+    float *q = m->qsa_q, *gate = m->qsa_gate;
+    for (int h = 0; h < Hq; h++) {
+        memcpy(q + (size_t)h * D, qgate + (size_t)h * 2 * D, (size_t)D * sizeof(float));
+        memcpy(gate + (size_t)h * D, qgate + (size_t)h * 2 * D + D, (size_t)D * sizeof(float));
+    }
+    const waste_tensor *tqn = waste_find(m, tname("%smodel.layers.%d.self_attn.q_norm.weight",
+                                                  c->prefix, L));
+    const waste_tensor *tkn = waste_find(m, tname("%smodel.layers.%d.self_attn.k_norm.weight",
+                                                  c->prefix, L));
+    if (!tqn || !tqn->data || !tkn || !tkn->data) return;
+    for (int h = 0; h < Hq; h++)
+        waste_qwen_rmsnorm(q + (size_t)h * D, q + (size_t)h * D, tqn->data, D, D, c->eps);
+    for (int h = 0; h < Hkv; h++)
+        waste_qwen_rmsnorm(k + (size_t)h * D, k + (size_t)h * D, tkn->data, D, D, c->eps);
+    float cos[256], sin[256];
+    qwen_rope_cs(c, pos, cos, sin);
+    for (int h = 0; h < Hq; h++)
+        if (waste_qwen_rope_apply(q + (size_t)h * D, D, cos, sin, rot) != 0) return;
+    for (int h = 0; h < Hkv; h++)
+        if (waste_qwen_rope_apply(k + (size_t)h * D, D, cos, sin, rot) != 0) return;
+
+    if (pos >= 0 && pos < m->kv_cap) {
+        uint16_t *kb = m->qsa_k[L] + (size_t)pos * Hkv * D;
+        uint16_t *vb = m->qsa_v[L] + (size_t)pos * Hkv * D;
+        for (int i = 0; i < kvd; i++) {
+            kb[i] = f32_to_bf16(k[i]);
+            vb[i] = f32_to_bf16(v[i]);
+        }
+        m->n_kv[L] = pos + 1;
+    }
+    const int iq = c->idx_n_heads * Dk;
+    float *q_idx = idx;
+    float *raw_k = idx + iq;
+    const waste_tensor *tqln = waste_find(m, tname(
+        "%smodel.layers.%d.self_attn.indexer.q_layernorm.weight", c->prefix, L));
+    const waste_tensor *tkln = waste_find(m, tname(
+        "%smodel.layers.%d.self_attn.indexer.k_layernorm.weight", c->prefix, L));
+    if (!tqln || !tqln->data || !tkln || !tkln->data) return;
+    for (int h = 0; h < c->idx_n_heads; h++) {
+        waste_qwen_rmsnorm(q_idx + (size_t)h * Dk, q_idx + (size_t)h * Dk,
+                           tqln->data, Dk, Dk, c->eps);
+        if (waste_qwen_rope_apply(q_idx + (size_t)h * Dk, Dk, cos, sin, rot) != 0)
+            return;
+    }
+    if (pos >= 0 && pos < m->kv_cap && m->qsa_rawk[L])
+        memcpy(m->qsa_rawk[L] + (size_t)pos * Dk, raw_k, (size_t)Dk * sizeof(float));
+    const int T = m->n_kv[L];
+    m->n_qsa_blk[L] = compress > 0 ? T / compress : 0;
+    m->n_qsa_tail[L] = compress > 0 ? T % compress : 0;
+
+    PROF_START(P_QSAK);
+    const int block_topk = c->idx_budget / compress;
+    float *full_cos = m->qsa_cs;
+    float *full_sin = m->qsa_cs + (size_t)m->kv_cap * (rot > 0 ? rot : 1);
+    PROF_START(P_QSAR);
+    /* A row of the table is a function of its position and nothing else, so
+     * once written it is right for every later token, every layer and every
+     * session — a reset or a restore leaves it valid. Rewriting all T rows
+     * every token in every QSA layer was 4.3 ms a step at 2,830 tokens and
+     * growing with the context; only the rows past the last one filled are
+     * ever new. */
+    if (full_cos && rot > 0) {
+        for (int t = m->qsa_cs_n; t < T; t++)
+            qwen_rope_cs(c, t, full_cos + (size_t)t * rot, full_sin + (size_t)t * rot);
+        if (T > m->qsa_cs_n) m->qsa_cs_n = T;
+    }
+    PROF_END(P_QSAR);
+    PROF_START(P_QSAS);
+    /* waste_qwen_qsa_select, taken apart so the blocks can be scored at once:
+     * each writes its own pooled row and its own score (qwen_qsa.h). The pick
+     * is a sort in the order the argmax chose, not a pass per block kept, and
+     * together they were 5.2 ms a step at 2,830 tokens. */
+    int nsel = 0;
+    if (T >= 1) {
+        const int qp = pos < 0 ? 0 : (pos >= T ? T - 1 : pos);
+        const int n_complete = (qp + 1) / compress;
+        const int n_tail = qp + 1 - n_complete * compress;
+        const float *scores = m->qsa_work + (size_t)n_complete * Dk;
+        if (n_complete > 0) {
+            qsas_arg sa = { q_idx, m->qsa_rawk[L], full_cos, full_sin, tkln->data,
+                            m->qsa_work, m->qsa_work + (size_t)n_complete * Dk,
+                            c->idx_n_heads, Dk, rot, compress, c->eps };
+            if (n_complete >= 32)
+                waste_parallel_for_fast(n_complete, 4, qsa_score_range, &sa);
+            else
+                qsa_score_range(0, n_complete, &sa);
+        }
+        nsel = waste_qwen_qsa_pick(n_complete > 0 ? scores : NULL, n_complete, block_topk,
+                                   compress, n_tail, m->qsa_sel, m->qsa_taken);
+    }
+    PROF_END(P_QSAS);
+    PROF_START(P_QSAG);
+    float *kf = m->qsa_kf, *vf = m->qsa_vf, *attn = m->qsa_attn, *scr = m->qsa_scr;
+    /* Each selected index writes its own rows of kf and vf and its own slot of
+     * sel, so the conversion goes in ranges: 5.3 ms a step at 2,830 tokens on
+     * one core. */
+    {
+        qsag_arg ga = { m->qsa_k[L], m->qsa_v[L], kf, vf, m->qsa_sel, Hkv, D, kvd, T };
+        waste_parallel_for_fast(nsel, 16, qsa_gather_range, &ga);
+    }
+    PROF_END(P_QSAG);
+    PROF_START(P_QSAA);
+    /* One task per query head. Serial this was 3.4 ms of a step at a 220
+     * token context and 58 ms at 2,800 — a third of the step, on one core,
+     * and it stops growing only when the selection fills its budget. A head
+     * reads its own query and its KV head's rows and writes its own row of
+     * attn (qwen_qsa.h), with its own row of scores, so the output is the
+     * serial loop's bit for bit. */
+    if (nsel > 0) {
+        qsaa_arg aa = { q, kf, vf, m->qsa_sel, attn, scr, Hq, D, Hkv, nsel,
+                        1.0f / sqrtf((float)D) };
+        waste_parallel_for_fast(Hq, 1, qsa_attn_range, &aa);
+    } else {
+        memset(attn, 0, (size_t)qd * sizeof(float));
+    }
+    PROF_END(P_QSAA);
+    PROF_END(P_QSAK);
+    for (int i = 0; i < qd; i++)
+        attn[i] *= 1.0f / (1.0f + expf(-gate[i]));
+    matvec_t(m, out, waste_find(m, tname("%smodel.layers.%d.self_attn.o_proj.weight",
+                                         c->prefix, L)), attn, hid, qd);
+}
+
+/* One routed expert through the row-parallel kernels, into `acc`.
+ *
+ * The serial loop's body: the path WASTE_XPAR=0 forces, and the one a layer
+ * falls back to when a record does not read. */
+static void qwen_expert_rows(waste_model *m, const uint8_t *rec, int inter,
+                             int hid, const float *lut_gate,
+                             const float *lut_up, float *ga, float *ub,
+                             float *acc, float *lut_down)
+{
+    const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
+    const uint16_t *corr = (const uint16_t *)(rec + h->chan_corr_off);
+    vq_apply(m, ga, rec + h->gate_off, corr, inter, hid, lut_gate, NULL, NULL);
+    vq_apply(m, ub, rec + h->up_off, corr + inter, inter, hid, lut_up, NULL, NULL);
+    for (int i = 0; i < inter; i++) ga[i] = silu(ga[i]) * ub[i];
+    vq_matvec(m, acc, rec + h->down_off, corr + 2 * inter, ga, hid, inter,
+              h->codebook_id + 2 * m->stages, lut_down, NULL, NULL);
+}
+
+/* The shared expert and its gate, into `acc`; returns the gate. The add
+ * into the layer output is the caller's, and stays after the routed sum,
+ * so running this early changes when it is computed and not what is
+ * summed.
+ *
+ * `pre` says the router's job already projected `in` through the gate and
+ * up matrices into m->ff and the gate scalar into `sg_raw` (see
+ * qwen_moe_layer); what is left is the activation, the down projection and
+ * the sigmoid. Without it, all of it is done here, as ffn does it. */
+static float qwen_shared_expert(waste_model *m, int L, const float *in, float *acc,
+                                int pre, float sg_raw)
+{
+    const waste_config *c = &m->cfg;
+    const int hid = c->hidden;
+    PROF_START(P_QSHX);
+    const int shared = c->shared_inter;
+    if (pre) {
+        waste_act_pair_range(c, m->ff, m->ff + shared, shared);
+        matvec_t(m, acc, waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.down_proj.weight",
+                                             c->prefix, L)), m->ff, hid, shared);
+    } else {
+        ffn(m,
+            waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.gate_proj.weight", c->prefix, L)),
+            waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.up_proj.weight", c->prefix, L)),
+            waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.down_proj.weight", c->prefix, L)),
+            in, acc, shared, hid, 1.0f, 0);
+        matvec_t(m, &sg_raw, waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert_gate.weight",
+                                                 c->prefix, L)), in, 1, hid);
+    }
+    const float sg = 1.0f / (1.0f + expf(-sg_raw));
+    PROF_END(P_QSHX);
+    return sg;
+}
+
+static void qwen_moe_layer(waste_model *m, int L, const float *in, float *out, int *routed)
+{
+    const waste_config *c = &m->cfg;
+    const int E = c->n_experts, K = c->top_k, hid = c->hidden, inter = c->moe_inter;
+    float *sc = m->att + WASTE_ATT_ROUTER_OFF;
+    int idx[64];
+    float w[64];
+    const int shared_in = c->shared_inter;
+    float sg_raw = 0.0f;
+    int shared_pre = 1;
+    PROF_START(P_QRTR);
+    {
+        /* The router and the shared expert's gate, up and gate scalar all
+         * read `in`: one job. The shared expert keeps its outputs in m->ff
+         * until it runs, which nothing on the routed paths below touches
+         * except the serial loop — and that clears shared_pre. */
+        const mvb_item proj[4] = {
+            { sc, waste_find(m, tname("%smodel.layers.%d.mlp.gate.weight", c->prefix, L)), E },
+            { m->ff, waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.gate_proj.weight",
+                                         c->prefix, L)), shared_in },
+            { m->ff + shared_in, waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.up_proj.weight",
+                                                     c->prefix, L)), shared_in },
+            { &sg_raw, waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert_gate.weight",
+                                           c->prefix, L)), 1 },
+        };
+        matvec_t_batch(m, in, hid, proj, 4);
+    }
+    const int route_rc = waste_qwen_moe_route(sc, E, K, c->renorm, idx, w,
+                                              m->moe_prob, m->moe_used);
+    PROF_END(P_QRTR);
+    if (route_rc != 0) {
+        memset(out, 0, (size_t)hid * sizeof(float));
+        return;
+    }
+    if (routed) for (int j = 0; j < K; j++) routed[j] = idx[j];
+    if (dump_route) {
+        FILE *df = fopen(dump_route, (dump_pos0 || L) ? "a" : "wb");
+        if (df) {
+            fprintf(df, "%d %d", dump_pos0, L);
+            for (int j = 0; j < K; j++) fprintf(df, " %d", idx[j]);
+            for (int j = 0; j < K; j++) fprintf(df, " %.6g", w[j]);
+            for (int j = 0; j < K; j++) fprintf(df, " -1");
+            fputc('\n', df);
+            fclose(df);
+        }
+    }
+    waste_ecache_hint(&m->cache, L, idx, K);
+    memset(out, 0, (size_t)hid * sizeof(float));
+    float *ga = m->ff, *ub = ga + inter, *acc = m->e_gate;
+    const int lut_sz = (hid / m->vec_dim) * m->stages * m->cb_entries;
+    float *lut_gate = m->lut, *lut_up = lut_gate + lut_sz, *lut_down = lut_up + lut_sz;
+    float sg = 0.0f;
+    int shared_done = 0;
+
+    /* When the cache decides, it decides per expert and not per layer.
+     *
+     * §82 took the expert-parallel path only when all ten records were
+     * resident, and a layer missing one went to the row split for all ten:
+     * thirty dispatches of rows too short to fill the pool. At a 16 GiB
+     * cache that was 4,723 of 10,464 layers in a 200-token run, at 1.71 ms
+     * against 0.69 for a whole-resident layer, and half of them were missing
+     * exactly one record. So the residents go first, one expert per task —
+     * they need no read, so holding them is no barrier — and the reads the
+     * hint issued for the rest run underneath. The misses follow once they
+     * land, with the shared expert computed in the gap, since it needs no
+     * record either.
+     *
+     * Both stages run through experts_staged, in equal row ranges rather
+     * than one task per expert, so neither a batch of ten nor a lone miss
+     * leaves threads idle. §88 had split the misses between rows and tasks
+     * at four; the row ranges beat both (LEARNED §90).
+     *
+     * The order experts are computed in is not the order they are summed
+     * in — each writes its own slice and the sum below runs in route order —
+     * so this path, the fixed batches and the serial loop are bit-identical.
+     * A forced WASTE_XPAR, or an explicit WASTE_XPAR_BATCH, keeps §82's
+     * fixed batches; WASTE_XPAR=0 the serial loop. */
+    if (xpar_on < 0 && !xpar_batch_set && m->xga && K > 1 &&
+        K <= WASTE_PF_MAX && m->cache.n_slots >= 4 * K) {
+        const uint8_t *recs[WASTE_PF_MAX];
+        int order[WASTE_PF_MAX], later[WASTE_PF_MAX];
+        int nres = 0, nmis = 0, ok = 1, lut_done = 0;
+        for (int j = 0; j < K; j++) {
+            if (waste_ecache_resident_all(&m->cache, L, idx + j, 1)) order[nres++] = j;
+            else later[nmis++] = j;
+        }
+        memcpy(order + nres, later, (size_t)nmis * sizeof(int));
+        for (int stage = 0; stage < 2 && ok; stage++) {
+            const int *list = stage ? order + nres : order;
+            const int n = stage ? nmis : nres;
+            if (!n) continue;
+            if (stage) { sg = qwen_shared_expert(m, L, in, acc, shared_pre, sg_raw); shared_done = 1; }
+            PROF_START(P_EDEQ);
+            for (int t = 0; t < n && ok; t++) {
+                recs[list[t]] = waste_ecache_hold(&m->cache, L, idx[list[t]],
+                                                  bank_fetch, m);
+                if (!recs[list[t]]) ok = 0;
+            }
+            PROF_END(P_EDEQ);
+            if (!ok) break;
+            PROF_START(P_EMM);
+            if (!lut_done) {
+                const waste_expert_hdr *h0 = (const waste_expert_hdr *)recs[list[0]];
+                vq_build_lut(m, lut_gate, h0->codebook_id + 0 * m->stages,
+                             in, hid, m->stages, m->cb_entries, m->vec_dim,
+                             NULL, NULL);
+                vq_build_lut(m, lut_up, h0->codebook_id + 1 * m->stages,
+                             in, hid, m->stages, m->cb_entries, m->vec_dim,
+                             NULL, NULL);
+                lut_done = 1;
+            }
+            if (m->index_bits != 6 && !vq8_on) {
+                experts_staged(m, recs, list, n, inter, hid, lut_gate, lut_up);
+            } else {
+                xpar_arg pa = { m, c, recs, w, 0, inter, hid,
+                                lut_gate, lut_up, NULL, NULL, NULL, NULL, list };
+                waste_parallel_for_each(n, moe_expert_range, &pa, g_pool.nthreads);
+            }
+            PROF_END(P_EMM);
+            waste_ecache_release(&m->cache);
+        }
+        if (ok) goto qwen_moe_sum;
+        /* Something did not read: let go of what was held and fall through
+         * to the serial loop, which re-reads and reports the reason. It uses
+         * `acc` as its accumulator, so the shared expert is redone after. */
+        waste_ecache_release(&m->cache);
+        shared_done = 0;
+    }
+
+    /* Forced, or batched explicitly: §82's fixed batches, the barrier and
+     * all. WASTE_XPAR=0/1 forces the path either way. */
+    const int xpar_here = xpar_on >= 0
+        ? xpar_on
+        : waste_ecache_resident_all(&m->cache, L, idx, K);
+    if (xpar_here && m->xga && K > 1 && K <= WASTE_PF_MAX &&
+        m->cache.n_slots >= 4 * K) {
+        const uint8_t *recs[WASTE_PF_MAX];
+        const int batch = xpar_batch;
+        int lut_done = 0, ok = 1;
+        for (int j0 = 0; j0 < K; j0 += batch) {
+            int j1 = j0 + batch;
+            if (j1 > K) j1 = K;
+            PROF_START(P_EDEQ);
+            int n = j0;
+            for (; n < j1; n++) {
+                recs[n] = waste_ecache_hold(&m->cache, L, idx[n], bank_fetch, m);
+                if (!recs[n]) break;
+            }
+            PROF_END(P_EDEQ);
+            if (n < j1) { ok = 0; break; }
+            PROF_START(P_EMM);
+            if (!lut_done) {
+                const waste_expert_hdr *h0 = (const waste_expert_hdr *)recs[0];
+                vq_build_lut(m, lut_gate, h0->codebook_id + 0 * m->stages,
+                             in, hid, m->stages, m->cb_entries, m->vec_dim,
+                             NULL, NULL);
+                vq_build_lut(m, lut_up, h0->codebook_id + 1 * m->stages,
+                             in, hid, m->stages, m->cb_entries, m->vec_dim,
+                             NULL, NULL);
+                lut_done = 1;
+            }
+            /* Qwen's experts read the hidden state directly: there is no
+             * latent projection, so `lat` is the hidden size. One expert
+             * per range: a batch of ten on eight threads cut as rows would
+             * be five ranges of two, and three threads with nothing. */
+            xpar_arg pa = { m, c, recs, w, j0, inter, hid,
+                            lut_gate, lut_up, NULL, NULL, NULL, NULL, NULL };
+            waste_parallel_for_each(j1 - j0, moe_expert_range, &pa,
+                                    g_pool.nthreads);
+            PROF_END(P_EMM);
+            waste_ecache_release(&m->cache);
+        }
+        if (ok) goto qwen_moe_sum;
+        waste_ecache_release(&m->cache);
+    }
+
+    /* ga and ub are m->ff: the shared expert's projections are about to be
+     * overwritten, and it redoes them after. */
+    shared_pre = 0;
+    int lut_ready = 0;
+    for (int j = 0; j < K; j++) {
+        PROF_START(P_EDEQ);
+        const uint8_t *rec = read_expert(m, L, idx[j]);
+        PROF_END(P_EDEQ);
+        if (!rec) break;
+        PROF_START(P_EMM);
+        if (!lut_ready) {
+            const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
+            vq_build_lut(m, lut_gate, h->codebook_id + 0 * m->stages,
+                         in, hid, m->stages, m->cb_entries, m->vec_dim, NULL, NULL);
+            vq_build_lut(m, lut_up, h->codebook_id + 1 * m->stages,
+                         in, hid, m->stages, m->cb_entries, m->vec_dim, NULL, NULL);
+            lut_ready = 1;
+        }
+        qwen_expert_rows(m, rec, inter, hid, lut_gate, lut_up, ga, ub, acc, lut_down);
+        const float wj = w[j];
+        for (int i = 0; i < hid; i++) out[i] += wj * acc[i];
+        PROF_END(P_EMM);
+    }
+    goto qwen_moe_shared;
+
+qwen_moe_sum:
+    /* Summed in route order, so the total does not depend on the thread
+     * count, the batch, or which experts were resident. */
+    {
+        PROF_START(P_EMM);
+        for (int j = 0; j < K; j++) {
+            const float *accj = m->xacc + (size_t)j * hid;
+            const float wj = w[j];
+            for (int i = 0; i < hid; i++) out[i] += wj * accj[i];
+        }
+        PROF_END(P_EMM);
+    }
+qwen_moe_shared:
+    /* Not m->h: qwen_step passes it as `out`, and the routed sum is already
+     * in there waiting for HyperConnection to consume it. The expert
+     * accumulator is dead once the routed experts are done and is sized for
+     * hid floats, so the shared expert lands there. */
+    if (!shared_done) sg = qwen_shared_expert(m, L, in, acc, shared_pre, sg_raw);
+    {
+        PROF_START(P_QSHX);
+        for (int i = 0; i < hid; i++) out[i] += sg * acc[i];
+        PROF_END(P_QSHX);
+    }
+}
+
+/* Which experts layer L+1 is about to route to, asked as soon as layer L's
+ * MoE is back in the streams — so the reads it starts run under L+1's
+ * attention instead of after its router.
+ *
+ * Kimi's lookahead (§34) runs the next router on this layer's MoE input.
+ * On Qwen that input is one HyperConnection mix of four streams, and L+1's
+ * router will see a different mix of different streams. At the width used
+ * here it would have started 32% of L+1's cache misses early, for 0.43
+ * wasted reads a layer. L+1's own MLP mix, applied to the streams as they
+ * now are, starts 43% for 0.09 — and costs more than the reads it saves,
+ * 4.6% slower end to end. This is its cheap half: each stream normalized
+ * with L+1's MLP mix weights and averaged, the dynamic gate left out. 43%
+ * for 0.23, at the price of four norms and one router projection. LEARNED
+ * §89 has the other predictors and the widths.
+ *
+ * `m->x`, the block output and the router area are all dead here — the
+ * next layer's attention mix writes the first, its attention the second —
+ * so the guess needs no scratch of its own. Asking earlier, straight after
+ * layer L routes, would have needed scratch and measured the same expert
+ * I/O: what is still waited for is the misses no top-6 guesses. It only chooses what is read
+ * early; the real router still decides, so the logits cannot move. */
+static int qwen_predict_next_moe(waste_model *m, int L, int *out, int n)
+{
+    const waste_config *c = &m->cfg;
+    const int E = c->n_experts, hid = c->hidden, hc = c->hc_count;
+    if (n <= 0 || L + 1 >= c->n_layers) return 0;
+    if (n > E) n = E;
+    const waste_tensor *g = waste_find(m, tname("%smodel.layers.%d.mlp.gate.weight",
+                                                c->prefix, L + 1));
+    const waste_tensor *nw = waste_find(m, tname(
+        "%smodel.layers.%d.mlp_hyper_connection.hc_norm.weight", c->prefix, L + 1));
+    if (!g || !nw || !nw->data) return 0;
+    float *x = m->x, *nb = m->h, *sc = m->att + WASTE_ATT_ROUTER_OFF;
+    memset(x, 0, (size_t)hid * sizeof(float));
+    for (int b = 0; b < hc; b++) {
+        waste_qwen_rmsnorm(nb, m->hcx + (size_t)b * hid,
+                           nw->data + (size_t)b * hid, hid, hid, c->eps);
+        for (int i = 0; i < hid; i++) x[i] += nb[i];
+    }
+    matvec_t(m, sc, g, x, E, hid);
+    /* Top n by insertion: n is a handful and E is 512. */
+    int k = 0;
+    for (int e = 0; e < E; e++) {
+        const float v = sc[e];
+        if (!(v == v)) continue;
+        if (k == n && !(v > sc[out[n - 1]])) continue;
+        int q = k < n ? k++ : n - 1;
+        while (q > 0 && v > sc[out[q - 1]]) { out[q] = out[q - 1]; q--; }
+        out[q] = e;
+    }
+    return k;
+}
+
+static const float *qwen_step(waste_model *m, int token, int pos, int *routed)
+{
+    dump_pos0 = pos;
+    const waste_config *c = &m->cfg;
+    const int hid = c->hidden, hc = c->hc_count;
+    {
+        const int cm = waste_model_ctx_max(m);
+        if (cm && (pos < 0 || pos >= cm)) { m->ctx_full = 1; return NULL; }
+    }
+    waste_embed_row(m, token, m->x);
+    for (int b = 0; b < hc; b++)
+        memcpy(m->hcx + (size_t)b * hid, m->x, (size_t)hid * sizeof(float));
+
+    float *block = m->h;
+    for (int L = 0; L < c->n_layers; L++) {
+        if (m->read_error) break;
+        if (L == c->ple_layer) {
+            PROF_START(P_QPLE);
+            qwen_ple_inject(m, token);
+            PROF_END(P_QPLE);
+        }
+        float inj[16];
+        /* The braces are for PROF_START, which declares its start time:
+         * HyperConnection is timed in three pieces per layer, and each
+         * needs a scope of its own. */
+        {
+            PROF_START(P_QHC);
+            qwen_hc_mix_t(m, m->hcx, NULL, NULL,
+                waste_find(m, tname("%smodel.layers.%d.attn_hyper_connection.hc_norm.weight", c->prefix, L)),
+                waste_find(m, tname("%smodel.layers.%d.attn_hyper_connection.input_mix_weight_down.weight", c->prefix, L)),
+                waste_find(m, tname("%smodel.layers.%d.attn_hyper_connection.input_mix_weight_up.weight", c->prefix, L)),
+                waste_find(m, tname("%smodel.layers.%d.attn_hyper_connection.block_inject_weight.weight", c->prefix, L)),
+                1, m->x, inj);
+            PROF_END(P_QHC);
+        }
+        if (!c->qwen_full[L]) {
+            PROF_START(P_KDA);
+            qwen_gdn_layer(m, L, m->x, block);
+            PROF_END(P_KDA);
+        } else {
+            PROF_START(P_MLA);
+            qwen_qsa_layer(m, L, m->x, block, pos);
+            PROF_END(P_MLA);
+        }
+        {
+            PROF_START(P_QHC);
+            /* The attention block goes into the streams inside the mix. */
+            qwen_hc_mix_t(m, m->hcx, block, inj,
+                waste_find(m, tname("%smodel.layers.%d.mlp_hyper_connection.hc_norm.weight", c->prefix, L)),
+                waste_find(m, tname("%smodel.layers.%d.mlp_hyper_connection.input_mix_weight_down.weight", c->prefix, L)),
+                waste_find(m, tname("%smodel.layers.%d.mlp_hyper_connection.input_mix_weight_up.weight", c->prefix, L)),
+                waste_find(m, tname("%smodel.layers.%d.mlp_hyper_connection.block_inject_weight.weight", c->prefix, L)),
+                1, m->x, inj);
+            PROF_END(P_QHC);
+        }
+        {
+            PROF_START(P_ROUTE);
+            qwen_moe_layer(m, L, m->x, block, routed ? routed + (size_t)L * c->top_k : NULL);
+            PROF_END(P_ROUTE);
+        }
+        {
+            PROF_START(P_QHC);
+            waste_qwen_hc_combine(m->hcx, block, inj, hc, hid, m->hcx);
+            PROF_END(P_QHC);
+        }
+        /* The disk is about to go idle through the next layer's attention:
+         * start the reads its router is likely to ask for. Width 6 is
+         * WASTE_LOOKAHEAD's default for Kimi too, and it is where Qwen's
+         * curve peaked here — wider guesses read more than they save. */
+        if (lookahead_n && m->cache.io && m->cache.n_slots > 0) {
+            PROF_START(P_ROUTE);
+            PROF_START(P_QLAH);
+            int nxt[64];
+            const int nn = qwen_predict_next_moe(m, L, nxt, lookahead_n);
+            if (nn) waste_ecache_prefetch(&m->cache, L + 1, nxt, nn);
+            PROF_END(P_QLAH);
+            PROF_END(P_ROUTE);
+        }
+        /* Same role as the Kimi dump in waste_model_step: one residual
+         * stream after every layer. Qwen's stream is the hc hyper-state. */
+        const char *dump_hidden = getenv("WASTE_DUMP_HIDDEN");
+        if (dump_hidden) {
+            FILE *df = fopen(dump_hidden, (L || pos) ? "ab" : "wb");
+            if (df) {
+                fwrite(m->hcx, sizeof(float), (size_t)hc * (size_t)hid, df);
+                fclose(df);
+            }
+        }
+    }
+    PROF_START(P_QHC);
+    qwen_hc_mix_t(m, m->hcx, NULL, NULL,
+        waste_find(m, tname("%smodel.hyper_connection_mixer.hc_norm.weight", c->prefix)),
+        waste_find(m, tname("%smodel.hyper_connection_mixer.input_mix_weight_down.weight", c->prefix)),
+        waste_find(m, tname("%smodel.hyper_connection_mixer.input_mix_weight_up.weight", c->prefix)),
+        NULL, 0, m->x, NULL);
+    PROF_END(P_QHC);
+    PROF_START(P_HEAD);
+    matvec_t(m, m->logits, waste_find(m, tname("%slm_head.weight", c->prefix)), m->x,
+             c->vocab, hid);
+    PROF_END(P_HEAD);
+    return m->read_error ? NULL : m->logits;
+}
+
 const float *waste_model_step(waste_model *m, int token, int pos, int *routed)
 {
+    if (m->cfg.arch_qwen) return qwen_step(m, token, pos, routed);
     dump_pos0 = pos;
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;

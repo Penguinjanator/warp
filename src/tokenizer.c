@@ -44,6 +44,12 @@ struct waste_tok {
      * and one without — which is exactly the kind of text that appears in
      * a Chinese release's own prompts. */
     int han_split;
+    /* How many digits one pre-token may take: `\p{N}{1,3}` on the Kimi and
+     * GLM patterns, `\p{N}` on Qwen's, which splits every digit into its
+     * own piece. Not cosmetic — "2026" is one token under a 3-digit run
+     * and four under a 1-digit one, and the difference shows up nowhere as
+     * an error, only as a model reading numbers it was never trained on. */
+    int digit_run;
     /* WASTE_TOKPAT_*. han_split is read only by the cl100k scanner; the
      * DeepSeek one isolates CJK unconditionally because its own pattern
      * does, in a dedicated Split that runs before the main one. */
@@ -212,7 +218,7 @@ waste_tok *waste_tok_open(const char *dir)
     /* The Kimi pattern until a container says otherwise: every model here
      * before GLM has the Han branch, and a default that has to be set to
      * keep working is a default that will be missed. */
-    if (t) t->han_split = 1;
+    if (t) { t->han_split = 1; t->digit_run = 3; }
     if (!t) { free(raw); return NULL; }
     t->blob = (uint8_t *)malloc((size_t)sz);          /* decoded is smaller */
     t->cap_tokens = 4096;
@@ -305,6 +311,14 @@ void waste_tok_set_pattern(waste_tok *t, int pattern)
     if (t && pattern >= 0 && pattern < WASTE_TOKPAT__COUNT) t->pattern = pattern;
 }
 
+void waste_tok_set_digit_run(waste_tok *t, int n)
+{
+    /* A container that states something outside what any of these patterns
+     * spell is a container this cannot honour; keep the default rather
+     * than invent a third behaviour. */
+    if (t && (n == 1 || n == 3)) t->digit_run = n;
+}
+
 /* ---- UTF-8 + the character classes the pattern needs -------------------- */
 
 static int utf8_next(const char *s, int len, int *cp)
@@ -376,7 +390,7 @@ static int is_space(int c)
 
 /* Advances one pre-token, returning its byte length. Mirrors the branch
  * order of the model's pat_str. */
-static int next_piece(const char *s, int len, int han_split)
+static int next_piece(const char *s, int len, int han_split, int digit_run)
 {
     int cp, n = utf8_next(s, len, &cp), i;
     if (n == 0) return 0;
@@ -422,11 +436,11 @@ static int next_piece(const char *s, int len, int han_split)
         return i;
     }
 
-    if (is_digit(cp)) {                                 /* \p{N}{1,3} */
+    if (is_digit(cp)) {                     /* \p{N}{1,digit_run} */
         i = n;
         int cnt = 1;
-        while (i < len && cnt < 3) { int c3, k = utf8_next(s + i, len - i, &c3);
-                                     if (!is_digit(c3)) break; i += k; cnt++; }
+        while (i < len && cnt < digit_run) { int c3, k = utf8_next(s + i, len - i, &c3);
+                                             if (!is_digit(c3)) break; i += k; cnt++; }
         return i;
     }
 
@@ -664,7 +678,7 @@ static int next_piece_ds(const char *s, int len)
 static int next_piece_pat(const waste_tok *t, const char *s, int len)
 {
     if (t->pattern == WASTE_TOKPAT_DEEPSEEK) return next_piece_ds(s, len);
-    return next_piece(s, len, t->han_split);
+    return next_piece(s, len, t->han_split, t->digit_run);
 }
 
 /* ---- byte-pair merge ---------------------------------------------------- */

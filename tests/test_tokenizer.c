@@ -30,6 +30,10 @@ int main(int argc, char **argv)
      * to reach the GLM pattern. See waste_tok_set_han_split. */
     const char *nohan = getenv("WASTE_TOK_NOHAN");
     if (nohan && *nohan != '0') waste_tok_set_han_split(t, 0);
+    /* Same for the digit run: 1 is Qwen's `\p{N}`, 3 the default
+     * `\p{N}{1,3}`. See waste_tok_set_digit_run. */
+    const char *drun = getenv("WASTE_TOK_DIGITS");
+    if (drun) waste_tok_set_digit_run(t, atoi(drun));
     /* Same reason, for the release that needs a different pattern rather
      * than the same one without its Han branch. */
     const char *pat = getenv("WASTE_TOK_PATTERN");

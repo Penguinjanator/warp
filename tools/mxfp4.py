@@ -135,7 +135,8 @@ class ST:
         with open(os.path.join(self.dir, fn), "rb") as f:
             f.seek(base + beg)
             buf = bytearray(f.read(end - beg))
-        dt = {"U8": torch.uint8, "I8": torch.int8, "BF16": torch.bfloat16,
+        dt = {"U8": torch.uint8, "I8": torch.int8, "I64": torch.int64,
+              "BF16": torch.bfloat16,
               # E8M0 is a bare biased exponent with no sign and no mantissa.
               # Read as bytes; e8m0_scale() turns it into 2^(e-127). torch
               # has float8_e8m0fnu in recent versions and not in all of

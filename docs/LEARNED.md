@@ -5725,3 +5725,1363 @@ hotlist check knew how to say "this container's floor is too high"; it
 just did not know that opening is not the same as having room to learn
 anything. Both guards read the same JSON from `waste plan`. The second one
 cost one line.
+
+## 80. Qwen3.8-Flash-Next: what was new, and what only looked new (2026-09-04)
+
+Four architectural pieces this engine had never run — Gated DeltaNet,
+Qwen Sparse Attention, HyperConnection, and a per-layer n-gram embedding —
+and the useful finding is how little of the *engine* they touched. The
+container format did not change: a packed `[E, 2I, H]` gate_up beside an
+`[E, H, I]` down splits into exactly the WEXP records everything else
+writes, one expert per 4 KiB-aligned record, so routing still costs one
+`pread` and the expert cache, the read-ahead and the expert-parallel path
+were reused unmodified. What is genuinely Qwen's is five self-contained
+kernel files and a loader branch.
+
+**The 80 GiB trunk that is 2.6 GB resident.** The n-gram tables are 16
+heads of ~20 M rows, 78 of the trunk file's 80.51 GiB. Held resident they
+would exceed the whole RAM budget on any machine this targets; read a row
+per head per token they cost one Q8G row each. The same exclusion the
+embedding table has always had, for the same reason, and it is what makes
+a 176.94 B model open with a 3.11 GB floor. The converter has the mirror
+problem: a head is ~12 GiB as f32, so it is written 64 Ki rows at a time,
+relying on Q8G grouping along the last dimension to make the batches
+reconstruct what quantizing the head whole would have produced.
+
+**8 GiB of expert cache, and nothing above it.** Measured over 48 greedy
+tokens: 4 GiB gives 3.20 tok/s at an 8% hit rate, 8 GiB gives 4.97 at 64%,
+16 GiB gives 4.92 at 88%. The collapse below one working set is §3's rule
+again — below a multiple the hit rate is zero, not low. The flat top is
+the more useful half: **24 points of hit rate bought nothing**, because at
+64% the remaining reads already overlap the arithmetic. A cache sized to
+the machine rather than to the knee spends RAM for no tokens.
+
+**A tokenizer difference that no vocabulary test could see.** Qwen's
+pre-tokenization pattern is `\p{N}` where Kimi's and GLM's are
+`\p{N}{1,3}`: every digit is its own piece. `tools/hf_tokenizer.py` was
+right to refuse the pattern rather than approximate it, and the engine now
+carries `tokenizer_digit_run` the way it already carried
+`tokenizer_han_split`. The trap is in the checking, not the fixing —
+**Qwen's vocabulary contains no multi-digit token at all**, so on this
+checkpoint the two settings produce identical ids and every parity test
+passes either way. "202" has no merge to reach. The flag is therefore
+tested on a synthetic vocabulary that does hold `20`, where the pre-token
+boundary is directly visible. A parity test against the release would have
+green-lit the wrong pattern for the next member of the family.
+
+**An unexplained 4e-3.** The container-native oracle and the engine read
+the same trunk dequantized to the same f32, so their difference should be
+summation order — around 1e-6. It is 4e-3 relative per layer. Routed
+expert ids and weights match exactly at every layer and the argmax matches,
+so nothing observable is wrong, and end-to-end generation is coherent on
+the real checkpoint. It is recorded here undiagnosed rather than absorbed
+into a tolerance: 4e-3 is close to bf16's epsilon and nothing in that path
+should be rounding to bf16. The suite gates at the measured value so the
+number cannot grow while nobody is looking, which is the least a check can
+do about a thing it does not understand.
+
+## 81. Where a Qwen decode step goes, and a cache curve that climbs to 17 GiB (2026-09-11)
+
+`WASTE_PROFILE` stopped at Qwen's door. The forward pass had timers only
+in the expert-parallel branch of its MoE, so §80 could say how fast a token
+was and not where it went. It now times HyperConnection, PLE, GDN with its
+recurrence as a sub-phase, QSA with block selection and attention as a
+sub-phase, the router, the shared expert and the head, and both routed
+expert paths rather than one. The new phases take slots after the old ones
+— `tests/sweep.c` reads slots by number — and `test_forward` prints Qwen's
+as a tree with ms/step and a `wall` line. `WASTE_PROFILE=decode` leaves
+out the prompt steps, which are the ones that find the cache empty.
+
+The timers change nothing they time: final logits and every generated token
+are byte-identical with profiling on and off, on both MoE paths of the
+synthetic Qwen fixture. Their cost is inside run-to-run noise — 7.03 against
+7.01 tok/s at a 16 GiB cache and 6.35 against 6.33 at 8 GiB, profile on
+first — and the phases account for 99.9–100% of wall time on the real
+container, so the tree is not missing a branch.
+
+Everything below: the pinned checkpoint, an M4 Pro with 8 performance and
+4 efficiency cores, 48 GiB, the container on the internal SSD; an 18-token
+prompt, 200 greedy decode tokens, `WASTE_THREADS=8`, `test_forward`, one
+process per arm.
+
+**Where 141.5 ms goes**, at a 16 GiB cache and 7.03 tok/s:
+
+| phase | ms/step |
+|---|---:|
+| MoE, all of it | 67.5 |
+| ├ routed expert arithmetic | 52.2 |
+| ├ routed expert I/O | 6.6 |
+| ├ shared expert | 6.4 |
+| └ router | 2.1 |
+| GDN | 35.7 |
+| └ recurrence | 5.4 |
+| HyperConnection | 18.0 |
+| QSA | 13.3 |
+| └ selection and attention | 4.0 |
+| lm_head | 6.5 |
+| PLE | 0.6 |
+
+Expert I/O is 5% of that step, and 11% (17.3 ms) of the same step at 8 GiB.
+At either size Qwen on this machine is bound by arithmetic, not by the disk.
+
+Two rows are not what their names suggest. Only 5.4 of GDN's 35.7 ms is the
+recurrence; the rest is five projections, a short conv and a gated norm.
+And the trunk matvecs, spread across every row, are 154,600 calls in 200
+steps — 500 GB at 37.4 GB/s overall, but 17.1 GB/s below 1 MB, 31.0 from 1
+to 8 MB, 39.0 from 8 to 32 MB, and 98.3 for the head alone above that. The
+small calls are slow per byte, and `WASTE_WIDE_MIN` is not why: with eight
+threads on eight performance cores the fast group is the whole pool. What
+they have in common is a dispatch each. GDN's four input projections read
+the same vector, as do HyperConnection's down and inject projections, and
+they are four and two dispatches where one would do.
+
+**The cache curve**, profile off; hit rates and bytes are the whole run,
+prompt included:
+
+| expert cache | tok/s | hit rate | evictions | read | peak RSS |
+|---:|---:|---:|---:|---:|---:|
+| 8 GiB | 6.33 | 80.3% | 16,013 | 35.61 GB | — |
+| 12 GiB | 6.86 | 88.0% | 5,637 | 21.72 GB | 15.70 GB |
+| 16 GiB | 7.01 | 90.3% | 914 | 17.58 GB | 20.01 GB |
+| 20 GiB | 7.06 | 90.4% | 0 | 17.33 GB | 21.46 GB |
+| 24 GiB | 7.07 | 90.4% | 0 | 17.33 GB | 21.48 GB |
+
+`WASTE_DUMP_ROUTE` over the same run gives the number the curve bends at:
+10,049 distinct records, 17.33 GiB. At 8 GiB, 10,603 of the 20,652 misses
+were re-reads of records the cache had evicted; at 16 GiB, 144 of 10,193.
+Past the distinct set nothing is left to miss but first use, which is why
+20 and 24 GiB read exactly the same 17.33 GB.
+
+That set belongs to the session, not the architecture. New records per
+token: 188 across the prompt, 74 over decode tokens 0–49, 29 over 50–99,
+and 15 over both 100–149 and 150–199 — still about 28 MB a token when the
+run stopped. The pre-rewrite branch
+(`archive/qwen38-flash-next-pre-rewrite-20260904`) measured 95.39% at 8 GiB
+over 216 tokens of a different prompt that touched 4,783 records; the same
+cache size is 95% or 80% depending on what is being written. On 48 GiB a
+20 GiB cache peaked at 21.5 GB resident with no swap, so this machine holds
+the whole distinct set of a run this long, and a longer one will keep
+asking for more.
+
+**§80's flat top does not survive a longer run.** §80 measured 4.97 tok/s
+at 8 GiB and 4.92 at 16 over 48 tokens and concluded that above 8 GiB a
+better hit rate buys nothing. Over 200 tokens the same step is worth 11%
+(6.33 to 7.01). The runs differ in length, prompt and thread count, and
+this entry does not isolate which of those flattened §80's curve.
+
+**The first PLE number was a cold page cache.** 3.54 ms/step on the first
+run after the container came back from network storage, 0.58 on every run
+after it. `trunk.bin` is opened without `F_NOCACHE`, unlike the expert
+banks, so on-disk n-gram rows go through the page cache.
+
+## 82. One dispatch per Qwen layer, when the cache already holds it (2026-09-11)
+
+The pre-rewrite branch had two measured Qwen CPU defaults that the rewrite
+dropped: the expert-parallel path forced on at a batch of four (+12.8%),
+and a "one-join layer job" that held all ten routed records and ran them in
+one pool dispatch (+10.9% on top). Both were measured at a 95.39% hit rate,
+and neither ports as it was.
+
+The layer job needs no port at all. Its CPU half holds all K records,
+builds the gate and up tables once and hands all K to one
+`waste_parallel_for` — which is this branch's expert-parallel loop with a
+batch of K. Its struct was a seam for a Metal backend; the CPU speed was
+the batch. So both changes could be measured from the environment before
+writing any code, on §81's protocol, 16 GiB arms alternated:
+
+| arm | 16 GiB tok/s | 8 GiB tok/s |
+|---|---:|---:|
+| cache decides, batch 4 (the default) | 7.00, 6.94, 7.10, 7.01 | 6.35 |
+| forced on, batch 4 | 6.85, 6.87 | — |
+| forced on, batch 10 | 7.34, 7.32 | 5.97 |
+| cache decides, batch 10 | 7.60, 7.48 | 6.52 |
+
+**Forcing the path is §44's barrier, measured on a third model.** Forced
+at batch 10 and 16 GiB, expert arithmetic fell from 52 to 34 ms a step and
+expert I/O rose from 6.3 to 19.3 ms, for 5%. At 8 GiB, where a fifth of the
+records miss, the same arm's I/O was 45.6 ms against 17.3 and the step lost
+6%. Forced at batch 4 it lost at 16 GiB as well. The archive's gains were
+real at 95% and are not a property of the model: at a lower hit rate the
+hold waits on reads that the row split would have overlapped.
+
+Letting the cache decide and then taking all ten keeps the arithmetic
+without the wait, because a layer only gets there with every record
+already held. It is now the Qwen default: `qwen_moe_layer` uses a batch of
+K when the cache chose the path, and a forced `WASTE_XPAR=1` or an explicit
+`WASTE_XPAR_BATCH` keeps the batch it was given. On that build, against
+`WASTE_XPAR_BATCH=4` in the same binary:
+
+| ms/step unless stated | 16 GiB | 16 GiB | 8 GiB |
+|---|---:|---:|---:|
+| tok/s, batch 4 → K | 7.08 → 7.65 | 7.02 → 7.50 | 6.34 → 6.52 |
+| MoE | 67.3 → 57.4 | 67.6 → 58.5 | 82.6 → 79.3 |
+| ├ expert arithmetic | 51.9 → 42.0 | 52.2 → 43.0 | 56.2 → 52.9 |
+| └ expert I/O | 6.6 → 6.6 | 6.5 → 6.4 | 17.3 → 17.2 |
+
++7.4% at 16 GiB and +2.8% at 8 GiB, the same bytes read, and no other phase
+moved by more than 0.6 ms. The gain is smaller at 8 GiB because fewer
+layers find all ten resident, and the path those layers take is unchanged.
+Kimi's and GLM's `moe_layer` keep a batch of four: the reasoning carries
+over, but nobody has measured it there.
+
+All 27 real-container runs in §81 and here generated the same 200 tokens.
+
+**Two harness mistakes, neither of which changed a conclusion.** The
+synthetic Qwen fixture opens with no expert cache under `test_forward`'s
+defaults, and the expert-parallel path needs four slots per routed expert.
+So every "both paths" comparison made on it — §81's profiling check and
+the first version of this entry's suite check — compared the row split with
+itself. With `WASTE_CACHE_MB=1`, 256 slots and the whole bank, the row
+split, forced batches of 4 and 64 and the default give identical logits and
+generated tokens with profiling on and off, and the forced arms record no
+LUT apply at all, which is how we know they took the parallel path. The
+suite check now sets that cache. And the token comparisons read the second
+whitespace field of `[  0] 248068`, which below step 100 is the step index,
+so they compared 100 tokens rather than 200. Re-read from the saved logs
+with the index stripped, all 200 agree in every run.
+
+## 83. Qwen's trunk through i8mm: 29% for a difference the text cannot see (2026-09-13)
+
+§81 left GDN at 35.7 ms a step and HyperConnection at 18.0. Both looked
+like places for NEON loops — HyperConnection alone runs a sigmoid over
+10,240 values 96 times a token. They are not. `WASTE_PROFILE` now splits
+every phase into how much of it was trunk matvec (`PROF_START` notes the
+matvec total and `PROF_END` charges the difference) and prints matvec time
+by tensor role, a tensor's name with its layer number taken out, because
+the size buckets could not tell GDN's `out_proj` from QSA's `o_proj`. At
+f32, 7.33 tok/s:
+
+| phase | ms/step | of which matvec |
+|---|---:|---:|
+| HyperConnection | 19.1 | 16.1 |
+| GDN (recurrence 5.3) | 35.4 | 27.8 |
+| QSA | 13.0 | 8.6 |
+| shared expert | 6.5 | 6.2 |
+| lm_head | 6.3 | 6.3 |
+
+HyperConnection's loops are 3 ms; the rest of both phases is 4-bit
+projections. By tensor, at f32 and 7.57 tok/s: `in_proj_qkv` 11.9 ms at
+39.8 GB/s, `in_proj_z` 7.5 at 37.6, GDN `out_proj` 7.5 at 37.8,
+HyperConnection's down projections 9.1 at 17.1 and its up projections 6.0
+at 31.3, the shared expert's three 5.9 at 18–21, the router 1.8 at 17.3,
+and GDN's 48-row `in_proj_a`/`in_proj_b` 0.8 at 5.3. The large shapes run
+at about 5 GB/s a core on eight cores — compute-bound, not bandwidth-bound —
+and the small ones below that.
+
+**The kernel.** `WASTE_TRUNK_KERNEL` already had three alternatives to
+the f32 path. `sweep trunk=0,2,3,1`, one process, two repeats, 200 tokens
+teacher-forced against f32, 16 GiB cache and eight threads:
+
+| kernel | tok/s | KL vs f32 | top-10 | argmax |
+|---|---:|---:|---:|---:|
+| f32 | 7.45, 7.42 | — (second repeat: 0) | | |
+| i8mm | 9.54, 9.51 | 1.9e-4 | 99.1% | 199/200 |
+| SMLAL | 9.02, 9.02 | 1.3e-4 | 99.1% | 199/200 |
+| SDOT | 9.73, 9.91 | 6.1e-3 | 95.0% | 197/200 |
+
+f32 scoring exactly zero against itself on the second repeat is the check
+that `waste_model_reset` clears Qwen's state between arms. i8mm takes
+`in_proj_qkv` from 39.8 to 98.9 GB/s and GDN from 35.3 to 19.7 ms. Over
+512 positions i8mm's KL is 2.1e-4 (511/512) and SMLAL's 1.4e-4 (510/512).
+SDOT is out at thirty times the KL for 2% more speed.
+
+**That KL measured the easy positions.** `sweep` scores only generated
+tokens, where the model is predicting its own confident output. On a
+document it did not write, i8mm's KL is forty times higher, and a question
+about 200 generated tokens says nothing about whether a sparse-attention
+selection that only starts choosing past 2,048 tokens starts choosing
+differently. `tests/kernel_kl.c` loads the container once per kernel,
+steps every copy through the same tokens with the trunk kernel switched
+between them, and scores each position as it goes: KL, argmax, top-10,
+the logits' relative L2, how many of each layer's ten routed experts
+agree, and each kernel's next-token perplexity on the real text — the one
+column that says whether a copy further from f32 is any worse. Against
+itself every column is exactly zero.
+
+The prompt was 5,918 tokens: `docs/QWEN.md`, `src/qwen_qsa.c`,
+`src/qwen_gdn.c` and a question about both, tokenized a file at a time;
+then 256 tokens generated from f32's greedy choices.
+
+| over the prompt | i8mm | SMLAL |
+|---|---:|---:|
+| perplexity (f32 3.712) | 3.698 (−0.40%) | 3.714 (+0.03%) |
+| KL | 9.2e-3 | 7.0e-3 |
+| argmax | 5,711/5,918 (96.5%) | 5,734/5,918 (96.9%) |
+| top-10 | 93.2% | 94.2% |
+| routed experts agreeing | 97.65% | 97.93% |
+| layer-positions with any expert different | 20.3% | 18.1% |
+| generated: KL, argmax | 1.5e-3, 251/256 | 1.2e-3, 251/256 |
+
+Nothing grows. By 512-position window i8mm's KL is 2.9e-2 over the first
+window, where the text is prose the model finds hardest, and falls to
+2–5e-3 across the source files; the window straddling 2,048 is 1.4e-2
+against 1.0e-2 before it, with perplexity 0.8% *lower*. Expert agreement is
+97.1–98.1% in every window, and perplexity per window moves between −2.3%
+and +0.8% with no trend. One expert in forty goes elsewhere and one argmax
+in thirty differs, and neither shows up in how well the model predicts the
+text.
+
+**Free-running, it is a coin that lands both ways.** Answering the
+5,918-token prompt, greedy for 400 tokens, f32 walked through QSA's
+selection correctly and i8mm stated the indexer's key width as 256 (it is
+128) and spent its tokens re-reading the table. Five short prompts at both
+kernels, greedy to 600 tokens, raw completion — a train catch-up (6:00 pm),
+reversing a linked list in C, why the sky is blue, ordering four people by
+age, a summary in exactly three bullets — gave the same correct answers on
+the first four. On the fifth it was f32 that deliberated until the token
+limit, one bullet started, and i8mm that finished in 479 tokens with three.
+Greedy decoding parts at the first near-tie and after that the two are
+writing different answers; one sample each way is what that looks like.
+
+**Speed is short-context speed.** At 200 decode tokens the default build
+measures 9.91 tok/s against 7.70 with `WASTE_TRUNK_KERNEL=0` in the same
+binary, 29%; the five prompts gained 26–28%. Decoding at a 6K context it
+was 5.19 against 4.67, 11% — the attention the context adds is not trunk
+matvec, and those two runs hit 88% and 93% of the cache on different text.
+
+So it is the Qwen default: a Qwen load selects i8mm when
+`WASTE_TRUNK_KERNEL` is not set, and the variable pins either kernel. The
+kernel is process-wide, so a process that loads Qwen and then another
+architecture keeps i8mm for both. The suite needs no change: the
+container-native oracle runs with `WASTE_Q8=0`, which dequantizes the
+trunk at load, and Qwen's chunked prefill is its decode step in a loop.
+K3 is the reason this was measured rather than assumed: SDOT measured KL
+0.289 there, teacher-forced, because its recurrence carried the error
+forward (the note above `WASTE_TRUNK_KERNEL` in `model.c`), and nothing
+here says the next model is Qwen.
+
+**Chunk size, a smaller and exact change.** A matvec's rows went to the
+pool at no fewer than 64 a chunk, and the pool rounds a chunk up to a
+multiple of that floor: on eight threads the 320-row HyperConnection down
+projection split into five chunks, the shared expert's 640 rows into five.
+Chunks are now about 16 KB of weights, a power of two of 2 to 64 rows, so
+i8mm's two-row tiles land on the same rows — tokens identical at both
+kernels. HyperConnection down went 17.1 → 19.4 GB/s at f32 and 29.5 → 31.6
+at i8mm, the shared expert 25.1 → 28.8. The first version also split the
+48-row projections and took `in_proj_a` from 7.5 to 2.7 GB/s — 63 KB is
+cheaper on the calling thread than dispatched — so anything under 256 KB
+stays there. Net: i8mm 9.59 → 9.82 and 9.79 tok/s, f32 inside its noise.
+It changes chunking on every model and was measured on this one.
+HyperConnection down is still 32 GB/s against `in_proj_qkv`'s 99, with a
+10,240-wide activation quantized serially before each call as the suspect,
+unmeasured.
+
+`sweep`'s route columns read 0% on Qwen: `qwen_moe_layer` does not write
+the capture it compares. `kernel_kl` reads routes from
+`waste_model_step`'s own argument instead.
+
+## 84. HyperConnection's down projection was waiting for the pool to wake (2026-09-13)
+
+§83 left HyperConnection's 320×10,240 down projection at 31.6 GB/s under
+i8mm, a third of `in_proj_qkv`'s 99. Two explanations fit that: the
+activation quantizer, scalar and on the calling thread, has four times the
+input to chew on at that shape; or the kernel is slower there. The profile
+now charges each tensor the time spent quantizing its activation and
+prints the kernel's speed with that taken out, and one thread against
+eight separates the kernel from the dispatch:
+
+| tensor | kernel GB/s, 1 thread | 8 threads | scaling | quantizing, ms/step |
+|---|---:|---:|---:|---:|
+| `in_proj_qkv` 13.1 MB | 16.5 | 81.1 | 4.9× | 0.14 |
+| GDN `out_proj` 7.9 MB | 16.1 | 70.8 | 4.4× | 0.33 |
+| HyperConnection up 2.0 MB | 16.6 | 47.3 | 2.9× | 0.03 |
+| HyperConnection down 1.6 MB | 16.1 | 37.3 | 2.3× | 0.75 |
+| shared expert gate 0.8 MB | 16.3 | 27.6 | 1.7× | 0.19 |
+
+The kernel is 16 GB/s a core at every shape. What falls off is how much
+eight threads get out of a small call, and HyperConnection down's
+quantization is a quarter of its time but not the rest of it.
+
+**A pool worker parks after 8 µs.** `WASTE_SPIN`'s default is 20,000
+iterations of an atomic load and `yield`, and the loop alone measures 6–8
+µs on this machine (50,000: 19; 100,000: 32–47; 200,000: 60–76). The number
+was chosen in iterations against a 54 µs wake measured on another model
+(§67). In front of the down projection sit a combine over 4×2,560, an
+RMSNorm over 10,240 and the quantization — timed alone, 2, 9 and 4 µs (to
+the 1 µs the clock resolves; about 15 µs inside the engine) — so that
+matvec always found the pool asleep. After the up projection, a sigmoid
+over 10,240 through `expf` (11 µs) did the same to the next block's first
+projection.
+
+Spinning longer confirms it and is not the fix. Profiled, one run each:
+0 → 8.95 tok/s, 20,000 → 9.68, 100,000 → 10.81 with HyperConnection down
+at 89.1 GB/s, 400,000 → 10.43. Unprofiled, two runs each, with user+system
+CPU seconds per token as the only energy measure available without root:
+
+| `WASTE_SPIN` | tok/s | CPU s/token |
+|---:|---|---:|
+| 20,000 | 9.78, 9.90 | 0.49 |
+| 50,000 | 10.10, 10.30 | 0.52 |
+| 100,000 | 10.10, 10.42 | 0.56 |
+| 200,000 | 10.33, 10.82 | 0.58 |
+
+At 200,000, 7.5% more speed costs 17% more CPU — fewer tokens per
+CPU-second, which is the trade §67 bounded the spin to avoid. The profiled
+sweep's 11.7% was the profiler's own doing: a lock and two clock reads on
+every matvec lengthen exactly the gaps being measured, so it inflates
+anything that keeps workers awake. Judge those unprofiled, with repeats.
+
+**The change is to stop leaving the gaps.** HyperConnection's RMSNorm now
+runs one stream per task and its sigmoid in ranges, on the fast group, and
+`quant_act4_mm` quantizes one weight group per task once an input has 32
+or more (4,096 activations; GDN's 2,560-wide inputs stay serial). Each
+element goes through the same function in the same order, so the bytes
+are the serial loops' — tokens identical in every run. Profiled,
+HyperConnection went 12.0 → 9.5 ms a step, its down projection 43.5 → 76
+GB/s and its up 47 → 88. Unprofiled, against a build of the previous
+commit in the same process sequence:
+
+| | default spin, three runs | CPU s/token | spin 200,000 |
+|---|---|---:|---:|
+| before | 9.80, 9.84, 9.91 | 0.487 | 10.64 |
+| after | 10.07, 10.00, 10.07 | 0.501 | 11.19 |
+
++2.0%, every run of the new build above every run of the old, for 3% more
+CPU a token. Smaller than the profile said, and cheaper than the spin that
+bought 3.7% for 7%.
+
+**What is left is not HyperConnection.** The new build is still 11% faster
+at spin 200,000, so other serial stretches still put the pool to sleep. The
+largest is GDN's recurrence, 5.3 ms a step on the calling thread — 147 µs a
+layer, sitting between `in_proj_qkv` and `out_proj` — then QSA's selection
+and attention at 4 ms.
+
+One harness note, for whoever measures this next: the session scratchpad
+was emptied twice mid-session and took reference logs with it. Every
+comparison above ran in one command against a build of `HEAD` made with
+`git archive`, so none of it depends on a file surviving between runs.
+
+## 85. GDN's recurrence, one value head per task (2026-09-14)
+
+§84 ended on the largest serial stretch left in a Qwen decode step: GDN's
+recurrence, 5.3 ms a step on the calling thread — 147 µs in each of 36
+layers, between `in_proj_qkv` and `out_proj`. Its 48 value heads share
+nothing they write. A head reads its own rows of `v`, the decay and `beta`
+and of `S`, plus the QK head it is repeated from, and writes only its own
+rows of `S` and the output; the one shared buffer was a `Dv`-float scratch.
+
+So `qwen_gdn.c` stays the kernel file, now with
+`waste_qwen_gdn_step_heads(h0, h1, ...)` for a range of value heads, and
+`waste_qwen_gdn_step` is that range over all of them — the reference check
+in `tests/test_qwenparts.c` still calls the whole step and still passes.
+`qwen_gdn_layer` hands the heads to the fast group, each task with its own
+scratch on its stack. Same code per head in the same order, so the state
+and output are the serial loop's bit for bit.
+
+Against a build of the previous commit, unprofiled, 200 decode tokens,
+16 GiB cache, eight threads:
+
+| | three runs, tok/s | mean | CPU s/token |
+|---|---|---:|---:|
+| before | 9.96, 9.86, 9.93 | 9.92 | 0.505 |
+| after | 10.31, 10.21, 10.15 | 10.22 | 0.509 |
+
++3.1%, every run above every run before, tokens identical in all seven
+runs including the profiled one, and CPU per token within 1% — this one is
+parallel work, not a worker spinning. Profiled, the recurrence went from
+5.3 to 1.64 ms a step and GDN from 19.8 to 15.7, which is the same 3.7 ms.
+
+What it did not do is the other half of the reason given for it. GDN's
+`out_proj`, which followed the serial recurrence and so was expected to be
+paying for a parked pool, measured about 88 GB/s against 86 before. That
+projection is 7.9 MB and was already long enough to hide a wake; the gaps
+§84 found were costly in front of HyperConnection's 1.6 MB matvecs, not
+in front of every matvec.
+
+The largest serial stretch left is QSA's block selection and attention,
+4 ms a step across 12 layers.
+
+## 86. QSA's attention was a third of a long-context step, on one core (2026-09-14)
+
+Every profile until now ran at a context of about 220 tokens, and at that
+length QSA's selection and attention looked like the 4 ms §85 ended on.
+Three of its four parts grow with the context rather than the token, so
+that number could not say what a long conversation costs. The profile now
+splits it into the RoPE table the block scores rotate by, block pooling
+and top-k, the BF16-to-F32 gather of the selected K/V, and the attention
+itself, and was run at both lengths — the same 18-token prompt with 200
+decode tokens, and `docs/QWEN.md` (2,801 tokens) with 32:
+
+| ms/step | ~220-token context | ~2,830-token context |
+|---|---:|---:|
+| RoPE table | 0.13 | 4.3 |
+| block pooling and top-k | 0.13 | 5.2 |
+| K/V gather | 0.30 | 5.3 |
+| attention | 3.4 | 58.1 |
+| QSA, all of it | 8.3 | 77.7 |
+| the step | 96.7 (10.34 tok/s) | 170 (5.88 tok/s) |
+
+Nothing else in the step moved with the context — MoE, GDN and
+HyperConnection cost the same at both lengths. At 2,830 tokens QSA was 46%
+of the step and its attention alone a third: 24 query heads, each over
+every selected token at dimension 256, one after another on the calling
+thread. Its cost stops rising only when the selection fills its 2,048-token
+budget, so a long context sits near that figure.
+
+The heads are independent. A head reads its own query row and its KV head's
+keys and values and writes its own row of the output; the one thing they
+shared was a buffer of scores the width of the selection. `qwen_qsa.c`
+gains `waste_qwen_qsa_attn_heads(h0, h1, ...)`, `waste_qwen_qsa_attn` is
+that over every head (so `test_qwenparts` still checks the whole thing
+against the reference), and `qwen_qsa_layer` runs one head per task with
+its own row of scores. `qsa_scr` is therefore `n_heads` rows of the maximum
+selection — about 200 KB on this model — and `waste_plan_memory` counts
+the same, so the floor still describes what the load allocates.
+
+Against a build of the previous commit, unprofiled, 16 GiB cache, eight
+threads:
+
+| | before | after |
+|---|---:|---:|
+| ~220-token context, decode, two runs | 10.33, 10.24 | 10.65, 10.36 |
+| 2,801-token context, decode | 5.95 | 8.58 (+44%) |
+| 2,801-token context, reading the prompt | 7.25 | 9.39 (+30%) |
+
+The first-position logits are byte-identical and every generated token
+the same in all six runs. The long-context rows are one run a build; the
+gap is fifteen times the run-to-run spread measured so far. Profiled at the
+short context, attention went from 3.4 to 0.74 ms a step.
+
+What is left grows with the context and has not been touched: at 2,830
+tokens, 15 ms a step between the RoPE table (every past position's row
+recomputed every token, though a row never changes), block pooling (every
+complete block re-pooled, though a full block never changes, then a top-k
+that rescans every block once per block kept) and the gather (the whole
+selection converted on one core).
+
+## 87. The rest of QSA: work redone every token, and an argmax per block (2026-09-14)
+
+§86 left 15 ms a step of QSA at 2,830 tokens that grows with the context.
+All three parts are now bit-identical rewrites; none adds state.
+
+**The RoPE table.** Every token, every QSA layer rewrote the cos/sin rows
+for all T positions. A row is a function of its position alone, so once
+written it is right for every later token, every layer and any session a
+reset or restore produces. The model counts the rows it has filled
+(`qsa_cs_n`) and writes only those past it: 4.3 ms a step → 0.00.
+
+**Block selection.** `waste_qwen_qsa_select` is now `score_blocks`, which
+pools, rotates and scores a range of blocks — each block writes only its
+own pooled row and its own score, so `qwen_qsa_layer` scores them on the
+pool once there are 32 — followed by `pick`. The pick was a pass over every
+block for each block kept, about 360,000 comparisons a layer at this
+length; it is now a heapsort in the order that argmax took: the higher
+score first, and a tie to the earlier block, over exactly the scores it
+could ever have taken (above -1e30, which leaves out NaN). The order is the
+point — attention sums the selected tokens in it, so the same set in a
+different sequence would move the bits. `tests/test_qsa_pick.c` holds the
+old loop verbatim and compares it with the new one over 4,000 cases built
+to break an ordering: ties everywhere, NaN, -1e30 and -inf scores, and a
+budget below, at and above the block count. Pooling was kept per token
+rather than cached: a cache of pooled blocks would have been one more
+thing a reset, a restore and a rewound position all had to invalidate, and
+scoring them at once already took the part to 1.3 ms from 5.2.
+
+**The gather.** Each selected index writes its own rows of the F32 K/V
+and its own slot of the selection, so the BF16 conversion goes in ranges:
+5.3 → 1.2 ms.
+
+Against a build of §86's commit, unprofiled:
+
+| | before | after |
+|---|---:|---:|
+| ~220-token context, decode, two runs | 10.51, 10.53 | 10.74, 10.66 |
+| 2,801-token context, decode | 8.53 | 9.47 (+11%) |
+| 2,801-token context, reading the prompt | 9.37 | 9.83 (+5%) |
+
+First-position logits byte-identical and every token the same in all seven
+runs. Across §86 and §87, decode at 2,801 tokens went from 5.95 to 9.47
+tok/s and QSA at that length from 77.7 ms a step to 15.0, of which the
+attention — on the pool now — is 8.3.
+
+The step at either length is now mostly MoE: 57 ms of it at 2,801 tokens,
+and its expert arithmetic the largest single part.
+
+## 88. A layer missing one expert ran all ten as rows (2026-09-14)
+
+§87 left MoE the largest part of a Qwen step. On §81's protocol (18-token
+prompt, 200 decode tokens, 16 GiB cache, eight threads) it was 55.7 ms of
+it, and 42.8 of those the routed experts' arithmetic. The profile hid where:
+its LUT apply row is timed only on the row split, so the expert-parallel
+layers showed up as a remainder of about 19 ms with no row of its own.
+
+**Counted per layer**, over that run with the prompt included:
+
+| path | layers | ms per layer |
+|---|---:|---:|
+| expert-parallel, all ten resident | 5,741 | 0.69 |
+| row split, anything missing | 4,723 | 1.71 |
+
+§82's rule sent a layer down the row split if any of its ten records was
+absent, and 2,343 of those 4,723 layers were missing exactly one. For one
+read, nine resident experts gave up the single dispatch and took thirty,
+over rows too short to fill the pool.
+
+**The thread split was a smaller thing than it looked.** A batch of ten on
+eight threads went to `waste_parallel_for`, which cuts n into equal ranges:
+five ranges of two, three threads with no expert. `waste_parallel_for_each`
+now gives each item its own range and lets every participant take the next
+one. On its own it measured within noise — 10.41 and 10.65 tok/s before,
+10.43 and 10.50 after, expert arithmetic 43.75 → 42.95 ms — because it
+only touches the layers that were already fast. It stays, since the staged
+path below runs through it.
+
+**The staged path.** When the cache decides, `qwen_moe_layer` asks it
+about each expert rather than the layer. The residents are held and run
+first, one task per expert: they need no read, so holding them is no
+barrier. The hint issued the reads for the rest before the first hold, so
+those run underneath. Then the misses are held and run: as rows when there
+are fewer than four, as tasks when there are more, because one expert on
+one thread is slower than its rows on eight. The shared expert, which needs
+no record either, is computed between the two stages. A forced `WASTE_XPAR`
+or an explicit `WASTE_XPAR_BATCH` keeps §82's fixed batches.
+
+Each expert writes its own slice, and the sum still runs in route order
+afterwards, so the order the experts are computed in does not reach the
+bits. First-position logits were byte-identical and every generated token
+the same in all ten real-container runs below. The suite's schedule check
+gains a cold-cache arm: the fixture preloads its whole bank, so the default
+arm never met a miss and only ever ran the first stage; with
+`WASTE_PRELOAD=0`, five of its layers take the second.
+
+The threshold of four, as single runs on an instrumented build before the
+shared expert moved: 11.57 tok/s at four, 11.16 with every miss a task,
+11.33 with every miss as rows.
+
+Against a build of §87's commit, unprofiled:
+
+| | before | after |
+|---|---:|---:|
+| 16 GiB, decode, two runs | 10.37, 10.28 | 11.30, 11.14 (+8.7%) |
+| 8 GiB, decode | 8.39 | 9.08 (+8.2%) |
+| 2,801-token context, decode | 9.41 | 10.03 (+6.6%) |
+| 2,801-token context, reading the prompt | 9.83 | 10.55 (+7.3%) |
+
+Hit rates and bytes read are unchanged at either cache size (90.2% and
+17.72 GB; 79.8% and 36.4 GB). Profiled, decode only, 16 GiB:
+
+| ms/step | before | after |
+|---|---:|---:|
+| MoE | 55.7 | 49.0 |
+| ├ expert arithmetic | 42.8 | 34.7 |
+| │ ├ LUT build | 5.6 | 3.0 |
+| │ └ LUT apply (row split only) | 18.6 | 2.6 |
+| ├ expert I/O | 7.1 | 8.2 |
+| ├ shared expert | 3.9 | 4.1 |
+| └ router | 1.6 | 1.7 |
+
+**Expert I/O rose, and that is the next thing.** On the row split a read
+landed under the arithmetic of the experts routed ahead of it; now the
+residents finish first and the misses are waited for. Timed on the
+instrumented build, over decode only: the second stage waited 9.4 ms a
+step and computed for 3.8. A record is 1.72 MB and a read took 0.88 ms,
+against about 0.6 ms of first-stage arithmetic. More readers did not buy
+it back: every read got slower and so did the arithmetic beside it.
+
+| readers / depth | tok/s | ms per read |
+|---|---:|---:|
+| 2 / 2 (the default) | 11.29 | 0.885 |
+| 4 / 4 | 10.91 | 1.239 |
+| 8 / 8 | 10.73 | 1.445 |
+| 4 / 10 | 10.94 | 1.228 |
+
+What would help is starting those reads earlier than the layer's own
+router. Kimi's `moe_layer` already does, through `predict_next_moe`
+(§34), and Qwen's does not.
+
+## 89. Qwen's router lookahead: the cheap half of the next layer's mix (2026-09-14)
+
+§88 ended on expert I/O: 8.2 ms of a step spent waiting for the reads of
+experts no layer had asked for until its own router ran. Kimi starts them
+a layer early (§34, §35); Qwen did not. Its default `WASTE_LOOKAHEAD` of 6
+now applies to Qwen as well, with a predictor of its own.
+
+**Which input to give layer L+1's router**, measured before any of it read
+a byte: per layer transition over §81's 200 decode tokens at a 16 GiB
+cache, against L+1's real routing and the cache's residency at that
+moment. 0.71 of L+1's ten experts missed per transition.
+
+| predictor, top 6 | misses it would have started | wasted reads a layer |
+|---|---:|---:|
+| (a) layer L's MoE input — Kimi's | 32.1% | 0.43 |
+| (b) the same plus L's MoE output | 32.7% | 0.42 |
+| (c) L+1's MLP HyperConnection mix, on the streams after L | 43.0% | 0.09 |
+| (d) the streams normalized with (c)'s weights, averaged, no gate | 42.7% | 0.23 |
+| (e) the raw streams averaged | 38.0% | 0.45 |
+
+Kimi's predictor is weak here for a reason Kimi does not have: the MoE
+input is one mix of four streams, and the next router will see a different
+mix of different ones. (c) is nearly L+1's real MoE input, missing only
+L+1's attention, and wider it is better still — 75% of misses at top 10 for
+0.43 wasted. It is also a down projection over 10,240 values and an up
+projection back, per layer: 10.71–11.07 tok/s against 11.32–11.48 without
+the lookahead. (d) keeps its norms and drops the gate.
+
+A sixth, (f), predicted layer L from its own attention input, which is
+already computed and so costs only the router projection. It chose worse:
+93.8% hit rate and 21.05 GB read, against (d)'s 94.6% and 19.20 GB.
+
+**Width**, with (d), 16 GiB unless stated:
+
+| width | tok/s | hit rate | read |
+|---|---|---:|---:|
+| off | 11.34, 11.41 | 90.2% | 17.72 GB |
+| 3 | 11.46, 11.45 | 92.3% | 18.08 GB |
+| 4 | 11.09, 11.58 | 93.1% | 18.34 GB |
+| 6 | 11.00, 11.68 | 94.6% | 19.20 GB |
+| 8 | 11.11, 11.68 | 95.9% | 20.69 GB |
+| 10 | 11.23, 11.66 | 97.0% | 22.84 GB |
+| 12 | 11.32, 11.47 | 97.6% | 26.19 GB |
+| 16 | 11.03, 11.27 | 98.3% | 35.15 GB |
+| 8 GiB: off, 6, 10 | 9.09, 9.56, 9.07 | 79.8%, 88.3%, 92.7% | 36.4, 42.3, 55.3 GB |
+
+The first pass of this table dipped from width 4 to 8 and the second did
+not; this machine's run-to-run spread was ±3% all afternoon. Six is where
+the 8 GiB row peaks and the bytes have not yet started to climb.
+
+**Asked earlier, it waits the same.** Issuing (d)'s guess straight after
+layer L routes instead of after L's MoE gives the reads a whole MoE more to
+land in. Its hit rate was 94.3% against 94.6%, and expert I/O was 4.13 ms
+a step against 4.19 at 16 GiB, 16.47 against 16.27 at 8. What is still
+waited for is the misses no top-6 guess contains, not guesses that land
+late — so the guess stays where the buffers it needs are already dead.
+
+**Against a build of §88's commit**, unprofiled:
+
+| | before | after |
+|---|---|---|
+| 16 GiB, decode, three runs | 11.40, 11.01, 11.00 | 11.86, 11.01, 11.67 |
+| 8 GiB, decode, two runs | 9.01, 9.08 | 9.74, 9.86 (+8.2%) |
+| 2,801-token context, decode | 10.09 | 10.06 |
+| 2,801-token context, reading the prompt | 10.50 | 10.79 (+2.8%) |
+| read: 16 GiB / 8 GiB / 2,801-token run | 17.7 / 36.4 / 179 GB | 19.2 / 42.2 / 230 GB |
+
+First-position logits byte-identical and every token the same in all
+eleven runs; the suite's Qwen schedule check gains a cold arm with the
+lookahead off, and on the fixture the default's demand misses fall from
+7 to 3 with the same logits.
+
+Profiled, decode only, 16 GiB: expert I/O 8.25 → 4.58 ms a step, the
+lookahead itself 1.88 ms (a row of its own now, inside MoE), MoE 49.5 →
+46.5.
+
+**It costs bytes, and that is a choice rather than a finding.** The
+2,801-token run read 28% more, 29,000 more records at 1.72 MB — about the
+0.23 wasted reads a layer the table above predicted, over 2,833 steps, most
+of them spent reading the prompt. On this machine's internal SSD reads are
+not the budget and the lookahead was not slower in any configuration
+measured, so it is on by default for Qwen. This file judges K3's changes on
+bytes per token, and by that measure this one is a cost. A confidence
+cutoff — prefetch a guess only when its score clears the rest by a margin —
+might keep the useful reads and drop some of the wasted ones. It is not
+measured.
+
+## 90. The expert kernel was not waiting on memory, it was waiting on a thread with two (2026-09-14)
+
+After §89, 16 GiB and eight threads, the step was 85.6 ms and 34.7 of it
+the routed experts' arithmetic. Across thread counts, 64 decode tokens each:
+
+| ms/step | 1 thread | 2 | 4 | 8 | 12 | 1 → 8 |
+|---|---:|---:|---:|---:|---:|---:|
+| expert arithmetic | 152.5 | 87.9 | 52.0 | 34.7 | 32.4 | 4.40x |
+| lm_head | 48.2 | 24.3 | 12.4 | 6.4 | 7.3 | 7.55x |
+| GDN | 72.0 | 39.9 | 23.2 | 16.2 | 19.8 | 4.44x |
+| HyperConnection | 26.2 | 14.7 | 10.1 | 9.6 | 10.5 | 2.72x |
+| tok/s | 2.98 | 5.24 | 8.49 | 11.09 | 10.46 | |
+
+The trunk kernel runs 15 GB/s on one core at every call size. On eight its
+large calls reach 92–100 GB/s, a third of this machine's 273 GB/s, and its
+calls under 1 MB 25–28: those are dispatch, not arithmetic. Twelve threads
+lose, as §47 found on other models — the efficiency cores are stragglers.
+
+The expert kernel falls behind at two threads already (1.7x against lm_head's
+2.0x), which looked like memory: a gather is a load, an address and a load,
+and its tables sit in a cache the performance cores share. **It is not.**
+One engine thread, 32 decode tokens, with six other cores running each of
+five loads, two passes in opposite orders:
+
+| load | expert arithmetic | lm_head |
+|---|---|---|
+| none | 149.9, 154.1 | 46.6, 48.2 |
+| spin | 157.4, 158.9 | 49.3, 50.2 |
+| memcpy, 64 MB buffers | 157.4, 157.3 | 49.5, 49.5 |
+| address-dependent reads over 1 GB | 159.5, 159.8 | 49.4, 49.4 |
+| the same over 2 MB each | 157.6, 157.9 | 49.3, 49.3 |
+
+Everything lost 4–5% to any load at all, spin included — the cluster
+sharing power — and memory traffic added at most 1% on top. So the table
+was not quantized; `WASTE_VQ8`'s case rests on its kernel being faster, not
+on memory being the wall, and this entry did not test it.
+
+**What it was.** §88 gave every routed expert one task. Ten experts of
+equal size on eight threads is two threads with two experts and a barrier
+waiting for them: ten experts of work in two experts of wall time, 5x at
+best, and 4.4x measured. `experts_staged` cuts the work into equal pieces
+instead, in the three stages an expert depends on — every expert's gate and
+up rows 128 at a time, then each expert's activation and down table, then
+every expert's down rows 128 at a time. Three dispatches a layer, each
+piece writing only its own rows through the same `vq_rows` and
+`lutb_range` the per-expert task called, so the logits are unchanged. It
+runs both of §88's stages, and replaces the split between rows and tasks
+for the misses: every threshold of that split was slower.
+
+Against a build of §89's commit, unprofiled, logits byte-identical, every
+token the same and the bytes read unchanged in all eleven runs:
+
+| | before | after |
+|---|---|---|
+| 16 GiB, decode, three runs | 11.87, 11.41, 11.51 | 12.23, 11.95, 11.98 (+3.9%) |
+| 8 GiB, decode, two runs | 9.80, 9.75 | 10.19, 10.27 (+4.6%) |
+| 2,801-token context, decode | 10.03 | 10.56 (+5.3%) |
+| 2,801-token context, reading the prompt | 10.47 | 11.12 (+6.2%) |
+| expert arithmetic, profiled, ms/step | 34.3 | 26.8 |
+
+In one binary with a switch, an hour earlier, the same change measured
+11.19 and 11.14 against 12.17 and 11.92. The machine drifted by that much
+between the two sessions, which is why the table above is the one kept.
+
+Measured and not adopted, each within noise of the plain version at 16 GiB:
+
+| variant | tok/s |
+|---|---|
+| rows per piece 64 / 128 / 256 / 512 | 12.18, 11.83 / 12.14, 12.14 / 12.03, 12.34 / 11.94, 12.18 |
+| stage 2 in 16-vector pieces, the activation serial | 12.14, 11.99, 12.22 |
+| gate and up tables built in one dispatch | 11.86, 12.07, 12.12 |
+| both | 11.90, 12.09, 12.14 |
+| none of them | 12.25, 11.90, 12.02 |
+
+The suite cannot see the splitting: the synthetic Qwen fixture's matrices
+are 16 and 32 rows, under one piece. The eleven real-container runs above
+are what checks it.
+
+**The rest of this measurement, for the next entry.** The SSD holding the
+container is the internal one, 97% full: uncontended, one reader gets 3.1
+GB/s at 0.59 ms a 1.77 MB record, two get 4.4 GB/s at 0.84 ms, four get
+3.9 GB/s at 1.88 ms. Beside eight spinning threads two readers take 1.08 ms
+a record, beside eight memcpy threads 1.15 — the engine's 0.88 ms is this
+drive plus the arithmetic beside it. Two readers is the drive's best.
+
+## 91. A bigger cache is a long-context fix, and one quantization per vector (2026-09-15)
+
+Two of the three places §90 left to look.
+
+**The cache.** 16 GiB has been every Qwen measurement's protocol since §82,
+not a recommendation. On the same build, one process per run, peak RSS from
+`/usr/bin/time -l`, swap unused before and after:
+
+| expert cache | 200 tokens, tok/s | read | peak RSS |
+|---|---|---:|---:|
+| 16 GiB | 11.91, 11.47 | 19.20 GB | 20.0 GB |
+| 20 GiB | 12.60, 11.58 | 18.34 GB | 22.5 GB |
+| 24 GiB | 12.06, 11.33 | 18.34 GB | 22.6 GB |
+| 28 GiB | 11.76, 11.94 | 18.34 GB | 22.6 GB |
+
+| expert cache | 2,801-token prompt | decode | hit rate | read | peak RSS |
+|---|---:|---:|---:|---:|---:|
+| 16 GiB | 11.20 tok/s | 10.70 | 95.3% | 229.6 GB | 20.1 GB |
+| 24 GiB | 11.88 | 11.19 | 98.5% | 72.2 GB | 28.7 GB |
+
+A 200-token session evicts nothing from 20 GiB up, and what it still misses
+is first use: nothing a cache can hold. The second pass of that table ran
+beside two compiles and says nothing about speed. A long prompt is
+different — 69% fewer bytes and about 5% on both phases, single runs.
+
+None of it needs a change. `waste run` with no `--budget` already takes
+35.18 of this machine's 48 GB, 32.31 of it expert cache.
+
+**One quantization per vector.** The trunk's calls under 1 MB ran at 25.9
+GB/s against the same kernel's 15 GB/s on one core (§90): per call, an
+activation quantization and a dispatch of their own. Qwen reads one vector
+three and four times over. GDN projects its input through `in_proj_qkv`,
+`_z`, `_a` and `_b`; QSA through q, k, v and the indexer; the MoE through
+the router and the shared expert's gate, up and gate scalar.
+
+`matvec_t_batch` quantizes the vector once — i8mm's planes are a function
+of the vector and the group size alone — and cuts every tensor's rows at
+the multiples `mv_chunk` would have, so i8mm's two-row tiles stay where
+they were, then hands every piece to one dispatch. Each row is the same
+kernel call on the same bytes, so the logits do not move; anything the
+shared planes do not fit goes through `matvec_t` as before. GDN's conv
+reads only the first projection and now follows all four. The shared
+expert keeps its gate and up outputs in `m->ff` until it runs; the serial
+loop is the one path that writes there, and it has the shared expert
+redo them.
+
+Against a build of §90's commit, unprofiled:
+
+| | before | after |
+|---|---|---|
+| 16 GiB, decode, three runs | 12.02, 12.03, 12.00 | 13.07, 12.28, 12.41 (+4.7%) |
+| 2,801-token context, decode | 10.56 | 10.88 (+3.0%) |
+| 2,801-token context, reading the prompt | 11.14 | 11.69 (+4.9%) |
+
+Logits byte-identical and every token the same in all eight runs. Profiled,
+decode only, 16 GiB:
+
+| | before | after |
+|---|---:|---:|
+| trunk calls under 1 MB | 25.9 GB/s | 38.9 GB/s |
+| QSA k, v, indexer projections | 26–31 GB/s | 97 GB/s |
+| GDN, ms/step | 16.6 | 15.1 |
+| QSA, ms/step | 5.5 | 4.9 |
+| router and shared expert, ms/step | 5.6 | 4.1 |
+
+The router row now carries the shared expert's gate and up projections;
+the profile splits a batch's time among its tensors by bytes.
+
+**For the CLI, not measured on it.** `--threads 0` is one thread per logical
+CPU, twelve here, and §90 measured twelve 6% slower than eight on Qwen:
+the efficiency cores are stragglers. A default that counted performance
+cores would be worth measuring on every model before it is one.
+
+## 92. The pool parks 300 times a token, and closing gaps is worth 2% (2026-09-16)
+
+§90 left seven milliseconds of the expert stages above their eight-thread
+ideal and HyperConnection's non-matvec work at 4.3 ms. Timed inside, with
+clock reads around each piece, 200 decode tokens at 16 GiB:
+
+| HyperConnection, per mix | us | ms/step |
+|---|---:|---:|
+| RMSNorm, four streams on the pool | 21.6 | 2.09 |
+| down projection, its quantization included | 40.2 | 3.90 |
+| up projection | 28.0 | 2.72 |
+| sigmoid over 10,240, on the pool | 10.1 | 0.98 |
+| weighted sum over streams | 4.4 | 0.42 |
+| inject projection | 5.0 | 0.49 |
+| combine | 3.6 | 0.35 |
+
+| expert stages, per call | us | ms/step |
+|---|---:|---:|
+| holds — the misses' reads | 103.6 | 6.66 |
+| gate and up tables | 40.0 | 2.57 |
+| stage 1, gate and up rows | 214.8 | 13.79 |
+| stage 2, activation and down table | 38.7 | 2.48 |
+| stage 3, down rows | 127.5 | 8.19 |
+
+A norm over 10,240 floats is about 10 us of arithmetic; it took 21.6. With
+`WASTE_SPIN=200000` in the same instrumented build it took 8.1, the down
+projection 21.0, the sigmoid 4.8 and the expert tables 19.4. What the pieces
+cost is mostly waking a parked pool.
+
+**How often.** A probe on `waste__pool_run` timed the calling thread's
+serial stretch before every dispatch, keyed by the function dispatched.
+Per token, the dispatches that followed a stretch longer than a worker's
+8 us spin:
+
+| next dispatch | per token | after a gap | serial ms |
+|---|---:|---:|---:|
+| GDN, QSA and router batches (§91) | 96 | 96 | 1.47 |
+| HyperConnection norm | 97 | 65 | 1.53 |
+| GDN recurrence | 36 | 36 | 1.66 |
+| i8mm matvecs | 339 | 55 | 1.41 |
+| activation quantization | 48 | 46 | 0.62 |
+| VQ tables | 96 | 28 | 0.54 |
+| stage 1 (after the misses' reads) | 64 | 14 | 5.98 |
+
+About 330 wakes a token, and 7.7 ms of serial time outside the expert
+reads. `waste_find` was a suspect — a linear `strcmp` over every tensor —
+and is not: one lookup averaged 0.1 us.
+
+**A wake is the scheduler, not the primitive.** Seven workers at the fast
+group's quality of service, parked, woken together after 2 ms idle, 500
+times, until the first and the last acknowledged:
+
+| primitive | first, median | last, median | last, p90 | last, p99 |
+|---|---:|---:|---:|---:|
+| condvar broadcast under a mutex | 18.6 us | 37.2 | 67.6 | 184 |
+| `os_sync_wake_by_address_all` | 18.6 | 37.5 | 66.2 | 178 |
+
+No cheaper wake to swap in, and a barrier waits for the last one.
+
+**Spinning through them is §84's trade again.** Unprofiled, same build,
+user+system CPU for the whole run:
+
+| `WASTE_SPIN` | tok/s | CPU s |
+|---:|---|---:|
+| 20,000 | 12.89, 12.63 | 100.6, 103.6 |
+| 50,000 | 13.26, 13.32 | 108.7, 107.5 |
+| 100,000 | 13.33, 13.61 | 113.4, 110.0 |
+| 200,000 | 13.50, 13.68 | 114.9, 112.3 |
+
++6.5% for +12% CPU. The instrumented build said +10%: clock reads lengthen
+the gaps being measured, as §84 found of the profiler.
+
+**Closing gaps instead**, each the same function over the same elements in
+the same order, so the logits do not move:
+
+- *HyperConnection's norm task* now also does the combine that finishes the
+  previous block, when the mix is the MLP's, and quantizes the stream's
+  weight groups for the down projection, which reads the planes through
+  `matvec_t_prequant`. `prequant_ok` says when a tensor can: i8mm, four
+  bits, and the caller's piece a whole number of groups.
+- *Its gate* is one job of pieces: the sigmoid and the sum over streams, a
+  256-wide hidden range at a time, and the inject projection's four rows,
+  each the `dotf` `matvec` would have taken. A quantized inject falls back
+  to `matvec_t`.
+- *GDN's short conv* runs a range of channels per task, 46 us of SiLU a
+  layer that had been serial in front of the recurrence.
+- *GDN's gated RMSNorm* and out_proj's quantization moved into the
+  recurrence's per-head tasks.
+
+HyperConnection is three dispatches where it was six. In the instrumented
+build the down projection went 42.4 → 27.3 us and the sum and sigmoid 16.0
+→ 11.4; the recurrence's serial gap 1.70 → 0.20 ms a token and the parked
+quantizations 47 → 11. Folding the inject and the combine in cut the
+batches' parked count 96 → 82, which is how we know most of their gap is
+not those two.
+
+Three runs a side could not see any of it — the arms landed within 0.2
+tok/s of each other in both directions. Against a build of §91's commit,
+six alternated pairs:
+
+| | tok/s | mean | CPU s |
+|---|---|---:|---:|
+| before | 13.04, 13.24, 13.03, 12.96, 13.09, 13.15 | 13.09 | 101.3 |
+| after | 13.73, 13.26, 13.17, 13.32, 13.29, 13.32 | 13.35 | 100.8 |
+
++2.0%, faster in all six pairs, at the same CPU. The 2,801-token context
+did not move (prompt 12.13 → 12.22, decode 11.27 → 11.23, one run each).
+Logits byte-identical and every token the same in every run, and also
+against the same commit with `WASTE_TRUNK_KERNEL=0` and `=1`, where
+nothing can take prequantized planes and every fallback runs. Profiled:
+HyperConnection 10.1 → 9.3 ms a step, GDN 14.7 → 13.8.
+
+Two percent here was not obviously worth the code. It went in because the
+gaps are a property of this machine's wake latency and eight cores, and a
+machine with more cores or a slower scheduler pays more for each one.
+
+## 93. QSA's attention, four scores at a time — and the product that must not fuse (2026-09-16)
+
+At a 2,801-token context QSA's attention was 8.3 ms of a 87 ms step, on
+the pool since §86 and scalar inside: per selected token a 256-wide dot
+against the query, then a 256-wide accumulation of that token's values.
+
+The dot was not short of arithmetic, it was short of independence — each
+element's multiply-add waits for the one before it, ~4 cycles deep,
+whatever else the core could issue. So four selected tokens are scored in
+one pass now, each with its own accumulator summing its own dimensions in
+its own order: §41's trick on the VQ gather, for the same reason. The
+value accumulation is the other way round — every output dimension sums
+the tokens in order — so its lanes run along the dimension, four vectors
+at a time. Both leave every element's sequence where it was.
+
+Against a build of §92's commit, 16 GiB, three pairs:
+
+| | before | after |
+|---|---|---|
+| 2,801-token context, decode | 11.35, 11.35, 11.47 | 11.68, 11.81, 11.72 (+3.0%) |
+| 2,801-token context, reading the prompt | 11.89, 12.13, 12.15 | 12.32, 12.51, 12.35 (+2.6%) |
+| attention, ms/step | 8.34 | 5.36 |
+| QSA, ms/step | 14.59 | 11.78 |
+
+A short context selects a handful of tokens and measured 0.5% slower in
+three pairs of three, so the four-at-a-time pass is taken from 32
+selections up; below that the plain loop runs and the short prompt is back
+to level.
+
+**What nearly shipped instead.** The first two versions were not
+bit-identical, and neither was wrong about the order of anything. The loop
+they replaced compiles — at -O2, no fast-math — to four *products* in one
+vector and a scalar chain of adds: the products are independent, the sum
+order is not, so clang vectorizes the multiplies and leaves the additions
+alone. Each product is therefore rounded on its own. Write the same
+arithmetic as `s += q * k` in four accumulators and clang's SLP pass packs
+them into a vector too, but emits a multiply and an add where the original
+contracted to one fused multiply-add; write it as `fmaf` and every product
+fuses. Both round differently from the original — by one ulp, on a dot of
+256 terms, over 2,048 tokens and 24 heads. The logits moved in the last
+bits and the text diverged a few hundred tokens in.
+
+The fix is to say exactly what the original does: a product, then a sum,
+as two statements, which C's contraction rules leave alone. `-fno-vectorize
+-fno-slp-vectorize` also fixes it, and is not a fix — it is a build flag
+this file cannot rely on.
+
+**A bit-identical kernel needs a bit-identical test.** `tests/run.sh` ran
+the whole suite green through both wrong versions: its Qwen checks compare
+paths of *one* build against each other, and both paths had the same
+kernel. `tests/test_qsa_attn.c` holds the old loops verbatim and compares
+them with the new ones over 40 random cases with out-of-range selections
+mixed in, in one translation unit, where a compiler that transforms one
+and not the other is exactly what is being looked for. It is the same
+shape as §87's `test_qsa_pick`, and it was written after the fact rather
+than before, which is the part to do differently next time.
+
+## 94. DeepSeek takes the Qwen branch's trunk kernel and not its batched matvec (2026-09-16)
+
+PR #63 carries Qwen3.8-Flash-Next from 7.01 tok/s to about 12.3, on its
+own 16 GiB protocol, over eleven changes. Ten of them are parallelism and
+one is arithmetic, and the question this entry answers is which of them
+are properties of that model rather than of this engine. Measured on
+DeepSeek-V4.1-Flash, because it is the container here whose profile most
+resembles Qwen's: at its operating point it is compute-bound, not
+disk-bound.
+
+Protocol for every number below: Apple M5 Pro, 12 logical CPUs, 64 GB,
+`ds41.waste` on the internal SSD, `WASTE_CACHE_MB=17000`, `test_forward`
+with a 12-token prompt and 40 decode steps, the mean of the last 30.
+
+**The trunk kernel ports, and it is the only one that did.**
+`WASTE_TRUNK_KERNEL` is not new — the Qwen branch only changes its default
+— so this needed no code at all:
+
+| trunk kernel | tok/s |
+|---|---:|
+| 0, f32 (today's default) | 3.96 |
+| 2, i8mm | **4.55** |
+
+**1.148x.** All 40 generated ids identical between the two, which is a
+signal and not a proof: the prompt is synthetic ids and the harness that
+measures this properly (`tests/kernel_kl.c`, perplexity and top-1 over real
+text) arrives with #63. The branch measured +29% on Qwen for the same
+switch, and the ratio is explained by how much of a step the trunk matvec
+is: 24.6% here, measured, against roughly half there — §81's
+phase table less the recurrence and the selection, which is a subtraction
+and not a figure it states. Half the pie, half the gain.
+
+Where a DS41 step goes at 17 GB and i8mm, 90.8% hit:
+
+| phase | share |
+|---|---:|
+| moe, all of it | 82.1% |
+| ├ expert matmul | 65.5% |
+| └ expert I/O | 8.8% |
+| attention (CSA2) | 15.9% |
+| trunk matvec, cutting across both | 24.6% |
+
+**The batched matvec does not port, and the profile said it would.** §91
+quantizes one activation vector once and dispatches every
+4-bit projection of it as one job, worth +4.7% on Qwen. Ported here to
+`ffn`'s gate beside its up — so every model's shared expert and dense FFN,
+not only DS41's — to CSA2's compressor, and to the query low-rank beside
+the window KV. Bit-identical to the unbatched path under both trunk
+kernels, and worth nothing:
+
+| arm | round 1 | round 2 | round 3 |
+|---|---:|---:|---:|
+| baseline | 4.545 | 4.399 | 4.418 |
+| granularity only (`mv_chunk` for the row split) | 4.471 | 4.380 | 4.425 |
+| batched | 4.418 | 4.412 | 4.386 |
+
+The arms were rotated because this machine drifts: the first slot of a
+round is always the fastest, by more than any arm differs from any other.
+There is no effect here to find.
+
+**The reason, and the reading mistake that hid it.** The decision to try
+§91 came from one row of the trunk matvec table:
+
+| call size | calls | bytes | time | rate |
+|---|---:|---:|---:|---:|
+| <1 MB | 8,811 | 6.12 GB | 0.28 s | 21.8 GB/s |
+| 1–8 MB | 27,817 | 82.80 GB | 1.60 s | 51.7 GB/s |
+| 8–32 MB | 4,160 | 87.24 GB | 0.71 s | 123.5 GB/s |
+| >32 MB | 156 | 42.60 GB | 0.27 s | 159.0 GB/s |
+
+21.8 GB/s against 159 looks like the thing to fix. It is 6.12 GB of 218.76
+and 0.28 s of 11.6: **fixing it perfectly is worth 2.5%.** The rate column
+says how badly a call runs and the bytes column says whether it matters,
+and only the second one chooses what to work on.
+
+What §91 actually needs is *many projections of one vector, each too small
+to be worth a dispatch*. Qwen's GDN projects its input through
+`in_proj_a` and `in_proj_b`, which are **48 rows** each. DS41's smallest
+projection of a layer input is 512 rows of 2,640 bytes — 1.35 MB, already
+enough to fill the pool on its own. The saving left is one quantization of
+a 5,120-element vector per pair, which is microseconds.
+
+Code on `perf/mvb-ds41`, not merged. §95 is the same shape of answer for
+§88.
+
+## 95. A staged expert schedule for a model whose experts are big enough already (2026-09-16)
+
+`moe_layer` asks the cache one question per layer: are all K records
+resident? If any is absent the whole layer takes the row split. §88
+replaces that on Qwen with a question per expert — residents first as
+tasks, since they need no read and holding them barriers nothing, then the
+misses once they land — and measures +8.7%.
+
+Ported here to the shared `moe_layer`, for partly-resident layers only: a
+whole-resident layer keeps the fixed batches and a wholly cold one the row
+split, so neither changes. Bit-identical to the baseline and to all four
+schedules (`WASTE_XPAR=0`, `=1`, `WASTE_XPAR_BATCH=64`, default) under both
+trunk kernels; `tests/run.sh` 77 passed, 0 failed.
+
+**The premise holds.** Counted over a 40-token decode at a 17 GB cache,
+2,080 layers:
+
+| | layers | |
+|---|---:|---|
+| all K resident | 1,205 | 58% |
+| **partly resident** | **831** | **40%**, 469 of them missing exactly one |
+| none resident | 46 | 2% |
+
+1,497 misses across the partial layers — 1.8 of 6. That is §88's case, and
+the staged path takes every one of the 831.
+
+**The conclusion does not.** Timed inside those layers:
+
+| path | layers | ms per layer |
+|---|---:|---:|
+| staged | 830 | 3.713 |
+| row split, the same layers | 832 | 3.754 |
+
+**1.1%**, which is less than the position of an arm within a round is
+worth on this machine. The 46 cold layers cost 9.14 ms each and the staged
+path deliberately does not touch them; that number is the disk.
+
+**Why, and it is §94's reason again.** On Qwen the two paths were 1.71 ms
+against 0.69 — a 2.5x gap, and a dispatch cost rather than an arithmetic
+one: the row split issues three dispatches per expert over rows too short
+to fill the pool. Qwen's experts are **640 rows**. DS41's are **2,304**. A
+row-split dispatch here has 3.6x the work to amortize the same fork-join
+over, so there is no gap left to close.
+
+That is the general finding, and it is worth more than either port. **The
+Qwen ladder is about work units too small to be worth a dispatch**, which
+is a property of Gated DeltaNet's 48-row projections and QSA's per-head
+loops, not of this engine. It predicts that §84, §85, §90 and
+§92 — all of them "the pool was parked" or "the dispatch cost more than
+the work" — will measure the same nothing on a container whose kernels are
+large, and it is why the one change that did port, i8mm, is the one that
+changes the arithmetic rather than who runs it.
+
+`waste_parallel_for_each` in `threads.h` is §88's other half and is kept
+with this: one item per range instead of `n` cut into equal ranges. The
+branch measured it within noise on its own, and DS41 routes six experts in
+batches of four, which the equal split already cuts one apiece.
+
+Code on `perf/xpar-staged-ds41`, not merged.
+
+## 96. The DeepSeek oracle gate is six layers deep and the model is forty (2026-09-16)
+
+§94 found that the one thing of the Qwen branch's speed work that ports to
+DeepSeek-V4.1 is the i8mm trunk kernel, +14.8%. This is what happened when
+that was taken seriously enough to check. Same protocol as §94: M5 Pro,
+`ds41.waste`, `WASTE_CACHE_MB=17000`, arms rotated.
+
+**Two switches, and both are already in the tree.** `docs/EXP1.md` built
+them and measured them on K3 and Kimi-Linear; neither had been pointed at
+DeepSeek-V4.1, which did not exist when that branch was written.
+
+| | tok/s | vs today |
+|---|---:|---:|
+| today — f32 trunk, VQ3R | 3.87–3.97 | 1.00x |
+| `WASTE_TRUNK_KERNEL=2` | 4.52–4.56 | 1.15x |
+| `+ WASTE_VQ8=1` | 5.35–5.43 | **1.38x** |
+
+`WASTE_VQ8=1` is the register-resident int8 VQ3R table. It takes the
+`LUT apply` bucket from 2.32 s to 0.59 s — **3.9x** — and the expert
+arithmetic that bucket is part of, 65.5% of a DS41 step, from 7.65 s to
+6.03 s. It pays 0.30 s back in `LUT build`, which is the table being
+quantized. EXP1 measured it at 1.05x end to end on K3; here it is
+1.19x, and that is the largest single number anything in this repo has
+produced on this container.
+
+**It is also not a speed switch.** `WASTE_DUMP_ROUTE` and
+`tests/route_diff.py`, 880 decisions:
+
+| | decisions differing | the first one |
+|---|---:|---|
+| i8mm | 0 of 880 | — |
+| i8mm + VQ8 | **574 of 880** | a real disagreement at relative margin 1.13e-04 |
+
+Two thirds of the routing changes, and the first divergence is one the
+reference separated by ten times the tie threshold. §43 said an int8
+table makes the engine discontinuous and EXP1 recorded a route set of
+89.3% on K3; on DeepSeek it is 35%. Top-6 of 384 is sparser than K3's top-8 and
+there are forty layers to accumulate in. The forty generated token ids
+matched, which is exactly the evidence CLAUDE.md says not to accept.
+
+Over 2,080 decisions i8mm alone has 202 differing, and `route_diff` puts
+the first at relative margin 1.663e-06 — a tie the reference itself cannot
+resolve, with the other 201 downstream of it. §71's case, and clean.
+
+**So i8mm went to the oracle, and the oracle is where this entry earns its
+number.** `tools/ds41_ref.py` on the real container, 12 tokens:
+
+| | rel L2 | max abs | top-10 |
+|---|---:|---:|---|
+| engine f32 | 0.001407% | 2.0e-04 | identical |
+| engine i8mm | **0.056379%** | 7.5e-03 | identical |
+
+Forty times the error, against a suite threshold of 0.01%. Then the same
+comparison on the fixture `tests/run.sh` actually runs:
+
+| container | layers | hidden | f32 | i8mm | gate |
+|---|---:|---:|---:|---:|---|
+| `make_test_container.py --ds41` | 6 | 128 | 0.000018% | 0.001066% | PASS |
+| the real one | 40 | 5120 | 0.001407% | **0.056379%** | **FAIL** |
+
+**The fixture is 53x quieter than the model on the same change**, and every
+part of that is accumulation: six layers against forty, 128 hidden against
+5,120. The check is not wrong and it is not weak for what it covers — it
+caught real defects when DS41 landed — but it cannot see a per-matvec error
+that compounds with depth, and a numerical change that passes it has not
+been told anything about the model. CLAUDE.md already says this about
+`--trunk8` containers; it is the same sentence with a different subject,
+and it applies to any future kernel, not to i8mm.
+
+**What that settles, and what it does not.** The first reading of this was
+that i8mm fails the gate and therefore waits. That is the wrong reading,
+and naming why is the point of writing it down.
+
+**0.01% is a bug detector, not a numerics budget.** The check exists to
+catch a wrong CSA2, mHC, Engram or router — it fires when a kernel is
+incorrect, not when a kernel is deliberately approximate. The oracle reads
+the same quantized container the engine does, so f32's 0.0014% is
+summation order and nothing else; the container around it is 3-bit experts
+and a 4-bit trunk, approximations orders of magnitude coarser than the
+0.056% being weighed. Holding an approximate kernel to a threshold set for
+an exact one asks a question the number cannot answer.
+
+**On a MoE the evidence that bears on "is this the same model" is the
+routing and the top-k**, which is this file's own rule and CLAUDE.md's.
+Both are clean here: one unresolvable tie in 2,080 decisions, and a top-10
+identical to the oracle. That is the same standard §71 set, and i8mm meets
+it where `WASTE_VQ8=1`, at 574 real disagreements, does not.
+
+The Qwen branch decided the identical question on evidence of the right
+kind — perplexity and top-1 over 5,918 tokens of real text
+(`tests/kernel_kl.c`: 3.698 against f32's 3.712, 96.5% top-1) — and i8mm
+came out *ahead* on that sample, which says the error is noise-shaped
+rather than biased. **So i8mm is a defensible default for DeepSeek now**,
+with `kernel_kl` owed as confirmation when #63 lands rather than as a
+precondition. What the gate comparison above actually establishes is about
+the gate, not about the kernel.
+
+**Gate 9's break-even is in bytes, and this engine has moved.** The gate
+defers DSpark on the premise that "the pass IS the expert reads", so a
+window of five drafts touching 3.45x one token's records must accept 3.45
+of 5 to break even. Where a DS41 step goes at 17 GB and 90.8% hit:
+
+| | share of step |
+|---|---:|
+| moe, all of it | 82.1% |
+| ├ expert matmul | **65.5%** |
+| └ expert I/O | **8.8%** |
+| attention (CSA2) | 15.9% |
+| trunk matvec, across both | 24.6% |
+
+§46 already recorded this drift for K3 and said the claim was worth
+re-checking rather than inheriting. At this operating point the bytes are
+not the budget, and a batched verification amortizes the index stream and
+the held records across the window rather than the disk. That is a
+different sum from the one gate 9 computed. It is not an argument that the
+verdict flips — the batched CSA2 and mHC path it needs is still the
+expensive part — only that the deciding number should be recomputed on this
+profile.
+
+**What measured nothing, so the next person need not.** `WASTE_METAL_MOE=1`
+on DeepSeek, never tried there before: 4.30–4.39 against 4.56 on the CPU, a
+wash or slightly worse, which is what EXP1 found on K3. Thread count is
+flat from 6 to 18 (4.32–4.46), so §47's efficiency-core straggler does not
+bite a model whose applies are this large. The two ports in §94 and §95.
+The one unstarted lever on EXP1's board, a GPU LUT build, has a 2.1%
+ceiling here.
+
+Externally: T-MAC (arXiv 2407.00088) and Vec-LUT (arXiv 2512.06443) are the
+in-register table lookup this repo already implements — `vqtbl4q_s8` in
+`src/kda_neon.c`, `_mm512_permutexvar_epi8` in `src/simd_avx512.c` — and
+confirm the direction without offering anything to import. The MoE
+offloading literature assumes the bottleneck is moving experts; at 8.8% it
+cannot pay here whatever it does.

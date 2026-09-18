@@ -44,6 +44,14 @@ void waste_tok_set_eos(waste_tok *t, int id);
  * Han run touches a Latin one, and they differ silently. */
 void waste_tok_set_han_split(waste_tok *t, int on);
 
+/* Digits per pre-token: 3 (the default) for `\p{N}{1,3}`, as the Kimi and
+ * GLM patterns spell it; 1 for `\p{N}`, which is Qwen's and puts every
+ * digit in its own piece. Anything else is ignored and the default kept —
+ * there is no third spelling in this family. "2026" is one token under 3
+ * and four under 1, so a container that gets this wrong reads every
+ * number differently from the model that was trained on it. */
+void waste_tok_set_digit_run(waste_tok *t, int n);
+
 /* Which pre-tokenization pattern the release splits with. The Kimi and GLM
  * containers are all cl100k-shaped and differ only in the Han branch, which
  * is why that one is a flag; DeepSeek-V4.1 splits with a different pattern
