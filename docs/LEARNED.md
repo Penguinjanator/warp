@@ -6806,3 +6806,148 @@ mixed in, in one translation unit, where a compiler that transforms one
 and not the other is exactly what is being looked for. It is the same
 shape as §87's `test_qsa_pick`, and it was written after the fact rather
 than before, which is the part to do differently next time.
+
+## 94. DeepSeek takes the Qwen branch's trunk kernel and not its batched matvec (2026-09-16)
+
+PR #63 carries Qwen3.8-Flash-Next from 7.01 tok/s to about 12.3, on its
+own 16 GiB protocol, over eleven changes. Ten of them are parallelism and
+one is arithmetic, and the question this entry answers is which of them
+are properties of that model rather than of this engine. Measured on
+DeepSeek-V4.1-Flash, because it is the container here whose profile most
+resembles Qwen's: at its operating point it is compute-bound, not
+disk-bound.
+
+Protocol for every number below: Apple M5 Pro, 12 logical CPUs, 64 GB,
+`ds41.waste` on the internal SSD, `WASTE_CACHE_MB=17000`, `test_forward`
+with a 12-token prompt and 40 decode steps, the mean of the last 30.
+
+**The trunk kernel ports, and it is the only one that did.**
+`WASTE_TRUNK_KERNEL` is not new — the Qwen branch only changes its default
+— so this needed no code at all:
+
+| trunk kernel | tok/s |
+|---|---:|
+| 0, f32 (today's default) | 3.96 |
+| 2, i8mm | **4.55** |
+
+**1.148x.** All 40 generated ids identical between the two, which is a
+signal and not a proof: the prompt is synthetic ids and the harness that
+measures this properly (`tests/kernel_kl.c`, perplexity and top-1 over real
+text) arrives with #63. The branch measured +29% on Qwen for the same
+switch, and the ratio is explained by how much of a step the trunk matvec
+is: 24.6% here, measured, against roughly half there — §81's
+phase table less the recurrence and the selection, which is a subtraction
+and not a figure it states. Half the pie, half the gain.
+
+Where a DS41 step goes at 17 GB and i8mm, 90.8% hit:
+
+| phase | share |
+|---|---:|
+| moe, all of it | 82.1% |
+| ├ expert matmul | 65.5% |
+| └ expert I/O | 8.8% |
+| attention (CSA2) | 15.9% |
+| trunk matvec, cutting across both | 24.6% |
+
+**The batched matvec does not port, and the profile said it would.** §91
+quantizes one activation vector once and dispatches every
+4-bit projection of it as one job, worth +4.7% on Qwen. Ported here to
+`ffn`'s gate beside its up — so every model's shared expert and dense FFN,
+not only DS41's — to CSA2's compressor, and to the query low-rank beside
+the window KV. Bit-identical to the unbatched path under both trunk
+kernels, and worth nothing:
+
+| arm | round 1 | round 2 | round 3 |
+|---|---:|---:|---:|
+| baseline | 4.545 | 4.399 | 4.418 |
+| granularity only (`mv_chunk` for the row split) | 4.471 | 4.380 | 4.425 |
+| batched | 4.418 | 4.412 | 4.386 |
+
+The arms were rotated because this machine drifts: the first slot of a
+round is always the fastest, by more than any arm differs from any other.
+There is no effect here to find.
+
+**The reason, and the reading mistake that hid it.** The decision to try
+§91 came from one row of the trunk matvec table:
+
+| call size | calls | bytes | time | rate |
+|---|---:|---:|---:|---:|
+| <1 MB | 8,811 | 6.12 GB | 0.28 s | 21.8 GB/s |
+| 1–8 MB | 27,817 | 82.80 GB | 1.60 s | 51.7 GB/s |
+| 8–32 MB | 4,160 | 87.24 GB | 0.71 s | 123.5 GB/s |
+| >32 MB | 156 | 42.60 GB | 0.27 s | 159.0 GB/s |
+
+21.8 GB/s against 159 looks like the thing to fix. It is 6.12 GB of 218.76
+and 0.28 s of 11.6: **fixing it perfectly is worth 2.5%.** The rate column
+says how badly a call runs and the bytes column says whether it matters,
+and only the second one chooses what to work on.
+
+What §91 actually needs is *many projections of one vector, each too small
+to be worth a dispatch*. Qwen's GDN projects its input through
+`in_proj_a` and `in_proj_b`, which are **48 rows** each. DS41's smallest
+projection of a layer input is 512 rows of 2,640 bytes — 1.35 MB, already
+enough to fill the pool on its own. The saving left is one quantization of
+a 5,120-element vector per pair, which is microseconds.
+
+Code on `perf/mvb-ds41`, not merged. §95 is the same shape of answer for
+§88.
+
+## 95. A staged expert schedule for a model whose experts are big enough already (2026-09-16)
+
+`moe_layer` asks the cache one question per layer: are all K records
+resident? If any is absent the whole layer takes the row split. §88
+replaces that on Qwen with a question per expert — residents first as
+tasks, since they need no read and holding them barriers nothing, then the
+misses once they land — and measures +8.7%.
+
+Ported here to the shared `moe_layer`, for partly-resident layers only: a
+whole-resident layer keeps the fixed batches and a wholly cold one the row
+split, so neither changes. Bit-identical to the baseline and to all four
+schedules (`WASTE_XPAR=0`, `=1`, `WASTE_XPAR_BATCH=64`, default) under both
+trunk kernels; `tests/run.sh` 77 passed, 0 failed.
+
+**The premise holds.** Counted over a 40-token decode at a 17 GB cache,
+2,080 layers:
+
+| | layers | |
+|---|---:|---|
+| all K resident | 1,205 | 58% |
+| **partly resident** | **831** | **40%**, 469 of them missing exactly one |
+| none resident | 46 | 2% |
+
+1,497 misses across the partial layers — 1.8 of 6. That is §88's case, and
+the staged path takes every one of the 831.
+
+**The conclusion does not.** Timed inside those layers:
+
+| path | layers | ms per layer |
+|---|---:|---:|
+| staged | 830 | 3.713 |
+| row split, the same layers | 832 | 3.754 |
+
+**1.1%**, which is less than the position of an arm within a round is
+worth on this machine. The 46 cold layers cost 9.14 ms each and the staged
+path deliberately does not touch them; that number is the disk.
+
+**Why, and it is §94's reason again.** On Qwen the two paths were 1.71 ms
+against 0.69 — a 2.5x gap, and a dispatch cost rather than an arithmetic
+one: the row split issues three dispatches per expert over rows too short
+to fill the pool. Qwen's experts are **640 rows**. DS41's are **2,304**. A
+row-split dispatch here has 3.6x the work to amortize the same fork-join
+over, so there is no gap left to close.
+
+That is the general finding, and it is worth more than either port. **The
+Qwen ladder is about work units too small to be worth a dispatch**, which
+is a property of Gated DeltaNet's 48-row projections and QSA's per-head
+loops, not of this engine. It predicts that §84, §85, §90 and
+§92 — all of them "the pool was parked" or "the dispatch cost more than
+the work" — will measure the same nothing on a container whose kernels are
+large, and it is why the one change that did port, i8mm, is the one that
+changes the arithmetic rather than who runs it.
+
+`waste_parallel_for_each` in `threads.h` is §88's other half and is kept
+with this: one item per range instead of `n` cut into equal ranges. The
+branch measured it within noise on its own, and DS41 routes six experts in
+batches of four, which the equal split already cuts one apiece.
+
+Code on `perf/xpar-staged-ds41`, not merged.
