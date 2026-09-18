@@ -51,13 +51,33 @@ import json
 import os
 import sys
 
-# The pattern src/tokenizer.c implements, minus the Han branch that only the
-# Kimi models carry. Compared literally: a release that reorders one
+# The patterns src/tokenizer.c implements, spelled out rather than parsed.
+# Three things vary across this family and nothing else does, so the whole
+# set is enumerated and compared literally: a release that reorders one
 # alternative is a release this splits differently, and the difference does
 # not show up as an error.
-PAT_NO_HAN = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|"
-              r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
-PAT_HAN = r"[\p{Han}]+|" + PAT_NO_HAN
+#
+#   han     — `[\p{Han}]+` as its own leading branch (both Kimi releases)
+#             or Han left to the letter branch (GLM, Qwen).
+#   marks   — `[\p{L}\p{M}]` (Qwen) or `\p{L}` (Kimi, GLM). Descriptive
+#             only: tokenizer.c's letter class is the union either way, so
+#             the two spellings are the same engine behaviour.
+#   digits  — `\p{N}{1,3}` (Kimi, GLM) or `\p{N}` (Qwen). NOT cosmetic;
+#             it is carried to the engine as `tokenizer_digit_run`.
+def _pattern(han, marks, digit_run):
+    letter = r"[\p{L}\p{M}]" if marks else r"\p{L}"
+    other = r"[^\s\p{L}\p{M}\p{N}]" if marks else r"[^\s\p{L}\p{N}]"
+    return ((r"[\p{Han}]+|" if han else "") +
+            r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?" + letter +
+            r"+|\p{N}" + (r"{1,3}" if digit_run == 3 else "") +
+            r"| ?" + other + r"+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+
+
+# pattern -> (han_split, digit_run)
+KNOWN_PATTERNS = {_pattern(h, m, d): (h, d)
+                  for h in (0, 1) for m in (0, 1) for d in (1, 3)}
+PAT_NO_HAN = _pattern(0, 0, 3)
+PAT_HAN = _pattern(1, 0, 3)
 
 # DeepSeek-V4.1 splits with three isolating Splits in sequence rather than
 # one pattern, and src/tokenizer.c implements the composition as a mode of
@@ -115,7 +135,7 @@ def split_patterns(tok):
 
 
 def convert(src, quiet=False):
-    """Returns (rank-file text, han_split, specials list)."""
+    """Returns (rank text, han split, specials, digit run, pattern mode)."""
     path = os.path.join(src, "tokenizer.json")
     with io.open(path, encoding="utf-8") as f:
         tok = json.load(f)
@@ -132,18 +152,17 @@ def convert(src, quiet=False):
     pats = split_patterns(tok)
     pat = pats[0] if pats else None
     if pats == PAT_DS41:
-        han, pattern = True, TOKPAT_DEEPSEEK   # its CJK Split is unconditional
-    elif len(pats) == 1 and pat == PAT_HAN:
-        han, pattern = True, TOKPAT_CL100K
-    elif len(pats) == 1 and pat == PAT_NO_HAN:
-        han, pattern = False, TOKPAT_CL100K
+        han, digit_run, pattern = True, 3, TOKPAT_DEEPSEEK
+    elif len(pats) == 1 and pat in KNOWN_PATTERNS:
+        han, digit_run = KNOWN_PATTERNS[pat]
+        han, pattern = bool(han), TOKPAT_CL100K
     else:
         raise SystemExit(
             "this release pre-tokenizes with a pattern src/tokenizer.c does "
             "not implement, and the difference would be silent:\n"
             + "".join(f"  release: {p}\n" for p in pats or [None]) +
-            f"  engine : {PAT_NO_HAN}\n"
-            "(optionally preceded by [\\p{Han}]+), or DeepSeek-V4.1's three "
+            + "".join(f"  known  : {k}\n" for k in KNOWN_PATTERNS) +
+            "or DeepSeek-V4.1's three "
             "Splits. See tools/hf_tokenizer.py.")
 
     dec = bytes_to_unicode()
@@ -204,8 +223,9 @@ def convert(src, quiet=False):
                  else f"cl100k {'with' if han else 'without'} a Han branch")
         print(f"tokenizer: {len(lines)} merges, {len(specials)} specials"
               + (f" ({inline_specials} of them inside the BPE table)"
-                 if inline_specials else "") + f", pattern {which}")
-    return "\n".join(lines) + "\n", han, specials, pattern
+                 if inline_specials else "") + f", pattern {which}, "
+              f"up to {digit_run} digit(s) per piece")
+    return "\n".join(lines) + "\n", han, specials, digit_run, pattern
 
 
 def main():
@@ -220,7 +240,7 @@ def main():
     if os.path.exists(dst) and not args.force:
         print(f"{dst} exists; --force to replace it", file=sys.stderr)
         return 1
-    text, han, specials, pattern = convert(args.src)
+    text, han, specials, digit_run, pattern = convert(args.src)
     os.makedirs(args.out, exist_ok=True)
     with io.open(dst, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
@@ -236,6 +256,8 @@ def main():
         notes.append("tokenizer_han_split must be false")
     if pattern != TOKPAT_CL100K:
         notes.append(f"tokenizer_pattern must be {pattern}")
+    if digit_run != 3:
+        notes.append(f"tokenizer_digit_run must be {digit_run}")
     print(f"wrote {dst}" + (f"  ({'; '.join(notes)})" if notes else ""))
     return 0
 

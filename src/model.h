@@ -44,7 +44,26 @@ typedef struct {
      * ever read). q and qs are NULL in that case. */
     int64_t file_off, file_scale_off;   /* not long: 32 bits on Windows */
     int    on_disk;
+    /* Row in waste_tmv_roles plus one, filled on the first profiled matvec
+     * so the profiler looks the name up once rather than every call. */
+    int    prof_slot;
 } waste_tensor;
+
+/* Trunk matvec by tensor role, under WASTE_PROFILE: a tensor's name with
+ * its layer number taken out, so all 36 of a model's in_proj_qkv are one
+ * row. The size buckets could not say which projection a millisecond was
+ * in — on Qwen, GDN's out_proj and QSA's o_proj are the same shape, and so
+ * are QSA's K/V projections and the router. */
+typedef struct {
+    char role[96];
+    int out, in, bits;          /* bits 32: an F32 tensor                    */
+    uint64_t calls, bytes;
+    double t;
+    double tq;                  /* of t: quantizing the activation, serial */
+} waste_tmv_role;
+#define WASTE_TMV_ROLES 96
+extern waste_tmv_role waste_tmv_roles[WASTE_TMV_ROLES];
+extern int waste_tmv_nroles;
 
 typedef struct {
     int n_layers, hidden, n_experts, top_k, moe_inter, dense_inter;
@@ -107,6 +126,7 @@ typedef struct {
      * branch. 1 on both Kimi models and the default; GLM's pattern has no
      * such branch and its containers say so. */
     int   tok_han_split;
+    int   tok_digit_run;    /* digits per pre-token: 3 (default) or 1     */
     /* WASTE_TOKPAT_*: which pre-tokenization pattern the release splits
      * with. 0 = cl100k, which is every container written before
      * DeepSeek-V4.1 and the only one tok_han_split means anything for. */
@@ -183,6 +203,25 @@ typedef struct {
     char  rope_err[128];             /* non-empty: a shape rope_init does not
                                       * implement, and why. The load refuses on
                                       * it rather than running unrotated.    */
+
+    /* --- Qwen3.8-Flash-Next (all 0 / -1 for Kimi) ---------------------- */
+    int   arch_qwen;                 /* 1 = GDN/QSA/HC path, never KDA/MLA  */
+    int   qwen_full[WASTE_MAX_LAYERS]; /* 1 = QSA (full_attention)          */
+    int   qwen_n_layer_types;        /* entries the container actually gave */
+    int   gdn_k_heads, gdn_v_heads, gdn_k_dim, gdn_v_dim;
+    int   qsa_n_kv, qsa_head_dim;
+    int   idx_n_heads, idx_kv_heads, idx_head_dim;
+    int   idx_budget, idx_compress;
+    int   hc_count, hc_lowrank;
+    int   ple_layer;                 /* 0-based; -1 = no PLE                */
+    int   ngram_size, heads_per_ngram, ple_embed, ple_conv_k;
+    int   shared_inter;
+    int   rotary_dim;
+    int   mrope_section[3];
+#define WASTE_QWEN_PLE_HEADS 16
+    int64_t ple_off[WASTE_QWEN_PLE_HEADS];
+    int64_t ple_sz[WASTE_QWEN_PLE_HEADS];
+    int64_t ple_mult[8];
 } waste_config;
 
 typedef struct {
@@ -341,6 +380,27 @@ typedef struct {
      * collapsed single stream the sublayer runs on. */
     float *hcflat, *hccol, *hcmix;
 
+    /* Qwen residual streams and QSA caches. GDN reuses S[]/conv[] with
+     * Gated-DeltaNet sizes, not KDA's. */
+    float    *hcx;                               /* [hc_count * hidden]                 */
+    uint16_t *qsa_k[WASTE_MAX_LAYERS];           /* BF16 [kv_cap][n_kv][head_dim]        */
+    uint16_t *qsa_v[WASTE_MAX_LAYERS];
+    float    *qsa_rawk[WASTE_MAX_LAYERS];        /* FP32 raw index keys [kv_cap][Dk]     */
+    int       n_qsa_blk[WASTE_MAX_LAYERS];
+    int       n_qsa_tail[WASTE_MAX_LAYERS];
+    int       ple_prev[8];
+    float    *ple_ring;                          /* dilated PLE conv [H*(K-1)*ngram]    */
+    float    *ple_emb;                           /* concatenated PLE row [ple_embed]    */
+    float    *gdn_g;                             /* per-V-head decay [Hv]               */
+    float    *qsa_q, *qsa_gate, *qsa_attn;       /* [Hq][D]                             */
+    float    *qsa_kf, *qsa_vf, *qsa_scr, *qsa_work;
+    float    *qsa_cs;                            /* cos then sin, each [kv_cap][rot]    */
+    int       qsa_cs_n;                          /* rows of qsa_cs already filled       */
+    int      *qsa_sel, *qsa_taken;
+    float    *moe_prob;
+    uint8_t  *moe_used;
+    int       has_qsa;
+
     /* scratch */
     float *x, *h, *tmp, *att, *logits;
     /* 1 when at least one layer is MLA, i.e. when the sequence is bounded
@@ -373,6 +433,7 @@ typedef struct {
     size_t lut_bytes;               /* what m->lut was allocated */
     int8_t *xq;
     uint64_t expert_reads;
+    uint64_t ple_reads;
     waste_ecache cache;
     /* Background fill. Runs only when the resolved cache can hold every
      * record the container has, walks the banks in file order, and stops on

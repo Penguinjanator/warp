@@ -319,6 +319,9 @@ static inline int waste_pool_fast(void)
  * wants every core for the kernel next to it. So the count is per call
  * site now, and the two available answers are the pool and the fast
  * group. Results do not depend on it: the split is by row either way. */
+static inline void waste__pool_run(int n, int chunk, waste_range_fn fn,
+                                   void *arg, int workers);
+
 static inline void waste_parallel_for_n(int n, int min_chunk, waste_range_fn fn,
                                         void *arg, int workers)
 {
@@ -334,7 +337,30 @@ static inline void waste_parallel_for_n(int n, int min_chunk, waste_range_fn fn,
     /* Round up to a whole number of min_chunk units: callers that block
      * their data (the VQ tile) need every range to start on a boundary. */
     chunk = ((chunk + min_chunk - 1) / min_chunk) * min_chunk;
+    waste__pool_run(n, chunk, fn, arg, workers);
+}
 
+/* One item per range, however many items there are per worker.
+ *
+ * waste_parallel_for_n cuts n into `workers` equal ranges, which is right for
+ * rows and wrong for a handful of large, uneven tasks: ten routed experts on
+ * eight threads came out as five ranges of two, so three threads never got
+ * an expert while five did two each. Here every participant takes the next
+ * item as it finishes the last, so all of them work until the queue is empty.
+ * Only for items that are each worth a dispatch on their own. */
+static inline void waste_parallel_for_each(int n, waste_range_fn fn, void *arg,
+                                           int workers)
+{
+    waste__bind_self();
+    if (workers > g_pool.nthreads) workers = g_pool.nthreads;
+    if (workers > n) workers = n;
+    if (workers <= 1) { fn(0, n, arg); return; }
+    waste__pool_run(n, 1, fn, arg, workers);
+}
+
+static inline void waste__pool_run(int n, int chunk, waste_range_fn fn,
+                                   void *arg, int workers)
+{
     /* Keep the descriptor stable until every worker has left this job.
      * Distinct waste_ctx instances may be called concurrently even though
      * they reuse this process-wide pool. */
