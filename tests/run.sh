@@ -1795,12 +1795,25 @@ PYQ
     # second indexer KV head is a shape nothing here implements, and a
     # missing layer_types reads as "every layer is GDN" — plausible,
     # answer-changing, and invisible.
+    #
+    # "Refused" means cfg_sane said so, and nothing looser. Any non-zero exit
+    # used to count, which let two of these pass on a tree without the bound
+    # they name: a manifest-only edit of the shared width trips the tensor
+    # shape check first, and `ngram_size: 1` reached a division by zero that
+    # arm64 answers with 0 — and so a shape refusal — while x86 answers it
+    # with SIGFPE, an exit status just as non-zero. A crash is not a
+    # refusal, and neither is a refusal by a later check.
     qwen_refused() {                  # <what> <python-edit>
-        local what="$1" edit="$2" dir="$TMP/qwen-bad.waste"
+        local what="$1" edit="$2" dir="$TMP/qwen-bad.waste" out rc
         rm -rf "$dir"; cp -R "$QWENC" "$dir"
         python3 -c "$edit" "$dir" || { no "$what (fixture edit failed)"; return; }
-        if ./waste info "$dir" >/dev/null 2>&1; then
+        out=$(./waste info "$dir" 2>&1); rc=$?
+        if [ "$rc" -eq 0 ]; then
             no "$what was accepted"
+        elif [ "$rc" -ge 128 ]; then
+            no "$what crashed the loader (signal $((rc - 128))) instead of being refused"
+        elif ! printf '%s' "$out" | grep -q "config is out of range"; then
+            no "$what was refused, but not by cfg_sane: $(printf '%s' "$out" | head -1)"
         else
             ok "$what is refused"
         fi
@@ -1818,12 +1831,33 @@ PYQ
             'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"]["layer_types"]=m["config"]["layer_types"][:1];json.dump(m,open(p,"w"))'
         qwen_refused "a PLE conv kernel the ring cannot hold" \
             'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"]["ple_conv_kernel_size"]=0;json.dump(m,open(p,"w"))'
-        qwen_refused "a shared expert wider than the allocated FFN scratch" \
-            'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));c=m["config"];c["shared_expert_intermediate_size"]=max(c["moe_intermediate_size"],c.get("intermediate_size",0))+1;json.dump(m,open(p,"w"))'
+        qwen_refused "a shared expert of width zero" \
+            'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"]["shared_expert_intermediate_size"]=0;json.dump(m,open(p,"w"))'
         qwen_refused "a PLE n-gram order that divides by zero" \
             'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"]["ngram_size"]=1;json.dump(m,open(p,"w"))'
         qwen_refused "a zero-width GDN convolution kernel" \
             'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"]["linear_conv_kernel_dim"]=0;json.dump(m,open(p,"w"))'
+    fi
+
+    # The other direction: a shared expert wider than anything else in the
+    # model is a real shape — Qwen2-57B-A14B's is wider than both its dense
+    # and its routed FFN — so it is opened, not refused, and every buffer a
+    # vector of that width passes through is sized from it. 2048 over a
+    # 32-wide hidden state is past m->xq's slack as well as m->ff, which is
+    # the pair a narrower test would let through: bounding the width by
+    # max(moe, dense) left m->xq short, and sizing m->ff alone left it
+    # short too. Plain, this checks it opens and runs; under `make asan` —
+    # which CI runs — it is the overflow check, and the oracle below checks
+    # the arithmetic on the same shape.
+    QWENW="$TMP/qwen-wide.waste"
+    if ! python3 tools/make_test_container.py --qwen --qwen-shared 2048 "$QWENW" >/dev/null 2>&1; then
+        no "make_test_container.py --qwen --qwen-shared did not build a container"
+    elif ./waste info "$QWENW" >/dev/null 2>&1 &&
+         WASTE_CACHE_MB=1 ./test_forward "$QWENW" 3,7,11,5 "$TMP/qwen_wide.bin" 0 >/dev/null 2>&1 &&
+         [ -s "$TMP/qwen_wide.bin" ]; then
+        ok "a shared expert 64x the hidden width opens and runs"
+    else
+        no "a wide shared expert was refused or did not run"
     fi
 
     # The isolated ops against an independent PyTorch reference written
@@ -1875,6 +1909,23 @@ PYQ
         77)  sk "container-native Qwen oracle" "torch not installed" ;;
         124) sk "container-native Qwen oracle" "uv timed out" ;;
         *)   no "the engine diverges from the container-native Qwen oracle"
+             printf '%s\n' "$qout" | tail -12 ;;
+        esac
+        # The same comparison on the wide shared expert above. Running is
+        # not enough there: a buffer sized from the wrong width can hold
+        # the vector and still be read at the wrong stride.
+        qout=$(QWEN_FIXTURE_ARGS="--qwen-shared 2048" run_uv run --quiet \
+                   --with torch --no-project python \
+                   tests/test_qwen_container_ref.py 2>&1); qrc=$?
+        case "$qrc" in
+        0)   if printf '%s' "$qout" | grep -q 'shared=2048'; then
+                 ok "a shared expert 64x the hidden width matches the oracle too"
+             else
+                 no "the wide-shared oracle arm ran the default fixture instead"
+             fi ;;
+        77)  sk "container-native Qwen oracle, wide shared expert" "torch not installed" ;;
+        124) sk "container-native Qwen oracle, wide shared expert" "uv timed out" ;;
+        *)   no "the engine diverges from the oracle on a wide shared expert"
              printf '%s\n' "$qout" | tail -12 ;;
         esac
     fi

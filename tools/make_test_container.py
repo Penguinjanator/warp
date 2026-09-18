@@ -549,8 +549,11 @@ def write_tokenizer(outdir):
 def write_qwen_container(args, rng):
     """A structurally valid Qwen text fixture. Format v0, WEXP unchanged."""
     cfg = dict(QWEN_CFG)
+    if getattr(args, "qwen_shared", None):
+        cfg["shared_expert_intermediate_size"] = args.qwen_shared
     hid = cfg["hidden_size"]
     moe = cfg["moe_intermediate_size"]
+    shw = cfg["shared_expert_intermediate_size"]
     hc, lr = cfg["hc_count"], cfg["hc_lowrank"]
     hc_w = hc * hid
     t = Trunk(rng, "")
@@ -596,9 +599,9 @@ def write_qwen_container(args, rng):
             t.f32(a + "indexer.k_layernorm.weight", [cfg["indexer_head_dim"]])
         m = p + "mlp."
         t.quant(m + "gate.weight", [cfg["num_experts"], hid])
-        t.quant(m + "shared_expert.gate_proj.weight", [moe, hid])
-        t.quant(m + "shared_expert.up_proj.weight", [moe, hid])
-        t.quant(m + "shared_expert.down_proj.weight", [hid, moe])
+        t.quant(m + "shared_expert.gate_proj.weight", [shw, hid])
+        t.quant(m + "shared_expert.up_proj.weight", [shw, hid])
+        t.quant(m + "shared_expert.down_proj.weight", [hid, shw])
         t.quant(m + "shared_expert_gate.weight", [1, hid])
         if L == 1:
             pe = cfg["ple_embed_dim"]
@@ -794,6 +797,12 @@ def main():
     ap.add_argument("--qwen", action="store_true",
                     help="a tiny Qwen3.8-Flash-Next text fixture: packed-MoE "
                          "WEXP banks, GDN/QSA/HC names, 16 on-disk PLE heads")
+    ap.add_argument("--qwen-shared", type=int, metavar="N",
+                    help="with --qwen: the shared expert N wide, tensors and "
+                         "manifest both. Editing the manifest alone makes a "
+                         "container the shape check refuses before anything "
+                         "that sizes a buffer from N is reached, so a wide "
+                         "shared expert has to be generated, not patched in")
     args = ap.parse_args()
     if args.index_bits == 6:
         # The engine validates index_bits 6 only as 4 stages of 64 entries

@@ -48,9 +48,14 @@ def main():
     tmp = tempfile.mkdtemp(prefix="qwen-cref-")
     try:
         cont = os.path.join(tmp, "qwen.waste")
+        # QWEN_FIXTURE_ARGS reshapes the fixture — tests/run.sh passes
+        # `--qwen-shared N` to run a shared expert wider than every buffer
+        # the default fixture would ever size — and the comparison below is
+        # the same one either way.
+        extra = os.environ.get("QWEN_FIXTURE_ARGS", "").split()
         r = subprocess.run(
             [sys.executable, os.path.join(ROOT, "tools", "make_test_container.py"),
-             "--qwen", cont],
+             "--qwen", *extra, cont],
             cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0:
             print("FAIL fixture", r.stderr[-400:] or r.stdout[-400:])
@@ -143,7 +148,10 @@ def main():
         if cmp.returncode != 0:
             print("FAIL compare", cmp.stdout[-800:] or cmp.stderr[-800:])
             return 1
-        print(f"CONTAINER REF OK logits max|diff| {mx:.3e} argmax {ai}")
+        # The shared width goes in the verdict so a caller asking for a wide
+        # fixture can tell it got one, rather than a default run that passed.
+        print(f"CONTAINER REF OK logits max|diff| {mx:.3e} argmax {ai} "
+              f"shared={cfg.get('shared_expert_intermediate_size')}")
         return 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

@@ -1491,7 +1491,7 @@ static int validate_qwen_tensors(waste_model *m)
     const int qd = c->n_heads * c->qsa_head_dim;
     const int kvd = c->qsa_n_kv * c->qsa_head_dim;
     const int idxd = (c->idx_n_heads + c->idx_kv_heads) * c->idx_head_dim;
-    const int shared = c->shared_inter ? c->shared_inter : c->moe_inter;
+    const int shared = c->shared_inter;
 
     for (int L = 0; L < c->n_layers; L++) {
         const char *side[2] = { "attn_hyper_connection", "mlp_hyper_connection" };
@@ -1888,10 +1888,17 @@ static int cfg_sane(const waste_config *c)
      * an allocation or indexes a loop below. A container that omits one is
      * refused here rather than opened and read out of bounds. */
     if (c->arch_qwen) {
-        const int max_inter = c->dense_inter > c->moe_inter
-                            ? c->dense_inter : c->moe_inter;
         if (c->qwen_n_layer_types != c->n_layers) return 0;
-        if (c->shared_inter < 1 || c->shared_inter > max_inter) return 0;
+        /* The shared expert's width is a dimension of its own, not a
+         * fraction of the other two — Qwen2-57B-A14B ships it wider than
+         * both — so it is bounded the way they are rather than by them,
+         * and every buffer a vector of that width passes through is sized
+         * from it at load: m->ff for its gate and up, and m->xq, which
+         * quantizes its down projection's input. Bounding it by
+         * max(moe, dense) instead left m->xq short whenever moe_inter
+         * exceeded the hidden width, and a container with both at 2048
+         * over a 32-wide hidden state wrote past it on the first token. */
+        if (c->shared_inter < 1 || c->shared_inter > (1 << 20)) return 0;
         if (c->conv_k < 1) return 0;
         if (c->gdn_k_heads < 1 || c->gdn_v_heads < 1 ||
             c->gdn_k_dim < 1 || c->gdn_v_dim < 1) return 0;
@@ -3274,7 +3281,12 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         m->mrow = (float *)calloc(n, sizeof(float));
     }
     m->logits = (float *)calloc((size_t)c->vocab, sizeof(float));
-    m->ff = (float *)calloc((size_t)2 * (c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter), sizeof(float));
+    {   /* The dense FFN's gate and up, a routed expert's on the serial
+         * path, and Qwen's shared expert's (0 everywhere else). */
+        int ffw = c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter;
+        if (c->shared_inter > ffw) ffw = c->shared_inter;
+        m->ff = (float *)calloc((size_t)2 * ffw, sizeof(float));
+    }
     m->e_gate = (float *)malloc((size_t)c->moe_inter * c->hidden * sizeof(float));
     m->e_up = (float *)malloc((size_t)c->moe_inter * c->hidden * sizeof(float));
     m->e_down = (float *)malloc((size_t)c->hidden * c->moe_inter * sizeof(float));
@@ -3298,6 +3310,9 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
                                       c->arch_qwen && c->hc_count ? c->hc_count : 1)
                           * c->hidden;
         if (hcw > nmax) nmax = (int)hcw;
+        /* And Qwen's shared expert: its down projection reads a vector
+         * shared_inter wide, which nothing above bounds. */
+        if (c->shared_inter > nmax) nmax = c->shared_inter;
         /* Two bytes per activation: the i8mm path writes two int8 planes
          * and the SMLAL path writes int16, both over the padded group
          * count rather than over `in`. */
@@ -8134,7 +8149,7 @@ static float qwen_shared_expert(waste_model *m, int L, const float *in, float *a
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
     PROF_START(P_QSHX);
-    const int shared = c->shared_inter ? c->shared_inter : c->moe_inter;
+    const int shared = c->shared_inter;
     if (pre) {
         waste_act_pair_range(c, m->ff, m->ff + shared, shared);
         matvec_t(m, acc, waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.down_proj.weight",
@@ -8160,7 +8175,7 @@ static void qwen_moe_layer(waste_model *m, int L, const float *in, float *out, i
     float *sc = m->att + WASTE_ATT_ROUTER_OFF;
     int idx[64];
     float w[64];
-    const int shared_in = c->shared_inter ? c->shared_inter : inter;
+    const int shared_in = c->shared_inter;
     float sg_raw = 0.0f;
     int shared_pre = 1;
     PROF_START(P_QRTR);

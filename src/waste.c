@@ -637,6 +637,31 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
         sc += (uint64_t)nblk * 4u;
         sc += 2ull * ctx_tokens * (uint64_t)(rot > 0 ? rot : 1) * 4u;
         sc += (uint64_t)(n_exp > 0 ? n_exp : 1) * 5u;
+        {   /* What waste_model_load widens past the generic terms above:
+             * m->ff to the shared expert's gate and up, and m->xq / m->xs
+             * to the widest vector a trunk matvec quantizes — the four
+             * HyperConnection streams, or the shared expert's down
+             * projection input, whichever is wider. The generic mHC term
+             * reads hc_mult, which a Qwen manifest does not carry. */
+            const uint64_t moe = (uint64_t)moe_inter;
+            /* dense as the loader reads it — 0 when absent, where this
+             * function's dense_inter defaults to moe_inter — so the
+             * widening is counted from the base that is really allocated */
+            const uint64_t dn = (uint64_t)js_int(&d, js_get(&d, cfg,
+                                    "intermediate_size"), 0);
+            const uint64_t sh = (uint64_t)js_int(&d, js_get(&d, cfg,
+                                    "shared_expert_intermediate_size"), moe_inter);
+            const uint64_t ffw = dn > moe ? dn : moe;
+            if (sh > ffw) sc += 2u * (sh - ffw) * 4u;            /* m->ff */
+            const uint64_t hcq = (uint64_t)js_int(&d, js_get(&d, cfg,
+                                     "hc_count"), 4) * (uint64_t)hidden;
+            const uint64_t was = (uint64_t)hidden > dn ? (uint64_t)hidden : dn;
+            uint64_t xw = hcq > sh ? hcq : sh;
+            if (xw > was) {
+                sc += (xw - was) * 2u;                           /* m->xq */
+                sc += (xw - was) / 32u * 4u;                     /* m->xs */
+            }
+        }
     }
     out->scratch_bytes = sc;
 
